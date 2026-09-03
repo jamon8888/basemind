@@ -46,7 +46,7 @@ function getPlatformTriple() {
 
 function getReleaseAssets() {
   const platform = getPlatformTriple();
-  const baseUrl = `https://github.com/Goldziher/basemind/releases/download/v${version}`;
+  const baseUrl = `https://github.com/jamon8888/basemind/releases/download/v${version}`;
   const ext = platform.includes("windows") ? "zip" : "tar.gz";
   const assetName = `basemind-${platform}.${ext}`;
   return {

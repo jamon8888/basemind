@@ -210,12 +210,12 @@ jobs:
           fi
 
           npm_exists=false
-          if npm view "basemind@${version}" version >/dev/null 2>&1; then
+          if npm view "@jamon8888/basemind-fork@${version}" version >/dev/null 2>&1; then
             npm_exists=true
           fi
 
           opencode_exists=false
-          if npm view "basemind-opencode@${version}" version >/dev/null 2>&1; then
+          if npm view "@jamon8888/basemind-fork-opencode@${version}" version >/dev/null 2>&1; then
             opencode_exists=true
           fi
 
