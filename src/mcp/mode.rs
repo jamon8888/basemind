@@ -194,6 +194,19 @@ define_mode! {
 }
 
 define_mode! {
+    /// Which vault / rehydration-map operation the `vault` tool should run.
+    pub enum VaultMode {
+        domain: "vault",
+        summary: "Encrypted PII rehydration map operation to run.",
+        Encrypt => "encrypt", "encrypt a rehydration map (token→original) with a passphrase";
+        Decrypt => "decrypt", "decrypt a vault blob back into a rehydration map";
+        Find => "find", "search a decrypted map for token or original value (case-insensitive substring)";
+        Forget => "forget", "remove entries matching a query from the in-memory map";
+        Inspect => "inspect", "show token count, categories, and a sample from a decrypted map";
+    }
+}
+
+define_mode! {
     /// Which workspace / worktree registry operation the `workspace` tool should run.
     pub enum WorkspaceMode {
         domain: "workspace",

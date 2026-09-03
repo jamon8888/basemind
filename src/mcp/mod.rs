@@ -57,6 +57,7 @@ mod helpers_registry;
 mod helpers_shells;
 mod helpers_telemetry;
 mod helpers_traverse;
+mod helpers_vault;
 #[cfg(feature = "crawl")]
 mod helpers_web;
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -97,6 +98,7 @@ mod tools_memory;
 mod tools_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 mod tools_shells;
+mod tools_vault;
 #[cfg(feature = "crawl")]
 mod tools_web;
 mod toon;
@@ -121,6 +123,7 @@ mod types_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 mod types_shells;
 mod types_traverse;
+mod types_vault;
 #[cfg(feature = "crawl")]
 mod types_web;
 
@@ -467,6 +470,7 @@ impl BasemindServer {
         {
             router += Self::tool_router_shells();
         }
+        router += Self::tool_router_vault();
         router
     }
 

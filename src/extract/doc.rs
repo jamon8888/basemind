@@ -15,11 +15,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+use xberg::LanguageDetectionConfig;
 use xberg::core::config::processing::{ChunkerType, ChunkingConfig};
 use xberg::core::config::{ConcurrencyConfig, ExtractionConfig};
 use xberg::extractors::security::SecurityLimits;
-use xberg::LanguageDetectionConfig;
-use xberg::{extract, ExtractInput};
+use xberg::{ExtractInput, extract};
 
 use super::{ExtractError, SCHEMA_VER};
 use crate::config::{

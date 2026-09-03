@@ -28,6 +28,7 @@ pub mod registry;
 pub mod render;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shell;
+pub mod vault;
 pub mod web;
 
 use std::io::Write;
@@ -71,6 +72,9 @@ pub enum ToolCmd {
     #[cfg(all(feature = "shells", any(unix, windows)))]
     #[command(subcommand)]
     Shell(shell::ShellCmd),
+    /// Encrypted PII rehydration map operations: encrypt, decrypt, find, forget, inspect.
+    #[command(subcommand)]
+    Vault(vault::VaultCmd),
 }
 
 /// Map a tool `Result<CallToolResult, McpError>` into an `anyhow::Result`,
@@ -123,6 +127,7 @@ pub fn run(
             ToolCmd::Admin(a) => admin::run(&server, a, &opts, &mut out).await?,
             #[cfg(all(feature = "shells", any(unix, windows)))]
             ToolCmd::Shell(s) => shell::run(&server, s, &opts, &mut out).await?,
+            ToolCmd::Vault(v) => vault::run(&server, v, &opts, &mut out).await?,
         }
         out.flush().context("flush stdout")?;
         Ok(())
