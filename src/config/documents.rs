@@ -423,7 +423,7 @@ pub struct RedactionConfig {
     /// tokens per category and is reversible via the rehydration map. `mask`
     /// replaces with `[REDACTED]` irreversibly. `hash` replaces with
     /// `[HASH:...` irreversibly. `drop` removes the span with no marker.
-    #[serde(default = "RedactionConfig::default_strategy")]
+    #[serde(default)]
     pub strategy: RedactionStrategy,
     /// NER backend config for PERSON / ORGANIZATION / LOCATION categories.
     #[serde(default)]
@@ -439,6 +439,20 @@ pub struct RedactionConfig {
     /// in the redaction report.
     #[serde(default)]
     pub custom_patterns: Vec<RedactionCustomPattern>,
+}
+
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            categories: Vec::new(),
+            strategy: RedactionStrategy::TokenReplace,
+            ner: None,
+            preserve_offsets: true,
+            custom_terms: Vec::new(),
+            custom_patterns: Vec::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -554,7 +568,7 @@ impl RedactionConfig {
                 super::NerBackend::Onnx => xberg::core::config::ner::NerBackendKind::Onnx,
                 super::NerBackend::Llm => xberg::core::config::ner::NerBackendKind::Llm,
             },
-            categories: n.categories.clone(),
+            categories: n.categories.iter().cloned().map(xberg::types::entity::EntityCategory::from).collect(),
             model: n.model.clone(),
             llm: None,
             custom_labels: n.custom_labels.clone(),
@@ -581,7 +595,7 @@ impl RedactionConfig {
             .collect();
 
         Some(xberg::RedactionConfig {
-            categories,
+            categories: std::collections::HashSet::from_iter(categories),
             strategy,
             ner,
             preserve_offsets: self.preserve_offsets,

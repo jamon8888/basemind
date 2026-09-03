@@ -1,14 +1,15 @@
 //! CLI parity for the `vault` tool: encrypt, decrypt, find, forget, inspect.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use super::render::Emit;
-use crate::cli::context::BasemindServer;
+use crate::mcp::BasemindServer;
 use crate::mcp::mode::VaultMode;
 use crate::mcp::types_vault::VaultParams;
 
@@ -60,7 +61,7 @@ fn read_map(path: Option<&PathBuf>) -> Result<BTreeMap<String, String>> {
         }
         _ => {
             let mut raw = Vec::new();
-            std::io::stdin().read_to_end(&mut raw).context("read stdin")?;
+            Read::read_to_end(&mut std::io::stdin(), &mut raw).context("read stdin")?;
             String::from_utf8_lossy(&raw).into_owned()
         }
     };

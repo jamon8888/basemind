@@ -123,6 +123,7 @@ pub(crate) fn doc_config_from(
         embed_max_threads: resources.effective_embed_threads(cfg.embed_max_threads),
         embed_batch_size: resources.embed_batch_size,
         document_models: resources.document_models,
+        redaction: cfg.redaction.clone(),
     }
 }
 

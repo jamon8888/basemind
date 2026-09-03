@@ -9,9 +9,11 @@
 
 use std::collections::BTreeMap;
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
+use serde::Serialize;
 use xberg::text::redaction::rehydration::{self, SubjectMatch};
 
 use super::mode::{VaultMode, reject_unsupported};
@@ -20,7 +22,7 @@ use super::types_vault::{
 };
 use crate::mcp::helpers::json_result;
 
-pub(super) type Base64 = Base64Engine;
+
 
 fn reject_foreign_fields(mode: VaultMode, present: &[(&str, bool)], allowed: &[&str]) -> Result<(), McpError> {
     let foreign: Vec<(&str, bool)> = present
@@ -86,12 +88,12 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
             let passphrase = require_field(mode, "passphrase", p.passphrase)?;
             let token_count = map.len();
             let encrypted = rehydration::encrypt_map(&map, &passphrase)
-                .map_err(|e| McpError::internal_error(format!("encryption failed: {e}")))?;
+                .map_err(|e| McpError::internal_error(format!("encryption failed: {e}"), None))?;
             let response = VaultEncryptResponse {
                 encrypted_blob: encode_blob(&encrypted),
                 token_count,
             };
-            json_result(serde_json::to_value(response).unwrap())
+            json_result(&response)
         }
         VaultMode::Decrypt => {
             reject_foreign_fields(mode, &present, &["encrypted_blob", "passphrase"])?;
@@ -102,7 +104,7 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
                 .map_err(|e| McpError::invalid_params(format!("decryption failed: {e}"), None))?;
             let token_count = map.len();
             let response = VaultDecryptResponse { map, token_count };
-            json_result(serde_json::to_value(response).unwrap())
+            json_result(&response)
         }
         VaultMode::Find => {
             reject_foreign_fields(mode, &present, &["map", "query"])?;
@@ -121,7 +123,7 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
                     .collect(),
                 searched_token_count,
             };
-            json_result(serde_json::to_value(response).unwrap())
+            json_result(&response)
         }
         VaultMode::Forget => {
             reject_foreign_fields(mode, &present, &["map", "query"])?;
@@ -140,7 +142,7 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
                     .collect(),
                 remaining_token_count,
             };
-            json_result(serde_json::to_value(response).unwrap())
+            json_result(&response)
         }
         VaultMode::Inspect => {
             reject_foreign_fields(mode, &present, &["map"])?;
@@ -155,7 +157,7 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
                 categories,
                 sample,
             };
-            json_result(serde_json::to_value(response).unwrap())
+            json_result(&response)
         }
     }
 }
