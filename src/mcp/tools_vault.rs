@@ -40,8 +40,8 @@ impl BasemindServer {
     pub(crate) async fn vault(
         &self,
         Parameters(Lenient(p)): Parameters<Lenient<VaultParams>>,
-        peer: rmcp::Peer<rmcp::RoleServer>,
-        meta: rmcp::model::RequestMetaObject,
+        _peer: rmcp::Peer<rmcp::RoleServer>,
+        _meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
         let key = p.mode.telemetry_key();

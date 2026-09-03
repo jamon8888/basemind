@@ -7,13 +7,12 @@
 //! `{appData}/vaults/`. This tool only encrypts/decrypts in-memory maps. `find` and `forget`
 //! operate on a map supplied in the same call (never persisted here).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
-use serde::Serialize;
 use xberg::text::redaction::rehydration::{self, SubjectMatch};
 
 use super::mode::{VaultMode, reject_unsupported};
@@ -36,8 +35,8 @@ fn require_field<T>(mode: VaultMode, field: &str, value: Option<T>) -> Result<T,
         .ok_or_else(|| McpError::invalid_params(format!("`vault` mode=\"{}\" requires `{field}`", mode.as_str()), None))
 }
 
-fn require_map(mode: VaultMode, map: Option<BTreeMap<String, String>>) -> Result<BTreeMap<String, String>, McpError> {
-    map.ok_or_else(|| {
+fn require_map(mode: VaultMode, map: Option<BTreeMap<String, String>>) -> Result<HashMap<String, String>, McpError> {
+    map.map(|m| m.into_iter().collect()).ok_or_else(|| {
         McpError::invalid_params(
             format!(
                 "`vault` mode=\"{}\" requires `map` (the rehydration map)",
@@ -98,10 +97,13 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
             let blob_b64 = require_field(mode, "encrypted_blob", p.encrypted_blob)?;
             let passphrase = require_field(mode, "passphrase", p.passphrase)?;
             let blob = decode_blob(&blob_b64)?;
-            let map = rehydration::decrypt_map(&blob, &passphrase)
+            let map: HashMap<String, String> = rehydration::decrypt_map(&blob, &passphrase)
                 .map_err(|e| McpError::invalid_params(format!("decryption failed: {e}"), None))?;
             let token_count = map.len();
-            let response = VaultDecryptResponse { map, token_count };
+            let response = VaultDecryptResponse {
+                map: map.into_iter().collect(),
+                token_count,
+            };
             json_result(&response)
         }
         VaultMode::Find => {
@@ -144,7 +146,7 @@ pub(super) async fn run_vault(p: super::types_vault::VaultParams) -> Result<Call
         }
         VaultMode::Inspect => {
             reject_foreign_fields(mode, &present, &["map"])?;
-            let map = require_map(mode, p.map)?;
+            let map: HashMap<String, String> = require_map(mode, p.map)?;
             let token_count = map.len();
             let mut categories: Vec<String> = map.keys().filter_map(|t| category_from_token(t)).collect();
             categories.sort();
