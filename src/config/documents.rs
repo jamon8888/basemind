@@ -470,7 +470,7 @@ pub enum RedactionStrategy {
 }
 
 /// NER backend config for redaction (separate from the extraction-tier NER config).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NerRedactionConfig {
     /// NER backend: `onnx` (local GLiNER) or `llm` (provider API).
@@ -485,17 +485,6 @@ pub struct NerRedactionConfig {
     /// Custom labels for zero-shot detection.
     #[serde(default)]
     pub custom_labels: Vec<String>,
-}
-
-impl Default for NerRedactionConfig {
-    fn default() -> Self {
-        Self {
-            backend: NerBackend::default(),
-            model: None,
-            categories: Vec::new(),
-            custom_labels: Vec::new(),
-        }
-    }
 }
 
 /// A literal string to redact, surfaced as `Custom(<label>)` in the report.
@@ -538,7 +527,7 @@ impl RedactionConfig {
         } else {
             self.categories
                 .iter()
-                .filter_map(|c| match c.to_lowercase().as_str() {
+                .map(|c| match c.to_lowercase().as_str() {
                     "email" => Some(xberg::types::redaction::PiiCategory::Email),
                     "phone" => Some(xberg::types::redaction::PiiCategory::Phone),
                     "ssn" => Some(xberg::types::redaction::PiiCategory::Ssn),
