@@ -568,7 +568,12 @@ impl RedactionConfig {
                 super::NerBackend::Onnx => xberg::core::config::ner::NerBackendKind::Onnx,
                 super::NerBackend::Llm => xberg::core::config::ner::NerBackendKind::Llm,
             },
-            categories: n.categories.iter().cloned().map(xberg::types::entity::EntityCategory::from).collect(),
+            categories: n
+                .categories
+                .iter()
+                .cloned()
+                .map(xberg::types::entity::EntityCategory::from)
+                .collect(),
             model: n.model.clone(),
             llm: None,
             custom_labels: n.custom_labels.clone(),

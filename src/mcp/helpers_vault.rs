@@ -22,8 +22,6 @@ use super::types_vault::{
 };
 use crate::mcp::helpers::json_result;
 
-
-
 fn reject_foreign_fields(mode: VaultMode, present: &[(&str, bool)], allowed: &[&str]) -> Result<(), McpError> {
     let foreign: Vec<(&str, bool)> = present
         .iter()
