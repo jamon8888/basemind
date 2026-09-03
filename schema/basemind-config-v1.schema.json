@@ -505,6 +505,18 @@
             "strategy": "extractive"
           }
         },
+        "redaction": {
+          "description": "PII redaction / anonymisation at ingest time. When enabled, xberg's\nredaction processor runs at the Late stage and rewrites every textual field\nwith [TYPE_N] tokens via TokenReplace. The rehydration map is returned via\nthe extraction result and is NOT stored by basemind — use `basemind vault-encrypt`\nto persist it separately.",
+          "$ref": "#/$defs/RedactionConfig",
+          "default": {
+            "enabled": false,
+            "categories": [],
+            "strategy": "token_replace",
+            "preserve_offsets": true,
+            "custom_terms": [],
+            "custom_patterns": []
+          }
+        },
         "ocr": {
           "description": "OCR backend selection for image / scanned-PDF inputs.",
           "$ref": "#/$defs/OcrConfig",
@@ -726,6 +738,119 @@
         "extractive",
         "abstractive"
       ]
+    },
+    "RedactionConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch — off by default.",
+          "type": "boolean",
+          "default": false
+        },
+        "categories": {
+          "description": "PII categories to redact. Empty = all categories supported by the engine.\nAccepted values: email, phone, ssn, credit_card, iban, ip_address, swift_bic,\npostal_code, date_of_birth, person, organization, location.",
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "strategy": {
+          "description": "Redaction strategy. token_replace (default) assigns stable [TYPE_N] tokens\nand is reversible. mask replaces with [REDACTED] irreversibly. hash replaces\nwith [HASH:... irreversibly. drop removes the span with no marker.",
+          "$ref": "#/$defs/RedactionStrategy",
+          "default": "token_replace"
+        },
+        "ner": {
+          "description": "NER backend config for PERSON/ORGANIZATION/LOCATION categories.",
+          "$ref": "#/$defs/NerRedactionConfig"
+        },
+        "preserve_offsets": {
+          "description": "Preserve chunk byte ranges after redaction.",
+          "type": "boolean",
+          "default": true
+        },
+        "custom_terms": {
+          "description": "Custom literal terms to redact.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/RedactionCustomTerm" },
+          "default": []
+        },
+        "custom_patterns": {
+          "description": "Custom regex patterns to redact.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/RedactionCustomPattern" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "RedactionStrategy": {
+      "type": "string",
+      "enum": ["token_replace", "mask", "hash", "drop"]
+    },
+    "NerRedactionConfig": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/NerBackend",
+          "default": "onnx"
+        },
+        "model": {
+          "description": "Override the ONNX model name.",
+          "type": ["string", "null"]
+        },
+        "categories": {
+          "description": "NER categories to detect.",
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "custom_labels": {
+          "description": "Custom labels for zero-shot detection.",
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "RedactionCustomTerm": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "Label shown in the redaction report for each hit.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Literal value to find and redact.",
+          "type": "string"
+        },
+        "case_sensitive": {
+          "description": "Case-sensitive match (default: false).",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": ["label", "value"],
+      "additionalProperties": false
+    },
+    "RedactionCustomPattern": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "Label shown in the redaction report for each hit.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regex pattern (Rust dialect, no look-around).",
+          "type": "string"
+        },
+        "case_sensitive": {
+          "description": "Case-sensitive match (default: false).",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": ["label", "pattern"],
+      "additionalProperties": false
     },
     "OcrConfig": {
       "type": "object",

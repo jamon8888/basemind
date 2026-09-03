@@ -18,8 +18,8 @@ pub use code::CodeSearchConfig;
 pub use comms::CommsConfig;
 pub use documents::{
     ApiKey, DocLanguageConfig, DocumentsConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    OcrBackend, OcrConfig, OutputConfig, OutputFormat, RerankerConfig, SecretString, SummarizationConfig,
-    SummarizationStrategy,
+    NerRedactionConfig, OcrBackend, OcrConfig, OutputConfig, OutputFormat, RedactionConfig, RedactionCustomPattern,
+    RedactionCustomTerm, RedactionStrategy, RerankerConfig, SecretString, SummarizationConfig, SummarizationStrategy,
 };
 pub use layered::{ConfigLayers, LoadedConfig, defaults_only, merge_layers};
 pub use overrides::DocumentsCliOverrides;

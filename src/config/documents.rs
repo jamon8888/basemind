@@ -82,6 +82,9 @@ pub struct DocumentsConfig {
     /// Document summarization at ingest time.
     #[serde(default)]
     pub summarization: SummarizationConfig,
+    /// PII redaction / anonymisation at ingest time.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
     /// OCR backend selection for image / scanned-PDF inputs.
     #[serde(default)]
     pub ocr: OcrConfig,
@@ -148,6 +151,7 @@ impl Default for DocumentsConfig {
             keywords: KeywordsConfig::default(),
             ner: NerConfig::default(),
             summarization: SummarizationConfig::default(),
+            redaction: RedactionConfig::default(),
             ocr: OcrConfig::default(),
             output: OutputConfig::default(),
             embed_max_threads: 0,
@@ -388,6 +392,203 @@ pub enum SummarizationStrategy {
     #[default]
     Extractive,
     Abstractive,
+}
+
+/// PII redaction / anonymisation config.
+///
+/// When `enabled = true`, xberg's redaction post-processor runs at the Late stage
+/// of document extraction and rewrites every textual field (content, tables, metadata,
+/// URIs, form fields, OCR, Djot, etc.) with `[TYPE_N]` tokens via `TokenReplace`.
+/// The rehydration map is NOT stored by basemind — it is returned to the caller
+/// via `ExtractedDocument.redaction_report`. Use `basemind vault-encrypt` to
+/// encrypt and persist the map separately.
+///
+/// Requires `xberg/redaction` (enabled in the `documents` feature) and
+/// `xberg/redaction-rehydrate` (also enabled in the `documents` feature) for the
+/// `TokenReplace` strategy that enables later rehydration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionConfig {
+    /// Master switch — off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// PII categories to redact. Empty = all categories supported by the engine.
+    /// Accepted values: `email`, `phone`, `ssn`, `credit_card`, `iban`,
+    /// `ip_address`, `swift_bic`, `postal_code`, `person`, `organization`,
+    /// `location`, `date_of_birth`. Categories suffixed with `_strict` use
+    /// checksum validation where applicable (e.g. `iban_strict`).
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Redaction strategy. `token_replace` (default) assigns stable `[TYPE_N]`
+    /// tokens per category and is reversible via the rehydration map. `mask`
+    /// replaces with `[REDACTED]` irreversibly. `hash` replaces with
+    /// `[HASH:...` irreversibly. `drop` removes the span with no marker.
+    #[serde(default = "RedactionConfig::default_strategy")]
+    pub strategy: RedactionStrategy,
+    /// NER backend config for PERSON / ORGANIZATION / LOCATION categories.
+    #[serde(default)]
+    pub ner: Option<NerRedactionConfig>,
+    /// Preserve chunk byte ranges after redaction (default: `true`).
+    #[serde(default = "default_true")]
+    pub preserve_offsets: bool,
+    /// Custom literal terms to redact. Each hit surfaces as `Custom(<label>)`
+    /// in the redaction report.
+    #[serde(default)]
+    pub custom_terms: Vec<RedactionCustomTerm>,
+    /// Custom regex patterns to redact. Each hit surfaces as `Custom(<label>)`
+    /// in the redaction report.
+    #[serde(default)]
+    pub custom_patterns: Vec<RedactionCustomPattern>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RedactionStrategy {
+    #[default]
+    TokenReplace,
+    Mask,
+    Hash,
+    Drop,
+}
+
+/// NER backend config for redaction (separate from the extraction-tier NER config).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NerRedactionConfig {
+    /// NER backend: `onnx` (local GLiNER) or `llm` (provider API).
+    #[serde(default)]
+    pub backend: NerBackend,
+    /// Override the ONNX model name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Categories to detect via NER.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Custom labels for zero-shot detection.
+    #[serde(default)]
+    pub custom_labels: Vec<String>,
+}
+
+impl Default for NerRedactionConfig {
+    fn default() -> Self {
+        Self {
+            backend: NerBackend::default(),
+            model: None,
+            categories: Vec::new(),
+            custom_labels: Vec::new(),
+        }
+    }
+}
+
+/// A literal string to redact, surfaced as `Custom(<label>)` in the report.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionCustomTerm {
+    /// Label shown in the redaction report for each hit.
+    pub label: String,
+    /// Literal value to find and redact.
+    pub value: String,
+    /// Case-sensitive match (default: false, i.e. case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+/// A regex pattern to redact, surfaced as `Custom(<label>)` in the report.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionCustomPattern {
+    /// Label shown in the redaction report for each hit.
+    pub label: String,
+    /// Regex pattern (Rust dialect, no look-around).
+    pub pattern: String,
+    /// Case-sensitive match (default: false, i.e. case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+#[cfg(feature = "intelligence")]
+impl RedactionConfig {
+    /// Translate the basemind-side `RedactionConfig` into xberg's `RedactionConfig`.
+    /// Returns `None` when redaction is disabled.
+    pub fn to_xberg(&self) -> Option<xberg::RedactionConfig> {
+        if !self.enabled {
+            return None;
+        }
+
+        let categories = if self.categories.is_empty() {
+            Vec::new()
+        } else {
+            self.categories
+                .iter()
+                .filter_map(|c| match c.to_lowercase().as_str() {
+                    "email" => Some(xberg::types::redaction::PiiCategory::Email),
+                    "phone" => Some(xberg::types::redaction::PiiCategory::Phone),
+                    "ssn" => Some(xberg::types::redaction::PiiCategory::Ssn),
+                    "credit_card" => Some(xberg::types::redaction::PiiCategory::CreditCard),
+                    "iban" => Some(xberg::types::redaction::PiiCategory::Iban),
+                    "ip_address" => Some(xberg::types::redaction::PiiCategory::IpAddress),
+                    "swift_bic" => Some(xberg::types::redaction::PiiCategory::SwiftBic),
+                    "postal_code" => Some(xberg::types::redaction::PiiCategory::PostalCode),
+                    "date_of_birth" => Some(xberg::types::redaction::PiiCategory::DateOfBirth),
+                    "person" => Some(xberg::types::redaction::PiiCategory::Person),
+                    "organization" => Some(xberg::types::redaction::PiiCategory::Organization),
+                    "location" => Some(xberg::types::redaction::PiiCategory::Location),
+                    s => Some(xberg::types::redaction::PiiCategory::Custom(s.into())),
+                })
+                .collect()
+        };
+
+        let strategy = match self.strategy {
+            RedactionStrategy::TokenReplace => xberg::types::redaction::RedactionStrategy::TokenReplace,
+            RedactionStrategy::Mask => xberg::types::redaction::RedactionStrategy::Mask,
+            RedactionStrategy::Hash => xberg::types::redaction::RedactionStrategy::Hash,
+            RedactionStrategy::Drop => xberg::types::redaction::RedactionStrategy::Drop,
+        };
+
+        let ner = self.ner.as_ref().map(|n| xberg::core::config::ner::NerConfig {
+            backend: match n.backend {
+                super::NerBackend::Onnx => xberg::core::config::ner::NerBackendKind::Onnx,
+                super::NerBackend::Llm => xberg::core::config::ner::NerBackendKind::Llm,
+            },
+            categories: n.categories.clone(),
+            model: n.model.clone(),
+            llm: None,
+            custom_labels: n.custom_labels.clone(),
+        });
+
+        let custom_terms = self
+            .custom_terms
+            .iter()
+            .map(|t| xberg::RedactionTerm {
+                label: t.label.clone(),
+                value: t.value.clone(),
+                case_sensitive: t.case_sensitive,
+            })
+            .collect();
+
+        let custom_patterns = self
+            .custom_patterns
+            .iter()
+            .map(|p| xberg::RedactionPattern {
+                label: p.label.clone(),
+                pattern: p.pattern.clone(),
+                case_sensitive: p.case_sensitive,
+            })
+            .collect();
+
+        Some(xberg::RedactionConfig {
+            categories,
+            strategy,
+            ner,
+            preserve_offsets: self.preserve_offsets,
+            custom_terms,
+            custom_patterns,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

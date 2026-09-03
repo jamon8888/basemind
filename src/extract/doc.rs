@@ -15,16 +15,16 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use xberg::LanguageDetectionConfig;
 use xberg::core::config::processing::{ChunkerType, ChunkingConfig};
 use xberg::core::config::{ConcurrencyConfig, ExtractionConfig};
 use xberg::extractors::security::SecurityLimits;
-use xberg::{ExtractInput, extract};
+use xberg::LanguageDetectionConfig;
+use xberg::{extract, ExtractInput};
 
 use super::{ExtractError, SCHEMA_VER};
 use crate::config::{
     DocLanguageConfig, DocumentModelProfile, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    SummarizationConfig, SummarizationStrategy,
+    RedactionConfig, SummarizationConfig, SummarizationStrategy,
 };
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
@@ -198,6 +198,11 @@ pub struct DocConfig {
     /// profiles strip enrichment / embeddings to shrink the scan-time footprint — see
     /// [`crate::config::DocumentModelProfile`] and [`DocConfig::to_xberg`].
     pub document_models: DocumentModelProfile,
+    /// PII redaction / anonymisation config. When enabled, xberg's redaction processor
+    /// runs at the Late stage and rewrites every textual field with `[TYPE_N]` tokens.
+    /// The rehydration map is returned via `ExtractedDocument.redaction_report` — it is
+    /// NOT stored by basemind; callers should use `basemind vault-encrypt` to persist it.
+    pub redaction: RedactionConfig,
 }
 
 impl Default for DocConfig {
@@ -217,6 +222,7 @@ impl Default for DocConfig {
             embed_max_threads: 0,
             embed_batch_size: 32,
             document_models: DocumentModelProfile::default(),
+            redaction: RedactionConfig::default(),
         }
     }
 }
@@ -266,6 +272,7 @@ impl DocConfig {
             keywords,
             ner,
             summarization,
+            redaction: self.redaction.to_xberg(),
             disable_ocr: strip_enrichment,
             concurrency,
             extraction_timeout_secs: Some(self.extraction_timeout_secs),
