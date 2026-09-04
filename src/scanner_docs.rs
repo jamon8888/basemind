@@ -126,7 +126,6 @@ pub(crate) fn doc_config_from(
         redaction: cfg.redaction.clone(),
     }
 }
-
 /// Archive / compressed-container extensions. xberg routes `.zip/.tar/.gz/...` into its
 /// `ZipExtractor`/`GzipExtractor`/`build_archive_doc` path, which recursively unpacks the archive and
 /// embeds every entry — an enormous, pointless cost during a code-map scan (the observed 1119%-CPU /
