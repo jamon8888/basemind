@@ -138,6 +138,8 @@ fn tool_to_cli() -> Vec<(&'static str, Option<&'static str>, &'static str)> {
         ("shell", Some("list"), "shell list"),
         ("shell", Some("broadcast"), "shell broadcast"),
     ]);
+    #[cfg(feature = "documents")]
+    m.extend([("vault", None, "vault")]);
     m
 }
 

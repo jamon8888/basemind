@@ -3729,13 +3729,13 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
     let full = spawn_serve(root, None).await;
     let full_tools = full.list_all_tools().await.expect("list tools (full)");
     let full_names: Vec<&str> = full_tools.iter().map(|t| t.name.as_ref()).collect();
-    // The surface is nine domain tools at most (fewer when `crawl` / `comms` / `shells` are off),
+    // The surface is ten domain tools at most (fewer when `crawl` / `comms` / `shells` / `documents` are off),
     // which is the whole point of the consolidation: hosts defer tools and surface them by keyword
     // search, so a count that creeps back up is a regression, not growth. Asserted as a ceiling
     // plus the always-on names, rather than a floor that a re-flattening would still satisfy.
     assert!(
-        full_tools.len() <= 9,
-        "the surface must stay at nine domain tools or fewer, got {}: {full_names:?}",
+        full_tools.len() <= 10,
+        "the surface must stay at ten domain tools or fewer, got {}: {full_names:?}",
         full_tools.len()
     );
     for domain in ["code", "graph", "git", "memory", "admin"] {
