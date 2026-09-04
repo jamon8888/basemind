@@ -522,12 +522,13 @@ impl RedactionConfig {
             return None;
         }
 
-        let categories = if self.categories.is_empty() {
+        #[allow(clippy::unnecessary_filter_map)]
+        let categories: Vec<xberg::types::redaction::PiiCategory> = if self.categories.is_empty() {
             Vec::new()
         } else {
             self.categories
                 .iter()
-                .map(|c| match c.to_lowercase().as_str() {
+                .filter_map(|c| match c.to_lowercase().as_str() {
                     "email" => Some(xberg::types::redaction::PiiCategory::Email),
                     "phone" => Some(xberg::types::redaction::PiiCategory::Phone),
                     "ssn" => Some(xberg::types::redaction::PiiCategory::Ssn),
