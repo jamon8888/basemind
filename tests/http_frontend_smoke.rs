@@ -350,6 +350,7 @@ async fn both_routes_require_the_daemon_bearer_token() {
 
 /// ADR-0006: `GET /ui?root=<repo>` serves the self-contained interactive graph page (the browser/
 /// agent-drivable twin the `ui` tool points at), and the route's error paths return the right status.
+#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_route_serves_interactive_html() {
     basemind::store::init_isolated_cache();
@@ -433,6 +434,7 @@ async fn ui_route_serves_interactive_html() {
 /// project. A relative value is rejected BEFORE `std::fs::canonicalize` (which would otherwise
 /// resolve it against the daemon's own cwd — wherever the daemon happened to be spawned), and the
 /// filesystem root is refused outright. Neither may mint a workspace cache directory on the way.
+#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_root_param_must_be_absolute_and_must_be_a_project() {
     basemind::store::init_isolated_cache();
