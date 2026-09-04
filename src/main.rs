@@ -95,6 +95,10 @@ enum Cmd {
     /// Server + cache administration: status, repo, rescan, caches, telemetry, compression.
     #[command(subcommand)]
     Admin(basemind::cli::admin::AdminCmd),
+    /// Encrypted PII rehydration map operations: encrypt, decrypt, find, forget, inspect.
+    #[cfg(feature = "documents")]
+    #[command(subcommand)]
+    Vault(basemind::cli::vault::VaultCmd),
     /// Install a pre-commit hook that runs `basemind scan --staged`.
     Hook {
         #[command(subcommand)]
@@ -385,6 +389,8 @@ fn main() -> Result<()> {
         #[cfg(all(feature = "shells", any(unix, windows)))]
         Cmd::Shell(s) => dispatch(basemind::cli::ToolCmd::Shell(s)),
         Cmd::Admin(a) => dispatch(basemind::cli::ToolCmd::Admin(a)),
+        #[cfg(feature = "documents")]
+        Cmd::Vault(v) => dispatch(basemind::cli::ToolCmd::Vault(v)),
         Cmd::Hook { action } => match action {
             HookCmd::Install => cmd_hook_install(&root),
         },
@@ -426,6 +432,8 @@ fn warn_ignored_global_flags(cmd: &Cmd, json: bool, view: &str) {
         cmd,
         Cmd::Code(_) | Cmd::Git(_) | Cmd::Graph(_) | Cmd::Memory(_) | Cmd::Web(_) | Cmd::Admin(_) | Cmd::Cache(_)
     );
+    #[cfg(feature = "documents")]
+    let consumes_json = consumes_json || matches!(cmd, Cmd::Vault(_));
     #[cfg(all(feature = "comms", any(unix, windows)))]
     let consumes_json = consumes_json
         || matches!(
