@@ -1,6 +1,6 @@
 {
   "name": "@jamon8888/basemind-fork-opencode",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "description": "basemind fork — MCP code map and document RAG plugin for OpenCode.",
   "keywords": ["agent-context", "code-map", "mcp", "rag", "tree-sitter"],
   "homepage": "https://github.com/jamon8888/basemind",
