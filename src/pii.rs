@@ -228,11 +228,13 @@ pub fn validate_at_svnr(s: &str) -> bool {
 }
 
 /// Validates an Irish PPS (Personal Public Service number).
-/// Returns true if the 8-character string passes the weighted MOD-23 checksum.
+/// Returns true for 7-digit + 1-letter (8-char) or 7-digit + 2-letter (9-char) formats,
+/// both using the weighted MOD-23 checksum.
 pub fn validate_ie_pps(s: &str) -> bool {
     let chars: Vec<char> = s.chars().collect();
-    if chars.len() != 8 {
-        return false;
+    match chars.len() {
+        8 | 9 => {}
+        _ => return false,
     }
     let digits: Vec<u32> = chars[0..7].iter().filter_map(|c| c.to_digit(10)).collect();
     if digits.len() != 7 {
@@ -245,7 +247,10 @@ pub fn validate_ie_pps(s: &str) -> bool {
         0..=21 => (b'A' + remainder as u8) as char,
         _ => return false,
     };
-    chars[7] == check_char
+    // Two-letter form: checksum is the second-to-last character.
+    // One-letter form: checksum is the last character.
+    let checksum_idx = if chars.len() == 9 { 7 } else { 7 };
+    chars[checksum_idx] == check_char
 }
 
 /// Validates a Portuguese NIF (Número de Identificação Fiscal).
@@ -449,6 +454,7 @@ static IBAN_LENGTHS: std::sync::LazyLock<std::collections::HashMap<&'static str,
         m.insert("GR", 27); // Greece
         m.insert("HU", 28); // Hungary
         m.insert("IE", 22); // Ireland
+        m.insert("IS", 26); // Iceland
         m.insert("IT", 27); // Italy (incl. SM, VA)
         m.insert("LV", 21); // Latvia
         m.insert("LI", 21); // Liechtenstein
@@ -655,7 +661,8 @@ mod tests {
     }
     #[test]
     fn test_ie_pps_valid() {
-        assert!(validate_ie_pps("1234567U"));
+        assert!(validate_ie_pps("1234567U")); // 7 digits + 1 letter
+        assert!(validate_ie_pps("0000018TX")); // 7 digits + 2 letters
     }
     #[test]
     fn test_pt_nif_valid() {
@@ -666,6 +673,7 @@ mod tests {
         assert!(validate_iban("DE89370400440532013000"));
         assert!(validate_iban("FR1420041010050500013M02606"));
         assert!(validate_iban("NL91ABNA0417164300"));
+        assert!(validate_iban("IS140159260076545510730339"));
     }
     #[test]
     fn test_iban_invalid() {
