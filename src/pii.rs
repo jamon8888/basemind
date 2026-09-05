@@ -248,6 +248,7 @@ pub fn validate_ie_pps(s: &str) -> bool {
         _ => return false,
     };
     chars[7] == check_char
+        && (chars.len() == 8 || chars[8].is_ascii_uppercase())
 }
 
 /// Validates a Portuguese NIF (Número de Identificação Fiscal).
@@ -467,10 +468,14 @@ static IBAN_LENGTHS: std::sync::LazyLock<std::collections::HashMap<&'static str,
         m.insert("SM", 27); // San Marino
         m.insert("SK", 24); // Slovakia
         m.insert("SI", 19); // Slovenia
-        m.insert("ES", 24); // Spain (incl. AD)
+        m.insert("ES", 24); // Spain
         m.insert("SE", 24); // Sweden
-        m.insert("CH", 21); // Switzerland (incl. VA)
+        m.insert("CH", 21); // Switzerland
         m.insert("GB", 22); // United Kingdom (incl. IM, JE, GG)
+        m.insert("AD", 24); // Andorra
+        m.insert("AL", 28); // Albania
+        m.insert("MK", 19); // North Macedonia
+        m.insert("XK", 20); // Kosovo
         m
     });
 
@@ -671,6 +676,7 @@ mod tests {
         assert!(validate_iban("FR1420041010050500013M02606"));
         assert!(validate_iban("NL91ABNA0417164300"));
         assert!(validate_iban("IS140159260076545510730339"));
+        assert!(validate_iban("AD1200012030200359100100"));
     }
     #[test]
     fn test_iban_invalid() {

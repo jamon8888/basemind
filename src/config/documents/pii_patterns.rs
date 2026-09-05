@@ -126,5 +126,40 @@ pub fn code_security_patterns() -> Vec<RedactionCustomPattern> {
                 .into(),
             case_sensitive: false,
         },
+        RedactionCustomPattern {
+            label: "ipv4_private".into(),
+            pattern: r"\b(?:(?:10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.)[0-9]{1,3}\.[0-9]{1,3}|127\.[0-9]+\.[0-9]+\.[0-9]+|169\.254\.[0-9]+\.[0-9]+)\b"
+                .into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "ipv6_private".into(),
+            pattern: r"(?i)\b(?:[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F:]{4,39}|fe80:[0-9a-fA-F:]{4,39}|::1)\b"
+                .into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "internal_hostname".into(),
+            pattern: r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*(?:internal|corp|local|intranet|private|dmz|lan)(?:\.[a-z]{2,})?\b"
+                .into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "internal_url".into(),
+            pattern: r#"(?i)https?://(?:(?:10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.|192\.168\.)[0-9]{1,3}(?:\.[0-9]{1,3})?(?::\d+)?|(?:[a-z0-9-]+\.)*(?:internal|corp|local|intranet|private|dmz)\.[a-z]{2,}(?::\d+)?)/[^\s"']*"#
+                .into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "mac_address".into(),
+            pattern: r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b".into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "cookie_id".into(),
+            pattern: r#"(?i)(?:session[_-]?id|session[_-]?token|cookie)[=\s]+["']?[A-Za-z0-9_.\-]{10,}["']?"#
+                .into(),
+            case_sensitive: false,
+        },
     ]
 }
