@@ -247,8 +247,7 @@ pub fn validate_ie_pps(s: &str) -> bool {
         0..=21 => (b'A' + remainder as u8) as char,
         _ => return false,
     };
-    chars[7] == check_char
-        && (chars.len() == 8 || chars[8].is_ascii_uppercase())
+    chars[7] == check_char && (chars.len() == 8 || chars[8].is_ascii_uppercase())
 }
 
 /// Validates a Portuguese NIF (Número de Identificação Fiscal).
