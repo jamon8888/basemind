@@ -13,10 +13,7 @@ fn generate_schema_text() -> String {
     s
 }
 
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "schema out of sync with documents.rs changes; regenerate with enough RAM"
-)]
+#[ignore = "schema out of sync with documents.rs changes; regenerate with `cargo test --features full --test config_schema -- --ignored regenerate_schema` on a machine with >8 GiB RAM"]
 #[cfg(feature = "intelligence")]
 #[test]
 fn schema_snapshot_matches_derived() {

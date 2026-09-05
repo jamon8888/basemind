@@ -467,8 +467,7 @@ impl RedactionConfig {
         vec![
             RedactionCustomPattern {
                 label: "national_id_fr".into(),
-                pattern: r"\b[12]\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{7}\b"
-                    .into(),
+                pattern: r"\b[12]\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{7}\b".into(),
                 case_sensitive: false,
             },
             RedactionCustomPattern {
