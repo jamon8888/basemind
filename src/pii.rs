@@ -247,10 +247,7 @@ pub fn validate_ie_pps(s: &str) -> bool {
         0..=21 => (b'A' + remainder as u8) as char,
         _ => return false,
     };
-    // Two-letter form: checksum is the second-to-last character.
-    // One-letter form: checksum is the last character.
-    let checksum_idx = if chars.len() == 9 { 7 } else { 7 };
-    chars[checksum_idx] == check_char
+    chars[7] == check_char
 }
 
 /// Validates a Portuguese NIF (Número de Identificação Fiscal).
