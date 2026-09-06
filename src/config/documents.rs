@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod pii_patterns;
+mod redaction_gate;
 
 /// Top-level `[documents]` table. Each sub-config has `#[serde(default)]` so
 /// adding a new tier never breaks older TOML files.
@@ -441,6 +442,17 @@ pub struct RedactionConfig {
     /// in the redaction report.
     #[serde(default)]
     pub custom_patterns: Vec<RedactionCustomPattern>,
+    /// Skip pseudonymization for local-only providers (default: `false`).
+    /// Local inference never leaves the machine, so redaction latency buys
+    /// no privacy there; opt in for local-first workspaces. Hosted providers
+    /// always pseudonymize. Off preserves current behavior exactly.
+    #[serde(default)]
+    pub bypass_local_providers: bool,
+    /// Provider routing prefixes treated as local (default: `["ollama"]`).
+    /// Matched case-insensitively against the `provider` half of the
+    /// `[llm]` routing string. See `RedactionConfig::applies_to_provider`.
+    #[serde(default = "RedactionConfig::default_local_providers")]
+    pub local_providers: Vec<String>,
 }
 
 impl Default for RedactionConfig {
@@ -453,7 +465,15 @@ impl Default for RedactionConfig {
             preserve_offsets: true,
             custom_terms: Vec::new(),
             custom_patterns: Vec::new(),
+            bypass_local_providers: false,
+            local_providers: Self::default_local_providers(),
         }
+    }
+}
+
+impl RedactionConfig {
+    fn default_local_providers() -> Vec<String> {
+        vec!["ollama".to_string()]
     }
 }
 

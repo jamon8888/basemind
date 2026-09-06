@@ -272,7 +272,11 @@ impl DocConfig {
             keywords,
             ner,
             summarization,
-            redaction: self.redaction.to_xberg(),
+            redaction: if self.redaction.applies_to_provider(&self.llm.model) {
+                self.redaction.to_xberg()
+            } else {
+                None
+            },
             disable_ocr: strip_enrichment,
             concurrency,
             extraction_timeout_secs: Some(self.extraction_timeout_secs),
@@ -713,6 +717,47 @@ mod tests {
             x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none(),
             "basemind must embed the breadcrumbed retrieval view after extraction"
         );
+    }
+
+    #[test]
+    fn to_xberg_redaction_bypassed_for_local_provider_when_opted_in() {
+        let cfg = DocConfig {
+            redaction: RedactionConfig {
+                enabled: true,
+                bypass_local_providers: true,
+                ..RedactionConfig::default()
+            },
+            llm: LlmConfig {
+                model: "ollama/llama3.1".to_string(),
+                ..LlmConfig::default()
+            },
+            ..DocConfig::default()
+        };
+        assert!(
+            cfg.to_xberg().redaction.is_none(),
+            "opted-in bypass skips xberg redaction for local providers"
+        );
+    }
+
+    #[test]
+    fn to_xberg_redaction_preserved_by_default_for_every_provider() {
+        for model in ["ollama/llama3.1", "openai/gpt-4o", ""] {
+            let cfg = DocConfig {
+                redaction: RedactionConfig {
+                    enabled: true,
+                    ..RedactionConfig::default()
+                },
+                llm: LlmConfig {
+                    model: model.to_string(),
+                    ..LlmConfig::default()
+                },
+                ..DocConfig::default()
+            };
+            assert!(
+                cfg.to_xberg().redaction.is_some(),
+                "default routing preserves redaction for {model:?}"
+            );
+        }
     }
 
     #[test]
