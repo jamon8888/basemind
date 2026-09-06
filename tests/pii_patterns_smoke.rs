@@ -34,6 +34,11 @@ mod eu_national_ids {
         assert!(!validate_eu_national_id("national_id_fr", "185071510000057"));
     }
     #[test]
+    fn fr_nir_corsica() {
+        assert!(matches("national_id_fr", "185072A10000047"));
+        assert!(validate_eu_national_id("national_id_fr", "185072A10000047"));
+    }
+    #[test]
     fn fr_nir_too_short() {
         assert!(!matches("national_id_fr", "1234567890123"));
     }
@@ -212,6 +217,8 @@ mod code_security {
     fn internal_hostname_detected() {
         assert!(matches("internal_hostname", "dev-api.internal"));
         assert!(matches("internal_hostname", "db.corp"));
+        assert!(matches("internal_hostname", "db.corp.local"));
+        assert!(matches("internal_hostname", "host.intranet"));
     }
     #[test]
     fn internal_hostname_public_not_matched() {
@@ -240,6 +247,8 @@ mod code_security {
         assert!(matches("ipv6_private", "fe80::1"));
         assert!(matches("ipv6_private", "fc00::1"));
         assert!(matches("ipv6_private", "::1"));
+        assert!(matches("ipv6_private", "FE80::1")); // case-insensitive
+        assert!(matches("ipv6_private", "gateway is fe80::1 reachable")); // in-text
     }
     #[test]
     fn mac_address_detected() {
@@ -362,5 +371,46 @@ mod category_labels {
         assert!(labels.contains(&"ssh_private_key"));
         assert!(labels.contains(&"env_secret"));
         assert!(labels.contains(&"internal_url"));
+    }
+}
+
+mod facade_sync {
+    use super::*;
+    use basemind::config::RedactionConfig;
+
+    #[test]
+    fn eu_patterns_match_canonical_table() {
+        let facade = RedactionConfig::eu_national_id_patterns();
+        assert_eq!(facade.len(), EU_NATIONAL_ID_PATTERNS.len());
+        for pat in EU_NATIONAL_ID_PATTERNS {
+            let f = facade
+                .iter()
+                .find(|f| f.label == pat.label)
+                .unwrap_or_else(|| panic!("facade missing {}", pat.label));
+            assert_eq!(f.pattern, pat.regex, "facade diverged for {}", pat.label);
+            regex::Regex::new(&f.pattern).expect("facade regex must compile");
+        }
+    }
+
+    #[test]
+    fn code_security_patterns_match_canonical_table() {
+        let facade = RedactionConfig::code_security_patterns();
+        assert_eq!(facade.len(), CODE_SECURITY_PATTERNS.len());
+        for pat in CODE_SECURITY_PATTERNS {
+            let f = facade
+                .iter()
+                .find(|f| f.label == pat.label)
+                .unwrap_or_else(|| panic!("facade missing {}", pat.label));
+            assert_eq!(f.pattern, pat.regex, "facade diverged for {}", pat.label);
+        }
+    }
+
+    #[test]
+    fn facade_ipv6_matches_in_text() {
+        let facade = RedactionConfig::code_security_patterns();
+        let f = facade.iter().find(|f| f.label == "ipv6_private").unwrap();
+        let re = regex::Regex::new(&f.pattern).unwrap();
+        assert!(re.is_match("gateway is fe80::1 reachable"));
+        assert!(re.is_match("FE80::1"));
     }
 }

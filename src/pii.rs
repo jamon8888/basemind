@@ -345,7 +345,7 @@ pub const EU_NATIONAL_ID_PATTERNS: &[EuNationalIdPattern] = &[
     EuNationalIdPattern {
         label: "national_id_fr",
         country: "FR",
-        regex: r"\b[12]\d{2}(?:0[1-9]|1[0-2])\d{10}\b",
+        regex: r"\b[12]\d{2}(?:0[1-9]|1[0-2])(?:\d{2}|2[AB])\d{8}\b",
     },
     EuNationalIdPattern {
         label: "national_id_nl",
@@ -454,12 +454,12 @@ pub const CODE_SECURITY_PATTERNS: &[CodeSecurityPattern] = &[
     },
     CodeSecurityPattern {
         label: "ipv6_private",
-        regex: r"(?i)^(?:[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F:]{1,39}|fe80:[0-9a-fA-F:]{1,39}|::1|0:0:0:0:0:0:0:1)$",
+        regex: r"(?i)\b(?:[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F:]{1,39}|fe80:[0-9a-fA-F:]{1,39})\b|(?:^|[^0-9a-fA-F:])::1\b",
         sensitivity: SensitivityTier::MEDIUM,
     },
     CodeSecurityPattern {
         label: "internal_hostname",
-        regex: r"(?i)\.(?:internal|corp)$",
+        regex: r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*(?:internal|corp|local|intranet|private|dmz|lan)(?:\.[a-z]{2,})?\b",
         sensitivity: SensitivityTier::MEDIUM,
     },
     CodeSecurityPattern {

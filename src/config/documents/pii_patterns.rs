@@ -16,7 +16,7 @@ pub fn eu_national_id_patterns() -> Vec<RedactionCustomPattern> {
     vec![
         RedactionCustomPattern {
             label: "national_id_fr".into(),
-            pattern: r"\b[12]\d{2}(?:0[1-9]|1[0-2])\d{10}\b".into(),
+            pattern: r"\b[12]\d{2}(?:0[1-9]|1[0-2])(?:\d{2}|2[AB])\d{8}\b".into(),
             case_sensitive: false,
         },
         RedactionCustomPattern {
@@ -134,7 +134,7 @@ pub fn code_security_patterns() -> Vec<RedactionCustomPattern> {
         },
         RedactionCustomPattern {
             label: "ipv6_private".into(),
-            pattern: r"(?i)\b(?:[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F:]{4,39}|fe80:[0-9a-fA-F:]{4,39}|::1)\b"
+            pattern: r"(?i)\b(?:[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F:]{1,39}|fe80:[0-9a-fA-F:]{1,39})\b|(?:^|[^0-9a-fA-F:])::1\b"
                 .into(),
             case_sensitive: false,
         },
