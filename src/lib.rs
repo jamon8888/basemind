@@ -29,6 +29,7 @@ pub mod lance;
 pub mod lang;
 pub mod mcp;
 pub mod path;
+pub mod pii;
 pub mod query;
 pub mod registry;
 pub mod render;
