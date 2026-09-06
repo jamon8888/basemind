@@ -54,8 +54,13 @@ mod eu_national_ids {
     }
     #[test]
     fn be_niss_valid() {
-        assert!(matches("national_id_be", "00012512321"));
-        assert!(validate_eu_national_id("national_id_be", "00012512321"));
+        assert!(matches("national_id_be", "85073003328"));
+        assert!(validate_eu_national_id("national_id_be", "85073003328"));
+    }
+    #[test]
+    fn be_niss_invalid_checksum() {
+        assert!(matches("national_id_be", "12345678901"));
+        assert!(!validate_eu_national_id("national_id_be", "12345678901"));
     }
     #[test]
     fn at_svnr_valid() {
@@ -64,13 +69,22 @@ mod eu_national_ids {
     }
     #[test]
     fn ie_pps_valid() {
-        assert!(matches("national_id_ie", "1234567U"));
-        assert!(validate_eu_national_id("national_id_ie", "1234567U"));
+        assert!(matches("national_id_ie", "6433435F"));
+        assert!(validate_eu_national_id("national_id_ie", "6433435F"));
+        assert!(validate_eu_national_id("national_id_ie", "6433435OA"));
+    }
+    #[test]
+    fn ie_pps_invalid_checksum() {
+        assert!(!validate_eu_national_id("national_id_ie", "6433435E"));
     }
     #[test]
     fn pt_nif_valid() {
         assert!(matches("national_id_pt", "200000039"));
         assert!(validate_eu_national_id("national_id_pt", "200000039"));
+    }
+    #[test]
+    fn pt_nif_invalid_checksum() {
+        assert!(!validate_eu_national_id("national_id_pt", "299999999"));
     }
     #[test]
     fn all_eu_patterns_have_valid_regex() {

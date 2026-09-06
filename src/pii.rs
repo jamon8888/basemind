@@ -151,16 +151,39 @@ impl From<&PiiCategory> for f32 {
 
 /// Validates a French NIR (Numéro d'Inscription au Répertoire).
 /// Returns true if the 15-digit number passes the MOD-97 checksum.
+/// Validates a French NIR (Numéro d'Inscription au Répertoire).
+/// 15 chars; Corsica department codes `2A`/`2B` at positions 6–7 are
+/// substituted with `19`/`18` before the MOD-97 checksum (per python-stdnum
+/// `fr.nir`). A zero remainder yields check digits `97`, not `00`.
 pub fn validate_fr_nir(s: &str) -> bool {
-    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
-    if digits.len() != 15 {
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() != 15 || !chars[..5].iter().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    let first13: String = digits.iter().take(13).map(|d| d.to_string()).collect();
+    let dept: String = chars[5..7].iter().collect();
+    let dept = match dept.as_str() {
+        "2A" => "19",
+        "2B" => "18",
+        d if d.chars().all(|c| c.is_ascii_digit()) => {
+            if !chars[7..13].iter().all(|c| c.is_ascii_digit()) || !chars[13..15].iter().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            d
+        }
+        _ => return false,
+    };
+    let first13: String = chars[..5].iter().collect::<String>() + dept + &chars[7..13].iter().collect::<String>();
     let first13_val: u64 = first13.parse().unwrap_or(u64::MAX);
-    let remainder = first13_val % 97;
-    let check = (97 - remainder as u32) % 97;
-    let last2 = digits[13] * 10 + digits[14];
+    if first13_val == u64::MAX {
+        return false;
+    }
+    let check = 97 - (first13_val % 97) as u32;
+    let last2: u32 = chars[13..15].iter().collect::<String>().parse().unwrap_or(u32::MAX);
     last2 == check
 }
 
@@ -189,19 +212,30 @@ fn bsn_eleven_proef(digits: &[u32]) -> bool {
     sum % 11 == 0
 }
 
-/// Validates a Belgian NISS (Numéro d'Identification de la Sécurité Sociale).
-/// Returns true if the 11-digit number passes the MOD-97 + check-digit formula.
+/// Validates a Belgian NISS (Numéro d'Identification de la Sécurité Sociale,
+/// Rijksregisternummer). 11 digits: YYMMDD + 3-digit serial + 2-digit check.
+/// Checksum per python-stdnum `be.nn`: `97 - (int(n[:-2]) % 97) == int(n[-2:])`,
+/// trying both the bare number and the `2`-prefixed variant for post-2000 births.
+/// No birth-date validation — the regex is conservative, the checksum filters.
 pub fn validate_be_niss(s: &str) -> bool {
-    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
-    if digits.len() != 11 {
+    let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 11 || digits.chars().all(|c| c == '0') {
         return false;
     }
-    let first9: String = digits.iter().take(9).map(|d| d.to_string()).collect();
-    let first9_val: u64 = first9.parse().unwrap_or(u64::MAX);
-    let remainder = first9_val % 97;
-    let last2 = digits[9] * 10 + digits[10];
-    let expected = ((97 - remainder as u32) * 100) % 97;
-    last2 == expected
+    let be_check = |n: &str| -> bool {
+        let (head, tail) = n.split_at(n.len() - 2);
+        let head_val: u64 = head.parse().unwrap_or(u64::MAX);
+        let tail_val: u32 = tail.parse().unwrap_or(u32::MAX);
+        let check = 97 - (head_val % 97) as u32;
+        check == tail_val
+    };
+    if be_check(&digits) {
+        return true;
+    }
+    // Post-2000 births: the same check against '2' + number (stdnum tries this
+    // variant when YY + 2000 <= current year; trying unconditionally is a
+    // negligible over-accept for a checksum pre-filter).
+    be_check(&format!("2{digits}"))
 }
 
 /// Validates an Austrian SVNR (Sozialversicherungsnummer).
@@ -228,26 +262,43 @@ pub fn validate_at_svnr(s: &str) -> bool {
 }
 
 /// Validates an Irish PPS (Personal Public Service number).
-/// Returns true for 7-digit + 1-letter (8-char) or 7-digit + 2-letter (9-char) formats,
-/// both using the weighted MOD-23 checksum.
+/// 7 digits + check letter (8 chars), optionally followed by a second letter
+/// (9 chars). Check digit per python-stdnum `ie.vat.calc_check_digit`:
+/// alphabet `WABCDEFGHIJKLMNOPQRSTUV`, weights 8..2 over the 7 digits plus
+/// `9 * alphabet.index(second_letter)` for 2013-format numbers whose second
+/// letter is in `ABH`. Old-format second letters (`WTX`) are ignored.
 pub fn validate_ie_pps(s: &str) -> bool {
+    const ALPHABET: &str = "WABCDEFGHIJKLMNOPQRSTUV";
+    let s: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
     let chars: Vec<char> = s.chars().collect();
-    match chars.len() {
-        8 | 9 => {}
-        _ => return false,
-    }
-    let digits: Vec<u32> = chars[0..7].iter().filter_map(|c| c.to_digit(10)).collect();
-    if digits.len() != 7 {
+    if chars.len() != 8 && chars.len() != 9 {
         return false;
     }
-    let weights: [u32; 7] = [8, 7, 6, 5, 4, 3, 2];
-    let sum: u32 = digits.iter().zip(weights.iter()).map(|(d, w)| d * w).sum();
-    let remainder = sum % 23;
-    let check_char = match remainder {
-        0..=21 => (b'A' + remainder as u8) as char,
-        _ => return false,
-    };
-    chars[7] == check_char && (chars.len() == 8 || chars[8].is_ascii_uppercase())
+    if !chars[..7].iter().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // First check letter is restricted to A-W (stdnum `pps_re`).
+    if !(('A'..='W').contains(&chars[7])) {
+        return false;
+    }
+    let digits: Vec<u32> = chars[..7].iter().filter_map(|c| c.to_digit(10)).collect();
+    let mut sum: u32 = digits.iter().enumerate().map(|(i, d)| d * (8 - i as u32)).sum();
+    if chars.len() == 9 {
+        let second = chars[8];
+        if "ABH".contains(second) {
+            let idx = ALPHABET.find(second).unwrap_or(0) as u32;
+            sum += 9 * idx;
+        } else if !"WTX".contains(second) {
+            return false;
+        }
+        // Old-format (WTX): second letter ignored, falls through to 7-digit check.
+    }
+    let expected = ALPHABET.chars().nth((sum % 23) as usize).unwrap_or('?');
+    chars[7] == expected
 }
 
 /// Validates a Portuguese NIF (Número de Identificação Fiscal).
@@ -628,6 +679,203 @@ pub fn suppress_by_sensitivity(results: &mut [(String, f32)], entity_sensitiviti
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 }
 
+// ─── Pipeline helpers: thresholds, span dedup, format validators, erasure ───
+
+/// Per-entity-type confidence threshold for the Layer-4 pipeline filter (spec §3).
+/// High legal/financial risk and secrets sit at 0.95; contact identifiers lower.
+/// Unknown categories default to 0.80.
+pub fn confidence_threshold(category: &str) -> f32 {
+    match category {
+        "national_id"
+        | "national_id_fr"
+        | "national_id_nl"
+        | "national_id_be"
+        | "national_id_at"
+        | "national_id_ie"
+        | "national_id_pt"
+        | "national_id_generic"
+        | "iban"
+        | "credit_card"
+        | "health_data"
+        | "biometric"
+        | "genetic"
+        | "api_key"
+        | "aws_access_key"
+        | "aws_secret_key"
+        | "gcp_credentials"
+        | "azure_credentials"
+        | "jwt_token"
+        | "oauth_token"
+        | "bearer_token"
+        | "ssh_private_key"
+        | "gpg_private_key"
+        | "tls_certificate"
+        | "db_connection_string"
+        | "env_secret" => 0.95,
+        "internal_hostname" | "internal_url" | "email" => 0.90,
+        "phone" | "phone_number" | "ip_address" | "ipv4" | "ipv6" | "ipv4_private" | "ipv6_private" => 0.85,
+        "person_name" | "person" | "full_name" | "first_name" | "last_name" => 0.75,
+        "organization" | "location" => 0.70,
+        _ => 0.80,
+    }
+}
+
+/// Returns true when a detection at `confidence` survives the Layer-4 filter.
+pub fn passes_threshold(category: &str, confidence: f32) -> bool {
+    confidence >= confidence_threshold(category)
+}
+
+/// Raw GLiNER label thresholds (spec §17). Lenient for secrets (high recall —
+/// format validation downstream removes false positives), strict for names
+/// (the model over-predicts `person`/`full_name`). Unknown labels default to 0.5.
+pub fn gliner_label_threshold(label: &str) -> f32 {
+    match label {
+        "full_name" | "person" => 0.7,
+        "api_key" | "password" | "iban" | "ip_address" => 0.3,
+        _ => 0.5,
+    }
+}
+
+/// Validates a phone number against E.164 (spec user story 7): leading `+`,
+/// 8–15 digits, no leading zero after `+`. Formatting characters
+/// (spaces, dashes, parens, dots) are stripped before validation.
+pub fn validate_e164(phone: &str) -> bool {
+    let normalized: String = phone
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '(' | ')' | '.'))
+        .collect();
+    let digits = normalized.strip_prefix('+').unwrap_or("");
+    if normalized.len() != digits.len() + 1 {
+        return false;
+    }
+    if !(8..=15).contains(&digits.len()) {
+        return false;
+    }
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    !digits.starts_with('0')
+}
+
+fn is_base64url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='
+}
+
+/// Returns true when `=` padding appears only as trailing padding (≤2 chars).
+fn has_valid_padding(part: &str) -> bool {
+    let stripped = part.trim_end_matches('=');
+    !stripped.contains('=') && part.len() - stripped.len() <= 2
+}
+
+/// Validates JWT structure (spec §16): three non-empty dot-separated
+/// base64url sections, header starting with `eyJ`.
+pub fn validate_jwt(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    if !parts[0].starts_with("eyJ") {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| p.chars().all(is_base64url_char) && has_valid_padding(p))
+}
+
+/// Returns true for RFC 1918 private ranges (10/8, 172.16/12, 192.168/16)
+/// plus loopback (127/8) and link-local (169.254/16).
+pub fn is_private_ipv4(ip: &str) -> bool {
+    let octets: Vec<u32> = ip.split('.').filter_map(|o| o.parse().ok()).collect();
+    if octets.len() != 4 || octets.iter().any(|o| *o > 255) {
+        return false;
+    }
+    let [a, b, ..] = octets[..] else { return false };
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168) || a == 127 || (a == 169 && b == 254)
+}
+
+/// Validates a DB connection string (spec §16): known scheme, `://` authority
+/// with `user:password@host` (non-empty password). Rejects credential-less
+/// URIs like `postgresql://host/db`.
+pub fn validate_db_connection_string(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    let scheme_ok = [
+        "postgresql://",
+        "postgres://",
+        "mysql://",
+        "mongodb://",
+        "jdbc:",
+        "mssql://",
+        "redis://",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+    if !scheme_ok {
+        return false;
+    }
+    let Some(auth) = uri.split("://").nth(1) else {
+        return false;
+    };
+    let Some((userinfo, host)) = auth.rsplit_once('@') else {
+        return false;
+    };
+    let Some((user, password)) = userinfo.split_once(':') else {
+        return false;
+    };
+    !user.is_empty() && !password.is_empty() && !host.is_empty()
+}
+
+/// One PII detection span. `start`/`end` are char offsets into the chunk text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectedSpan {
+    pub start: usize,
+    pub end: usize,
+    pub label: String,
+    pub confidence: f32,
+}
+
+/// Merges overlapping detection spans (spec user story 8) so GLiNER and regex
+/// hits on the same mention collapse to a single entity. The higher-confidence
+/// span wins; ties keep the longer span. Adjacent (non-overlapping) spans are
+/// preserved. Output is sorted by `start`.
+pub fn dedupe_spans(mut spans: Vec<DetectedSpan>) -> Vec<DetectedSpan> {
+    spans.sort_by_key(|s| (s.start, s.end));
+    let mut out: Vec<DetectedSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(last) = out.last_mut()
+            && span.start < last.end
+        {
+            if span.confidence > last.confidence
+                || (span.confidence == last.confidence && (span.end - span.start) > (last.end - last.start))
+            {
+                *last = span;
+            } else {
+                last.end = last.end.max(span.end);
+            }
+            continue;
+        }
+        out.push(span);
+    }
+    out
+}
+
+/// Marker written into `value_hash` by [`PiiEntity::soft_erase`].
+pub const ERASED_VALUE_HASH: &str = "ERASED";
+
+impl PiiEntity {
+    /// Right-to-erasure soft erase (spec §9 step 3): drops the value hash while
+    /// preserving `category`, `locations` and `detected_at` for audit.
+    /// The tombstone can never collide with a real entry: `value_hash` holds a
+    /// hex SHA-256 digest, which never equals `"ERASED"`.
+    pub fn soft_erase(&mut self) {
+        self.value_hash = ERASED_VALUE_HASH.to_string();
+    }
+
+    /// Returns true after [`PiiEntity::soft_erase`] ran.
+    pub fn is_erased(&self) -> bool {
+        self.value_hash == ERASED_VALUE_HASH
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +890,12 @@ mod tests {
         assert!(!validate_fr_nir("18507151234668"));
     }
     #[test]
+    fn test_fr_nir_corsica() {
+        // Corsica department codes 2A/2B substitute 19/18 (stdnum vector).
+        assert!(validate_fr_nir("185072A10000047"));
+        assert!(!validate_fr_nir("185072A10000058"));
+    }
+    #[test]
     fn test_nl_bsn_valid() {
         assert!(validate_nl_bsn("100000009"));
         assert!(validate_nl_bsn("10000008"));
@@ -654,7 +908,15 @@ mod tests {
     }
     #[test]
     fn test_be_niss_valid() {
-        assert!(validate_be_niss("00012512321"));
+        // Vectors from python-stdnum `be.nn` docstrings.
+        assert!(validate_be_niss("85073003328"));
+        assert!(validate_be_niss("17073003384"));
+    }
+    #[test]
+    fn test_be_niss_invalid() {
+        assert!(!validate_be_niss("12345678901"));
+        assert!(!validate_be_niss("00012512321"));
+        assert!(!validate_be_niss("85073003329"));
     }
     #[test]
     fn test_at_svnr_valid() {
@@ -662,8 +924,19 @@ mod tests {
     }
     #[test]
     fn test_ie_pps_valid() {
-        assert!(validate_ie_pps("1234567U")); // 7 digits + 1 letter
-        assert!(validate_ie_pps("0000018TX")); // 7 digits + 2 letters
+        // Vectors from python-stdnum `ie.pps` docstrings.
+        assert!(validate_ie_pps("6433435F")); // pre-2013
+        assert!(validate_ie_pps("6433435FT")); // pre-2013 with special final 'T'
+        assert!(validate_ie_pps("6433435FW")); // pre-2013 married-women format
+        assert!(validate_ie_pps("6433435OA")); // 2013 personal format
+        assert!(validate_ie_pps("6433435IH")); // 2013 non-personal format
+    }
+    #[test]
+    fn test_ie_pps_invalid() {
+        assert!(!validate_ie_pps("6433435E")); // wrong check digit
+        assert!(!validate_ie_pps("6433435VH")); // wrong check digit, 2013 format
+        assert!(!validate_ie_pps("1234567U"));
+        assert!(!validate_ie_pps("1234567"));
     }
     #[test]
     fn test_pt_nif_valid() {
@@ -733,5 +1006,150 @@ mod tests {
         for pat in EU_NATIONAL_ID_PATTERNS {
             regex::Regex::new(pat.regex).unwrap_or_else(|_| panic!("invalid regex for {}", pat.label));
         }
+    }
+    #[test]
+    fn test_confidence_thresholds_per_spec() {
+        assert_eq!(confidence_threshold("national_id_fr"), 0.95);
+        assert_eq!(confidence_threshold("iban"), 0.95);
+        assert_eq!(confidence_threshold("credit_card"), 0.95);
+        assert_eq!(confidence_threshold("api_key"), 0.95);
+        assert_eq!(confidence_threshold("jwt_token"), 0.95);
+        assert_eq!(confidence_threshold("health_data"), 0.95);
+        assert_eq!(confidence_threshold("internal_hostname"), 0.90);
+        assert_eq!(confidence_threshold("email"), 0.90);
+        assert_eq!(confidence_threshold("phone"), 0.85);
+        assert_eq!(confidence_threshold("ip_address"), 0.85);
+        assert_eq!(confidence_threshold("person_name"), 0.75);
+        assert_eq!(confidence_threshold("organization"), 0.70);
+        assert_eq!(confidence_threshold("location"), 0.70);
+    }
+    #[test]
+    fn test_passes_threshold_boundary() {
+        assert!(passes_threshold("iban", 0.95));
+        assert!(!passes_threshold("iban", 0.949));
+        assert!(passes_threshold("person_name", 0.75));
+        assert!(!passes_threshold("person_name", 0.74));
+    }
+    #[test]
+    fn test_gliner_label_thresholds_per_spec() {
+        assert_eq!(gliner_label_threshold("full_name"), 0.7);
+        assert_eq!(gliner_label_threshold("person"), 0.7);
+        assert_eq!(gliner_label_threshold("api_key"), 0.3);
+        assert_eq!(gliner_label_threshold("password"), 0.3);
+        assert_eq!(gliner_label_threshold("iban"), 0.3);
+        assert_eq!(gliner_label_threshold("ip_address"), 0.3);
+    }
+    #[test]
+    fn test_validate_e164() {
+        assert!(validate_e164("+33612345678"));
+        assert!(validate_e164("+1 415 555 2671"));
+        assert!(validate_e164("+49-170-1234567"));
+        assert!(!validate_e164("0612345678")); // missing +
+        assert!(!validate_e164("+012345678")); // leading zero
+        assert!(!validate_e164("+123")); // too short
+        assert!(!validate_e164("not a phone"));
+    }
+    #[test]
+    fn test_validate_jwt() {
+        assert!(validate_jwt(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        ));
+        assert!(!validate_jwt("not.a.jwt.at.all.extra"));
+        assert!(!validate_jwt("eyJhbGciOiJIUzI1NiJ9.only-two"));
+        assert!(!validate_jwt("abc.def.ghi")); // header must start with eyJ
+        assert!(!validate_jwt("eyJ.abc.def=ghi.jkl")); // = only as trailing padding
+        assert!(!validate_jwt(""));
+    }
+    #[test]
+    fn test_is_private_ipv4() {
+        assert!(is_private_ipv4("10.0.0.1"));
+        assert!(is_private_ipv4("172.16.0.1"));
+        assert!(is_private_ipv4("172.31.255.255"));
+        assert!(is_private_ipv4("192.168.1.1"));
+        assert!(is_private_ipv4("127.0.0.1"));
+        assert!(is_private_ipv4("169.254.10.20"));
+        assert!(!is_private_ipv4("8.8.8.8"));
+        assert!(!is_private_ipv4("172.32.0.1"));
+        assert!(!is_private_ipv4("not-an-ip"));
+    }
+    #[test]
+    fn test_validate_db_connection_string() {
+        assert!(validate_db_connection_string("postgresql://user:pass@host:5432/db"));
+        assert!(validate_db_connection_string(
+            "mongodb://admin:s3cret@10.0.0.5:27017/app"
+        ));
+        assert!(!validate_db_connection_string("postgresql://host/db")); // no creds
+        assert!(!validate_db_connection_string("postgresql://user:@host/db")); // empty password
+        assert!(!validate_db_connection_string("postgresql://:pass@host/db")); // empty user
+        assert!(validate_db_connection_string("postgresql://user:p@ss@host/db")); // @ in password
+        assert!(!validate_db_connection_string("https://example.com/page")); // wrong scheme
+    }
+    #[test]
+    fn test_dedupe_spans_overlap_merge() {
+        let spans = vec![
+            DetectedSpan {
+                start: 0,
+                end: 10,
+                label: "person".into(),
+                confidence: 0.6,
+            },
+            DetectedSpan {
+                start: 5,
+                end: 15,
+                label: "full_name".into(),
+                confidence: 0.8,
+            },
+        ];
+        let out = dedupe_spans(spans);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "full_name");
+    }
+    #[test]
+    fn test_dedupe_spans_adjacent_preserved() {
+        let spans = vec![
+            DetectedSpan {
+                start: 0,
+                end: 5,
+                label: "a".into(),
+                confidence: 0.9,
+            },
+            DetectedSpan {
+                start: 5,
+                end: 10,
+                label: "b".into(),
+                confidence: 0.9,
+            },
+        ];
+        assert_eq!(dedupe_spans(spans).len(), 2);
+    }
+    #[test]
+    fn test_dedupe_spans_empty() {
+        assert!(dedupe_spans(vec![]).is_empty());
+    }
+    fn test_entity(entity_id: &str) -> PiiEntity {
+        PiiEntity {
+            entity_id: entity_id.into(),
+            category: "iban".into(),
+            subcategory: None,
+            value_hash: "abc123".into(),
+            confidence: 0.97,
+            detector_version: "rule-iban-v1".into(),
+            locations: vec![],
+            detected_at: "2026-09-06T00:00:00Z".into(),
+            processed_by: "test".into(),
+            legal_basis: None,
+            retention_until: None,
+            risk_level: RiskLevel::High,
+            lineage: vec![],
+        }
+    }
+    #[test]
+    fn test_soft_erase_preserves_audit_fields() {
+        let mut e = test_entity("e1");
+        e.soft_erase();
+        assert!(e.is_erased());
+        assert_eq!(e.category, "iban");
+        assert_eq!(e.detected_at, "2026-09-06T00:00:00Z");
+        assert!(!test_entity("e2").is_erased());
     }
 }
