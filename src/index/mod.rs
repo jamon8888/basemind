@@ -19,6 +19,8 @@
 
 pub mod keys;
 pub mod keys_governance;
+pub mod keys_pii;
+pub mod pii_lineage;
 pub mod writer;
 
 use std::path::{Path, PathBuf};
@@ -81,6 +83,7 @@ const KEYSPACE_MEMTABLE_BYTES: &[(&str, u64)] = &[
     ("memory_by_key", MEMTABLE_COLD_BYTES),
     ("memory_archive", MEMTABLE_COLD_BYTES),
     ("proposals", MEMTABLE_COLD_BYTES),
+    ("pii_lineage", MEMTABLE_COLD_BYTES),
 ];
 
 /// Memtable size for the BM25 posting keyspace — the one partition that measurably benefits from
@@ -239,6 +242,8 @@ pub enum IndexError {
     Encode(#[from] rmp_serde::encode::Error),
     #[error("msgpack decode error: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
+    #[error("pii lineage key component exceeds the 64 KiB u16 ceiling")]
+    KeyTooLong,
 }
 
 /// Handle to every keyspace we read or write. Cloned cheaply (each `Keyspace` is `Arc`'d
@@ -295,6 +300,10 @@ pub struct IndexDb {
     /// W11 propose-don't-commit skill-mining surface. Always created for DB stability.
     #[allow(dead_code)]
     pub(crate) proposals: Keyspace,
+    /// `pii_lineage`: `(scope, file_id, entity_id)` → msgpack [`crate::pii::PiiEntity`].
+    /// GDPR Article 30 audit trail for detected PII. Always created for DB stability;
+    /// populated by the document scan lane, read by erasure/audit paths.
+    pub(crate) pii_lineage: Keyspace,
 }
 
 impl IndexDb {
@@ -344,6 +353,7 @@ impl IndexDb {
         let memory_by_key = open_keyspace(&db, "memory_by_key")?;
         let memory_archive = open_keyspace(&db, "memory_archive")?;
         let proposals = open_keyspace(&db, "proposals")?;
+        let pii_lineage = open_keyspace(&db, "pii_lineage")?;
 
         meta.insert(META_SCHEMA_VER, INDEX_SCHEMA_VER.to_be_bytes())?;
 
@@ -366,6 +376,7 @@ impl IndexDb {
             memory_by_key,
             memory_archive,
             proposals,
+            pii_lineage,
         })
     }
 

@@ -23,6 +23,9 @@ pub use crate::index::keys_governance::{
     memory_by_key, memory_by_key_ns_prefix, memory_scope_prefix, parse_memory_by_key, parse_memory_key_only,
     parse_proposal_by_id, proposal_by_id, proposal_ns_prefix,
 };
+pub use crate::index::keys_pii::{
+    parse_pii_lineage_key, pii_lineage_file_prefix, pii_lineage_key, pii_lineage_scope_prefix,
+};
 
 /// `u16:name_len ‖ name`. Internal helper.
 ///
