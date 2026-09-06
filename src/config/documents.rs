@@ -50,6 +50,12 @@ pub struct DocumentsConfig {
     #[schemars(range(min = 0))]
     pub overlap: usize,
     /// Xberg embedding preset name. Defaults to "balanced".
+    ///
+    /// EU/GDPR workspaces should opt into `embedding_preset = "multilingual"`
+    /// (multilingual-e5-base, 768-dim) instead. The default stays "balanced"
+    /// deliberately: the preset feeds the LanceDB `(dim, embedding_model,
+    /// schema_ver)` triple, so flipping it wipes and re-embeds every existing
+    /// workspace index — an opt-in, not a silent migration.
     #[serde(default = "DocumentsConfig::default_embedding_preset")]
     pub embedding_preset: String,
     /// Generate embeddings (`true`) or skip vector storage entirely (`false`).
@@ -225,22 +231,23 @@ pub struct RerankerConfig {
     /// latency means users should opt in explicitly.
     #[serde(default)]
     pub enabled: bool,
-    /// Xberg reranker preset name (`bge-reranker-base` is the small default;
-    /// `bge-reranker-large` and `bge-reranker-v2-m3` are heavier alternatives).
+    /// Xberg reranker preset name. Defaults to `bge-reranker-v2-m3` (multilingual,
+    /// 568M params, 100+ languages) per the GDPR PII spec: cross-encoder reranking
+    /// must cover all EU languages. Costs nothing while `enabled = false` (default).
     #[serde(default = "RerankerConfig::default_preset")]
     pub preset: String,
     /// How many hits to rerank. The vector search returns `top_k` candidates
-    /// which the cross-encoder then reorders.
+    /// which the cross-encoder then reorders. Defaults to 20 per spec.
     #[serde(default = "RerankerConfig::default_top_k")]
     pub top_k: usize,
 }
 
 impl RerankerConfig {
     fn default_preset() -> String {
-        "bge-reranker-base".to_string()
+        "bge-reranker-v2-m3".to_string()
     }
     fn default_top_k() -> usize {
-        10
+        20
     }
 }
 
@@ -620,13 +627,18 @@ pub struct OcrConfig {
     #[serde(default)]
     pub backend: OcrBackend,
     /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`).
+    /// Defaults to English plus the six EU national-ID languages (DE, FR, ES,
+    /// IT, NL, PL) so ID documents OCR correctly before PII detection.
     #[serde(default = "OcrConfig::default_languages")]
     pub languages: Vec<String>,
 }
 
 impl OcrConfig {
     fn default_languages() -> Vec<String> {
-        vec!["eng".to_string()]
+        ["eng", "deu", "fra", "spa", "ita", "nld", "pol"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -931,5 +943,28 @@ mod tests {
         let key = ApiKey::Unset;
         let json = serde_json::to_string(&key).expect("serialize");
         assert_eq!(json, "null");
+    }
+
+    #[test]
+    fn reranker_defaults_follow_eu_spec() {
+        let r = RerankerConfig::default();
+        assert!(!r.enabled);
+        assert_eq!(r.preset, "bge-reranker-v2-m3");
+        assert_eq!(r.top_k, 20);
+    }
+
+    #[test]
+    fn ocr_defaults_cover_eu_id_languages() {
+        let o = OcrConfig::default();
+        for lang in ["eng", "deu", "fra", "spa", "ita", "nld", "pol"] {
+            assert!(o.languages.contains(&lang.to_string()), "missing {lang}");
+        }
+    }
+
+    #[test]
+    fn embedding_preset_default_stays_balanced() {
+        // Flipping the preset changes the LanceDB dim triple and wipes every
+        // existing index — EU workspaces opt into "multilingual" explicitly.
+        assert_eq!(DocumentsConfig::default().embedding_preset, "balanced");
     }
 }
