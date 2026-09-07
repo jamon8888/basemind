@@ -88,8 +88,8 @@
         },
         "reranker": {
           "enabled": false,
-          "preset": "bge-reranker-base",
-          "top_k": 10
+          "preset": "bge-reranker-v2-m3",
+          "top_k": 20
         },
         "keywords": {
           "enabled": false,
@@ -117,7 +117,13 @@
         "ocr": {
           "backend": "tesseract",
           "languages": [
-            "eng"
+            "eng",
+            "deu",
+            "fra",
+            "spa",
+            "ita",
+            "nld",
+            "pol"
           ]
         },
         "output": {
@@ -151,8 +157,8 @@
         "embed_exclude": [],
         "reranker": {
           "enabled": false,
-          "preset": "bge-reranker-base",
-          "top_k": 10
+          "preset": "bge-reranker-v2-m3",
+          "top_k": 20
         }
       }
     },
@@ -428,7 +434,7 @@
           "default": 200
         },
         "embedding_preset": {
-          "description": "Xberg embedding preset name. Defaults to \"balanced\".",
+          "description": "Xberg embedding preset name. Defaults to \"balanced\".\n\nEU/GDPR workspaces should opt into `embedding_preset = \"multilingual\"`\n(multilingual-e5-base, 768-dim) instead. The default stays \"balanced\"\ndeliberately: the preset feeds the LanceDB `(dim, embedding_model,\nschema_ver)` triple, so flipping it wipes and re-embeds every existing\nworkspace index — an opt-in, not a silent migration.",
           "type": "string",
           "default": "balanced"
         },
@@ -466,8 +472,8 @@
           "$ref": "#/$defs/RerankerConfig",
           "default": {
             "enabled": false,
-            "preset": "bge-reranker-base",
-            "top_k": 10
+            "preset": "bge-reranker-v2-m3",
+            "top_k": 20
           }
         },
         "keywords": {
@@ -586,16 +592,16 @@
           "default": false
         },
         "preset": {
-          "description": "Xberg reranker preset name (`bge-reranker-base` is the small default;\n`bge-reranker-large` and `bge-reranker-v2-m3` are heavier alternatives).",
+          "description": "Xberg reranker preset name. Defaults to `bge-reranker-v2-m3` (multilingual,\n568M params, 100+ languages) per the GDPR PII spec: cross-encoder reranking\nmust cover all EU languages. Costs nothing while `enabled = false` (default).",
           "type": "string",
-          "default": "bge-reranker-base"
+          "default": "bge-reranker-v2-m3"
         },
         "top_k": {
-          "description": "How many hits to rerank. The vector search returns `top_k` candidates\nwhich the cross-encoder then reorders.",
+          "description": "How many hits to rerank. The vector search returns `top_k` candidates\nwhich the cross-encoder then reorders. Defaults to 20 per spec.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 10
+          "default": 20
         }
       },
       "additionalProperties": false
@@ -861,13 +867,19 @@
           "default": "tesseract"
         },
         "languages": {
-          "description": "Tesseract / PaddleOCR language packs (ISO 639-3 codes like `\"eng\"`).",
+          "description": "Tesseract / PaddleOCR language packs (ISO 639-3 codes like `\"eng\"`).\nDefaults to English plus the six EU national-ID languages (DE, FR, ES,\nIT, NL, PL) so ID documents OCR correctly before PII detection.",
           "type": "array",
           "items": {
             "type": "string"
           },
           "default": [
-            "eng"
+            "eng",
+            "deu",
+            "fra",
+            "spa",
+            "ita",
+            "nld",
+            "pol"
           ]
         }
       },
@@ -1050,8 +1062,8 @@
           "$ref": "#/$defs/RerankerConfig",
           "default": {
             "enabled": false,
-            "preset": "bge-reranker-base",
-            "top_k": 10
+            "preset": "bge-reranker-v2-m3",
+            "top_k": 20
           }
         }
       },
