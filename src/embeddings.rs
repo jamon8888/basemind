@@ -6,6 +6,9 @@ use anyhow::{Context, Result, anyhow};
 use xberg::embeddings::EMBEDDING_PRESETS;
 use xberg::{EmbeddingConfig, EmbeddingModelType};
 
+/// Custom HF repos usable without a preset-table entry: repo id → vector dims.
+/// xberg Custom models resolve `onnx/model.onnx` with Mean pooling from the repo.
+const KNOWN_CUSTOM_DIMENSIONS: &[(&str, usize)] = &[("Infojura/mmlw-retrieval-e5-small-onnx", 384)];
 /// Global bounded rayon `ThreadPool` for all ONNX embed calls. Initialized once
 /// on first use; subsequent calls to `embed_pool` return the same pool regardless
 /// of the `max_threads` argument (the pool size is fixed for the process).
@@ -64,18 +67,45 @@ impl SharedEmbedder {
     /// (sourced from `[resources].embed_batch_size`). Larger batches amortise
     /// per-call overhead at a higher transient memory spike.
     pub fn load(preset: &str, max_embed_threads: usize, batch_size: usize) -> Result<Self> {
-        let meta = EMBEDDING_PRESETS.iter().find(|p| p.name == preset).ok_or_else(|| {
-            anyhow!(
-                "unknown embedding preset '{preset}'; \
-                     available: fast, balanced, quality, multilingual"
-            )
-        })?;
-        let dim = u16::try_from(meta.dimensions)
-            .with_context(|| format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions))?;
+        let (model, dim, model_name) = match EMBEDDING_PRESETS.iter().find(|p| p.name == preset) {
+            Some(meta) => {
+                let dim = u16::try_from(meta.dimensions).with_context(|| {
+                    format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions)
+                })?;
+                (
+                    EmbeddingModelType::Preset {
+                        name: preset.to_string(),
+                    },
+                    dim,
+                    preset.to_string(),
+                )
+            }
+            None => {
+                let dimensions = KNOWN_CUSTOM_DIMENSIONS
+                    .iter()
+                    .find(|(id, _)| *id == preset)
+                    .map(|(_, dims)| *dims)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "unknown embedding preset '{preset}'; \
+                             available: fast, balanced, quality, multilingual"
+                        )
+                    })?;
+                let dim = u16::try_from(dimensions).with_context(|| {
+                    format!("custom model '{preset}' dimension {dimensions} exceeds u16")
+                })?;
+                (
+                    EmbeddingModelType::Custom {
+                        model_id: preset.to_string(),
+                        dimensions,
+                    },
+                    dim,
+                    preset.to_string(),
+                )
+            }
+        };
         let config = EmbeddingConfig {
-            model: EmbeddingModelType::Preset {
-                name: preset.to_string(),
-            },
+            model,
             normalize: true,
             batch_size,
             show_download_progress: false,
@@ -87,7 +117,7 @@ impl SharedEmbedder {
         Ok(Self {
             config,
             dim,
-            model_name: preset.to_string(),
+            model_name,
             max_embed_threads,
         })
     }
@@ -151,13 +181,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_embed_threads_zero_gives_auto() {
-        let got = resolve_embed_threads(0);
+    fn resolve_embed_threads_zero_gives_auto() {        let got = resolve_embed_threads(0);
         let expected = std::cmp::max(2, rayon::current_num_threads() / 4);
         assert_eq!(
             got, expected,
             "resolve_embed_threads(0) should yield max(2, cores/4) = {expected}"
         );
         assert!(got >= 2, "auto embed cap must be >= 2, got {got}");
+    }
+
+    #[test]
+    fn load_known_custom_repo_falls_back_to_custom() {
+        let got = SharedEmbedder::load("Infojura/mmlw-retrieval-e5-small-onnx", 0, 32)
+            .expect("known custom repo must load");
+        assert_eq!(got.dim(), 384);
+        assert!(matches!(
+            got.config.model,
+            EmbeddingModelType::Custom { .. }
+        ));
+    }
+
+    #[test]
+    fn load_unknown_name_still_errors() {
+        assert!(SharedEmbedder::load("nope-not-a-model", 0, 32).is_err());
     }
 }
