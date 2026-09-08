@@ -9,6 +9,19 @@ use xberg::{EmbeddingConfig, EmbeddingModelType};
 /// Custom HF repos usable without a preset-table entry: repo id → vector dims.
 /// xberg Custom models resolve `onnx/model.onnx` with Mean pooling from the repo.
 const KNOWN_CUSTOM_DIMENSIONS: &[(&str, usize)] = &[("Infojura/mmlw-retrieval-e5-small-onnx", 384)];
+
+/// Resolve vector dims for a preset name or a known custom HF repo id.
+/// Shared by the loader and the scanner so both agree (a mismatch would write
+/// a LanceDB table with the wrong dim and force a later wipe-and-rebuild).
+pub(crate) fn resolve_embedding_dims(name: &str) -> Option<usize> {
+    if let Some(meta) = EMBEDDING_PRESETS.iter().find(|p| p.name == name) {
+        return Some(meta.dimensions);
+    }
+    KNOWN_CUSTOM_DIMENSIONS
+        .iter()
+        .find(|(id, _)| *id == name)
+        .map(|(_, dims)| *dims)
+}
 /// Global bounded rayon `ThreadPool` for all ONNX embed calls. Initialized once
 /// on first use; subsequent calls to `embed_pool` return the same pool regardless
 /// of the `max_threads` argument (the pool size is fixed for the process).
@@ -80,16 +93,12 @@ impl SharedEmbedder {
                 )
             }
             None => {
-                let dimensions = KNOWN_CUSTOM_DIMENSIONS
-                    .iter()
-                    .find(|(id, _)| *id == preset)
-                    .map(|(_, dims)| *dims)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "unknown embedding preset '{preset}'; \
-                             available: fast, balanced, quality, multilingual"
-                        )
-                    })?;
+                let dimensions = resolve_embedding_dims(preset).ok_or_else(|| {
+                    anyhow!(
+                        "unknown embedding preset '{preset}'; \
+                         available: fast, balanced, quality, multilingual"
+                    )
+                })?;
                 let dim = u16::try_from(dimensions)
                     .with_context(|| format!("custom model '{preset}' dimension {dimensions} exceeds u16"))?;
                 (
