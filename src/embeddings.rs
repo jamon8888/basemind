@@ -69,9 +69,8 @@ impl SharedEmbedder {
     pub fn load(preset: &str, max_embed_threads: usize, batch_size: usize) -> Result<Self> {
         let (model, dim, model_name) = match EMBEDDING_PRESETS.iter().find(|p| p.name == preset) {
             Some(meta) => {
-                let dim = u16::try_from(meta.dimensions).with_context(|| {
-                    format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions)
-                })?;
+                let dim = u16::try_from(meta.dimensions)
+                    .with_context(|| format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions))?;
                 (
                     EmbeddingModelType::Preset {
                         name: preset.to_string(),
@@ -91,9 +90,8 @@ impl SharedEmbedder {
                              available: fast, balanced, quality, multilingual"
                         )
                     })?;
-                let dim = u16::try_from(dimensions).with_context(|| {
-                    format!("custom model '{preset}' dimension {dimensions} exceeds u16")
-                })?;
+                let dim = u16::try_from(dimensions)
+                    .with_context(|| format!("custom model '{preset}' dimension {dimensions} exceeds u16"))?;
                 (
                     EmbeddingModelType::Custom {
                         model_id: preset.to_string(),
@@ -181,7 +179,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_embed_threads_zero_gives_auto() {        let got = resolve_embed_threads(0);
+    fn resolve_embed_threads_zero_gives_auto() {
+        let got = resolve_embed_threads(0);
         let expected = std::cmp::max(2, rayon::current_num_threads() / 4);
         assert_eq!(
             got, expected,
@@ -192,13 +191,10 @@ mod tests {
 
     #[test]
     fn load_known_custom_repo_falls_back_to_custom() {
-        let got = SharedEmbedder::load("Infojura/mmlw-retrieval-e5-small-onnx", 0, 32)
-            .expect("known custom repo must load");
+        let got =
+            SharedEmbedder::load("Infojura/mmlw-retrieval-e5-small-onnx", 0, 32).expect("known custom repo must load");
         assert_eq!(got.dim(), 384);
-        assert!(matches!(
-            got.config.model,
-            EmbeddingModelType::Custom { .. }
-        ));
+        assert!(matches!(got.config.model, EmbeddingModelType::Custom { .. }));
     }
 
     #[test]
