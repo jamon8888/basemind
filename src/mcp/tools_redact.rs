@@ -69,9 +69,9 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         strategy: RedactionStrategy::TokenReplace,
         ..Default::default()
     };
-    let redaction_config = basemind_config.to_xberg().ok_or_else(|| {
-        McpError::internal_error("failed to convert redaction config".to_string(), None)
-    })?;
+    let redaction_config = basemind_config
+        .to_xberg()
+        .ok_or_else(|| McpError::internal_error("failed to convert redaction config".to_string(), None))?;
 
     let mut extraction_config = xberg::core::config::ExtractionConfig::default();
     extraction_config.redaction = None;
@@ -80,9 +80,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut extraction = extract(input, &extraction_config)
         .await
         .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
-    let mut doc = extraction.results.pop().ok_or_else(|| {
-        McpError::internal_error("xberg returned no extracted document".to_string(), None)
-    })?;
+    let mut doc = extraction
+        .results
+        .pop()
+        .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?;
     let original = doc.content.clone();
 
     let map = redaction::redact_capturing_rehydration_map(&mut doc, &redaction_config)

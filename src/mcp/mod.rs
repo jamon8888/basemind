@@ -95,12 +95,12 @@ mod tools_comms;
 mod tools_git;
 mod tools_graph;
 mod tools_memory;
+#[cfg(feature = "documents")]
+mod tools_redact;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod tools_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 mod tools_shells;
-#[cfg(feature = "documents")]
-mod tools_redact;
 #[cfg(feature = "documents")]
 mod tools_vault;
 #[cfg(feature = "crawl")]

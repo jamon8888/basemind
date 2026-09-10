@@ -4,14 +4,17 @@ use serde::{Deserialize, Serialize};
 
 mod patterns;
 mod pipeline;
+mod translation;
 mod validators;
+
+pub use translation::{ChunkSpan, FindingInput, TranslationStats, translate_findings};
 
 pub use patterns::{
     CODE_SECURITY_PATTERNS, CodeSecurityPattern, EU_NATIONAL_ID_PATTERNS, EuNationalIdPattern, IBAN_REGEX,
 };
 pub use pipeline::{
     DetectedSpan, ERASED_VALUE_HASH, confidence_threshold, dedupe_spans, gliner_label_threshold, is_private_ipv4,
-    passes_threshold, validate_db_connection_string, validate_e164, validate_jwt,
+    passes_threshold, risk_for_label, validate_db_connection_string, validate_e164, validate_jwt,
 };
 pub use validators::{
     validate_at_svnr, validate_be_niss, validate_eu_national_id, validate_fr_nir, validate_iban, validate_ie_pps,
@@ -167,8 +170,17 @@ impl From<&PiiCategory> for f32 {
 pub struct EntityLocation {
     pub file_id: String,
     pub chunk_index: i32,
+    /// Character offsets when the source text is available; `-1` when only byte
+    /// offsets were reported (the redaction engine drops original bytes, so the
+    /// translation layer cannot map bytes back to chars).
     pub char_start: i32,
     pub char_end: i32,
+    /// Byte offsets in the original content, when reported. `Some` for entities
+    /// translated from redaction findings, whose offsets are byte-exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_start: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_end: Option<i32>,
     pub page_number: Option<i32>,
     pub context: String,
 }
@@ -185,8 +197,10 @@ pub struct PiiEntity {
     pub confidence: f32,
     pub detector_version: String,
     pub locations: Vec<EntityLocation>,
-    /// RFC 3339 timestamp when the entity was first detected.
-    pub detected_at: String,
+    /// Unix microseconds when the entity was first detected. Integer timestamps
+    /// follow the repo convention (no date crate in the tree); the originating
+    /// spec's ISO 8601 rendering is a display concern, not a storage one.
+    pub detected_at: i64,
     /// Identifier of the pipeline stage or worker that processed this entity.
     pub processed_by: String,
     /// Legal basis for processing (e.g. "consent", "contract", "legitimate_interest").
@@ -427,6 +441,17 @@ mod tests {
         assert!(!passes_threshold("person_name", 0.74));
     }
     #[test]
+    fn test_risk_for_label_tiers() {
+        assert_eq!(risk_for_label("api_key"), RiskLevel::Critical);
+        assert_eq!(risk_for_label("jwt_token"), RiskLevel::Critical);
+        assert_eq!(risk_for_label("national_id_fr"), RiskLevel::High);
+        assert_eq!(risk_for_label("iban"), RiskLevel::High);
+        assert_eq!(risk_for_label("email"), RiskLevel::Medium);
+        assert_eq!(risk_for_label("internal_url"), RiskLevel::Medium);
+        assert_eq!(risk_for_label("person_name"), RiskLevel::Low);
+        assert_eq!(risk_for_label("something_new"), RiskLevel::Low);
+    }
+    #[test]
     fn test_gliner_label_thresholds_per_spec() {
         assert_eq!(gliner_label_threshold("full_name"), 0.7);
         assert_eq!(gliner_label_threshold("person"), 0.7);
@@ -531,7 +556,7 @@ mod tests {
             confidence: 0.97,
             detector_version: "rule-iban-v1".into(),
             locations: vec![],
-            detected_at: "2026-09-06T00:00:00Z".into(),
+            detected_at: 1786051200000000,
             processed_by: "test".into(),
             legal_basis: None,
             retention_until: None,
@@ -545,7 +570,7 @@ mod tests {
         e.soft_erase();
         assert!(e.is_erased());
         assert_eq!(e.category, "iban");
-        assert_eq!(e.detected_at, "2026-09-06T00:00:00Z");
+        assert_eq!(e.detected_at, 1786051200000000);
         assert!(!test_entity("e2").is_erased());
     }
 }

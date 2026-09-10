@@ -23,10 +23,10 @@ pub mod graph;
 pub mod init;
 pub mod init_rules;
 pub mod memory;
-#[cfg(all(feature = "comms", any(unix, windows)))]
-pub mod registry;
 #[cfg(feature = "documents")]
 pub mod redact;
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub mod registry;
 pub mod render;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shell;
