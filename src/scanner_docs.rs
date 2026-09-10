@@ -411,6 +411,7 @@ fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
             text: chunk.text,
             byte_start: chunk.byte_start,
             byte_end: chunk.byte_end,
+            rehydration_ref: None,
             embedding: chunk.embedding,
         })
         .collect()

@@ -69,6 +69,9 @@ pub struct DocumentRow {
     pub text: String,
     pub byte_start: u32,
     pub byte_end: u32,
+    /// Vault key for the document's encrypted rehydration map. `None` until
+    /// extraction runs with redaction enabled for the document.
+    pub rehydration_ref: Option<String>,
     pub embedding: Vec<f32>,
 }
 
@@ -540,6 +543,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut text = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
     let mut byte_end = UInt32Builder::new();
+    let mut rehydration_ref = StringBuilder::new();
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
@@ -557,6 +561,10 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         text.append_value(&r.text);
         byte_start.append_value(r.byte_start);
         byte_end.append_value(r.byte_end);
+        match &r.rehydration_ref {
+            Some(value) => rehydration_ref.append_value(value),
+            None => rehydration_ref.append_null(),
+        }
         for v in &r.embedding {
             embedding.values().append_value(*v);
         }
@@ -574,6 +582,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(text.finish()),
             Arc::new(byte_start.finish()),
             Arc::new(byte_end.finish()),
+            Arc::new(rehydration_ref.finish()),
             Arc::new(embedding.finish()),
         ],
     )

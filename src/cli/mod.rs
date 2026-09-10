@@ -25,6 +25,8 @@ pub mod init_rules;
 pub mod memory;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod registry;
+#[cfg(feature = "documents")]
+pub mod redact;
 pub mod render;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shell;

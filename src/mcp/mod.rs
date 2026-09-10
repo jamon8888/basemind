@@ -100,6 +100,8 @@ mod tools_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 mod tools_shells;
 #[cfg(feature = "documents")]
+mod tools_redact;
+#[cfg(feature = "documents")]
 mod tools_vault;
 #[cfg(feature = "crawl")]
 mod tools_web;
@@ -476,6 +478,7 @@ impl BasemindServer {
         #[cfg(feature = "documents")]
         {
             router += Self::tool_router_vault();
+            router += Self::tool_router_redact_text();
         }
         router
     }

@@ -104,6 +104,7 @@ pub fn index_page(
             text: chunk.content.clone(),
             byte_start,
             byte_end,
+            rehydration_ref: None,
             embedding,
         });
     }

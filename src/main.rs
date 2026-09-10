@@ -140,6 +140,9 @@ enum Cmd {
     /// Manage the `.basemind/` caches (gc / stats / clear). Offline path.
     #[command(subcommand)]
     Cache(basemind::cli::admin::CacheCmd),
+    /// Redact arbitrary text using the same pipeline as document extraction.
+    #[cfg(feature = "documents")]
+    Redact(basemind::cli::redact::RedactArgs),
     /// Manage the user-global agent-comms broker daemon (needs `--features comms`).
     #[cfg(all(feature = "comms", any(unix, windows)))]
     Comms {
@@ -409,6 +412,11 @@ fn main() -> Result<()> {
         #[cfg(feature = "desktop-ui")]
         Cmd::Ui(args) => ui_cmd::run(&root, &args.args),
         Cmd::Cache(action) => basemind::cli::run_cache(&root, action, json),
+        #[cfg(feature = "documents")]
+        Cmd::Redact(args) => {
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            basemind::cli::redact::run(&args, &mut std::io::stdout(), is_tty)
+        }
         // An explicit `--root` selects the per-repo line for that (resolved) workspace; bare
         // `basemind statusline` keeps the daemon hot-workspace summary.
         Cmd::Statusline => comms_cli::cmd_statusline(cli.root.as_ref().map(|_| root.as_path())),
