@@ -968,4 +968,14 @@ mod tests {
         wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
         assert!(!keep.exists(), "a schema_ver bump should wipe the store");
     }
+
+    #[test]
+    fn documents_schema_contains_rehydration_ref() {
+        use crate::lance::schema::documents_schema;
+        let schema = documents_schema(384);
+        let names: Vec<_> = schema.fields().iter().map(|f| f.name().to_string()).collect();
+        assert!(names.contains(&"rehydration_ref".to_string()));
+        let field = schema.field_with_name("rehydration_ref").unwrap();
+        assert!(field.is_nullable());
+    }
 }

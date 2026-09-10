@@ -31,11 +31,13 @@ pub fn put_entity(idx: &IndexDb, scope: &str, file_id: &str, entity: &PiiEntity)
     Ok(())
 }
 
-/// Fetch one entity record; `None` when absent or undecodable.
+/// Fetch one entity record; `None` when absent.
 pub fn get_entity(idx: &IndexDb, scope: &str, file_id: &str, entity_id: &str) -> Result<Option<PiiEntity>, IndexError> {
     let key = encode_key(scope, file_id, entity_id)?;
-    let bytes = idx.pii_lineage.get(key)?;
-    Ok(bytes.and_then(|b| rmp_serde::from_slice(&b).ok()))
+    let Some(bytes) = idx.pii_lineage.get(key)? else {
+        return Ok(None);
+    };
+    Ok(Some(rmp_serde::from_slice(&bytes)?))
 }
 
 /// Every entity record filed under one `(scope, file_id)`, in key order.
@@ -123,6 +125,19 @@ mod tests {
         let ids: Vec<_> = listed.iter().map(|e| e.entity_id.as_str()).collect();
         assert_eq!(ids, vec!["e1", "e2"]);
         assert!(list_file_entities(&db, "ws", "empty").unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_entity_propagates_decode_error() {
+        use crate::index::keys::pii_lineage_key;
+        let (_dir, db) = fresh_db();
+        let key = pii_lineage_key("ws", "f1", "corrupt").unwrap();
+        db.pii_lineage.insert(key, b"not-msgpack".as_slice()).unwrap();
+        assert!(matches!(
+            get_entity(&db, "ws", "f1", "corrupt"),
+            Err(IndexError::Decode(_))
+        ));
+        assert!(erase_entity(&db, "ws", "f1", "corrupt").is_err());
     }
 
     #[test]

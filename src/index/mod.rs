@@ -308,8 +308,9 @@ pub struct IndexDb {
 
 impl IndexDb {
     /// Open (or create) the index DB under `view_dir`. On schema-version mismatch the
-    /// existing `index.fjall/` directory is dropped and a fresh one is created — the
-    /// caller is responsible for repopulating it via `IndexWriter`.
+    /// scanner-derived keyspaces are cleared and rebuilt via `IndexWriter`;
+    /// user-managed (`memory_by_key`, `memory_archive`, `proposals`) and audit
+    /// (`pii_lineage`) keyspaces are preserved.
     pub fn open(view_dir: &Path) -> Result<Self, IndexError> {
         let dir = view_dir.join(INDEX_DIR);
         std::fs::create_dir_all(&dir).map_err(|source| IndexError::Io {
@@ -317,25 +318,31 @@ impl IndexDb {
             source,
         })?;
         let cache_bytes = index_cache_bytes(&dir);
-        let mut db = Database::builder(&dir).cache_size(cache_bytes).open()?;
-        let mut meta = open_keyspace(&db, "meta")?;
+        let db = Database::builder(&dir).cache_size(cache_bytes).open()?;
+        let meta = open_keyspace(&db, "meta")?;
         let on_disk_ver = meta
             .get(META_SCHEMA_VER)?
             .and_then(|bytes| <[u8; 4]>::try_from(&bytes[..]).ok())
             .map(u32::from_be_bytes);
         if matches!(on_disk_ver, Some(ver) if ver != INDEX_SCHEMA_VER) {
-            drop(meta);
-            drop(db);
-            std::fs::remove_dir_all(&dir).map_err(|source| IndexError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            std::fs::create_dir_all(&dir).map_err(|source| IndexError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            db = Database::builder(&dir).cache_size(cache_bytes).open()?;
-            meta = open_keyspace(&db, "meta")?;
+            // ponytail: clear scanner keyspaces in place; a full dir wipe would drop user-managed and audit records
+            for name in [
+                "symbols_by_path",
+                "symbols_by_name",
+                "calls_by_path",
+                "calls_by_callee",
+                "imports_by_module",
+                "imports_by_path",
+                "implementations_by_trait",
+                "implementations_by_path",
+                "refs_by_def",
+                "refs_by_path",
+                "code_bm25_postings",
+                "code_bm25_by_path",
+                "embeddings",
+            ] {
+                open_keyspace(&db, name)?.clear()?;
+            }
         }
         let symbols_by_path = open_keyspace(&db, "symbols_by_path")?;
         let symbols_by_name = open_keyspace(&db, "symbols_by_name")?;

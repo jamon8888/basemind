@@ -59,7 +59,11 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     const MAX_BYTES: usize = 1 << 20; // 1 MiB
     if args.text.len() > MAX_BYTES {
         return Err(McpError::internal_error(
-            format!("redact_text input too large: {} bytes (max {})", args.text.len(), MAX_BYTES),
+            format!(
+                "redact_text input too large: {} bytes (max {})",
+                args.text.len(),
+                MAX_BYTES
+            ),
             None,
         ));
     }
