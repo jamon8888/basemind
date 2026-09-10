@@ -60,24 +60,21 @@ pub fn translate_findings(
         let mut unmapped = false;
 
         if num_chunks > 0 {
+            let mut found = false;
             for (i, ch) in chunks.iter().enumerate() {
                 let ch_start = ch.byte_start as i64;
                 let ch_end = ch.byte_end as i64;
                 if start >= ch_start && start < ch_end {
                     chunk_idx = i;
-                    break;
-                }
-                if start < ch_start {
-                    // start lies before this chunk; keep previous
-                    chunk_idx = i.saturating_sub(1).max(0);
+                    found = true;
                     break;
                 }
             }
-            // if not inside any chunk, start is after last chunk
-            if start >= chunks[last_idx].byte_end as i64 {
+            if !found {
                 unmapped = true;
-                chunk_idx = last_idx;
             }
+        } else {
+            unmapped = true;
         }
 
         if unmapped {
