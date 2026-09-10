@@ -203,9 +203,80 @@ where
         if let Ok(i) = trimmed.parse::<i64>() {
             return Ok(i);
         }
+        // fallback: legacy RFC 3339 strings written when `detected_at` was a `String`
+        if let Some(micros) = rfc3339_to_micros(trimmed) {
+            return Ok(micros);
+        }
         return Err(D::Error::custom(format!("invalid detected_at string: {s}")));
     }
     Err(D::Error::custom("detected_at must be integer or numeric string"))
+}
+
+/// Convert a legacy RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]`)
+/// to unix microseconds. Dependency-free on purpose (no date crate in the tree).
+fn rfc3339_to_micros(s: &str) -> Option<i64> {
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (clock, off_secs): (&str, i64) = if let Some(c) = time.strip_suffix(['Z', 'z']) {
+        (c, 0)
+    } else {
+        let i = time.rfind(['+', '-'])?;
+        if i < 8 {
+            return None;
+        }
+        let (c, zone) = time.split_at(i);
+        let sign: i64 = if zone.starts_with('+') { 1 } else { -1 };
+        let mut z = zone[1..].split(':');
+        let zh: i64 = z.next()?.parse().ok()?;
+        let zm: i64 = z.next().map_or(Ok(0), |v| v.parse()).ok()?;
+        if z.next().is_some() || zh > 23 || zm > 59 {
+            return None;
+        }
+        (c, sign * (zh * 3600 + zm * 60))
+    };
+    let mut c = clock.split(':');
+    let h: i64 = c.next()?.parse().ok()?;
+    let min: i64 = c.next()?.parse().ok()?;
+    let sec_frac = c.next()?;
+    if c.next().is_some() || h > 23 || min > 59 {
+        return None;
+    }
+    let (sec_part, frac_part) = match sec_frac.split_once('.') {
+        Some((s, f)) => (s, f),
+        None => (sec_frac, ""),
+    };
+    let sec: i64 = sec_part.parse().ok()?;
+    if sec > 60 || !frac_part.bytes().all(|b| b.is_ascii_digit()) || frac_part.len() > 9 {
+        return None;
+    }
+    let mut frac_micros: i64 = 0;
+    for (i, b) in frac_part.bytes().enumerate() {
+        if i < 6 {
+            frac_micros = frac_micros * 10 + i64::from(b - b'0');
+        }
+    }
+    for _ in frac_part.len().min(6)..6 {
+        frac_micros *= 10;
+    }
+    // days from civil (Hinnant), March-based
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days
+        .checked_mul(86400)?
+        .checked_add(h * 3600 + min * 60 + sec)?
+        .checked_sub(off_secs)?;
+    secs.checked_mul(1_000_000)?.checked_add(frac_micros)
 }
 
 /// PII entity for GDPR Article 30 accountability.
@@ -596,5 +667,21 @@ mod tests {
         assert_eq!(e.category, "iban");
         assert_eq!(e.detected_at, 1786051200000000);
         assert!(!test_entity("e2").is_erased());
+    }
+    #[test]
+    fn detected_at_accepts_legacy_rfc3339() {
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:01Z"), Some(1_000_000));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:01+00:00"), Some(1_000_000));
+        assert_eq!(rfc3339_to_micros("1970-01-01T02:00:00+02:00"), Some(0));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:00.5Z"), Some(500_000));
+        assert!(rfc3339_to_micros("not-a-date").is_none());
+        // legacy msgpack record with an RFC 3339 string still decodes
+        let bytes = rmp_serde::to_vec_named(&test_entity("e1")).unwrap();
+        let mut v: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        v["detected_at"] = serde_json::Value::String("1970-01-01T00:00:01Z".into());
+        let legacy = rmp_serde::to_vec_named(&v).unwrap();
+        let got: PiiEntity = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(got.detected_at, 1_000_000);
     }
 }
