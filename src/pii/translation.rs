@@ -39,15 +39,86 @@ pub struct TranslationStats {
 }
 
 pub fn translate_findings(
-    scope: &str,
+    _scope: &str,
     file_id: &str,
     findings: &[FindingInput],
     chunks: &[ChunkSpan],
     detected_at: i64,
     processed_by: &str,
 ) -> (Vec<PiiEntity>, TranslationStats) {
-    let _ = (scope, file_id, findings, chunks, detected_at, processed_by);
-    todo!("translate report findings into lineage records")
+    let mut entities = Vec::with_capacity(findings.len());
+    let mut stats = TranslationStats::default();
+    let num_chunks = chunks.len();
+    let last_idx = num_chunks.saturating_sub(1);
+
+    for f in findings {
+        stats.total += 1;
+        *stats.by_category.entry(f.category.clone()).or_insert(0) += 1;
+
+        let start = f.start as i64;
+        let mut chunk_idx = last_idx;
+        let mut unmapped = false;
+
+        if num_chunks > 0 {
+            for (i, ch) in chunks.iter().enumerate() {
+                let ch_start = ch.byte_start as i64;
+                let ch_end = ch.byte_end as i64;
+                if start >= ch_start && start < ch_end {
+                    chunk_idx = i;
+                    break;
+                }
+                if start < ch_start {
+                    // start lies before this chunk; keep previous
+                    chunk_idx = i.saturating_sub(1).max(0);
+                    break;
+                }
+            }
+            // if not inside any chunk, start is after last chunk
+            if start >= chunks[last_idx].byte_end as i64 {
+                unmapped = true;
+                chunk_idx = last_idx;
+            }
+        }
+
+        if unmapped {
+            stats.unmapped += 1;
+        }
+
+        let entity_id = format!("{file_id}:{}:{}:{}", f.category, f.start, f.end);
+        let value_hash = hex(&hash_bytes(f.token.as_bytes()));
+        let confidence = confidence_threshold(&f.category);
+
+        let location = EntityLocation {
+            file_id: file_id.to_string(),
+            chunk_index: chunk_idx as i32,
+            char_start: -1,
+            char_end: -1,
+            byte_start: Some(f.start as i32),
+            byte_end: Some(f.end as i32),
+            page_number: None,
+            context: String::new(),
+        };
+
+        let entity = PiiEntity {
+            entity_id,
+            category: f.category.clone(),
+            subcategory: None,
+            value_hash,
+            confidence,
+            detector_version: "xberg-redaction-v1".to_string(),
+            locations: vec![location],
+            detected_at,
+            processed_by: processed_by.to_string(),
+            legal_basis: None,
+            retention_until: None,
+            risk_level: risk_for_label(&f.category),
+            lineage: Vec::new(),
+        };
+
+        entities.push(entity);
+    }
+
+    (entities, stats)
 }
 
 #[cfg(test)]

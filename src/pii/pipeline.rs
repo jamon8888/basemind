@@ -236,6 +236,9 @@ impl PiiEntity {
     /// hex SHA-256 digest, which never equals `"ERASED"`.
     pub fn soft_erase(&mut self) {
         self.value_hash = ERASED_VALUE_HASH.to_string();
+        for loc in &mut self.locations {
+            loc.context.clear();
+        }
     }
 
     /// Returns true after [`PiiEntity::soft_erase`] ran.

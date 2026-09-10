@@ -185,6 +185,29 @@ pub struct EntityLocation {
     pub context: String,
 }
 
+fn deserialize_detected_at<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let val = serde_json::Value::deserialize(deserializer)?;
+    if let Some(i) = val.as_i64() {
+        return Ok(i);
+    }
+    if let Some(s) = val.as_str() {
+        if let Ok(i) = s.parse::<i64>() {
+            return Ok(i);
+        }
+        // fallback: attempt to parse numeric string with whitespace
+        let trimmed = s.trim();
+        if let Ok(i) = trimmed.parse::<i64>() {
+            return Ok(i);
+        }
+        return Err(D::Error::custom(format!("invalid detected_at string: {s}")));
+    }
+    Err(D::Error::custom("detected_at must be integer or numeric string"))
+}
+
 /// PII entity for GDPR Article 30 accountability.
 /// Constructed by the extraction pipeline; `lineage` links parent/child entities
 /// (e.g. a chunk → an IBAN → the document it came from) to support audit trails.
@@ -200,6 +223,7 @@ pub struct PiiEntity {
     /// Unix microseconds when the entity was first detected. Integer timestamps
     /// follow the repo convention (no date crate in the tree); the originating
     /// spec's ISO 8601 rendering is a display concern, not a storage one.
+    #[serde(deserialize_with = "deserialize_detected_at")]
     pub detected_at: i64,
     /// Identifier of the pipeline stage or worker that processed this entity.
     pub processed_by: String,

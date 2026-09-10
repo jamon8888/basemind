@@ -39,7 +39,7 @@ use thiserror::Error;
 /// into its meta keyspace at *create* time and recovers it on reopen, ignoring the create options
 /// for a keyspace that already exists, so an index built by an earlier build would keep the 64 MiB
 /// default forever unless the schema mismatch forces it to be recreated.
-const INDEX_PARTITION_REVISION: u32 = 5;
+const INDEX_PARTITION_REVISION: u32 = 6;
 
 /// Bumped whenever the on-disk key layout changes — the sum of `RELEASE_MINOR` and the
 /// [`INDEX_PARTITION_REVISION`] offset, monotonic across both. When `RELEASE_MINOR` next bumps,

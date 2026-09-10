@@ -40,12 +40,12 @@ pub struct RedactArgs {
 
     /// Custom literal terms to redact. Format: `--custom-term label,value`.
     /// Can be specified multiple times.
-    #[arg(long = "custom-term", value_delimiter = ',', value_name = "LABEL,VALUE")]
+    #[arg(long = "custom-term", value_name = "LABEL,VALUE")]
     pub custom_terms: Vec<String>,
 
     /// Custom regex patterns to redact. Format: `--custom-pattern label,regex`.
     /// Can be specified multiple times.
-    #[arg(long = "custom-pattern", value_delimiter = ',', value_name = "LABEL,REGEX")]
+    #[arg(long = "custom-pattern", value_name = "LABEL,REGEX")]
     pub custom_patterns: Vec<String>,
 
     /// Output machine-readable JSON regardless of TTY. Default when stdout is not a TTY.

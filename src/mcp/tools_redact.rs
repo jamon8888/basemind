@@ -36,7 +36,7 @@ impl BasemindServer {
         description = "Redact arbitrary text using the same pipeline as document extraction. Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
         annotations(
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
         )
@@ -56,6 +56,13 @@ impl BasemindServer {
 }
 
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
+    const MAX_BYTES: usize = 1 << 20; // 1 MiB
+    if args.text.len() > MAX_BYTES {
+        return Err(McpError::internal_error(
+            format!("redact_text input too large: {} bytes (max {})", args.text.len(), MAX_BYTES),
+            None,
+        ));
+    }
     if args.text.is_empty() {
         return Err(McpError::internal_error(
             "redact_text requires non-empty text".to_string(),

@@ -134,6 +134,7 @@ mod tests {
         assert!(got.is_erased());
         assert_eq!(got.category, "iban");
         assert_eq!(got.locations.len(), 1);
+        assert!(got.locations.iter().all(|l| l.context.is_empty()));
         assert!(!erase_entity(&db, "ws", "f1", "missing").unwrap());
     }
 }
