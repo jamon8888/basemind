@@ -408,29 +408,30 @@ async fn ui_route_serves_interactive_html() {
 
     // DNS-rebinding guard: a foreign `Host` (a rebound-to-127.0.0.1 attacker page) is rejected before
     // the workspace is read, even for an otherwise-valid, credentialed request — 403, not 200.
-    let (status, _, _) = http_get_with_host(&addr, &ui(&format!("root={encoded_root}")), "evil.example").await;
+    let root_q = encode_query(&[("root", root_str)]);
+    let (status, _, _) = http_get_with_host(&addr, &ui(&root_q), "evil.example").await;
     assert_eq!(
         status, 403,
         "a non-loopback Host must be rejected on the loopback listener"
     );
     // A `localhost` Host is loopback and still served (regression guard for the allowlist).
-    let (status, _, _) = http_get_with_host(&addr, &ui(&format!("root={encoded_root}")), "localhost:1234").await;
+    let (status, _, _) = http_get_with_host(&addr, &ui(&root_q), "localhost:1234").await;
     assert_eq!(status, 200, "a loopback Host (localhost) is still served");
 
     // The route serves visual formats only (like the `ui` tool): a graph *data* format is a 400 whose
     // body names the rejected knob — the route and tool reject it through the same `render_ui_parts`.
-    let (status, _, body) = http_get(&addr, &ui(&format!("root={encoded_root}&format=node_link"))).await;
+    let (status, _, body) = http_get(&addr, &ui(&encode_query(&[("root", root_str), ("format", "node_link")]))).await;
     assert_eq!(status, 400, "a graph data format is rejected by the route: {body}");
     assert!(body.contains("format"), "the 400 body names the bad format: {body}");
     // `format=svg` renders and is served with the SVG content-type (proves the format knob is plumbed
     // through to the response, not just the default HTML path).
-    let (status, head, _) = http_get(&addr, &ui(&format!("root={encoded_root}&format=svg"))).await;
+    let (status, head, _) = http_get(&addr, &ui(&encode_query(&[("root", root_str), ("format", "svg")]))).await;
     assert_eq!(status, 200, "svg renders");
     assert!(head.contains("image/svg+xml"), "svg content-type: {head}");
 
     // `/ui` is a pure read render, so it is method-agnostic: a POST carrying the same query serves the
     // same page (the body is ignored). Pins current behavior — the route has no write/side-effect path.
-    let (status, _) = http_post(&addr, &ui(&format!("root={encoded_root}")), b"", &[]).await;
+    let (status, _) = http_post(&addr, &ui(&root_q), b"", &[]).await;
     assert_eq!(status, 200, "POST /ui serves the same read-only page");
 
     served.stop().await;
