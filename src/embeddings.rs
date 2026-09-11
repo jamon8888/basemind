@@ -96,7 +96,8 @@ impl SharedEmbedder {
                 let dimensions = resolve_embedding_dims(preset).ok_or_else(|| {
                     anyhow!(
                         "unknown embedding preset '{preset}'; \
-                         available: fast, balanced, quality, multilingual"
+                             available: fast, balanced, quality, multilingual, \
+                             Infojura/mmlw-retrieval-e5-small-onnx"
                     )
                 })?;
                 let dim = u16::try_from(dimensions)

@@ -92,8 +92,7 @@ pub(crate) struct PendingDocBatch {
 pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
     let dimensions = crate::embeddings::resolve_embedding_dims(name)
         .with_context(|| format!("unknown xberg embedding preset: {name}"))?;
-    u16::try_from(dimensions)
-        .with_context(|| format!("preset {name} dimensions {dimensions} exceeds u16"))
+    u16::try_from(dimensions).with_context(|| format!("preset {name} dimensions {dimensions} exceeds u16"))
 }
 
 /// Translate the project-level `[documents]` config into the xberg-facing
