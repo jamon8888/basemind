@@ -100,7 +100,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
 
     let value = render::result_to_value(&result)?;
     if opts.json || args.json {
-        serde_json::to_writer(out, &value)?;
+        serde_json::to_writer(&mut *out, &value)?;
         writeln!(out)?;
     } else {
         render::render_human("redact_text", &value, out)?;
