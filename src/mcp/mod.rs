@@ -184,6 +184,8 @@ pub mod params {
     #[cfg(all(feature = "shells", any(unix, windows)))]
     pub use super::mode::ShellMode;
     pub use super::mode::WebMode;
+    #[cfg(feature = "documents")]
+    pub use super::tools_redact::{CustomPatternParam, CustomTermParam, RedactTextParams};
     pub use super::types::{
         BlameFileParams, BlameSymbolParams, CommitsTouchingParams, DependentsParams, DiffFileParams, DiffOutlineParams,
         FindCallersParams, FindCommitsByPathParams, FindFilesParams, FindReferencesParams, GotoDefinitionParams,

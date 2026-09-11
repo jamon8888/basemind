@@ -17,7 +17,7 @@ use super::helpers::record_call;
 use xberg::text::redaction;
 use xberg::{ExtractInput, extract};
 
-use crate::config::{RedactionConfig, RedactionStrategy};
+use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -28,6 +28,28 @@ pub struct RedactTextParams {
     /// categories supported by the engine.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Redaction strategy: `token-replace` (default, reversible), `mask`,
+    /// `hash`, or `drop`.
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// Custom literal terms to redact. Each entry is `{"label": "...", "value": "..."}`.
+    #[serde(default)]
+    pub custom_terms: Vec<CustomTermParam>,
+    /// Custom regex patterns to redact. Each entry is `{"label": "...", "pattern": "..."}`.
+    #[serde(default)]
+    pub custom_patterns: Vec<CustomPatternParam>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CustomTermParam {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CustomPatternParam {
+    pub label: String,
+    pub pattern: String,
 }
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
@@ -60,6 +82,16 @@ impl BasemindServer {
     }
 }
 
+impl BasemindServer {
+    pub(crate) async fn redact_text_cli(&self, p: RedactTextParams) -> Result<CallToolResult, McpError> {
+        let started = std::time::Instant::now();
+        let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
+        let result = run_redact(p).await;
+        record_call(&self.state, "redact_text", &params_json, started, &result);
+        result
+    }
+}
+
 const MAX_BYTES: usize = 1 << 20; // 1 MiB
 
 fn oversized_err(len: usize) -> McpError {
@@ -80,10 +112,45 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         ));
     }
 
+    let strategy = match args.strategy.as_deref() {
+        None | Some("token-replace") => RedactionStrategy::TokenReplace,
+        Some("mask") => RedactionStrategy::Mask,
+        Some("hash") => RedactionStrategy::Hash,
+        Some("drop") => RedactionStrategy::Drop,
+        Some(other) => {
+            return Err(McpError::internal_error(
+                format!("unknown strategy: {other} (expected token-replace|mask|hash|drop)"),
+                None,
+            ));
+        }
+    };
+
+    let custom_terms: Vec<RedactionCustomTerm> = args
+        .custom_terms
+        .into_iter()
+        .map(|t| RedactionCustomTerm {
+            label: t.label,
+            value: t.value,
+            case_sensitive: false,
+        })
+        .collect();
+
+    let custom_patterns: Vec<RedactionCustomPattern> = args
+        .custom_patterns
+        .into_iter()
+        .map(|p| RedactionCustomPattern {
+            label: p.label,
+            pattern: p.pattern,
+            case_sensitive: false,
+        })
+        .collect();
+
     let basemind_config = RedactionConfig {
         enabled: true,
         categories: args.categories,
-        strategy: RedactionStrategy::TokenReplace,
+        strategy,
+        custom_terms,
+        custom_patterns,
         ..Default::default()
     };
     let redaction_config = basemind_config
