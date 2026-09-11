@@ -48,6 +48,11 @@ impl BasemindServer {
         _meta: rmcp::model::RequestMetaObject,
     ) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
+        if p.text.len() > MAX_BYTES {
+            let result: Result<CallToolResult, McpError> = Err(oversized_err(p.text.len()));
+            record_call(&self.state, "redact_text", &serde_json::Value::Null, started, &result);
+            return result;
+        }
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
         let result = run_redact(p).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
@@ -55,17 +60,18 @@ impl BasemindServer {
     }
 }
 
+const MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+fn oversized_err(len: usize) -> McpError {
+    McpError::internal_error(
+        format!("redact_text input too large: {len} bytes (max {MAX_BYTES})"),
+        None,
+    )
+}
+
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
-    const MAX_BYTES: usize = 1 << 20; // 1 MiB
     if args.text.len() > MAX_BYTES {
-        return Err(McpError::internal_error(
-            format!(
-                "redact_text input too large: {} bytes (max {})",
-                args.text.len(),
-                MAX_BYTES
-            ),
-            None,
-        ));
+        return Err(oversized_err(args.text.len()));
     }
     if args.text.is_empty() {
         return Err(McpError::internal_error(
