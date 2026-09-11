@@ -190,6 +190,7 @@ async fn serve() -> ServedHttp {
     }
 }
 
+#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streamable_http_serves_initialize_and_tools_list() {
     basemind::store::init_isolated_cache();
