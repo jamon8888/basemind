@@ -394,6 +394,8 @@ fn main() -> Result<()> {
         Cmd::Admin(a) => dispatch(basemind::cli::ToolCmd::Admin(a)),
         #[cfg(feature = "documents")]
         Cmd::Vault(v) => dispatch(basemind::cli::ToolCmd::Vault(v)),
+        #[cfg(feature = "documents")]
+        Cmd::Redact(args) => dispatch(basemind::cli::ToolCmd::Redact(args)),
         Cmd::Hook { action } => match action {
             HookCmd::Install => cmd_hook_install(&root),
         },
@@ -412,11 +414,6 @@ fn main() -> Result<()> {
         #[cfg(feature = "desktop-ui")]
         Cmd::Ui(args) => ui_cmd::run(&root, &args.args),
         Cmd::Cache(action) => basemind::cli::run_cache(&root, action, json),
-        #[cfg(feature = "documents")]
-        Cmd::Redact(args) => {
-            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-            basemind::cli::redact::run(&args, &mut std::io::stdout(), is_tty)
-        }
         // An explicit `--root` selects the per-repo line for that (resolved) workspace; bare
         // `basemind statusline` keeps the daemon hot-workspace summary.
         Cmd::Statusline => comms_cli::cmd_statusline(cli.root.as_ref().map(|_| root.as_path())),

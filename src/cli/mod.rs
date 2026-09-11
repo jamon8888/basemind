@@ -137,7 +137,7 @@ pub fn run(
             #[cfg(feature = "documents")]
             ToolCmd::Vault(v) => vault::run(&server, v, &opts, &mut out).await?,
             #[cfg(feature = "documents")]
-            ToolCmd::Redact(r) => redact::run(&server, &r, &mut out).await?,
+            ToolCmd::Redact(r) => redact::run(&server, &r, &opts, &mut out).await?,
         }
         out.flush().context("flush stdout")?;
         Ok(())

@@ -83,7 +83,7 @@ fn read_input(args: &RedactArgs) -> Result<String> {
     }
 }
 
-pub async fn run(server: &BasemindServer, args: &RedactArgs, out: &mut impl Write) -> Result<()> {
+pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit, out: &mut impl Write) -> Result<()> {
     let text = read_input(args)?;
     let params = RedactTextParams {
         text,
@@ -99,7 +99,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, out: &mut impl Writ
         .map_err(|e| anyhow::anyhow!("redact_text: {e}"))?;
 
     let value = render::result_to_value(&result)?;
-    if args.json {
+    if opts.json || args.json {
         serde_json::to_writer(out, &value)?;
         writeln!(out)?;
     } else {
