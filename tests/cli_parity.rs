@@ -96,8 +96,9 @@ fn tool_to_cli() -> Vec<(&'static str, Option<&'static str>, &'static str)> {
         ("memory", Some("proposals"), "memory proposals"),
         ("memory", Some("accept"), "memory accept"),
         ("memory", Some("reject"), "memory reject"),
-        ("redact_text", None, "redact"),
     ];
+    #[cfg(feature = "documents")]
+    m.extend([("vault", None, "vault"), ("redact_text", None, "redact")]);
     #[cfg(feature = "crawl")]
     m.extend([
         ("web", Some("scrape"), "web scrape"),
@@ -139,8 +140,6 @@ fn tool_to_cli() -> Vec<(&'static str, Option<&'static str>, &'static str)> {
         ("shell", Some("list"), "shell list"),
         ("shell", Some("broadcast"), "shell broadcast"),
     ]);
-    #[cfg(feature = "documents")]
-    m.extend([("vault", None, "vault")]);
     m
 }
 
