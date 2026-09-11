@@ -96,6 +96,7 @@ fn tool_to_cli() -> Vec<(&'static str, Option<&'static str>, &'static str)> {
         ("memory", Some("proposals"), "memory proposals"),
         ("memory", Some("accept"), "memory accept"),
         ("memory", Some("reject"), "memory reject"),
+        ("redact_text", None, "redact"),
     ];
     #[cfg(feature = "crawl")]
     m.extend([
