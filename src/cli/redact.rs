@@ -94,12 +94,14 @@ fn build_config(
         "drop" => RedactionStrategy::Drop,
         other => anyhow::bail!("unknown strategy: {other} (expected token-replace|mask|hash|drop)"),
     };
-    let mut config = RedactionConfig::default();
-    config.enabled = true;
-    config.strategy = strategy;
-    config.categories = categories;
-    config.custom_terms = parse_custom_terms(custom_terms)?;
-    config.custom_patterns = parse_custom_patterns(custom_patterns)?;
+    let config = RedactionConfig {
+        enabled: true,
+        strategy,
+        categories,
+        custom_terms: parse_custom_terms(custom_terms)?,
+        custom_patterns: parse_custom_patterns(custom_patterns)?,
+        ..Default::default()
+    };
     Ok(config)
 }
 

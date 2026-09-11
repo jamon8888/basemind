@@ -90,8 +90,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .to_xberg()
         .ok_or_else(|| McpError::internal_error("failed to convert redaction config".to_string(), None))?;
 
-    let mut extraction_config = xberg::core::config::ExtractionConfig::default();
-    extraction_config.redaction = None;
+    let extraction_config = xberg::core::config::ExtractionConfig {
+        redaction: None,
+        ..Default::default()
+    };
 
     let input = ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()));
     let mut extraction = extract(input, &extraction_config)
