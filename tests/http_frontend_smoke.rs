@@ -420,7 +420,11 @@ async fn ui_route_serves_interactive_html() {
 
     // The route serves visual formats only (like the `ui` tool): a graph *data* format is a 400 whose
     // body names the rejected knob — the route and tool reject it through the same `render_ui_parts`.
-    let (status, _, body) = http_get(&addr, &ui(&encode_query(&[("root", root_str), ("format", "node_link")]))).await;
+    let (status, _, body) = http_get(
+        &addr,
+        &ui(&encode_query(&[("root", root_str), ("format", "node_link")])),
+    )
+    .await;
     assert_eq!(status, 400, "a graph data format is rejected by the route: {body}");
     assert!(body.contains("format"), "the 400 body names the bad format: {body}");
     // `format=svg` renders and is served with the SVG content-type (proves the format knob is plumbed
