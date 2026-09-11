@@ -3,6 +3,7 @@
 //! Dispatches through the same `redact_text` MCP tool method as the server,
 //! ensuring CLI-MCP parity.
 
+use std::io::Read;
 use std::io::Write;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,7 @@ use clap::Args;
 
 use crate::cli::render;
 use crate::mcp::BasemindServer;
-use crate::mcp::tools_redact::{CustomPatternParam, CustomTermParam, RedactTextParams};
+use crate::mcp::params::{CustomPatternParam, CustomTermParam, RedactTextParams};
 
 #[derive(Args, Debug)]
 pub struct RedactArgs {
