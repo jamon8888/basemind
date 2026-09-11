@@ -405,6 +405,8 @@ fn doc_scope_namespaces_external_files_under_their_extra_root() {
     cfg.scan.extra_roots = vec![ext.path().to_path_buf()];
 
     let file_key = ext_canonical.join("pkg/notes.pdf");
-    let scope = doc_scope_for(file_key.to_str().unwrap(), "repo:origin", &cfg);
-    assert_eq!(scope, format!("path:{}", ext_canonical.to_str().unwrap()));
+    let file_key = file_key.to_string_lossy().replace('\\', "/");
+    let expected_root = ext_canonical.to_string_lossy().replace('\\', "/");
+    let scope = doc_scope_for(&file_key, "repo:origin", &cfg);
+    assert_eq!(scope, format!("path:{expected_root}"));
 }

@@ -223,6 +223,19 @@ fn rfc3339_to_micros(s: &str) -> Option<i64> {
     if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
         return None;
     }
+    // Reject calendar-invalid dates (e.g. Feb 31).
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => unreachable!(),
+    };
+    if day > max_day {
+        return None;
+    }
     let (clock, off_secs): (&str, i64) = if let Some(c) = time.strip_suffix(['Z', 'z']) {
         (c, 0)
     } else {
@@ -683,5 +696,15 @@ mod tests {
         let legacy = rmp_serde::to_vec_named(&v).unwrap();
         let got: PiiEntity = rmp_serde::from_slice(&legacy).unwrap();
         assert_eq!(got.detected_at, 1_000_000);
+    }
+    #[test]
+    fn rfc3339_rejects_calendar_invalid_dates() {
+        assert!(rfc3339_to_micros("2025-02-31T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2025-04-31T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2024-02-30T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2024-02-29T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-02-28T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-12-31T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-06-31T00:00:00Z").is_none());
     }
 }
