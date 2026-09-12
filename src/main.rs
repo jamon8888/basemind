@@ -143,6 +143,9 @@ enum Cmd {
     /// Manage the `.basemind/` caches (gc / stats / clear). Offline path.
     #[command(subcommand)]
     Cache(basemind::cli::admin::CacheCmd),
+    /// Redact arbitrary text using the same pipeline as document extraction.
+    #[cfg(feature = "documents")]
+    Redact(basemind::cli::redact::RedactArgs),
     /// Manage the user-global agent-comms broker daemon (needs `--features comms`).
     #[cfg(all(feature = "comms", any(unix, windows)))]
     Comms {
@@ -394,6 +397,8 @@ fn main() -> Result<()> {
         Cmd::Admin(a) => dispatch(basemind::cli::ToolCmd::Admin(a)),
         #[cfg(feature = "documents")]
         Cmd::Vault(v) => dispatch(basemind::cli::ToolCmd::Vault(v)),
+        #[cfg(feature = "documents")]
+        Cmd::Redact(args) => dispatch(basemind::cli::ToolCmd::Redact(args)),
         Cmd::Hook { action } => match action {
             HookCmd::Install => cmd_hook_install(&root),
         },

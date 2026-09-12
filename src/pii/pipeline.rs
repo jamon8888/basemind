@@ -1,6 +1,6 @@
 //! Layer-4+ pipeline helpers: confidence thresholds, span dedup, erasure.
 
-use super::PiiEntity;
+use super::{PiiEntity, RiskLevel};
 
 // ─── Pipeline helpers: thresholds, span dedup, format validators, erasure ───
 
@@ -56,6 +56,51 @@ pub fn gliner_label_threshold(label: &str) -> f32 {
         "full_name" | "person" => 0.7,
         "api_key" | "password" | "iban" | "ip_address" => 0.3,
         _ => 0.5,
+    }
+}
+
+/// String-keyed risk tier mirroring the `PiiCategory` sensitivity table for
+/// labels arriving as text (redaction findings, GLiNER tags). Secrets are
+/// critical, national/financial identifiers high, infrastructure and contact
+/// identifiers medium or low. Unknown labels default to low.
+pub fn risk_for_label(label: &str) -> RiskLevel {
+    match label {
+        "api_key"
+        | "aws_access_key"
+        | "aws_secret_key"
+        | "gcp_credentials"
+        | "azure_credentials"
+        | "jwt_token"
+        | "oauth_token"
+        | "oauth"
+        | "bearer_token"
+        | "bearer"
+        | "ssh_private_key"
+        | "gpg_private_key"
+        | "tls_certificate"
+        | "db_connection_string"
+        | "env_secret"
+        | "password" => RiskLevel::Critical,
+        "national_id"
+        | "national_id_fr"
+        | "national_id_nl"
+        | "national_id_be"
+        | "national_id_at"
+        | "national_id_ie"
+        | "national_id_pt"
+        | "national_id_generic"
+        | "iban"
+        | "credit_card"
+        | "bank_account"
+        | "passport_number"
+        | "passport"
+        | "drivers_license"
+        | "tax_id"
+        | "health_data"
+        | "biometric"
+        | "genetic" => RiskLevel::High,
+        "internal_url" | "internal_hostname" | "phone" | "phone_number" | "email" => RiskLevel::Medium,
+        _ => RiskLevel::Low,
     }
 }
 
@@ -191,6 +236,9 @@ impl PiiEntity {
     /// hex SHA-256 digest, which never equals `"ERASED"`.
     pub fn soft_erase(&mut self) {
         self.value_hash = ERASED_VALUE_HASH.to_string();
+        for loc in &mut self.locations {
+            loc.context.clear();
+        }
     }
 
     /// Returns true after [`PiiEntity::soft_erase`] ran.

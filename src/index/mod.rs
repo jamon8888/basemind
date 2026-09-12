@@ -19,6 +19,8 @@
 
 pub mod keys;
 pub mod keys_governance;
+pub mod keys_pii;
+pub mod pii_lineage;
 pub mod writer;
 
 use std::path::{Path, PathBuf};
@@ -37,7 +39,7 @@ use thiserror::Error;
 /// into its meta keyspace at *create* time and recovers it on reopen, ignoring the create options
 /// for a keyspace that already exists, so an index built by an earlier build would keep the 64 MiB
 /// default forever unless the schema mismatch forces it to be recreated.
-const INDEX_PARTITION_REVISION: u32 = 5;
+const INDEX_PARTITION_REVISION: u32 = 6;
 
 /// Bumped whenever the on-disk key layout changes — the sum of `RELEASE_MINOR` and the
 /// [`INDEX_PARTITION_REVISION`] offset, monotonic across both. When `RELEASE_MINOR` next bumps,
@@ -81,6 +83,7 @@ const KEYSPACE_MEMTABLE_BYTES: &[(&str, u64)] = &[
     ("memory_by_key", MEMTABLE_COLD_BYTES),
     ("memory_archive", MEMTABLE_COLD_BYTES),
     ("proposals", MEMTABLE_COLD_BYTES),
+    ("pii_lineage", MEMTABLE_COLD_BYTES),
 ];
 
 /// Memtable size for the BM25 posting keyspace — the one partition that measurably benefits from
@@ -239,6 +242,8 @@ pub enum IndexError {
     Encode(#[from] rmp_serde::encode::Error),
     #[error("msgpack decode error: {0}")]
     Decode(#[from] rmp_serde::decode::Error),
+    #[error("pii lineage key component exceeds the 64 KiB u16 ceiling")]
+    KeyTooLong,
 }
 
 /// Handle to every keyspace we read or write. Cloned cheaply (each `Keyspace` is `Arc`'d
@@ -295,12 +300,17 @@ pub struct IndexDb {
     /// W11 propose-don't-commit skill-mining surface. Always created for DB stability.
     #[allow(dead_code)]
     pub(crate) proposals: Keyspace,
+    /// `pii_lineage`: `(scope, file_id, entity_id)` → msgpack [`crate::pii::PiiEntity`].
+    /// GDPR Article 30 audit trail for detected PII. Always created for DB stability;
+    /// populated by the document scan lane, read by erasure/audit paths.
+    pub(crate) pii_lineage: Keyspace,
 }
 
 impl IndexDb {
     /// Open (or create) the index DB under `view_dir`. On schema-version mismatch the
-    /// existing `index.fjall/` directory is dropped and a fresh one is created — the
-    /// caller is responsible for repopulating it via `IndexWriter`.
+    /// scanner-derived keyspaces are cleared and rebuilt via `IndexWriter`;
+    /// user-managed (`memory_by_key`, `memory_archive`, `proposals`) and audit
+    /// (`pii_lineage`) keyspaces are preserved.
     pub fn open(view_dir: &Path) -> Result<Self, IndexError> {
         let dir = view_dir.join(INDEX_DIR);
         std::fs::create_dir_all(&dir).map_err(|source| IndexError::Io {
@@ -308,25 +318,31 @@ impl IndexDb {
             source,
         })?;
         let cache_bytes = index_cache_bytes(&dir);
-        let mut db = Database::builder(&dir).cache_size(cache_bytes).open()?;
-        let mut meta = open_keyspace(&db, "meta")?;
+        let db = Database::builder(&dir).cache_size(cache_bytes).open()?;
+        let meta = open_keyspace(&db, "meta")?;
         let on_disk_ver = meta
             .get(META_SCHEMA_VER)?
             .and_then(|bytes| <[u8; 4]>::try_from(&bytes[..]).ok())
             .map(u32::from_be_bytes);
         if matches!(on_disk_ver, Some(ver) if ver != INDEX_SCHEMA_VER) {
-            drop(meta);
-            drop(db);
-            std::fs::remove_dir_all(&dir).map_err(|source| IndexError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            std::fs::create_dir_all(&dir).map_err(|source| IndexError::Io {
-                path: dir.clone(),
-                source,
-            })?;
-            db = Database::builder(&dir).cache_size(cache_bytes).open()?;
-            meta = open_keyspace(&db, "meta")?;
+            // ponytail: clear scanner keyspaces in place; a full dir wipe would drop user-managed and audit records
+            for name in [
+                "symbols_by_path",
+                "symbols_by_name",
+                "calls_by_path",
+                "calls_by_callee",
+                "imports_by_module",
+                "imports_by_path",
+                "implementations_by_trait",
+                "implementations_by_path",
+                "refs_by_def",
+                "refs_by_path",
+                "code_bm25_postings",
+                "code_bm25_by_path",
+                "embeddings",
+            ] {
+                open_keyspace(&db, name)?.clear()?;
+            }
         }
         let symbols_by_path = open_keyspace(&db, "symbols_by_path")?;
         let symbols_by_name = open_keyspace(&db, "symbols_by_name")?;
@@ -344,6 +360,7 @@ impl IndexDb {
         let memory_by_key = open_keyspace(&db, "memory_by_key")?;
         let memory_archive = open_keyspace(&db, "memory_archive")?;
         let proposals = open_keyspace(&db, "proposals")?;
+        let pii_lineage = open_keyspace(&db, "pii_lineage")?;
 
         meta.insert(META_SCHEMA_VER, INDEX_SCHEMA_VER.to_be_bytes())?;
 
@@ -366,6 +383,7 @@ impl IndexDb {
             memory_by_key,
             memory_archive,
             proposals,
+            pii_lineage,
         })
     }
 

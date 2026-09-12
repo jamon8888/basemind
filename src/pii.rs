@@ -4,14 +4,17 @@ use serde::{Deserialize, Serialize};
 
 mod patterns;
 mod pipeline;
+mod translation;
 mod validators;
+
+pub use translation::{ChunkSpan, FindingInput, TranslationStats, translate_findings};
 
 pub use patterns::{
     CODE_SECURITY_PATTERNS, CodeSecurityPattern, EU_NATIONAL_ID_PATTERNS, EuNationalIdPattern, IBAN_REGEX,
 };
 pub use pipeline::{
     DetectedSpan, ERASED_VALUE_HASH, confidence_threshold, dedupe_spans, gliner_label_threshold, is_private_ipv4,
-    passes_threshold, validate_db_connection_string, validate_e164, validate_jwt,
+    passes_threshold, risk_for_label, validate_db_connection_string, validate_e164, validate_jwt,
 };
 pub use validators::{
     validate_at_svnr, validate_be_niss, validate_eu_national_id, validate_fr_nir, validate_iban, validate_ie_pps,
@@ -167,10 +170,126 @@ impl From<&PiiCategory> for f32 {
 pub struct EntityLocation {
     pub file_id: String,
     pub chunk_index: i32,
+    /// Character offsets when the source text is available; `-1` when only byte
+    /// offsets were reported (the redaction engine drops original bytes, so the
+    /// translation layer cannot map bytes back to chars).
     pub char_start: i32,
     pub char_end: i32,
+    /// Byte offsets in the original content, when reported. `Some` for entities
+    /// translated from redaction findings, whose offsets are byte-exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_start: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_end: Option<i32>,
     pub page_number: Option<i32>,
     pub context: String,
+}
+
+fn deserialize_detected_at<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let val = serde_json::Value::deserialize(deserializer)?;
+    if let Some(i) = val.as_i64() {
+        return Ok(i);
+    }
+    if let Some(s) = val.as_str() {
+        if let Ok(i) = s.parse::<i64>() {
+            return Ok(i);
+        }
+        // fallback: attempt to parse numeric string with whitespace
+        let trimmed = s.trim();
+        if let Ok(i) = trimmed.parse::<i64>() {
+            return Ok(i);
+        }
+        // fallback: legacy RFC 3339 strings written when `detected_at` was a `String`
+        if let Some(micros) = rfc3339_to_micros(trimmed) {
+            return Ok(micros);
+        }
+        return Err(D::Error::custom(format!("invalid detected_at string: {s}")));
+    }
+    Err(D::Error::custom("detected_at must be integer or numeric string"))
+}
+
+/// Convert a legacy RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM]`)
+/// to unix microseconds. Dependency-free on purpose (no date crate in the tree).
+fn rfc3339_to_micros(s: &str) -> Option<i64> {
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Reject calendar-invalid dates (e.g. Feb 31).
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => unreachable!(),
+    };
+    if day > max_day {
+        return None;
+    }
+    let (clock, off_secs): (&str, i64) = if let Some(c) = time.strip_suffix(['Z', 'z']) {
+        (c, 0)
+    } else {
+        let i = time.rfind(['+', '-'])?;
+        if i < 8 {
+            return None;
+        }
+        let (c, zone) = time.split_at(i);
+        let sign: i64 = if zone.starts_with('+') { 1 } else { -1 };
+        let mut z = zone[1..].split(':');
+        let zh: i64 = z.next()?.parse().ok()?;
+        let zm: i64 = z.next().map_or(Ok(0), |v| v.parse()).ok()?;
+        if z.next().is_some() || zh > 23 || zm > 59 {
+            return None;
+        }
+        (c, sign * (zh * 3600 + zm * 60))
+    };
+    let mut c = clock.split(':');
+    let h: i64 = c.next()?.parse().ok()?;
+    let min: i64 = c.next()?.parse().ok()?;
+    let sec_frac = c.next()?;
+    if c.next().is_some() || h > 23 || min > 59 {
+        return None;
+    }
+    let (sec_part, frac_part) = match sec_frac.split_once('.') {
+        Some((s, f)) => (s, f),
+        None => (sec_frac, ""),
+    };
+    let sec: i64 = sec_part.parse().ok()?;
+    if sec > 60 || !frac_part.bytes().all(|b| b.is_ascii_digit()) || frac_part.len() > 9 {
+        return None;
+    }
+    let mut frac_micros: i64 = 0;
+    for (i, b) in frac_part.bytes().enumerate() {
+        if i < 6 {
+            frac_micros = frac_micros * 10 + i64::from(b - b'0');
+        }
+    }
+    for _ in frac_part.len().min(6)..6 {
+        frac_micros *= 10;
+    }
+    // days from civil (Hinnant), March-based
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = y_adj.div_euclid(400);
+    let yoe = y_adj - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days
+        .checked_mul(86400)?
+        .checked_add(h * 3600 + min * 60 + sec)?
+        .checked_sub(off_secs)?;
+    secs.checked_mul(1_000_000)?.checked_add(frac_micros)
 }
 
 /// PII entity for GDPR Article 30 accountability.
@@ -185,8 +304,11 @@ pub struct PiiEntity {
     pub confidence: f32,
     pub detector_version: String,
     pub locations: Vec<EntityLocation>,
-    /// RFC 3339 timestamp when the entity was first detected.
-    pub detected_at: String,
+    /// Unix microseconds when the entity was first detected. Integer timestamps
+    /// follow the repo convention (no date crate in the tree); the originating
+    /// spec's ISO 8601 rendering is a display concern, not a storage one.
+    #[serde(deserialize_with = "deserialize_detected_at")]
+    pub detected_at: i64,
     /// Identifier of the pipeline stage or worker that processed this entity.
     pub processed_by: String,
     /// Legal basis for processing (e.g. "consent", "contract", "legitimate_interest").
@@ -427,6 +549,17 @@ mod tests {
         assert!(!passes_threshold("person_name", 0.74));
     }
     #[test]
+    fn test_risk_for_label_tiers() {
+        assert_eq!(risk_for_label("api_key"), RiskLevel::Critical);
+        assert_eq!(risk_for_label("jwt_token"), RiskLevel::Critical);
+        assert_eq!(risk_for_label("national_id_fr"), RiskLevel::High);
+        assert_eq!(risk_for_label("iban"), RiskLevel::High);
+        assert_eq!(risk_for_label("email"), RiskLevel::Medium);
+        assert_eq!(risk_for_label("internal_url"), RiskLevel::Medium);
+        assert_eq!(risk_for_label("person_name"), RiskLevel::Low);
+        assert_eq!(risk_for_label("something_new"), RiskLevel::Low);
+    }
+    #[test]
     fn test_gliner_label_thresholds_per_spec() {
         assert_eq!(gliner_label_threshold("full_name"), 0.7);
         assert_eq!(gliner_label_threshold("person"), 0.7);
@@ -531,7 +664,7 @@ mod tests {
             confidence: 0.97,
             detector_version: "rule-iban-v1".into(),
             locations: vec![],
-            detected_at: "2026-09-06T00:00:00Z".into(),
+            detected_at: 1786051200000000,
             processed_by: "test".into(),
             legal_basis: None,
             retention_until: None,
@@ -545,7 +678,33 @@ mod tests {
         e.soft_erase();
         assert!(e.is_erased());
         assert_eq!(e.category, "iban");
-        assert_eq!(e.detected_at, "2026-09-06T00:00:00Z");
+        assert_eq!(e.detected_at, 1786051200000000);
         assert!(!test_entity("e2").is_erased());
+    }
+    #[test]
+    fn detected_at_accepts_legacy_rfc3339() {
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:01Z"), Some(1_000_000));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:01+00:00"), Some(1_000_000));
+        assert_eq!(rfc3339_to_micros("1970-01-01T02:00:00+02:00"), Some(0));
+        assert_eq!(rfc3339_to_micros("1970-01-01T00:00:00.5Z"), Some(500_000));
+        assert!(rfc3339_to_micros("not-a-date").is_none());
+        // legacy msgpack record with an RFC 3339 string still decodes
+        let bytes = rmp_serde::to_vec_named(&test_entity("e1")).unwrap();
+        let mut v: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        v["detected_at"] = serde_json::Value::String("1970-01-01T00:00:01Z".into());
+        let legacy = rmp_serde::to_vec_named(&v).unwrap();
+        let got: PiiEntity = rmp_serde::from_slice(&legacy).unwrap();
+        assert_eq!(got.detected_at, 1_000_000);
+    }
+    #[test]
+    fn rfc3339_rejects_calendar_invalid_dates() {
+        assert!(rfc3339_to_micros("2025-02-31T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2025-04-31T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2024-02-30T00:00:00Z").is_none());
+        assert!(rfc3339_to_micros("2024-02-29T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-02-28T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-12-31T00:00:00Z").is_some());
+        assert!(rfc3339_to_micros("2025-06-31T00:00:00Z").is_none());
     }
 }

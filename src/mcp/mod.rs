@@ -95,6 +95,8 @@ mod tools_comms;
 mod tools_git;
 mod tools_graph;
 mod tools_memory;
+#[cfg(feature = "documents")]
+mod tools_redact;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod tools_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
@@ -182,6 +184,8 @@ pub mod params {
     #[cfg(all(feature = "shells", any(unix, windows)))]
     pub use super::mode::ShellMode;
     pub use super::mode::WebMode;
+    #[cfg(feature = "documents")]
+    pub use super::tools_redact::RedactTextParams;
     pub use super::types::{
         BlameFileParams, BlameSymbolParams, CommitsTouchingParams, DependentsParams, DiffFileParams, DiffOutlineParams,
         FindCallersParams, FindCommitsByPathParams, FindFilesParams, FindReferencesParams, GotoDefinitionParams,
@@ -476,6 +480,7 @@ impl BasemindServer {
         #[cfg(feature = "documents")]
         {
             router += Self::tool_router_vault();
+            router += Self::tool_router_redact_text();
         }
         router
     }

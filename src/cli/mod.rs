@@ -24,6 +24,8 @@ pub mod graph;
 pub mod init;
 pub mod init_rules;
 pub mod memory;
+#[cfg(feature = "documents")]
+pub mod redact;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod registry;
 pub mod render;
@@ -78,6 +80,9 @@ pub enum ToolCmd {
     #[cfg(feature = "documents")]
     #[command(subcommand)]
     Vault(vault::VaultCmd),
+    /// PII detection and redaction for arbitrary text (needs `--features documents`).
+    #[cfg(feature = "documents")]
+    Redact(redact::RedactArgs),
 }
 
 /// Map a tool `Result<CallToolResult, McpError>` into an `anyhow::Result`,
@@ -132,6 +137,8 @@ pub fn run(
             ToolCmd::Shell(s) => shell::run(&server, s, &opts, &mut out).await?,
             #[cfg(feature = "documents")]
             ToolCmd::Vault(v) => vault::run(&server, v, &opts, &mut out).await?,
+            #[cfg(feature = "documents")]
+            ToolCmd::Redact(r) => redact::run(&server, &r, &opts, &mut out).await?,
         }
         out.flush().context("flush stdout")?;
         Ok(())

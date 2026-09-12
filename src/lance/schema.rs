@@ -17,6 +17,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
 /// - `byte_start` UInt32   chunk start byte offset in the original document
 /// - `byte_end`  UInt32    chunk end byte offset
+/// - `rehydration_ref`  UTF-8    nullable vault key for the document's encrypted rehydration map
 /// - `embedding` FixedSizeList<Float32, DIM>  the embedding vector
 pub fn documents_schema(dim: u16) -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -27,6 +28,7 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new("text", DataType::Utf8, false),
         Field::new("byte_start", DataType::UInt32, false),
         Field::new("byte_end", DataType::UInt32, false),
+        Field::new("rehydration_ref", DataType::Utf8, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), i32::from(dim)),

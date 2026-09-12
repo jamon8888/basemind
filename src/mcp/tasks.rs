@@ -28,6 +28,7 @@ pub(super) const SLOW_CALLS: &[&str] = &[
     "admin:rescan",
     "graph:map",
     "code:semantic",
+    "redact_text",
     #[cfg(feature = "documents")]
     "memory:documents",
     #[cfg(feature = "crawl")]
