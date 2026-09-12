@@ -134,6 +134,9 @@ enum Cmd {
     /// `--features desktop-ui`).
     #[cfg(feature = "desktop-ui")]
     Ui(UiArgs),
+    /// Detect CPU feature flags (AVX2, AVX, SSE, NEON) for ONNX model compatibility.
+    /// Prints JSON to stdout and exits. No server needed.
+    CpuFeatures,
     /// Print a compact one-line summary of the daemon's currently-hot workspaces, for a shell
     /// statusline. Fast and silent: prints nothing and exits 0 when no daemon is running.
     Statusline,
@@ -403,6 +406,7 @@ fn main() -> Result<()> {
         Cmd::Delta(args) => basemind::textcompress::cli::run_delta(&args),
         Cmd::Checkpoint(args) => basemind::textcompress::cli::run_checkpoint(&root, &args),
         Cmd::DetectWaste(args) => basemind::textcompress::cli::run_detect_waste(&args),
+        Cmd::CpuFeatures => basemind::cli::cpu_features::run(&mut std::io::stdout()),
         Cmd::Serve(args) => cmd_serve(&root, &view, &args, json),
         #[cfg(feature = "agent-tui")]
         Cmd::Agent(args) => agent_cmd::run(&root, &args.args),

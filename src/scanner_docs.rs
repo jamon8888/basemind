@@ -28,7 +28,6 @@ use std::sync::OnceLock;
 use ahash::AHashSet;
 use anyhow::Context as _;
 use xberg::core::mime;
-use xberg::embeddings::{EMBEDDING_PRESETS, EmbeddingPreset};
 
 use crate::config::{DocumentsConfig, LlmConfig, ResourcesConfig};
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc};
@@ -91,12 +90,9 @@ pub(crate) struct PendingDocBatch {
 /// silent fallback would create a LanceDB table with the wrong dim and force a
 /// later wipe-and-rebuild.
 pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
-    let preset: &EmbeddingPreset = EMBEDDING_PRESETS
-        .iter()
-        .find(|p| p.name == name)
+    let dimensions = crate::embeddings::resolve_embedding_dims(name)
         .with_context(|| format!("unknown xberg embedding preset: {name}"))?;
-    u16::try_from(preset.dimensions)
-        .with_context(|| format!("preset {name} dimensions {} exceeds u16", preset.dimensions))
+    u16::try_from(dimensions).with_context(|| format!("preset {name} dimensions {dimensions} exceeds u16"))
 }
 
 /// Translate the project-level `[documents]` config into the xberg-facing
@@ -595,6 +591,12 @@ mod tests {
         assert_eq!(dim, 768);
     }
 
+    #[test]
+    fn preset_dim_for_known_custom_repo_returns_384() {
+        let dim = preset_dim("Infojura/mmlw-retrieval-e5-small-onnx").expect("known custom repo");
+        assert_eq!(dim, 384);
+    }
+
     /// A cached doc embedded under `balanced` (dim 768) must NOT be reused when the configured
     /// preset switches to `multilingual` (also dim 768, different model) — the dim matches, so only
     /// the model check closes the stale-vector hole. It stays reusable when the preset is unchanged.
@@ -620,7 +622,6 @@ mod tests {
             summary: None,
             language_confidences: Vec::new(),
         };
-
         let same = DocumentsConfig {
             embedding_preset: "balanced".to_string(),
             ..DocumentsConfig::default()
@@ -629,7 +630,6 @@ mod tests {
             cached_doc_is_reusable(&doc, &same, true),
             "same preset (balanced) must reuse the cached vectors"
         );
-
         let switched = DocumentsConfig {
             embedding_preset: "multilingual".to_string(),
             ..DocumentsConfig::default()
