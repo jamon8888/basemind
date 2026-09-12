@@ -622,7 +622,6 @@ mod tests {
             summary: None,
             language_confidences: Vec::new(),
         };
-
         let same = DocumentsConfig {
             embedding_preset: "balanced".to_string(),
             ..DocumentsConfig::default()
@@ -631,7 +630,6 @@ mod tests {
             cached_doc_is_reusable(&doc, &same, true),
             "same preset (balanced) must reuse the cached vectors"
         );
-
         let switched = DocumentsConfig {
             embedding_preset: "multilingual".to_string(),
             ..DocumentsConfig::default()
