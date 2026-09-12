@@ -32,24 +32,12 @@ pub struct RedactTextParams {
     /// `hash`, or `drop`.
     #[serde(default)]
     pub strategy: Option<String>,
-    /// Custom literal terms to redact. Each entry is `{"label": "...", "value": "..."}`.
+    /// Custom literal terms to redact. Each entry is `["label", "value"]`.
     #[serde(default)]
-    pub custom_terms: Vec<CustomTermParam>,
-    /// Custom regex patterns to redact. Each entry is `{"label": "...", "pattern": "..."}`.
+    pub custom_terms: Vec<Vec<String>>,
+    /// Custom regex patterns to redact. Each entry is `["label", "regex"]`.
     #[serde(default)]
-    pub custom_patterns: Vec<CustomPatternParam>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct CustomTermParam {
-    pub label: String,
-    pub value: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct CustomPatternParam {
-    pub label: String,
-    pub pattern: String,
+    pub custom_patterns: Vec<Vec<String>>,
 }
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
@@ -128,20 +116,32 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let custom_terms: Vec<RedactionCustomTerm> = args
         .custom_terms
         .into_iter()
-        .map(|t| RedactionCustomTerm {
-            label: t.label,
-            value: t.value,
-            case_sensitive: false,
+        .filter_map(|t| {
+            if t.len() == 2 {
+                Some(RedactionCustomTerm {
+                    label: t[0].clone(),
+                    value: t[1].clone(),
+                    case_sensitive: false,
+                })
+            } else {
+                None
+            }
         })
         .collect();
 
     let custom_patterns: Vec<RedactionCustomPattern> = args
         .custom_patterns
         .into_iter()
-        .map(|p| RedactionCustomPattern {
-            label: p.label,
-            pattern: p.pattern,
-            case_sensitive: false,
+        .filter_map(|p| {
+            if p.len() == 2 {
+                Some(RedactionCustomPattern {
+                    label: p[0].clone(),
+                    pattern: p[1].clone(),
+                    case_sensitive: false,
+                })
+            } else {
+                None
+            }
         })
         .collect();
 

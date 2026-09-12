@@ -11,7 +11,7 @@ use clap::Args;
 
 use crate::cli::render;
 use crate::mcp::BasemindServer;
-use crate::mcp::params::{CustomPatternParam, CustomTermParam, RedactTextParams};
+use crate::mcp::params::RedactTextParams;
 
 #[derive(Args, Debug)]
 pub struct RedactArgs {
@@ -44,28 +44,12 @@ pub struct RedactArgs {
     pub json: bool,
 }
 
-fn parse_custom_terms(raw: Vec<String>) -> Result<Vec<CustomTermParam>> {
+fn parse_pairs(raw: Vec<String>) -> Result<Vec<Vec<String>>> {
     raw.into_iter()
         .map(|s| {
             let parts: Vec<&str> = s.splitn(2, ',').collect();
-            anyhow::ensure!(parts.len() == 2, "--custom-term must be label,value (got: {s})");
-            Ok(CustomTermParam {
-                label: parts[0].to_string(),
-                value: parts[1].to_string(),
-            })
-        })
-        .collect()
-}
-
-fn parse_custom_patterns(raw: Vec<String>) -> Result<Vec<CustomPatternParam>> {
-    raw.into_iter()
-        .map(|s| {
-            let parts: Vec<&str> = s.splitn(2, ',').collect();
-            anyhow::ensure!(parts.len() == 2, "--custom-pattern must be label,regex (got: {s})");
-            Ok(CustomPatternParam {
-                label: parts[0].to_string(),
-                pattern: parts[1].to_string(),
-            })
+            anyhow::ensure!(parts.len() == 2, "expected label,value (got: {s})");
+            Ok(parts.into_iter().map(str::to_string).collect())
         })
         .collect()
 }
@@ -89,8 +73,8 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         text,
         categories: args.categories.clone(),
         strategy: Some(args.strategy.clone()),
-        custom_terms: parse_custom_terms(args.custom_terms.clone())?,
-        custom_patterns: parse_custom_patterns(args.custom_patterns.clone())?,
+        custom_terms: parse_pairs(args.custom_terms.clone())?,
+        custom_patterns: parse_pairs(args.custom_patterns.clone())?,
     };
 
     let result = server
