@@ -18,6 +18,7 @@ pub mod code;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod comms_daemon;
 pub mod context;
+pub mod cpu_features;
 pub mod git;
 pub mod graph;
 pub mod init;
