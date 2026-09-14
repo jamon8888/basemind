@@ -514,6 +514,21 @@ impl Store {
         }
     }
 
+    #[cfg(feature = "documents")]
+    pub fn blob_path_rehydration_hex(&self, hash_hex: &str) -> PathBuf {
+        self.blobs_dir.join(format!("{hash_hex}.rehydration.blob"))
+    }
+
+    #[cfg(feature = "documents")]
+    pub fn write_rehydration(&self, hash_hex: &str, encrypted: &[u8]) -> Result<(), StoreError> {
+        write_bytes_atomic(self.blob_path_rehydration_hex(hash_hex), encrypted)
+    }
+
+    #[cfg(feature = "documents")]
+    pub fn read_rehydration(&self, hash_hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        read_if_exists(&self.blob_path_rehydration_hex(hash_hex))
+    }
+
     /// Path of a file's resolution blob (`<hash>.rref.msgpack`) — the per-file code-intelligence
     /// facts (intra-file resolved edges + import/export list). A sibling of the `.fm`/`.doc`
     /// blobs, content-addressed by source hash and stored as compressed single-map msgpack.
@@ -797,6 +812,10 @@ mod tests {
             entities: Vec::new(),
             summary: None,
             language_confidences: Vec::new(),
+            redaction_findings: Vec::new(),
+            redaction_fingerprint: None,
+            rehydration_ref: None,
+            pending_rehydration: None,
         };
         store.write_doc(&hash, &vectorless).expect("write vectorless blob");
 

@@ -33,6 +33,7 @@ use crate::config::{DocumentsConfig, LlmConfig, ResourcesConfig};
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc};
 use crate::hashing::{self, Hash};
 use crate::lance::DocumentRow;
+use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::store::Store;
 
@@ -79,6 +80,9 @@ pub(crate) struct PendingDocBatch {
     /// rather than a fresh xberg extraction. Drives the `reused_doc_extraction` scan counter — the
     /// observable proof that churn (renames, rewrites) does not re-run extraction or embedding.
     pub reused: bool,
+    /// Hash of the encrypted rehydration blob, if redaction captured one.
+    /// Threaded into [`crate::store::DocEntry`] so the GC live set protects it.
+    pub rehydration_ref: Option<String>,
 }
 
 /// Look the configured embedding preset up in xberg's preset table and
@@ -289,8 +293,62 @@ pub(crate) fn extract_and_persist_doc(
     }
 
     let doc_config = doc_config_from(cfg, llm, resources, embed);
-    let doc: FileMapDoc =
+    let mut doc: FileMapDoc =
         extract_doc(abs, Some(mime_type), &doc_config).with_context(|| format!("extract document {rel}"))?;
+
+    // Persist the rehydration map as a content-addressed blob when redaction
+    // captured one. The encrypted blob's hash becomes the rehydration_ref stored
+    // in the doc blob and threaded into LanceDB rows.
+    if let Some(map) = doc.pending_rehydration.take()
+        && !map.is_empty()
+    {
+        let passphrase = derive_rehydration_passphrase(scope);
+        let encrypted =
+            xberg::text::redaction::rehydration::encrypt_map(&map, &passphrase).context("encrypt rehydration map")?;
+        let ref_hash = hashing::hash_bytes(&encrypted);
+        let ref_hex_buf = hashing::hex_buf(&ref_hash);
+        let ref_hex = hashing::hex_str(&ref_hex_buf);
+        store
+            .write_rehydration(ref_hex, &encrypted)
+            .context("write rehydration blob")?;
+        doc.rehydration_ref = Some(ref_hex.to_string());
+    }
+
+    // Wire redaction findings into the pii_lineage GDPR Article 30 audit trail.
+    if !doc.redaction_findings.is_empty()
+        && let Some(idx) = store.index_db.as_ref()
+    {
+        let findings_input: Vec<FindingInput> = doc
+            .redaction_findings
+            .iter()
+            .map(|f| FindingInput {
+                start: f.start,
+                end: f.end,
+                category: f.category.clone(),
+                token: f.replacement_token.clone(),
+            })
+            .collect();
+        let chunk_spans: Vec<ChunkSpan> = doc
+            .chunks
+            .iter()
+            .map(|c| ChunkSpan {
+                byte_start: c.byte_start,
+                byte_end: c.byte_end,
+            })
+            .collect();
+        let detected_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64;
+        let (entities, _stats) =
+            crate::pii::translate_findings(scope, rel, &findings_input, &chunk_spans, detected_at, "basemind-scan");
+        for entity in &entities {
+            if let Err(e) = crate::index::pii_lineage::put_entity(idx, scope, rel, entity) {
+                tracing::warn!(rel, ?e, "pii_lineage: failed to write entity");
+            }
+        }
+    }
+
     store
         .write_doc(hash, &doc)
         .with_context(|| format!("write doc blob for {rel}"))?;
@@ -305,6 +363,25 @@ pub(crate) fn extract_and_persist_doc(
 /// never disagree about the requirement — a disagreement is exactly the issue-#44 loop.
 pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedMode) -> bool {
     matches!(mode, EmbedMode::Inline) && cfg.embed && !crate::scanner_filter::embed_excluded(rel, &cfg.embed_exclude)
+}
+
+/// Derive a deterministic passphrase for encrypting rehydration maps.
+///
+/// Mixes the workspace scope with the data-directory path so blobs from
+/// different workspaces or machines cannot be decrypted interchangeably.
+/// The data directory is machine-unique and not derivable from scope alone,
+/// which protects against a copied blob being decrypted on a different
+/// machine with the same scope name.
+// ponytail: scope+data_dir is sufficient for local-only encryption.
+// Upgrade path: vault-managed random key if cross-device portability is needed.
+fn derive_rehydration_passphrase(scope: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope.hash(&mut hasher);
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "basemind") {
+        dirs.data_dir().hash(&mut hasher);
+    }
+    format!("basemind-rehydration-{:016x}", hasher.finish())
 }
 
 /// The pure (IO-free) half of the `process_doc` unchanged fast path: does a tracked entry settle the
@@ -332,6 +409,10 @@ pub(crate) fn doc_entry_settled(
 /// empty-of-chunks doc is always reusable (recompute would yield nothing anyway). When embedding is
 /// off, any cached doc is reusable (chunks only).
 fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool) -> bool {
+    // Redaction config changed — force re-extraction regardless of embedding state.
+    if cached.redaction_fingerprint != Some(crate::extract::doc::hash_redaction_config(&cfg.redaction)) {
+        return false;
+    }
     if !embed || cached.chunks.is_empty() {
         return true;
     }
@@ -343,6 +424,7 @@ fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: boo
             .chunks
             .iter()
             .all(|c| c.embedding.len() == cached.embedding_dim as usize)
+        && cached.redaction_fingerprint == Some(crate::extract::doc::hash_redaction_config(&cfg.redaction))
 }
 
 /// Assemble the deferred-write descriptor from an extracted-or-cached document. Decides — while the
@@ -383,6 +465,7 @@ fn pending_from_doc(
         // (the reuse gate requires them), so `embedded` covers it and the flag is moot there. ~keep
         embed_attempted: embed && !reused,
         reused,
+        rehydration_ref: doc.rehydration_ref.clone(),
     }
 }
 
@@ -396,6 +479,7 @@ fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
     let scope_owned = scope.to_string();
     let rel_owned = rel.to_string();
     let mime_owned = doc.mime_type;
+    let rehydration_ref = doc.rehydration_ref;
     doc.chunks
         .into_iter()
         .enumerate()
@@ -407,7 +491,7 @@ fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
             text: chunk.text,
             byte_start: chunk.byte_start,
             byte_end: chunk.byte_end,
-            rehydration_ref: None,
+            rehydration_ref: rehydration_ref.clone(),
             embedding: chunk.embedding,
         })
         .collect()

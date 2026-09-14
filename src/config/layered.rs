@@ -89,6 +89,9 @@ const DOCUMENT_LEAVES: &[&str] = &[
     "documents.summarization.enabled",
     "documents.summarization.strategy",
     "documents.summarization.max_tokens",
+    "documents.redaction.enabled",
+    "documents.redaction.allowed_categories",
+    "documents.redaction.strategy",
     "documents.output.format",
     "llm.model",
     "llm.api_key",
@@ -241,6 +244,10 @@ pub(crate) fn apply_documents_overrides(
                 d.output.format = OutputFormat::Toon;
                 true
             }
+            "markdown" => {
+                d.output.format = OutputFormat::Markdown;
+                true
+            }
             _ => {
                 tracing::warn!(value = %v, "unknown output_format value; ignoring");
                 false
@@ -248,6 +255,53 @@ pub(crate) fn apply_documents_overrides(
         };
         if applied && let Some(p) = provenance.as_mut() {
             p.insert("documents.output.format", source);
+        }
+    }
+    if let Some(v) = overrides.redaction_enabled {
+        d.redaction.enabled = v;
+        if let Some(p) = provenance.as_mut() {
+            p.insert("documents.redaction.enabled", source);
+        }
+    }
+    if let Some(ref cats) = overrides.redaction_allowed_categories {
+        let parsed: Vec<String> = cats.split(',').map(|s| s.trim().to_lowercase()).collect();
+        if let Some(ref mut ner) = d.redaction.ner {
+            ner.categories = parsed;
+        } else {
+            d.redaction.ner = Some(super::documents::NerRedactionConfig {
+                categories: parsed,
+                ..Default::default()
+            });
+        }
+        if let Some(p) = provenance.as_mut() {
+            p.insert("documents.redaction.allowed_categories", source);
+        }
+    }
+    if let Some(ref strat) = overrides.redaction_strategy {
+        let applied = match strat.to_ascii_lowercase().as_str() {
+            "replace" => {
+                d.redaction.strategy = super::documents::RedactionStrategy::TokenReplace;
+                true
+            }
+            "remove" => {
+                d.redaction.strategy = super::documents::RedactionStrategy::Drop;
+                true
+            }
+            "hash" => {
+                d.redaction.strategy = super::documents::RedactionStrategy::Hash;
+                true
+            }
+            "mask" => {
+                d.redaction.strategy = super::documents::RedactionStrategy::Mask;
+                true
+            }
+            _ => {
+                tracing::warn!(value = %strat, "unknown redaction_strategy value; ignoring");
+                false
+            }
+        };
+        if applied && let Some(p) = provenance.as_mut() {
+            p.insert("documents.redaction.strategy", source);
         }
     }
     apply_llm_overrides(config, overrides, source, provenance);

@@ -36,7 +36,13 @@ use crate::store::{
 /// (code-search tier), and `.rref.msgpack` (code-intel resolved-references tier). All share the
 /// same source-hash stem as the `.fm` blob, so they are reclaimed together when the source file
 /// changes or is deleted (its stem drops out of the live set).
-const BLOB_SUFFIXES: [&str; 4] = [".fm.msgpack", ".doc.msgpack", ".chunk.msgpack", ".rref.msgpack"];
+const BLOB_SUFFIXES: [&str; 5] = [
+    ".fm.msgpack",
+    ".doc.msgpack",
+    ".chunk.msgpack",
+    ".rref.msgpack",
+    ".rehydration.blob",
+];
 
 /// Pre-0.9 split-tier blob suffixes (`<hash>.l1.msgpack` / `<hash>.l2.msgpack`), superseded by
 /// the combined `.fm.msgpack` frame. No current code writes or reads these, so any left on disk
@@ -182,6 +188,9 @@ pub fn collect_referenced_hashes(basemind_dir: &Path) -> Result<AHashSet<String>
         }
         for entry in index.doc_files.values() {
             referenced.insert(entry.hash_hex.clone());
+            if let Some(ref rref) = entry.rehydration_ref {
+                referenced.insert(rref.clone());
+            }
         }
     }
     Ok(referenced)
@@ -969,5 +978,23 @@ mod tests {
             assert_eq!(parsed, component, "round-trip {token}");
         }
         assert!("nonsense".parse::<CacheComponent>().is_err(), "unknown token rejected");
+    }
+
+    #[test]
+    fn gc_reaps_unreferenced_rehydration_blobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blobs_dir = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs_dir).expect("mk blobs");
+        let ref_stem = "c".repeat(64);
+        let orphan_stem = "d".repeat(64);
+        fs::write(blobs_dir.join(format!("{ref_stem}.fm.msgpack")), b"fm").unwrap();
+        fs::write(blobs_dir.join(format!("{ref_stem}.rehydration.blob")), b"r").unwrap();
+        fs::write(blobs_dir.join(format!("{orphan_stem}.rehydration.blob")), b"o").unwrap();
+        let mut referenced = AHashSet::new();
+        referenced.insert(ref_stem.clone());
+        let report = gc_blobs_in(&blobs_dir, &referenced, Duration::ZERO).expect("gc");
+        assert_eq!(report.removed, 1);
+        assert!(!blobs_dir.join(format!("{orphan_stem}.rehydration.blob")).exists());
+        assert!(blobs_dir.join(format!("{ref_stem}.rehydration.blob")).exists());
     }
 }

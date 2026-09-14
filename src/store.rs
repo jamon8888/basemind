@@ -236,6 +236,12 @@ pub struct DocEntry {
     /// exactly one healing re-process.
     #[serde(default)]
     pub embed_attempted: bool,
+    /// Hash of the encrypted rehydration blob for this document, if redaction
+    /// captured one.  The GC live set must include this stem so the blob is not
+    /// reaped while the document still references it.  Additive msgpack field:
+    /// pre-existing entries deserialize as `None`.
+    #[serde(default)]
+    pub rehydration_ref: Option<String>,
 }
 
 pub struct Store {

@@ -30,6 +30,10 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         entities: Vec::new(),
         summary: None,
         language_confidences: Vec::new(),
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
     };
 
     let same = DocumentsConfig {
@@ -73,6 +77,7 @@ fn pending_doc_batch_is_metadata_only() {
         embedded: true,
         embed_attempted: true,
         reused: false,
+        rehydration_ref: None,
     };
     assert!(batch.emit_rows);
     assert_eq!(batch.chunk_count, 3);
@@ -107,6 +112,10 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
         entities: Vec::new(),
         summary: None,
         language_confidences: Vec::new(),
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
     }
 }
 
@@ -159,6 +168,7 @@ fn doc_entry_settled_backs_off_after_a_failed_embed_attempt() {
         mtime: 0,
         embedded: false,
         embed_attempted: true,
+        rehydration_ref: None,
     };
     assert!(
         doc_entry_settled(&base, "h", "balanced", true),
