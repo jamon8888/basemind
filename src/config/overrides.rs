@@ -145,6 +145,28 @@ pub struct DocumentsCliOverrides {
     /// Override `llm.max_tokens` (maximum tokens to generate).
     #[arg(long = "llm-max-tokens", env = "BASEMIND_LLM_MAX_TOKENS")]
     pub llm_max_tokens: Option<u64>,
+
+    /// Override `documents.redaction.enabled` (per-scan on/off).
+    #[arg(long = "documents-redaction-enabled", env = "BASEMIND_DOCUMENTS_REDACTION_ENABLED")]
+    pub redaction_enabled: Option<bool>,
+
+    /// Override `documents.redaction.allowed_categories` (comma-separated PII category names).
+    #[arg(
+        long = "documents-redaction-allowed-categories",
+        env = "BASEMIND_DOCUMENTS_REDACTION_ALLOWED_CATEGORIES"
+    )]
+    pub redaction_allowed_categories: Option<String>,
+
+    /// Override `documents.redaction.strategy` (replace / remove / hash).
+    #[arg(
+        long = "documents-redaction-strategy",
+        env = "BASEMIND_DOCUMENTS_REDACTION_STRATEGY"
+    )]
+    pub redaction_strategy: Option<String>,
+
+    /// Override `documents.output.format` (json / toon / markdown).
+    #[arg(long = "documents-output-format", env = "BASEMIND_DOCUMENTS_OUTPUT_FORMAT")]
+    pub output_format_override: Option<String>,
 }
 
 impl DocumentsCliOverrides {
@@ -175,6 +197,10 @@ impl DocumentsCliOverrides {
             || self.summarization_enabled.is_some()
             || self.summarization_strategy.is_some()
             || self.summarization_max_tokens.is_some()
+            || self.redaction_enabled.is_some()
+            || self.redaction_allowed_categories.is_some()
+            || self.redaction_strategy.is_some()
+            || self.output_format_override.is_some()
             || self.output_format.is_some()
             || self.llm_model.is_some()
             || self.llm_api_key.is_some()

@@ -674,6 +674,7 @@ pub enum OutputFormat {
     #[default]
     Json,
     Toon,
+    Markdown,
 }
 
 /// Shared LLM credentials + model selection. Consumed by every LLM-backed

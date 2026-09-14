@@ -30,6 +30,10 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         entities: Vec::new(),
         summary: None,
         language_confidences: Vec::new(),
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
     };
 
     let same = DocumentsConfig {
@@ -107,6 +111,10 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
         entities: Vec::new(),
         summary: None,
         language_confidences: Vec::new(),
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
     }
 }
 

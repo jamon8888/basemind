@@ -30,5 +30,11 @@ pub(crate) fn format_response<T: serde::Serialize>(
                 serde_toon::to_string(value).map_err(|e| McpError::internal_error(format!("toon: {e}"), None))?;
             Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
         }
+        crate::config::OutputFormat::Markdown => {
+            let body = serde_json::to_string_pretty(value)
+                .map_err(|e| McpError::internal_error(format!("json for markdown: {e}"), None))?;
+            let md = format!("```json\n{body}\n```");
+            Ok(CallToolResult::success(vec![ContentBlock::text(md)]))
+        }
     }
 }

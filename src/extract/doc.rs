@@ -11,6 +11,8 @@
 //! pass through the embedding engine.
 
 use std::borrow::Cow;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -24,7 +26,7 @@ use xberg::{ExtractInput, extract};
 use super::{ExtractError, SCHEMA_VER};
 use crate::config::{
     DocLanguageConfig, DocumentModelProfile, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    RedactionConfig, SummarizationConfig, SummarizationStrategy,
+    RedactionConfig, RedactionStrategy, SummarizationConfig, SummarizationStrategy,
 };
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
@@ -84,6 +86,43 @@ pub struct FileMapDoc {
     /// Tail field so older positional msgpack blobs remain readable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub language_confidences: Vec<DocLanguageConfidence>,
+    /// PII redaction findings captured during extraction.
+    ///
+    /// TAIL field — older blobs deserialise via `#[serde(default)]` as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redaction_findings: Vec<RedactionFinding>,
+    /// Hash of the `RedactionConfig` that produced these findings. Used by
+    /// `cached_doc_is_reusable` to detect config changes and force re-extraction.
+    ///
+    /// TAIL field — `None` for blobs extracted without redaction or by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction_fingerprint: Option<String>,
+    /// Vault key (hex hash of the encrypted rehydration map blob). Points to
+    /// the content-addressed rehydration blob in the store. Populated after
+    /// `extract_and_persist_doc` encrypts and persists the map.
+    ///
+    /// TAIL field — `None` when redaction was off or before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rehydration_ref: Option<String>,
+    /// Transient rehydration map captured during extraction. Not persisted in
+    /// the doc blob (`#[serde(skip)]`); consumed by `extract_and_persist_doc`
+    /// to encrypt and store as a content-addressed blob, then cleared.
+    #[serde(skip)]
+    pub pending_rehydration: Option<std::collections::HashMap<String, String>>,
+}
+
+/// One redaction finding captured during document extraction. Mirrors xberg's
+/// `RedactionFinding` to avoid coupling the persisted blob schema to xberg internals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RedactionFinding {
+    /// Byte-offset start in the original (pre-redaction) content.
+    pub start: u32,
+    /// Byte-offset end (exclusive) in the original content.
+    pub end: u32,
+    /// PII category that fired (e.g. "email", "person", "Custom(label)").
+    pub category: String,
+    /// Replacement token written into the redacted content (e.g. "[EMAIL_1]").
+    pub replacement_token: String,
 }
 
 /// Stable mirror of xberg's per-language confidence metadata.
@@ -435,14 +474,29 @@ fn extraction_runtime() -> &'static tokio::runtime::Runtime {
 ///
 /// `mime_type` may be supplied by the caller (e.g. from `lang::detect`); when
 /// `None`, xberg sniffs the file content.
+///
+/// When redaction is enabled with `TokenReplace` strategy, xberg's built-in
+/// redaction is disabled and `redact_capturing_rehydration_map` is called
+/// separately so the rehydration map (token → original) is captured alongside
+/// the rewritten content.
 pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> Result<FileMapDoc, ExtractError> {
-    let krz_config = config.to_xberg();
+    let mut krz_config = config.to_xberg();
+
+    // When redaction is enabled with TokenReplace, we need to capture the
+    // rehydration map. Disable xberg's built-in redaction and run it ourselves
+    // after extraction so the map doesn't get lost.
+    let capture_rehydration = config.redaction.enabled
+        && matches!(config.redaction.strategy, RedactionStrategy::TokenReplace);
+    if capture_rehydration {
+        krz_config.redaction = None;
+    }
+
     let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
     input.mime_type = mime_type.map(str::to_string);
     let mut extraction = extraction_runtime()
         .block_on(extract(input, &krz_config))
         .map_err(|e| ExtractError::Document(e.to_string()))?;
-    let result = extraction.results.pop().ok_or_else(|| {
+    let mut result = extraction.results.pop().ok_or_else(|| {
         let message = extraction
             .errors
             .into_iter()
@@ -451,6 +505,41 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
             .unwrap_or_else(|| "xberg returned no extracted document".to_string());
         ExtractError::Document(message)
     })?;
+
+    // Run redaction ourselves to capture the rehydration map.
+    let mut redaction_findings: Vec<RedactionFinding> = Vec::new();
+    let mut pending_rehydration = None;
+    let redaction_fingerprint = if config.redaction.enabled {
+        Some(hash_redaction_config(&config.redaction))
+    } else {
+        None
+    };
+    if capture_rehydration
+        && let Some(xberg_redaction_cfg) = config.redaction.to_xberg()
+    {
+        let map = extraction_runtime()
+            .block_on(xberg::text::redaction::redact_capturing_rehydration_map(
+                &mut result,
+                &xberg_redaction_cfg,
+            ))
+            .map_err(|e| ExtractError::Document(format!("xberg redaction: {e}")))?;
+        let findings = result
+            .redaction_report
+            .as_ref()
+            .map(|r| &r.findings)
+            .cloned()
+            .unwrap_or_default();
+        redaction_findings = findings
+            .into_iter()
+            .map(|f| RedactionFinding {
+                start: f.start,
+                end: f.end,
+                category: format!("{:?}", f.category).to_lowercase(),
+                replacement_token: f.replacement_token,
+            })
+            .collect();
+        pending_rehydration = Some(map);
+    }
 
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
@@ -547,6 +636,10 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         entities,
         summary,
         language_confidences,
+        redaction_findings,
+        redaction_fingerprint,
+        rehydration_ref: None,
+        pending_rehydration,
     })
 }
 
@@ -576,6 +669,17 @@ fn prepare_doc_chunk(
         embedding: Vec::new(),
     };
     (chunk, dense_input)
+}
+
+/// Deterministic fingerprint of a `RedactionConfig` for cache invalidation.
+/// Two configs that produce identical redaction behaviour hash to the same
+/// value; any field change produces a different fingerprint, forcing
+/// re-extraction of cached doc blobs.
+pub(crate) fn hash_redaction_config(cfg: &RedactionConfig) -> String {
+    let json = serde_json::to_string(cfg).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn map_language_confidences(input: Vec<xberg::types::LanguageConfidence>) -> Vec<DocLanguageConfidence> {
