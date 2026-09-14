@@ -77,6 +77,7 @@ fn pending_doc_batch_is_metadata_only() {
         embedded: true,
         embed_attempted: true,
         reused: false,
+        rehydration_ref: None,
     };
     assert!(batch.emit_rows);
     assert_eq!(batch.chunk_count, 3);
@@ -167,6 +168,7 @@ fn doc_entry_settled_backs_off_after_a_failed_embed_attempt() {
         mtime: 0,
         embedded: false,
         embed_attempted: true,
+        rehydration_ref: None,
     };
     assert!(
         doc_entry_settled(&base, "h", "balanced", true),

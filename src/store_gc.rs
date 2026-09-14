@@ -188,6 +188,9 @@ pub fn collect_referenced_hashes(basemind_dir: &Path) -> Result<AHashSet<String>
         }
         for entry in index.doc_files.values() {
             referenced.insert(entry.hash_hex.clone());
+            if let Some(ref rref) = entry.rehydration_ref {
+                referenced.insert(rref.clone());
+            }
         }
     }
     Ok(referenced)

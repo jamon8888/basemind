@@ -440,6 +440,7 @@ fn process_doc(
                 mtime,
                 embedded: batch.embedded,
                 embed_attempted: batch.embed_attempted,
+                rehydration_ref: batch.rehydration_ref.clone(),
             };
             let doc_upsert = match embed {
                 EmbedMode::Inline => Some(doc_entry),

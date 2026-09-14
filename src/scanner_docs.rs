@@ -80,6 +80,9 @@ pub(crate) struct PendingDocBatch {
     /// rather than a fresh xberg extraction. Drives the `reused_doc_extraction` scan counter — the
     /// observable proof that churn (renames, rewrites) does not re-run extraction or embedding.
     pub reused: bool,
+    /// Hash of the encrypted rehydration blob, if redaction captured one.
+    /// Threaded into [`crate::store::DocEntry`] so the GC live set protects it.
+    pub rehydration_ref: Option<String>,
 }
 
 /// Look the configured embedding preset up in xberg's preset table and
@@ -363,15 +366,18 @@ pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedM
 }
 
 /// Derive a deterministic passphrase for encrypting rehydration maps.
-/// Scoped to the workspace scope and the global data directory so blobs
-/// from different workspaces or machines cannot be decrypted interchangeably.
+///
+/// Mixes the workspace scope with the data-directory path so blobs from
+/// different workspaces or machines cannot be decrypted interchangeably.
+/// The data directory is machine-unique and not derivable from scope alone,
+/// which protects against a copied blob being decrypted on a different
+/// machine with the same scope name.
+// ponytail: scope+data_dir is sufficient for local-only encryption.
+// Upgrade path: vault-managed random key if cross-device portability is needed.
 fn derive_rehydration_passphrase(scope: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     scope.hash(&mut hasher);
-    // Mix in the data directory path — unique per machine, not guessable
-    // from scope alone. Protects against a copied blob being decrypted on
-    // a different machine with the same scope name.
     if let Some(dirs) = directories::ProjectDirs::from("", "", "basemind") {
         dirs.data_dir().hash(&mut hasher);
     }
@@ -459,6 +465,7 @@ fn pending_from_doc(
         // (the reuse gate requires them), so `embedded` covers it and the flag is moot there. ~keep
         embed_attempted: embed && !reused,
         reused,
+        rehydration_ref: doc.rehydration_ref.clone(),
     }
 }
 
