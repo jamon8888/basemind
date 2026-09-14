@@ -484,7 +484,8 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
 
     // When redaction is enabled with TokenReplace, we need to capture the
     // rehydration map. Disable xberg's built-in redaction and run it ourselves
-    // after extraction so the map doesn't get lost.
+    // after extraction so the map doesn't get lost. For other strategies, xberg
+    // handles redaction internally but we still need to capture findings.
     let capture_rehydration =
         config.redaction.enabled && matches!(config.redaction.strategy, RedactionStrategy::TokenReplace);
     if capture_rehydration {
@@ -521,6 +522,11 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
                 &xberg_redaction_cfg,
             ))
             .map_err(|e| ExtractError::Document(format!("xberg redaction: {e}")))?;
+        pending_rehydration = Some(map);
+    }
+    // Capture findings for ALL strategies (xberg ran redaction internally for
+    // non-TokenReplace strategies, so redaction_report is populated).
+    if config.redaction.enabled {
         let findings = result
             .redaction_report
             .as_ref()
@@ -536,7 +542,6 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
                 replacement_token: f.replacement_token,
             })
             .collect();
-        pending_rehydration = Some(map);
     }
 
     let mut chunks: Vec<DocChunk> = Vec::new();

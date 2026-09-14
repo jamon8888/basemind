@@ -363,12 +363,18 @@ pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedM
 }
 
 /// Derive a deterministic passphrase for encrypting rehydration maps.
-/// The passphrase is scoped to the workspace so rehydration blobs from
-/// different workspaces cannot be decrypted interchangeably.
+/// Scoped to the workspace scope and the global data directory so blobs
+/// from different workspaces or machines cannot be decrypted interchangeably.
 fn derive_rehydration_passphrase(scope: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     scope.hash(&mut hasher);
+    // Mix in the data directory path — unique per machine, not guessable
+    // from scope alone. Protects against a copied blob being decrypted on
+    // a different machine with the same scope name.
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "basemind") {
+        dirs.data_dir().hash(&mut hasher);
+    }
     format!("basemind-rehydration-{:016x}", hasher.finish())
 }
 
@@ -397,6 +403,10 @@ pub(crate) fn doc_entry_settled(
 /// empty-of-chunks doc is always reusable (recompute would yield nothing anyway). When embedding is
 /// off, any cached doc is reusable (chunks only).
 fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool) -> bool {
+    // Redaction config changed — force re-extraction regardless of embedding state.
+    if cached.redaction_fingerprint != Some(crate::extract::doc::hash_redaction_config(&cfg.redaction)) {
+        return false;
+    }
     if !embed || cached.chunks.is_empty() {
         return true;
     }

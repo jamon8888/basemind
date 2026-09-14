@@ -36,7 +36,13 @@ use crate::store::{
 /// (code-search tier), and `.rref.msgpack` (code-intel resolved-references tier). All share the
 /// same source-hash stem as the `.fm` blob, so they are reclaimed together when the source file
 /// changes or is deleted (its stem drops out of the live set).
-const BLOB_SUFFIXES: [&str; 4] = [".fm.msgpack", ".doc.msgpack", ".chunk.msgpack", ".rref.msgpack"];
+const BLOB_SUFFIXES: [&str; 5] = [
+    ".fm.msgpack",
+    ".doc.msgpack",
+    ".chunk.msgpack",
+    ".rref.msgpack",
+    ".rehydration.blob",
+];
 
 /// Pre-0.9 split-tier blob suffixes (`<hash>.l1.msgpack` / `<hash>.l2.msgpack`), superseded by
 /// the combined `.fm.msgpack` frame. No current code writes or reads these, so any left on disk

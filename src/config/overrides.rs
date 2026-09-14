@@ -160,10 +160,6 @@ pub struct DocumentsCliOverrides {
     /// Override `documents.redaction.strategy` (replace / remove / hash).
     #[arg(long = "documents-redaction-strategy", env = "BASEMIND_DOCUMENTS_REDACTION_STRATEGY")]
     pub redaction_strategy: Option<String>,
-
-    /// Override `documents.output.format` (json / toon / markdown).
-    #[arg(long = "documents-output-format", env = "BASEMIND_DOCUMENTS_OUTPUT_FORMAT")]
-    pub output_format_override: Option<String>,
 }
 
 impl DocumentsCliOverrides {
@@ -197,7 +193,6 @@ impl DocumentsCliOverrides {
             || self.redaction_enabled.is_some()
             || self.redaction_allowed_categories.is_some()
             || self.redaction_strategy.is_some()
-            || self.output_format_override.is_some()
             || self.output_format.is_some()
             || self.llm_model.is_some()
             || self.llm_api_key.is_some()
