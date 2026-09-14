@@ -158,10 +158,7 @@ pub struct DocumentsCliOverrides {
     pub redaction_allowed_categories: Option<String>,
 
     /// Override `documents.redaction.strategy` (replace / remove / hash).
-    #[arg(
-        long = "documents-redaction-strategy",
-        env = "BASEMIND_DOCUMENTS_REDACTION_STRATEGY"
-    )]
+    #[arg(long = "documents-redaction-strategy", env = "BASEMIND_DOCUMENTS_REDACTION_STRATEGY")]
     pub redaction_strategy: Option<String>,
 
     /// Override `documents.output.format` (json / toon / markdown).

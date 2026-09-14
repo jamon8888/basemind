@@ -299,16 +299,16 @@ pub(crate) fn extract_and_persist_doc(
     if let Some(map) = doc.pending_rehydration.take()
         && !map.is_empty()
     {
-            let passphrase = derive_rehydration_passphrase(scope);
-            let encrypted = xberg::text::redaction::rehydration::encrypt_map(&map, &passphrase)
-                .context("encrypt rehydration map")?;
-            let ref_hash = hashing::hash_bytes(&encrypted);
-            let ref_hex_buf = hashing::hex_buf(&ref_hash);
-            let ref_hex = hashing::hex_str(&ref_hex_buf);
-            store
-                .write_rehydration(ref_hex, &encrypted)
-                .context("write rehydration blob")?;
-            doc.rehydration_ref = Some(ref_hex.to_string());
+        let passphrase = derive_rehydration_passphrase(scope);
+        let encrypted =
+            xberg::text::redaction::rehydration::encrypt_map(&map, &passphrase).context("encrypt rehydration map")?;
+        let ref_hash = hashing::hash_bytes(&encrypted);
+        let ref_hex_buf = hashing::hex_buf(&ref_hash);
+        let ref_hex = hashing::hex_str(&ref_hex_buf);
+        store
+            .write_rehydration(ref_hex, &encrypted)
+            .context("write rehydration blob")?;
+        doc.rehydration_ref = Some(ref_hex.to_string());
     }
 
     // Wire redaction findings into the pii_lineage GDPR Article 30 audit trail.
@@ -337,14 +337,8 @@ pub(crate) fn extract_and_persist_doc(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64;
-        let (entities, _stats) = crate::pii::translate_findings(
-            scope,
-            rel,
-            &findings_input,
-            &chunk_spans,
-            detected_at,
-            "basemind-scan",
-        );
+        let (entities, _stats) =
+            crate::pii::translate_findings(scope, rel, &findings_input, &chunk_spans, detected_at, "basemind-scan");
         for entity in &entities {
             if let Err(e) = crate::index::pii_lineage::put_entity(idx, scope, rel, entity) {
                 tracing::warn!(rel, ?e, "pii_lineage: failed to write entity");

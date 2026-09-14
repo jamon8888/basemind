@@ -485,8 +485,8 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
     // When redaction is enabled with TokenReplace, we need to capture the
     // rehydration map. Disable xberg's built-in redaction and run it ourselves
     // after extraction so the map doesn't get lost.
-    let capture_rehydration = config.redaction.enabled
-        && matches!(config.redaction.strategy, RedactionStrategy::TokenReplace);
+    let capture_rehydration =
+        config.redaction.enabled && matches!(config.redaction.strategy, RedactionStrategy::TokenReplace);
     if capture_rehydration {
         krz_config.redaction = None;
     }
@@ -514,9 +514,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
     } else {
         None
     };
-    if capture_rehydration
-        && let Some(xberg_redaction_cfg) = config.redaction.to_xberg()
-    {
+    if capture_rehydration && let Some(xberg_redaction_cfg) = config.redaction.to_xberg() {
         let map = extraction_runtime()
             .block_on(xberg::text::redaction::redact_capturing_rehydration_map(
                 &mut result,
