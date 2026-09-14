@@ -442,16 +442,12 @@ fn process_doc(
                 embed_attempted: batch.embed_attempted,
                 rehydration_ref: batch.rehydration_ref.clone(),
             };
-            let doc_upsert = match embed {
-                EmbedMode::Inline => Some(doc_entry),
-                EmbedMode::Deferred => None,
-            };
             FileResult {
                 path: rel.to_string(),
                 status,
                 upsert: None,
                 doc_batch: Some(batch),
-                doc_upsert,
+                doc_upsert: Some(doc_entry),
                 #[cfg(feature = "code-search")]
                 code_batch: None,
             }
