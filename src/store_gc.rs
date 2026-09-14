@@ -982,29 +982,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let blobs_dir = tmp.path().join("blobs");
         fs::create_dir_all(&blobs_dir).expect("mk blobs");
-
-        let referenced_stem = "c".repeat(64);
+        let ref_stem = "c".repeat(64);
         let orphan_stem = "d".repeat(64);
-
-        fs::write(blobs_dir.join(format!("{referenced_stem}.fm.msgpack")), b"fm").expect("write fm");
-        fs::write(
-            blobs_dir.join(format!("{referenced_stem}.rehydration.blob")),
-            b"rehy-ref",
-        )
-        .expect("write ref rehy");
-        fs::write(
-            blobs_dir.join(format!("{orphan_stem}.rehydration.blob")),
-            b"rehy-orphan",
-        )
-        .expect("write orphan rehy");
-
+        fs::write(blobs_dir.join(format!("{ref_stem}.fm.msgpack")), b"fm").unwrap();
+        fs::write(blobs_dir.join(format!("{ref_stem}.rehydration.blob")), b"r").unwrap();
+        fs::write(blobs_dir.join(format!("{orphan_stem}.rehydration.blob")), b"o").unwrap();
         let mut referenced = AHashSet::new();
-        referenced.insert(referenced_stem.clone());
-
+        referenced.insert(ref_stem.clone());
         let report = gc_blobs_in(&blobs_dir, &referenced, Duration::ZERO).expect("gc");
-
-        assert_eq!(report.removed, 1, "orphan rehydration blob reaped");
+        assert_eq!(report.removed, 1);
         assert!(!blobs_dir.join(format!("{orphan_stem}.rehydration.blob")).exists());
-        assert!(blobs_dir.join(format!("{referenced_stem}.rehydration.blob")).exists());
+        assert!(blobs_dir.join(format!("{ref_stem}.rehydration.blob")).exists());
     }
 }
