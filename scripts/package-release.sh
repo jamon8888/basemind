@@ -160,9 +160,16 @@ macos)
 	if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
 		echo "Vendoring ONNX Runtime (ort-dynamic) for Intel macOS..."
 		ORT_VERSION="1.23.2"
-		curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
-		tar xzf /tmp/ort.tgz -C /tmp
-		ORT_PREFIX="/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib"
+		# Pinned SHA-256 of onnxruntime-osx-x86_64-${ORT_VERSION}.tgz, computed
+		# from a fresh HTTPS download — Microsoft publishes no sidecar checksum
+		# for this asset. Re-pin deliberately when ORT_VERSION changes.
+		ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
+		ORT_TMP_DIR="$(mktemp -d)"
+		trap 'rm -rf "$ORT_TMP_DIR"' EXIT
+		curl -fsSL -o "$ORT_TMP_DIR/ort.tgz" "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+		echo "$ORT_SHA256  $ORT_TMP_DIR/ort.tgz" | shasum -a 256 -c -
+		tar xzf "$ORT_TMP_DIR/ort.tgz" -C "$ORT_TMP_DIR"
+		ORT_PREFIX="$ORT_TMP_DIR/onnxruntime-osx-x86_64-${ORT_VERSION}/lib"
 		ort_lib="${ORT_PREFIX}/libonnxruntime.${ORT_VERSION}.dylib"
 		[ -f "$ort_lib" ] || {
 			echo "ONNX Runtime dylib not found at $ort_lib" >&2
