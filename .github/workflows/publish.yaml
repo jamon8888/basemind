@@ -414,14 +414,16 @@ jobs:
           # Binary + its otool-discovered lib/ closure load, and the ad-hoc signature is
           # valid (a bad install_name_tool rewrite would get the process SIGKILLed).
           "$dir/basemind" --version
-          # ONNX Runtime is vendored next to the binary; ort/load-dynamic resolves it
-          # relative to the executable. dlopen the vendored dylib + its full @loader_path
-          # closure — the exact load ort performs at runtime — so a missing closure
-          # member, broken install name, or invalid signature fails here. @loader_path
-          # never falls back to the runner's Homebrew copy, so this proves the bundle is
-          # self-contained even though onnxruntime is brew-installed on this runner.
+          # ONNX Runtime is vendored next to the binary (pinned directly from a
+          # microsoft/onnxruntime release, see scripts/package-release.sh); ort/
+          # load-dynamic resolves it relative to the executable. dlopen the
+          # vendored dylib — the exact load ort performs at runtime — so a
+          # broken install name or invalid signature fails here. This only
+          # proves the dylib loads on THIS runner's macOS version; it does not
+          # catch an incompatible minos on an older macOS the runner doesn't
+          # test (see the pinned version's own LC_BUILD_VERSION instead).
           test -f "$dir/libonnxruntime.dylib"
-          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./libonnxruntime.dylib'); print('libonnxruntime.dylib + closure load OK')" )
+          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./libonnxruntime.dylib'); print('libonnxruntime.dylib load OK')" )
 
       - name: Upload to GitHub release
         shell: bash
