@@ -159,10 +159,11 @@ macos)
 
 	if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
 		echo "Vendoring ONNX Runtime (ort-dynamic) for Intel macOS..."
-		export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
-		brew install --bottle-tag=sonoma onnxruntime || brew install onnxruntime
-		ORT_PREFIX="$(brew --prefix onnxruntime)/lib"
-		ort_lib="$ORT_PREFIX/libonnxruntime.dylib"
+		ORT_VERSION="1.23.2"
+		curl -fsSL -o /tmp/ort.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+		tar xzf /tmp/ort.tgz -C /tmp
+		ORT_PREFIX="/tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib"
+		ort_lib="${ORT_PREFIX}/libonnxruntime.${ORT_VERSION}.dylib"
 		[ -f "$ort_lib" ] || {
 			echo "ONNX Runtime dylib not found at $ort_lib" >&2
 			exit 1
