@@ -623,13 +623,14 @@ jobs:
     # leg is untouched.
     runs-on: ubuntu-latest
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64:latest
+      image: quay.io/pypa/manylinux_2_28_x86_64:latest@sha256:e84d335c4c0ab4dbc8efcd055a645d9665eed249454fe068a58355698944accd
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+          persist-credentials: false
 
       - name: Install Rust (in container)
         shell: bash
@@ -750,6 +751,20 @@ jobs:
           mv basemind-x86_64-unknown-linux-gnu.tar.gz \
             basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz
           tar tzf basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz | sort
+
+      - name: Smoke-test packaged noavx2 binary (ONNX Runtime loads)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
+          dir="$(mktemp -d)"
+          tar xzf "$archive" -C "$dir"
+          # Binary + its bundled ORT load — the exact runtime shape ort-dynamic
+          # resolves (binary RPATH $ORIGIN/lib, lib/ closure). A broken RPATH,
+          # SONAME, or missing bundled dep fails here instead of shipping.
+          "$dir/basemind" --version
+          test -f "$dir/lib/libonnxruntime.so.1"
+          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./lib/libonnxruntime.so.1'); print('libonnxruntime.so.1 load OK')" )
 
       - name: Upload to GitHub release
         shell: bash
