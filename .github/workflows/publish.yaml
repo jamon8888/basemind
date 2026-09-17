@@ -262,6 +262,7 @@ jobs:
           # a rerun (the v0.10.0 / release-window failure class).
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
@@ -313,7 +314,7 @@ jobs:
             # Create as a DRAFT. The build matrix uploads binaries to it, but it
             # stays invisible (assets not publicly downloadable) until the
             # finalize_release job promotes it — and that job only runs once
-            # checksums (which requires all 5 platform binaries) succeeds. A failed
+            # checksums (which requires all 6 platform binaries) succeeds. A failed
             # platform build therefore leaves a hidden draft, not a live release
             # with missing binaries and no checksums (the v0.10.0 failure mode that
             # broke the plugin launcher's checksum-verified download).
@@ -609,9 +610,165 @@ jobs:
           git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
           gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
 
+  build-linux-noavx2:
+    name: Build Linux no-AVX2 binary (x86_64, SSE2 baseline)
+    needs: [meta, create_release]
+    if: needs.meta.outputs.release_assets_exist != 'true'
+    # The stock x86_64 release links ort's prebuilt ONNX Runtime, which is
+    # compiled with AVX2 and SIGILL-crashes on pre-Haswell CPUs (Sandy Bridge
+    # and older). This leg builds ONNX Runtime from source without AVX and
+    # basemind with `ort-dynamic` against it, so the same `full` feature set
+    # runs on any x86_64 CPU (MLAS dispatches to AVX2/AVX-512 at runtime where
+    # available). The result ships as a separate `-noavx2` archive; the stock
+    # leg is untouched.
+    runs-on: ubuntu-latest
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+
+      - name: Install Rust (in container)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME=/opt/cargo
+          export RUSTUP_HOME=/opt/rustup
+          curl -fsSL https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustup default stable
+          rustup target add x86_64-unknown-linux-gnu
+          echo "CARGO_HOME=/opt/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/opt/rustup" >> "$GITHUB_ENV"
+          echo "/opt/cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install system dependencies (AlmaLinux 8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y epel-release
+          dnf install -y dnf-plugins-core
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y \
+            gcc gcc-c++ make cmake pkgconfig \
+            openssl-devel \
+            tesseract \
+            libaom-devel \
+            patchelf gh git \
+            curl wget unzip python3
+          echo "gcc: $(gcc --version | head -1)"
+
+      - name: Install protoc from official release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="28.2"
+          zip="protoc-28.2-linux-x86_64.zip"
+          mkdir -p /usr/local/protoc
+          cd /tmp
+          curl -fsSL -o "$zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/${zip}"
+          unzip -q "$zip" -d /usr/local/protoc
+          ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+          protoc --version
+
+      - name: Build libheif from source (1.23.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="1.23.0"
+          d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          curl -fsSL -o libheif.tar.gz \
+            "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
+          tar xzf libheif.tar.gz
+          cd "libheif-${ver}"
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DWITH_EXAMPLES=OFF \
+            -DWITH_GDK_PIXBUF=OFF \
+            -DBUILD_TESTING=OFF \
+            -DWITH_LIBDE265=OFF \
+            -DWITH_X265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_AOM=ON
+          make -j"$(nproc)"
+          make install
+          ldconfig
+          {
+            echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ONNX Runtime from source (no AVX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ORT_VERSION must match ort-sys's dist.tsv for x86_64-unknown-linux-gnu.
+          ./scripts/build-ort-noavx2.sh /tmp/ort-src /tmp/ort-build /opt/ort
+
+      - name: Build release binary (full + ort-dynamic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ort-dynamic loads libonnxruntime.so at runtime (no link-time ORT),
+          # so no ORT env vars are needed at build time. The .so is staged into
+          # release/deps next so package-release.sh bundles it into lib/.
+          cargo build --release --features full,ort-dynamic --bin basemind \
+            --target x86_64-unknown-linux-gnu
+          cp /opt/ort/lib/libonnxruntime.so* \
+            target/x86_64-unknown-linux-gnu/release/deps/
+          ls -la target/x86_64-unknown-linux-gnu/release/deps/ | grep onnxruntime
+
+      - name: Verify glibc floor (<= 2.28)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/x86_64-unknown-linux-gnu/release/basemind"
+          max="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
+          echo "highest glibc symbol required: ${max:-none}"
+          if [ -n "$max" ] && \
+             [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::basemind requires $max (> GLIBC_2.28); a dependency pulled a newer glibc symbol"
+            exit 1
+          fi
+          echo "✓ glibc floor verified: ${max:-none} <= GLIBC_2.28"
+
+      - name: Package release (noavx2 archive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package-release.sh x86_64-unknown-linux-gnu
+          mv basemind-x86_64-unknown-linux-gnu.tar.gz \
+            basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz
+          tar tzf basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz | sort
+
+      - name: Upload to GitHub release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
+          if [ ! -f "$archive" ]; then
+            echo "::error::Archive not found: $archive"
+            exit 1
+          fi
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
+          gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
+
   checksums:
     name: Generate and upload checksums
-    needs: [meta, build-binaries, build-linux-binaries]
+    needs: [meta, build-binaries, build-linux-binaries, build-linux-noavx2]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -619,16 +776,17 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Verify all 5 expected archives are present
+      - name: Verify all 6 expected archives are present
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ needs.meta.outputs.tag }}"
 
-          # Expected archives for the 5 build targets
+          # Expected archives for the 6 build targets
           expected=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
@@ -647,7 +805,7 @@ jobs:
           done
 
           if [ $missing_count -gt 0 ]; then
-            echo "::error::Release is incomplete: $missing_count of 5 platform archives missing. The release must have all 5 binaries before checksums can be generated."
+            echo "::error::Release is incomplete: $missing_count of 6 platform archives missing. The release must have all 6 binaries before checksums can be generated."
             exit 1
           fi
 
@@ -698,6 +856,7 @@ jobs:
           # every platform archive plus the checksums file they verify against.
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
