@@ -36,8 +36,19 @@ if [ ! -d "$SRC" ]; then
 fi
 
 cd "$SRC"
-git fetch --depth 1 origin "refs/tags/v${ORT_VERSION}:refs/tags/v${ORT_VERSION}" 2>/dev/null || true
-git checkout "v${ORT_VERSION}" 2>/dev/null || true
+# Fail on a stale or unrelated reuse of $SRC: require the ORT repo, make
+# fetch/checkout fatal, and verify HEAD matches the requested tag before
+# building (a silent fallback would ship an unverified ORT).
+git remote get-url origin | grep -q "onnxruntime" || {
+  echo "unexpected git remote in $SRC (expected onnxruntime)" >&2
+  exit 1
+}
+git fetch --depth 1 origin "refs/tags/v${ORT_VERSION}:refs/tags/v${ORT_VERSION}"
+git checkout "v${ORT_VERSION}"
+[ "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "v${ORT_VERSION}")" ] || {
+  echo "HEAD does not match v${ORT_VERSION} in $SRC" >&2
+  exit 1
+}
 
 # CMAKE_DISABLE_FIND_PACKAGE_flatbuffers: FetchContent prefers any system
 # flatbuffers >= 23.5.9 over fetching v23.5.26 — dev machines with Android SDK
