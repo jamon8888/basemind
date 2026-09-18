@@ -493,7 +493,10 @@ pub(super) async fn run_search_documents(
     params: SearchDocumentsParams,
 ) -> Result<CallToolResult, McpError> {
     let __body = std::time::Instant::now();
-    let (output_format, reranker_enabled, reranker_preset, reranker_top_k) = if params.overrides.any() {
+    // An explicit Mcp preset override always means a compiled-in preset;
+    // otherwise the workspace `custom_model` (if any) wins over the default.
+    let explicit_preset = params.overrides.reranker_preset.clone();
+    let (output_format, reranker_enabled, _reranker_preset, reranker_top_k) = if params.overrides.any() {
         let mut effective = (*state.shared.config).clone();
         crate::config::layered::apply_documents_overrides(
             &mut effective,
@@ -549,14 +552,29 @@ pub(super) async fn run_search_documents(
     .await?;
 
     if reranker_enabled && !hits.is_empty() {
-        if xberg::get_reranker_preset(&reranker_preset).is_none() {
-            return Err(McpError::invalid_params(
-                format!("unknown reranker preset: {reranker_preset:?}"),
-                None,
-            ));
-        }
+        let cfg = &state.shared.config.documents.reranker;
+        let krz_model = match cfg.resolve_model(explicit_preset.as_deref()) {
+            crate::config::ResolvedRerankerModel::Preset { name } => {
+                if xberg::get_reranker_preset(&name).is_none() {
+                    return Err(McpError::invalid_params(
+                        format!("unknown reranker preset: {name:?}"),
+                        None,
+                    ));
+                }
+                xberg::core::config::RerankerModelType::Preset { name }
+            }
+            crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+                xberg::core::config::RerankerModelType::Custom {
+                    model_id,
+                    model_file: Some(model_file),
+                    additional_files: Vec::new(),
+                    max_length: None,
+                    head: xberg::core::config::RerankerHead::CrossEncoder,
+                }
+            }
+        };
         let krz_config = xberg::core::config::RerankerConfig {
-            model: xberg::core::config::RerankerModelType::Preset { name: reranker_preset },
+            model: krz_model,
             top_k: Some(reranker_top_k),
             ..Default::default()
         };

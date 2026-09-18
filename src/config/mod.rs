@@ -17,9 +17,10 @@ use thiserror::Error;
 pub use code::CodeSearchConfig;
 pub use comms::CommsConfig;
 pub use documents::{
-    ApiKey, DocLanguageConfig, DocumentsConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    NerRedactionConfig, OcrBackend, OcrConfig, OutputConfig, OutputFormat, RedactionConfig, RedactionCustomPattern,
-    RedactionCustomTerm, RedactionStrategy, RerankerConfig, SecretString, SummarizationConfig, SummarizationStrategy,
+    ApiKey, CustomRerankerModel, DocLanguageConfig, DocumentsConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig,
+    NerBackend, NerConfig, NerRedactionConfig, OcrBackend, OcrConfig, OutputConfig, OutputFormat, RedactionConfig,
+    RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy, RerankerConfig, ResolvedRerankerModel,
+    SecretString, SummarizationConfig, SummarizationStrategy,
 };
 pub use layered::{ConfigLayers, LoadedConfig, defaults_only, merge_layers};
 pub use overrides::DocumentsCliOverrides;

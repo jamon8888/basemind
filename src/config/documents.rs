@@ -240,6 +240,36 @@ pub struct RerankerConfig {
     /// which the cross-encoder then reorders. Defaults to 20 per spec.
     #[serde(default = "RerankerConfig::default_top_k")]
     pub top_k: usize,
+    /// Custom ONNX cross-encoder (Hugging Face repo) used when no per-call
+    /// preset is given. Lets deployments run models xberg ships no preset
+    /// for (e.g. `onnx-community/gte-multilingual-reranker-base` int8).
+    /// An explicit per-call preset always wins over this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_model: Option<CustomRerankerModel>,
+}
+
+/// Custom ONNX cross-encoder resolved from a Hugging Face repo by xberg's
+/// lazy downloader (same layout convention as its `Custom` embedding models).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CustomRerankerModel {
+    /// Hugging Face repo id, e.g. `"onnx-community/gte-multilingual-reranker-base"`.
+    pub model_id: String,
+    /// ONNX file within the repo. Defaults to `"onnx/model.onnx"`; int8
+    /// variants use e.g. `"onnx/model_int8.onnx"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file: Option<String>,
+}
+
+/// Default ONNX path inside a custom reranker repo (xberg convention).
+pub const DEFAULT_CUSTOM_RERANKER_MODEL_FILE: &str = "onnx/model.onnx";
+
+/// Resolved reranker model, in plain data (no xberg types) so this stays
+/// compilable without the `intelligence` feature; call sites map it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedRerankerModel {
+    Preset { name: String },
+    Custom { model_id: String, model_file: String },
 }
 
 impl RerankerConfig {
@@ -249,6 +279,27 @@ impl RerankerConfig {
     fn default_top_k() -> usize {
         20
     }
+
+    /// Resolve which model serves a rerank call. One shared guard: an
+    /// explicit per-call preset always means a compiled-in preset; otherwise
+    /// the configured custom model wins over the default preset.
+    pub fn resolve_model(&self, preset_override: Option<&str>) -> ResolvedRerankerModel {
+        match preset_override {
+            Some(name) => ResolvedRerankerModel::Preset { name: name.to_string() },
+            None => match &self.custom_model {
+                Some(custom) => ResolvedRerankerModel::Custom {
+                    model_id: custom.model_id.clone(),
+                    model_file: custom
+                        .model_file
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_CUSTOM_RERANKER_MODEL_FILE.to_string()),
+                },
+                None => ResolvedRerankerModel::Preset {
+                    name: self.preset.clone(),
+                },
+            },
+        }
+    }
 }
 
 impl Default for RerankerConfig {
@@ -257,6 +308,7 @@ impl Default for RerankerConfig {
             enabled: false,
             preset: Self::default_preset(),
             top_k: Self::default_top_k(),
+            custom_model: None,
         }
     }
 }
@@ -952,6 +1004,79 @@ mod tests {
         assert!(!r.enabled);
         assert_eq!(r.preset, "bge-reranker-v2-m3");
         assert_eq!(r.top_k, 20);
+        assert!(r.custom_model.is_none());
+    }
+
+    #[test]
+    fn reranker_resolve_explicit_preset_wins_over_custom() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
+                model_file: Some("onnx/model_int8.onnx".to_string()),
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(Some("bge-reranker-base")) {
+            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-base"),
+            other => panic!("expected Preset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_custom_without_override() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
+                model_file: Some("onnx/model_int8.onnx".to_string()),
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Custom {
+                model_id, model_file, ..
+            } => {
+                assert_eq!(model_id, "onnx-community/gte-multilingual-reranker-base");
+                assert_eq!(model_file, "onnx/model_int8.onnx");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_custom_defaults_model_file() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "org/model".to_string(),
+                model_file: None,
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Custom { model_file, .. } => {
+                assert_eq!(model_file, "onnx/model.onnx");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_falls_back_to_preset() {
+        let r = RerankerConfig::default();
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-v2-m3"),
+            other => panic!("expected Preset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_custom_model_deserialises_from_toml_section() {
+        let cfg: RerankerConfig = toml::from_str(
+            "preset = \"bge-reranker-v2-m3\"\n[custom_model]\nmodel_id = \"onnx-community/gte-multilingual-reranker-base\"\nmodel_file = \"onnx/model_int8.onnx\"\n",
+        )
+        .expect("parse");
+        let custom = cfg.custom_model.expect("custom_model");
+        assert_eq!(custom.model_id, "onnx-community/gte-multilingual-reranker-base");
+        assert_eq!(custom.model_file.as_deref(), Some("onnx/model_int8.onnx"));
     }
 
     #[test]
