@@ -4,29 +4,29 @@ set -euo pipefail
 # NOTE: the archive contents are at the ROOT (no leading staging-dir component) so
 
 if [ $# -ne 1 ]; then
-	echo "Usage: $0 <target-triple>" >&2
-	exit 1
+  echo "Usage: $0 <target-triple>" >&2
+  exit 1
 fi
 
 TRIPLE="$1"
 
 case "$TRIPLE" in
 x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
-	SYSTEM="linux"
-	BINEXT=""
-	;;
+  SYSTEM="linux"
+  BINEXT=""
+  ;;
 aarch64-apple-darwin | x86_64-apple-darwin)
-	SYSTEM="macos"
-	BINEXT=""
-	;;
+  SYSTEM="macos"
+  BINEXT=""
+  ;;
 x86_64-pc-windows-msvc)
-	SYSTEM="windows"
-	BINEXT=".exe"
-	;;
+  SYSTEM="windows"
+  BINEXT=".exe"
+  ;;
 *)
-	echo "Unknown target triple: $TRIPLE" >&2
-	exit 1
-	;;
+  echo "Unknown target triple: $TRIPLE" >&2
+  exit 1
+  ;;
 esac
 
 RELEASE_DIR="target/${TRIPLE}/release"
@@ -38,11 +38,11 @@ RELEASE_DIR="target/${TRIPLE}/release"
 BINARIES=(basemind)
 
 for bin in "${BINARIES[@]}"; do
-	bin_path="${RELEASE_DIR}/${bin}${BINEXT}"
-	if [ ! -f "$bin_path" ]; then
-		echo "Binary not found at $bin_path" >&2
-		exit 1
-	fi
+  bin_path="${RELEASE_DIR}/${bin}${BINEXT}"
+  if [ ! -f "$bin_path" ]; then
+    echo "Binary not found at $bin_path" >&2
+    exit 1
+  fi
 done
 
 STAGING_DIR="basemind-staging-${TRIPLE}"
@@ -51,187 +51,187 @@ mkdir -p "$STAGING_DIR/lib"
 
 BINS_IN_STAGING=()
 for bin in "${BINARIES[@]}"; do
-	cp "${RELEASE_DIR}/${bin}${BINEXT}" "$STAGING_DIR/${bin}${BINEXT}"
-	BINS_IN_STAGING+=("$STAGING_DIR/${bin}${BINEXT}")
+  cp "${RELEASE_DIR}/${bin}${BINEXT}" "$STAGING_DIR/${bin}${BINEXT}"
+  BINS_IN_STAGING+=("$STAGING_DIR/${bin}${BINEXT}")
 done
 
 case "$SYSTEM" in
 linux)
-	echo "Gathering Linux dynamic dependencies (ldd transitive closure)..."
-	for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
-		while IFS= read -r line; do
-			lib=$(awk '{ for (i=1;i<=NF;i++){ if ($i=="=>" && $(i+1) ~ /^\//){print $(i+1); exit} if ($i ~ /^\// && $i !~ /^\(/){print $i; exit} } }' <<<"$line")
-			[ -n "$lib" ] && [ -f "$lib" ] || continue
-			base=$(basename "$lib")
-			case "$base" in
-			libc.so* | libm.so* | libpthread.so* | libdl.so* | librt.so* | libresolv.so* | \
-				ld-linux*.so* | ld-musl*.so* | libgcc_s.so*) continue ;;
-			esac
-			[ -f "$STAGING_DIR/lib/$base" ] && continue
-			cp -L "$lib" "$STAGING_DIR/lib/" 2>/dev/null || true
-		done < <(ldd "$bin_in_staging" 2>/dev/null || true)
-	done
+  echo "Gathering Linux dynamic dependencies (ldd transitive closure)..."
+  for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
+    while IFS= read -r line; do
+      lib=$(awk '{ for (i=1;i<=NF;i++){ if ($i=="=>" && $(i+1) ~ /^\//){print $(i+1); exit} if ($i ~ /^\// && $i !~ /^\(/){print $i; exit} } }' <<<"$line")
+      [ -n "$lib" ] && [ -f "$lib" ] || continue
+      base=$(basename "$lib")
+      case "$base" in
+      libc.so* | libm.so* | libpthread.so* | libdl.so* | librt.so* | libresolv.so* | \
+        ld-linux*.so* | ld-musl*.so* | libgcc_s.so*) continue ;;
+      esac
+      [ -f "$STAGING_DIR/lib/$base" ] && continue
+      cp -L "$lib" "$STAGING_DIR/lib/" 2>/dev/null || true
+    done < <(ldd "$bin_in_staging" 2>/dev/null || true)
+  done
 
-	if [ -d "${RELEASE_DIR}/deps" ]; then
-		for lib in "${RELEASE_DIR}/deps"/*.so*; do
-			[ -f "$lib" ] || continue
-			base=$(basename "$lib")
-			[ -f "$STAGING_DIR/lib/$base" ] && continue
-			cp -L "$lib" "$STAGING_DIR/lib/" 2>/dev/null || true
-		done
-	fi
+  if [ -d "${RELEASE_DIR}/deps" ]; then
+    for lib in "${RELEASE_DIR}/deps"/*.so*; do
+      [ -f "$lib" ] || continue
+      base=$(basename "$lib")
+      [ -f "$STAGING_DIR/lib/$base" ] && continue
+      cp -L "$lib" "$STAGING_DIR/lib/" 2>/dev/null || true
+    done
+  fi
 
-	for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
-		# shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
-		patchelf --set-rpath '$ORIGIN/lib' "$bin_in_staging"
-	done
-	for so in "$STAGING_DIR/lib/"*.so*; do
-		[ -f "$so" ] || continue
-		# shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
-		patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
-	done
-	tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-	echo "✓ Created basemind-${TRIPLE}.tar.gz"
-	;;
+  for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
+    # shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
+    patchelf --set-rpath '$ORIGIN/lib' "$bin_in_staging"
+  done
+  for so in "$STAGING_DIR/lib/"*.so*; do
+    [ -f "$so" ] || continue
+    # shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
+    patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+  done
+  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  ;;
 
 macos)
-	echo "Gathering macOS dynamic dependencies (otool transitive closure)..."
-	copied_bases=()
-	copied_olds=()
-	was_copied() {
-		[ ${#copied_bases[@]} -eq 0 ] && return 1
-		local b="$1" existing
-		for existing in "${copied_bases[@]}"; do
-			[ "$existing" = "$b" ] && return 0
-		done
-		return 1
-	}
-	QUEUE=("${BINS_IN_STAGING[@]}")
-	while [ ${#QUEUE[@]} -gt 0 ]; do
-		cur="${QUEUE[0]}"
-		QUEUE=("${QUEUE[@]:1}")
-		otool -L "$cur" 2>/dev/null | tail -n +2 | while read -r dep _; do echo "$dep"; done >/tmp/_otool_$$ || true
-		while IFS= read -r dep; do
-			[ -n "$dep" ] || continue
-			case "$dep" in
-			/usr/lib/* | /System/*) continue ;;
-			@rpath/* | @loader_path/* | @executable_path/*) continue ;;
-			esac
-			[ -f "$dep" ] || continue
-			base=$(basename "$dep")
-			was_copied "$base" && continue
-			cp -L "$dep" "$STAGING_DIR/lib/$base" 2>/dev/null || continue
-			chmod u+w "$STAGING_DIR/lib/$base" 2>/dev/null || true
-			copied_bases+=("$base")
-			copied_olds+=("$dep")
-			QUEUE+=("$STAGING_DIR/lib/$base")
-		done </tmp/_otool_$$
-		rm -f /tmp/_otool_$$
-	done
+  echo "Gathering macOS dynamic dependencies (otool transitive closure)..."
+  copied_bases=()
+  copied_olds=()
+  was_copied() {
+    [ ${#copied_bases[@]} -eq 0 ] && return 1
+    local b="$1" existing
+    for existing in "${copied_bases[@]}"; do
+      [ "$existing" = "$b" ] && return 0
+    done
+    return 1
+  }
+  QUEUE=("${BINS_IN_STAGING[@]}")
+  while [ ${#QUEUE[@]} -gt 0 ]; do
+    cur="${QUEUE[0]}"
+    QUEUE=("${QUEUE[@]:1}")
+    otool -L "$cur" 2>/dev/null | tail -n +2 | while read -r dep _; do echo "$dep"; done >/tmp/_otool_$$ || true
+    while IFS= read -r dep; do
+      [ -n "$dep" ] || continue
+      case "$dep" in
+      /usr/lib/* | /System/*) continue ;;
+      @rpath/* | @loader_path/* | @executable_path/*) continue ;;
+      esac
+      [ -f "$dep" ] || continue
+      base=$(basename "$dep")
+      was_copied "$base" && continue
+      cp -L "$dep" "$STAGING_DIR/lib/$base" 2>/dev/null || continue
+      chmod u+w "$STAGING_DIR/lib/$base" 2>/dev/null || true
+      copied_bases+=("$base")
+      copied_olds+=("$dep")
+      QUEUE+=("$STAGING_DIR/lib/$base")
+    done </tmp/_otool_$$
+    rm -f /tmp/_otool_$$
+  done
 
-	idx=0
-	while [ "$idx" -lt ${#copied_bases[@]} ]; do
-		base="${copied_bases[$idx]}"
-		old="${copied_olds[$idx]}"
-		install_name_tool -id "@loader_path/lib/$base" "$STAGING_DIR/lib/$base" 2>/dev/null || true
-		for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
-			install_name_tool -change "$old" "@loader_path/lib/$base" "$bin_in_staging" 2>/dev/null || true
-		done
-		for other in "$STAGING_DIR/lib/"*.dylib; do
-			[ -f "$other" ] || continue
-			install_name_tool -change "$old" "@loader_path/$base" "$other" 2>/dev/null || true
-		done
-		idx=$((idx + 1))
-	done
-	for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
-		install_name_tool -add_rpath "@loader_path/lib" "$bin_in_staging" 2>/dev/null || true
-	done
+  idx=0
+  while [ "$idx" -lt ${#copied_bases[@]} ]; do
+    base="${copied_bases[$idx]}"
+    old="${copied_olds[$idx]}"
+    install_name_tool -id "@loader_path/lib/$base" "$STAGING_DIR/lib/$base" 2>/dev/null || true
+    for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
+      install_name_tool -change "$old" "@loader_path/lib/$base" "$bin_in_staging" 2>/dev/null || true
+    done
+    for other in "$STAGING_DIR/lib/"*.dylib; do
+      [ -f "$other" ] || continue
+      install_name_tool -change "$old" "@loader_path/$base" "$other" 2>/dev/null || true
+    done
+    idx=$((idx + 1))
+  done
+  for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
+    install_name_tool -add_rpath "@loader_path/lib" "$bin_in_staging" 2>/dev/null || true
+  done
 
-	echo "Re-signing bundled dylibs + binaries (ad-hoc) after install_name_tool..."
-	for dylib in "$STAGING_DIR/lib/"*.dylib; do
-		[ -f "$dylib" ] || continue
-		codesign --force --sign - "$dylib"
-	done
-	for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
-		codesign --force --sign - "$bin_in_staging"
-		codesign --verify --strict "$bin_in_staging"
-	done
+  echo "Re-signing bundled dylibs + binaries (ad-hoc) after install_name_tool..."
+  for dylib in "$STAGING_DIR/lib/"*.dylib; do
+    [ -f "$dylib" ] || continue
+    codesign --force --sign - "$dylib"
+  done
+  for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
+    codesign --force --sign - "$bin_in_staging"
+    codesign --verify --strict "$bin_in_staging"
+  done
 
-	if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
-		# Pinned directly from microsoft/onnxruntime's GitHub releases instead of a
-		# Homebrew bottle: Homebrew's onnxruntime formula stopped shipping ANY
-		# Intel-macOS bottle as of v1.29.1 (2026-09-10, part of Homebrew 7.0's
-		# project-wide Tier-3 downgrade of Intel macOS), and the "sonoma" bottle
-		# this used to fetch required macOS 14+ at runtime regardless (its
-		# LC_BUILD_VERSION declared minos=14.0), breaking every macOS 13 (Ventura)
-		# user even before the bottle disappeared entirely. ort-dynamic
-		# (ort/load-dynamic) dlopen's this at runtime — it is never linked at
-		# compile time — so any compatible dylib is a drop-in replacement
-		# regardless of which toolchain built it.
-		#
-		# v1.23.2 is the last microsoft/onnxruntime release with an x86_64 macOS
-		# build (v1.24.1 onward ships arm64 only — see that release's own notes).
-		# Its dylib declares minos=13.4 (Ventura or later) and, unlike the
-		# Homebrew bottle, has zero external @rpath/Homebrew dependencies (its
-		# abseil/protobuf/re2 deps are statically linked in), so no dependency
-		# closure to vendor alongside it.
-		echo "Vendoring pinned ONNX Runtime for Intel macOS..."
-		ORT_VERSION="1.23.2"
-		ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
-		ORT_ASSET="onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
-		ort_tmp="$(mktemp -d)"
-		curl -fsSL -o "$ort_tmp/$ORT_ASSET" \
-			"https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ASSET}"
-		actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_ASSET" | awk '{print $1}')"
-		if [ "$actual_sha256" != "$ORT_SHA256" ]; then
-			echo "ONNX Runtime checksum mismatch: expected $ORT_SHA256, got $actual_sha256" >&2
-			exit 1
-		fi
-		tar xzf "$ort_tmp/$ORT_ASSET" -C "$ort_tmp"
-		ort_lib="$ort_tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
-		[ -f "$ort_lib" ] || {
-			echo "ONNX Runtime dylib not found at $ort_lib" >&2
-			exit 1
-		}
-		cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
-		chmod u+w "$STAGING_DIR/libonnxruntime.dylib"
-		install_name_tool -id "@loader_path/libonnxruntime.dylib" "$STAGING_DIR/libonnxruntime.dylib"
-		codesign --force --sign - "$STAGING_DIR/libonnxruntime.dylib"
-		rm -rf "$ort_tmp"
-		echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
-	fi
+  if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
+    # Pinned directly from microsoft/onnxruntime's GitHub releases instead of a
+    # Homebrew bottle: Homebrew's onnxruntime formula stopped shipping ANY
+    # Intel-macOS bottle as of v1.29.1 (2026-09-10, part of Homebrew 7.0's
+    # project-wide Tier-3 downgrade of Intel macOS), and the "sonoma" bottle
+    # this used to fetch required macOS 14+ at runtime regardless (its
+    # LC_BUILD_VERSION declared minos=14.0), breaking every macOS 13 (Ventura)
+    # user even before the bottle disappeared entirely. ort-dynamic
+    # (ort/load-dynamic) dlopen's this at runtime — it is never linked at
+    # compile time — so any compatible dylib is a drop-in replacement
+    # regardless of which toolchain built it.
+    #
+    # v1.23.2 is the last microsoft/onnxruntime release with an x86_64 macOS
+    # build (v1.24.1 onward ships arm64 only — see that release's own notes).
+    # Its dylib declares minos=13.4 (Ventura or later) and, unlike the
+    # Homebrew bottle, has zero external @rpath/Homebrew dependencies (its
+    # abseil/protobuf/re2 deps are statically linked in), so no dependency
+    # closure to vendor alongside it.
+    echo "Vendoring pinned ONNX Runtime for Intel macOS..."
+    ORT_VERSION="1.23.2"
+    ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
+    ORT_ASSET="onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+    ort_tmp="$(mktemp -d)"
+    curl -fsSL -o "$ort_tmp/$ORT_ASSET" \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ASSET}"
+    actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_ASSET" | awk '{print $1}')"
+    if [ "$actual_sha256" != "$ORT_SHA256" ]; then
+      echo "ONNX Runtime checksum mismatch: expected $ORT_SHA256, got $actual_sha256" >&2
+      exit 1
+    fi
+    tar xzf "$ort_tmp/$ORT_ASSET" -C "$ort_tmp"
+    ort_lib="$ort_tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
+    [ -f "$ort_lib" ] || {
+      echo "ONNX Runtime dylib not found at $ort_lib" >&2
+      exit 1
+    }
+    cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
+    chmod u+w "$STAGING_DIR/libonnxruntime.dylib"
+    install_name_tool -id "@loader_path/libonnxruntime.dylib" "$STAGING_DIR/libonnxruntime.dylib"
+    codesign --force --sign - "$STAGING_DIR/libonnxruntime.dylib"
+    rm -rf "$ort_tmp"
+    echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
+  fi
 
-	tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-	echo "✓ Created basemind-${TRIPLE}.tar.gz"
-	;;
+  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  ;;
 
 windows)
-	echo "Gathering Windows DLL dependencies..."
-	if [ -d "${RELEASE_DIR}/deps" ]; then
-		for dll in "${RELEASE_DIR}/deps"/*.dll; do
-			[ -f "$dll" ] || continue
-			base=$(basename "$dll")
-			[ -f "$STAGING_DIR/$base" ] && continue
-			cp -L "$dll" "$STAGING_DIR/" 2>/dev/null || true
-		done
-	fi
-	for ort_path in "C:/Program Files/onnxruntime" "C:/Program Files (x86)/onnxruntime" "${ONNXRUNTIME_ROOT:-}"; do
-		[ -n "$ort_path" ] && [ -d "$ort_path/lib" ] || continue
-		for dll in "$ort_path/lib"/*.dll; do
-			[ -f "$dll" ] || continue
-			base=$(basename "$dll")
-			[ -f "$STAGING_DIR/$base" ] && continue
-			cp -L "$dll" "$STAGING_DIR/" 2>/dev/null || true
-		done
-	done
+  echo "Gathering Windows DLL dependencies..."
+  if [ -d "${RELEASE_DIR}/deps" ]; then
+    for dll in "${RELEASE_DIR}/deps"/*.dll; do
+      [ -f "$dll" ] || continue
+      base=$(basename "$dll")
+      [ -f "$STAGING_DIR/$base" ] && continue
+      cp -L "$dll" "$STAGING_DIR/" 2>/dev/null || true
+    done
+  fi
+  for ort_path in "C:/Program Files/onnxruntime" "C:/Program Files (x86)/onnxruntime" "${ONNXRUNTIME_ROOT:-}"; do
+    [ -n "$ort_path" ] && [ -d "$ort_path/lib" ] || continue
+    for dll in "$ort_path/lib"/*.dll; do
+      [ -f "$dll" ] || continue
+      base=$(basename "$dll")
+      [ -f "$STAGING_DIR/$base" ] && continue
+      cp -L "$dll" "$STAGING_DIR/" 2>/dev/null || true
+    done
+  done
 
-	(cd "$STAGING_DIR" && {
-		7z a -tzip "../basemind-${TRIPLE}.zip" . >/dev/null 2>&1 ||
-			zip -q -r "../basemind-${TRIPLE}.zip" . ||
-			powershell -Command "Compress-Archive -Path '*' -DestinationPath '../basemind-${TRIPLE}.zip' -Force"
-	})
-	echo "✓ Created basemind-${TRIPLE}.zip"
-	;;
+  (cd "$STAGING_DIR" && {
+    7z a -tzip "../basemind-${TRIPLE}.zip" . >/dev/null 2>&1 ||
+      zip -q -r "../basemind-${TRIPLE}.zip" . ||
+      powershell -Command "Compress-Archive -Path '*' -DestinationPath '../basemind-${TRIPLE}.zip' -Force"
+  })
+  echo "✓ Created basemind-${TRIPLE}.zip"
+  ;;
 esac
 
 rm -rf "$STAGING_DIR"
