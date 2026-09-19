@@ -409,14 +409,14 @@ pub(crate) fn doc_entry_settled(
 /// empty-of-chunks doc is always reusable (recompute would yield nothing anyway). When embedding is
 /// off, any cached doc is reusable (chunks only).
 fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool) -> bool {
-    // Must mirror extract_doc: the fingerprint is Some only when redaction is enabled
-    // (off by default), otherwise a default-config blob (fingerprint None) never reuses.
-    let want_fingerprint = if cfg.redaction.enabled {
+    // Mirror the write path (extract/doc.rs): redaction disabled stamps `None`, enabled
+    // stamps `Some(hash)`. Demanding `Some` unconditionally kills reuse for every
+    // redaction-off corpus; a config change or enable/disable flip still forces re-extract.
+    let want_fingerprint: Option<String> = if cfg.redaction.enabled {
         Some(crate::extract::doc::hash_redaction_config(&cfg.redaction))
     } else {
         None
     };
-    // Redaction config changed — force re-extraction regardless of embedding state.
     if cached.redaction_fingerprint != want_fingerprint {
         return false;
     }
@@ -431,7 +431,6 @@ fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: boo
             .chunks
             .iter()
             .all(|c| c.embedding.len() == cached.embedding_dim as usize)
-        && cached.redaction_fingerprint == want_fingerprint
 }
 
 /// Assemble the deferred-write descriptor from an extracted-or-cached document. Decides — while the

@@ -240,14 +240,15 @@ fn embed_pass_reprocesses_the_chunk_only_sidecar_the_deferred_pass_left() {
     );
 }
 
-/// Bug #32, the document tier: since #16 a `Deferred` scan extracts a document AND persists its
-/// `DocEntry` (so the GC live set sees the `rehydration_ref`), with `embedded`/`embed_attempted`
-/// reflecting the deferred state. The `embed` (Inline) pass then upgrades the vectorless blob to an
-/// embedded one, the marker that the document is reachable via `search_documents`. Embedder-independent:
-/// the entries are written purely on the strength of the embed mode, not on a vector being produced.
+/// Bug #32, the document tier: a `Deferred` scan extracts a document but persists no `DocEntry`
+/// (`doc_upsert` is `None` under Deferred, see `scanner_file`), so nothing tracks it as embedded and
+/// nothing lands in LanceDB. The `embed` (Inline) pass persists the `DocEntry`, the marker that the
+/// document was embedded and is reachable via `search_documents`. Before the fix the daemon only ever
+/// ran Deferred, so `lookup_doc` stayed `None` forever. Embedder-independent: the `DocEntry` is
+/// written purely on the strength of the embed mode, not on a vector being produced.
 #[cfg(feature = "documents")]
 #[test]
-fn deferred_pass_tracks_a_document_the_embed_pass_completes() {
+fn embed_pass_indexes_a_document_the_deferred_pass_leaves_untracked() {
     store::init_isolated_cache();
     let pool = WorkspacePool::new(DEFAULT_HOT_CAP);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -271,8 +272,8 @@ fn deferred_pass_tracks_a_document_the_embed_pass_completes() {
         .with_workspace(dir.path(), |store| store.lookup_doc("notes.svg").is_some())
         .expect("read after deferred");
     assert!(
-        tracked_after_deferred,
-        "the deferred pass persists the document entry (see scanner_file)"
+        !tracked_after_deferred,
+        "the deferred pass must not persist a document embedding entry"
     );
 
     pool.rescan(dir.path(), None, false, true, &ScanCancel::default())
