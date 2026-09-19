@@ -158,11 +158,37 @@ macos)
 	done
 
 	if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
-		echo "Vendoring ONNX Runtime (ort-dynamic) for Intel macOS..."
-		export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
-		brew install --bottle-tag=sonoma onnxruntime || brew install onnxruntime
-		ORT_PREFIX="$(brew --prefix onnxruntime)/lib"
-		ort_lib="$ORT_PREFIX/libonnxruntime.dylib"
+		# Pinned directly from microsoft/onnxruntime's GitHub releases instead of a
+		# Homebrew bottle: Homebrew's onnxruntime formula stopped shipping ANY
+		# Intel-macOS bottle as of v1.29.1 (2026-09-10, part of Homebrew 7.0's
+		# project-wide Tier-3 downgrade of Intel macOS), and the "sonoma" bottle
+		# this used to fetch required macOS 14+ at runtime regardless (its
+		# LC_BUILD_VERSION declared minos=14.0), breaking every macOS 13 (Ventura)
+		# user even before the bottle disappeared entirely. ort-dynamic
+		# (ort/load-dynamic) dlopen's this at runtime — it is never linked at
+		# compile time — so any compatible dylib is a drop-in replacement
+		# regardless of which toolchain built it.
+		#
+		# v1.23.2 is the last microsoft/onnxruntime release with an x86_64 macOS
+		# build (v1.24.1 onward ships arm64 only — see that release's own notes).
+		# Its dylib declares minos=13.4 (Ventura or later) and, unlike the
+		# Homebrew bottle, has zero external @rpath/Homebrew dependencies (its
+		# abseil/protobuf/re2 deps are statically linked in), so no dependency
+		# closure to vendor alongside it.
+		echo "Vendoring pinned ONNX Runtime for Intel macOS..."
+		ORT_VERSION="1.23.2"
+		ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
+		ORT_ASSET="onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+		ort_tmp="$(mktemp -d)"
+		curl -fsSL -o "$ort_tmp/$ORT_ASSET" \
+			"https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ASSET}"
+		actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_ASSET" | awk '{print $1}')"
+		if [ "$actual_sha256" != "$ORT_SHA256" ]; then
+			echo "ONNX Runtime checksum mismatch: expected $ORT_SHA256, got $actual_sha256" >&2
+			exit 1
+		fi
+		tar xzf "$ort_tmp/$ORT_ASSET" -C "$ort_tmp"
+		ort_lib="$ort_tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
 		[ -f "$ort_lib" ] || {
 			echo "ONNX Runtime dylib not found at $ort_lib" >&2
 			exit 1
@@ -170,35 +196,9 @@ macos)
 		cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
 		chmod u+w "$STAGING_DIR/libonnxruntime.dylib"
 		install_name_tool -id "@loader_path/libonnxruntime.dylib" "$STAGING_DIR/libonnxruntime.dylib"
-		changed=1
-		while [ "$changed" = 1 ]; do
-			changed=0
-			for lib in "$STAGING_DIR"/*.dylib; do
-				[ -f "$lib" ] || continue
-				while IFS= read -r dep; do
-					[ -n "$dep" ] || continue
-					base=$(basename "$dep")
-					src="$dep"
-					case "$dep" in
-					@rpath/*) src="$ORT_PREFIX/$base" ;;
-					esac
-					if [ ! -f "$STAGING_DIR/$base" ]; then
-						[ -f "$src" ] || continue
-						cp "$src" "$STAGING_DIR/$base"
-						chmod u+w "$STAGING_DIR/$base"
-						install_name_tool -id "@loader_path/$base" "$STAGING_DIR/$base"
-						changed=1
-					fi
-					install_name_tool -change "$dep" "@loader_path/$base" "$lib" 2>/dev/null || true
-				done < <(otool -L "$lib" | tail -n +2 | awk '{print $1}' |
-					grep -E '^(/opt/homebrew|/usr/local|@rpath)/' || true)
-			done
-		done
-		for dylib in "$STAGING_DIR"/*.dylib; do
-			[ -f "$dylib" ] || continue
-			codesign --force --sign - "$dylib"
-		done
-		echo "✓ Vendored ONNX Runtime + closure next to the binary"
+		codesign --force --sign - "$STAGING_DIR/libonnxruntime.dylib"
+		rm -rf "$ort_tmp"
+		echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
 	fi
 
 	tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
