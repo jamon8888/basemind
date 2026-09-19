@@ -54,7 +54,7 @@ pub(super) async fn run_search_code(state: &ServerState, params: SearchCodeParam
 
     let rr = &state.shared.config.code_search.reranker;
     let rerank_enabled = params.reranker_enabled.unwrap_or(rr.enabled);
-    let rerank_preset = params.reranker_preset.clone().unwrap_or_else(|| rr.preset.clone());
+    let rerank_preset_override = params.reranker_preset.clone();
     let rerank_top_k = params.reranker_top_k.unwrap_or(rr.top_k);
 
     let fetch_n = if rerank_enabled { limit.max(rerank_top_k) } else { limit };
@@ -82,7 +82,14 @@ pub(super) async fn run_search_code(state: &ServerState, params: SearchCodeParam
     };
 
     let hits = if rerank_enabled {
-        rerank_hits(state, &params.query, hits, &rerank_preset, rerank_top_k).await?
+        rerank_hits(
+            state,
+            &params.query,
+            hits,
+            rerank_preset_override.as_deref(),
+            rerank_top_k,
+        )
+        .await?
     } else {
         hits
     };
@@ -431,23 +438,40 @@ fn hydrate_one(store: &Store, chunk_id: &str) -> Option<(CodeSearchHit, String)>
 /// Optional cross-encoder rerank of `hits`, reusing the same xberg reranker as the documents tier.
 /// Reads each hit's chunk body as the candidate text, scores against `query`, and returns the hits
 /// reordered best-first (truncated to `top_k`) with `rerank_score` set. Off-path when `hits` is
-/// empty. Errors on an unknown preset (before any model download) or an out-of-range rerank index.
+/// empty. An explicit per-call preset always means a compiled-in preset (unknown names error
+/// before any model download); otherwise the workspace `custom_model` wins over the default
+/// preset. Errors on an out-of-range rerank index.
 async fn rerank_hits(
     state: &ServerState,
     query: &str,
     hits: Vec<CodeSearchHit>,
-    preset: &str,
+    preset_override: Option<&str>,
     top_k: usize,
 ) -> Result<Vec<CodeSearchHit>, McpError> {
     if hits.is_empty() {
         return Ok(hits);
     }
-    if xberg::get_reranker_preset(preset).is_none() {
-        return Err(McpError::invalid_params(
-            format!("unknown reranker preset: {preset:?}"),
-            None,
-        ));
-    }
+    let cfg = &state.shared.config.code_search.reranker;
+    let krz_model = match cfg.resolve_model(preset_override) {
+        crate::config::ResolvedRerankerModel::Preset { name } => {
+            if xberg::get_reranker_preset(&name).is_none() {
+                return Err(McpError::invalid_params(
+                    format!("unknown reranker preset: {name:?}"),
+                    None,
+                ));
+            }
+            xberg::core::config::RerankerModelType::Preset { name }
+        }
+        crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+            xberg::core::config::RerankerModelType::Custom {
+                model_id,
+                model_file: Some(model_file),
+                additional_files: Vec::new(),
+                max_length: None,
+                head: xberg::core::config::RerankerHead::CrossEncoder,
+            }
+        }
+    };
     let texts: Vec<String> = {
         let store = state.shared.store.read().await;
         hits.iter()
@@ -459,9 +483,7 @@ async fn rerank_hits(
             .collect()
     };
     let krz_config = xberg::core::config::RerankerConfig {
-        model: xberg::core::config::RerankerModelType::Preset {
-            name: preset.to_string(),
-        },
+        model: krz_model,
         top_k: Some(top_k),
         ..Default::default()
     };

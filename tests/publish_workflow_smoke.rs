@@ -93,6 +93,7 @@ fn finalize_requires_the_full_asset_set() {
     let block = job_block(&workflow, "finalize_release");
     for asset in [
         "basemind-x86_64-unknown-linux-gnu.tar.gz",
+        "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz",
         "basemind-aarch64-unknown-linux-gnu.tar.gz",
         "basemind-aarch64-apple-darwin.tar.gz",
         "basemind-x86_64-apple-darwin.tar.gz",

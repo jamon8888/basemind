@@ -438,16 +438,28 @@ fn process_doc(
                 embedding_preset: config.documents.embedding_preset.clone(),
                 size_bytes,
                 mtime,
-                embedded: batch.embedded,
+                // A Deferred pass extracts without vectors: never let its entry claim
+                // `embedded`, or the unchanged fast path would settle a later Inline
+                // pass on it and vectors would never be filled (bug #32).
+                embedded: batch.embedded && matches!(embed, EmbedMode::Inline),
                 embed_attempted: batch.embed_attempted,
                 rehydration_ref: batch.rehydration_ref.clone(),
+            };
+            // Deferred persists an entry only to carry a rehydration_ref into the index
+            // for the GC live set (else the rehydration blob could be reaped while the
+            // doc references it). With no rehydration there is nothing the index must
+            // know: leave the doc untracked so a later Inline pass indexes it (bug #32).
+            let doc_upsert = match embed {
+                EmbedMode::Inline => Some(doc_entry),
+                EmbedMode::Deferred if doc_entry.rehydration_ref.is_some() => Some(doc_entry),
+                EmbedMode::Deferred => None,
             };
             FileResult {
                 path: rel.to_string(),
                 status,
                 upsert: None,
                 doc_batch: Some(batch),
-                doc_upsert: Some(doc_entry),
+                doc_upsert,
                 #[cfg(feature = "code-search")]
                 code_batch: None,
             }

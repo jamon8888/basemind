@@ -224,116 +224,10 @@ impl Default for DocLanguageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RerankerConfig {
-    /// Master switch — off by default; the reranker model download + per-query
-    /// latency means users should opt in explicitly.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Xberg reranker preset name. Defaults to `bge-reranker-v2-m3` (multilingual,
-    /// 568M params, 100+ languages) per the GDPR PII spec: cross-encoder reranking
-    /// must cover all EU languages. Costs nothing while `enabled = false` (default).
-    #[serde(default = "RerankerConfig::default_preset")]
-    pub preset: String,
-    /// How many hits to rerank. The vector search returns `top_k` candidates
-    /// which the cross-encoder then reorders. Defaults to 20 per spec.
-    #[serde(default = "RerankerConfig::default_top_k")]
-    pub top_k: usize,
-}
-
-impl RerankerConfig {
-    fn default_preset() -> String {
-        "bge-reranker-v2-m3".to_string()
-    }
-    fn default_top_k() -> usize {
-        20
-    }
-}
-
-impl Default for RerankerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            preset: Self::default_preset(),
-            top_k: Self::default_top_k(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct KeywordsConfig {
-    /// Master switch — off by default; YAKE / RAKE add ingest-time CPU cost.
-    /// Maps to `Some(KeywordConfig)` / `None` on `ExtractionConfig.keywords`;
-    /// xberg's own `KeywordConfig` has no `enabled` field — gating is via
-    /// the wrapping `Option`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Algorithm: YAKE (statistical, multi-language) or RAKE (rapid automatic
-    /// keyword extraction).
-    #[serde(default)]
-    pub algorithm: KeywordAlgorithm,
-    /// Maximum keywords to extract per document. Matches xberg's
-    /// `KeywordConfig.max_keywords` default of 10.
-    #[serde(default = "KeywordsConfig::default_max_keywords")]
-    pub max_keywords: usize,
-    /// Minimum score threshold. Matches xberg's `KeywordConfig.min_score`
-    /// default of 0.0 (i.e. surface every candidate). Score ranges differ
-    /// between YAKE (lower = better) and RAKE (higher = better) — see
-    /// `xberg::keywords::config::KeywordConfig.min_score`.
-    #[serde(default)]
-    #[schemars(range(min = 0.0))]
-    pub min_score: f32,
-    /// N-gram range as `[min, max]`. Matches xberg's
-    /// `KeywordConfig.ngram_range` default of `(1, 3)`. Encoded as an array of
-    /// length 2 so the JSON Schema stays human-readable; values map back to a
-    /// `(usize, usize)` tuple at the boundary.
-    #[serde(default = "KeywordsConfig::default_ngram_range")]
-    #[schemars(length(min = 2, max = 2))]
-    pub ngram_range: Vec<usize>,
-    /// Optional YAKE tuning (passed through to xberg unchanged). Shape
-    /// matches `xberg::keywords::YakeParams`; bad JSON is logged and
-    /// xberg's defaults are used instead of failing the scan.
-    #[serde(default)]
-    pub yake_params: Option<serde_json::Value>,
-    /// Optional RAKE tuning (passed through to xberg unchanged). Shape
-    /// matches `xberg::keywords::RakeParams`; bad JSON is logged and
-    /// xberg's defaults are used instead of failing the scan.
-    #[serde(default)]
-    pub rake_params: Option<serde_json::Value>,
-}
-
-impl KeywordsConfig {
-    fn default_max_keywords() -> usize {
-        10
-    }
-    fn default_ngram_range() -> Vec<usize> {
-        vec![1, 3]
-    }
-}
-
-impl Default for KeywordsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            algorithm: KeywordAlgorithm::default(),
-            max_keywords: Self::default_max_keywords(),
-            min_score: 0.0,
-            ngram_range: Self::default_ngram_range(),
-            yake_params: None,
-            rake_params: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum KeywordAlgorithm {
-    #[default]
-    Yake,
-    Rake,
-}
+// Re-exported from `enrichment` (split out to stay under the 1000-line cap).
+pub use super::enrichment::{
+    CustomRerankerModel, KeywordAlgorithm, KeywordsConfig, RerankerConfig, ResolvedRerankerModel,
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -952,6 +846,79 @@ mod tests {
         assert!(!r.enabled);
         assert_eq!(r.preset, "bge-reranker-v2-m3");
         assert_eq!(r.top_k, 20);
+        assert!(r.custom_model.is_none());
+    }
+
+    #[test]
+    fn reranker_resolve_explicit_preset_wins_over_custom() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
+                model_file: Some("onnx/model_int8.onnx".to_string()),
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(Some("bge-reranker-base")) {
+            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-base"),
+            other => panic!("expected Preset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_custom_without_override() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
+                model_file: Some("onnx/model_int8.onnx".to_string()),
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Custom {
+                model_id, model_file, ..
+            } => {
+                assert_eq!(model_id, "onnx-community/gte-multilingual-reranker-base");
+                assert_eq!(model_file, "onnx/model_int8.onnx");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_custom_defaults_model_file() {
+        let r = RerankerConfig {
+            custom_model: Some(CustomRerankerModel {
+                model_id: "org/model".to_string(),
+                model_file: None,
+            }),
+            ..RerankerConfig::default()
+        };
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Custom { model_file, .. } => {
+                assert_eq!(model_file, "onnx/model.onnx");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_resolve_falls_back_to_preset() {
+        let r = RerankerConfig::default();
+        match r.resolve_model(None) {
+            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-v2-m3"),
+            other => panic!("expected Preset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reranker_custom_model_deserialises_from_toml_section() {
+        let cfg: RerankerConfig = toml::from_str(
+            "preset = \"bge-reranker-v2-m3\"\n[custom_model]\nmodel_id = \"onnx-community/gte-multilingual-reranker-base\"\nmodel_file = \"onnx/model_int8.onnx\"\n",
+        )
+        .expect("parse");
+        let custom = cfg.custom_model.expect("custom_model");
+        assert_eq!(custom.model_id, "onnx-community/gte-multilingual-reranker-base");
+        assert_eq!(custom.model_file.as_deref(), Some("onnx/model_int8.onnx"));
     }
 
     #[test]
