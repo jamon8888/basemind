@@ -1,6 +1,7 @@
 mod code;
 mod comms;
 mod documents;
+mod enrichment;
 pub(crate) mod layered;
 mod overrides;
 mod resources;
