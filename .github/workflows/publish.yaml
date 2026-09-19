@@ -764,6 +764,15 @@ jobs:
           # SONAME, or missing bundled dep fails here instead of shipping.
           "$dir/basemind" --version
           test -f "$dir/lib/libonnxruntime.so.1"
+          # ponytail: no embedding session here on purpose — that needs a model
+          # download; linkage proof (NEEDED/RPATH/SONAME + real dlopen) is the
+          # deterministic gate that blocks a broken bundle before publish.
+          ldd "$dir/basemind" | grep -q "libonnxruntime" || {
+            echo "::error::basemind does not link the bundled libonnxruntime"; ldd "$dir/basemind"; exit 1
+          }
+          readelf -d "$dir/basemind" | grep -q "RUNPATH.*\$ORIGIN/lib" || {
+            echo "::error::basemind RUNPATH missing \$ORIGIN/lib"; readelf -d "$dir/basemind"; exit 1
+          }
           ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./lib/libonnxruntime.so.1'); print('libonnxruntime.so.1 load OK')" )
 
       - name: Upload to GitHub release

@@ -36,13 +36,17 @@ if [ ! -d "$SRC" ]; then
 fi
 
 cd "$SRC"
-# Fail on a stale or unrelated reuse of $SRC: require the ORT repo, make
-# fetch/checkout fatal, and verify HEAD matches the requested tag before
+# Fail on a stale or unrelated reuse of $SRC: require the canonical ORT repo,
+# make fetch/checkout fatal, and verify HEAD matches the requested tag before
 # building (a silent fallback would ship an unverified ORT).
-git remote get-url origin | grep -q "onnxruntime" || {
-  echo "unexpected git remote in $SRC (expected onnxruntime)" >&2
+case "$(git remote get-url origin)" in
+"https://github.com/microsoft/onnxruntime.git"|"git@github.com:microsoft/onnxruntime.git")
+  ;;
+*)
+  echo "unexpected git remote in $SRC (expected microsoft/onnxruntime)" >&2
   exit 1
-}
+  ;;
+esac
 git fetch --depth 1 origin "refs/tags/v${ORT_VERSION}:refs/tags/v${ORT_VERSION}"
 git checkout "v${ORT_VERSION}"
 [ "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "v${ORT_VERSION}")" ] || {
