@@ -40,7 +40,7 @@ jobs:
       release_assets_exist: ${{ steps.release_assets.outputs.release_assets_exist }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -294,7 +294,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -343,7 +343,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -467,7 +467,7 @@ jobs:
             protoc_arch: linux-aarch_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -482,8 +482,17 @@ jobs:
           # find it ("no default is configured"). Fixed paths remove the ambiguity.
           export CARGO_HOME=/opt/cargo
           export RUSTUP_HOME=/opt/rustup
-          curl -fsSL https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
+          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
+          # Re-pin deliberately on toolchain upgrades (hash from a fresh
+          # HTTPS download of the official static archive).
+          rustup_ver="1.28.2"
+          rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+          curl -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain stable
+          rm -f /tmp/rustup-init
           export PATH="$CARGO_HOME/bin:$PATH"
           rustup default stable
           rustup target add "${{ matrix.triple }}"
@@ -531,10 +540,12 @@ jobs:
         run: |
           set -euo pipefail
           ver="1.23.0"
+          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
           d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
           cd "$d"
           curl -fsSL -o libheif.tar.gz \
             "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
+          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
           tar xzf libheif.tar.gz
           cd "libheif-${ver}"
           mkdir build && cd build
@@ -626,7 +637,7 @@ jobs:
       image: quay.io/pypa/manylinux_2_28_x86_64:latest@sha256:e84d335c4c0ab4dbc8efcd055a645d9665eed249454fe068a58355698944accd
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -638,8 +649,17 @@ jobs:
           set -euo pipefail
           export CARGO_HOME=/opt/cargo
           export RUSTUP_HOME=/opt/rustup
-          curl -fsSL https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
+          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
+          # Re-pin deliberately on toolchain upgrades (hash from a fresh
+          # HTTPS download of the official static archive).
+          rustup_ver="1.28.2"
+          rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+          curl -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain stable
+          rm -f /tmp/rustup-init
           export PATH="$CARGO_HOME/bin:$PATH"
           rustup default stable
           rustup target add x86_64-unknown-linux-gnu
@@ -669,10 +689,12 @@ jobs:
           set -euo pipefail
           ver="28.2"
           zip="protoc-28.2-linux-x86_64.zip"
+          sha256="2febfd42b59ce93a28eb789019a470a3dd0449619bc04f84dad1333da261dec1"
           mkdir -p /usr/local/protoc
           cd /tmp
           curl -fsSL -o "$zip" \
             "https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/${zip}"
+          echo "${sha256}  ${zip}" | sha256sum -c -
           unzip -q "$zip" -d /usr/local/protoc
           ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
           echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
@@ -683,10 +705,12 @@ jobs:
         run: |
           set -euo pipefail
           ver="1.23.0"
+          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
           d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
           cd "$d"
           curl -fsSL -o libheif.tar.gz \
             "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
+          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
           tar xzf libheif.tar.gz
           cd "libheif-${ver}"
           mkdir build && cd build
@@ -796,7 +820,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
@@ -917,7 +941,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -964,7 +988,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -1000,7 +1024,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -1037,7 +1061,7 @@ jobs:
     environment: pypi
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -1068,7 +1092,7 @@ jobs:
     environment: pypi
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -1098,7 +1122,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
