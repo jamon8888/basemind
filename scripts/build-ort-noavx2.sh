@@ -21,8 +21,8 @@
 set -euo pipefail
 
 if [ $# -ne 3 ]; then
-  echo "Usage: $0 <source-dir> <build-dir> <install-prefix>" >&2
-  exit 1
+	echo "Usage: $0 <source-dir> <build-dir> <install-prefix>" >&2
+	exit 1
 fi
 
 SRC="$1"
@@ -31,8 +31,8 @@ PREFIX="$3"
 ORT_VERSION="${ORT_VERSION:-1.28.0}"
 
 if [ ! -d "$SRC" ]; then
-  git clone --depth 1 --branch "v${ORT_VERSION}" --recursive --shallow-submodules \
-    https://github.com/microsoft/onnxruntime.git "$SRC"
+	git clone --depth 1 --branch "v${ORT_VERSION}" --recursive --shallow-submodules \
+		https://github.com/microsoft/onnxruntime.git "$SRC"
 fi
 
 cd "$SRC"
@@ -40,18 +40,18 @@ cd "$SRC"
 # make fetch/checkout fatal, and verify HEAD matches the requested tag before
 # building (a silent fallback would ship an unverified ORT).
 case "$(git remote get-url origin)" in
-"https://github.com/microsoft/onnxruntime.git"|"git@github.com:microsoft/onnxruntime.git")
-  ;;
+"https://github.com/microsoft/onnxruntime.git" | "git@github.com:microsoft/onnxruntime.git")
+	;;
 *)
-  echo "unexpected git remote in $SRC (expected microsoft/onnxruntime)" >&2
-  exit 1
-  ;;
+	echo "unexpected git remote in $SRC (expected microsoft/onnxruntime)" >&2
+	exit 1
+	;;
 esac
 git fetch --depth 1 origin "refs/tags/v${ORT_VERSION}:refs/tags/v${ORT_VERSION}"
 git checkout "v${ORT_VERSION}"
 [ "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "v${ORT_VERSION}")" ] || {
-  echo "HEAD does not match v${ORT_VERSION} in $SRC" >&2
-  exit 1
+	echo "HEAD does not match v${ORT_VERSION} in $SRC" >&2
+	exit 1
 }
 
 # CMAKE_DISABLE_FIND_PACKAGE_flatbuffers: FetchContent prefers any system
@@ -59,23 +59,23 @@ git checkout "v${ORT_VERSION}"
 # installed resolve the emulator's flatbuffers v25.1, which breaks the
 # checked-in v23-generated headers (static_assert failure).
 python3 tools/ci_build/build.py \
-  --build_dir "$BUILD" \
-  --config Release \
-  --build_shared_lib \
-  --parallel "$(nproc)" \
-  --skip_tests \
-  --cmake_extra_defines \
-    onnxruntime_ENABLE_CPUINFO=ON \
-    onnxruntime_USE_AVX=OFF \
-    onnxruntime_BUILD_FOR_NATIVE_MACHINE=OFF \
-    CMAKE_DISABLE_FIND_PACKAGE_flatbuffers=TRUE \
-    'CMAKE_C_FLAGS=-mno-avx -mno-avx2 -mno-fma -mno-avx512f' \
-    'CMAKE_CXX_FLAGS=-mno-avx -mno-avx2 -mno-fma -mno-avx512f'
+	--build_dir "$BUILD" \
+	--config Release \
+	--build_shared_lib \
+	--parallel "$(nproc)" \
+	--skip_tests \
+	--cmake_extra_defines \
+	onnxruntime_ENABLE_CPUINFO=ON \
+	onnxruntime_USE_AVX=OFF \
+	onnxruntime_BUILD_FOR_NATIVE_MACHINE=OFF \
+	CMAKE_DISABLE_FIND_PACKAGE_flatbuffers=TRUE \
+	'CMAKE_C_FLAGS=-mno-avx -mno-avx2 -mno-fma -mno-avx512f' \
+	'CMAKE_CXX_FLAGS=-mno-avx -mno-avx2 -mno-fma -mno-avx512f'
 
 SO="$BUILD/Release/libonnxruntime.so.${ORT_VERSION}"
 [ -f "$SO" ] || {
-  echo "expected shared library not found: $SO" >&2
-  exit 1
+	echo "expected shared library not found: $SO" >&2
+	exit 1
 }
 
 mkdir -p "$PREFIX/lib"
