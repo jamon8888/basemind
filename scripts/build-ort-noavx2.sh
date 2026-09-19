@@ -14,6 +14,11 @@
 # ort 2.0.0-rc.13). A mismatched C ABI makes ort panic at startup
 # ("unsupported version of ONNX Runtime").
 #
+# ORT_COMMIT is the commit behind "v${ORT_VERSION}" (lightweight tag, so the
+# tag ref already is the commit). Pinned deliberately: a mutable tag can be
+# moved upstream, which would silently change the shipped binary.
+# Re-pin deliberately when ORT_VERSION changes.
+#
 # Usage:
 #   ORT_VERSION=1.28.0 ./scripts/build-ort-noavx2.sh <source-dir> <build-dir> <install-prefix>
 #
@@ -29,16 +34,18 @@ SRC="$1"
 BUILD="$2"
 PREFIX="$3"
 ORT_VERSION="${ORT_VERSION:-1.28.0}"
+ORT_COMMIT="${ORT_COMMIT:-da9b5e364c465de65c49d91e696cd6485270757f}"
 
 if [ ! -d "$SRC" ]; then
-  git clone --depth 1 --branch "v${ORT_VERSION}" --recursive --shallow-submodules \
+  git clone --depth 1 --recursive --shallow-submodules \
     https://github.com/microsoft/onnxruntime.git "$SRC"
 fi
 
 cd "$SRC"
 # Fail on a stale or unrelated reuse of $SRC: require the canonical ORT repo,
-# make fetch/checkout fatal, and verify HEAD matches the requested tag before
-# building (a silent fallback would ship an unverified ORT).
+# reject any local modification (checkout keeps dirty files and never touches
+# untracked ones, so a reused tree could build unverified content), then pin
+# the exact reviewed commit and synchronize submodules to it.
 case "$(git remote get-url origin)" in
 "https://github.com/microsoft/onnxruntime.git" | "git@github.com:microsoft/onnxruntime.git")
   ;;
@@ -47,10 +54,16 @@ case "$(git remote get-url origin)" in
   exit 1
   ;;
 esac
-git fetch --depth 1 origin "refs/tags/v${ORT_VERSION}:refs/tags/v${ORT_VERSION}"
-git checkout "v${ORT_VERSION}"
-[ "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "v${ORT_VERSION}")" ] || {
-  echo "HEAD does not match v${ORT_VERSION} in $SRC" >&2
+[ -z "$(git status --porcelain)" ] || {
+  echo "refusing to build from a dirty tree in $SRC (commit or clean it)" >&2
+  exit 1
+}
+git fetch --depth 1 origin "$ORT_COMMIT"
+git checkout "$ORT_COMMIT"
+git submodule sync --recursive
+git submodule update --init --recursive --depth 1
+[ "$(git rev-parse HEAD)" = "$ORT_COMMIT" ] || {
+  echo "HEAD does not match $ORT_COMMIT in $SRC" >&2
   exit 1
 }
 
