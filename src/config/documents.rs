@@ -120,7 +120,7 @@ impl DocumentsConfig {
         100
     }
     fn default_embedding_preset() -> String {
-        "fast".to_string()
+        "multilingual".to_string()
     }
     fn default_embed() -> bool {
         true
