@@ -114,13 +114,13 @@ impl DocumentsConfig {
         true
     }
     fn default_max_characters() -> usize {
-        1000
+        800
     }
     fn default_overlap() -> usize {
-        200
+        100
     }
     fn default_embedding_preset() -> String {
-        "balanced".to_string()
+        "fast".to_string()
     }
     fn default_embed() -> bool {
         true

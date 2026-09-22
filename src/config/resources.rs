@@ -29,34 +29,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResourcesConfig {
-    /// Cap on the code-map scanner's rayon pool. `0` (auto) keeps rayon's
-    /// default (one worker per logical CPU); a non-zero value pins the pool so
-    /// the scan can't saturate every core on a shared machine. First scan wins
-    /// for the process — the pool is built once and its size is then fixed.
-    #[serde(default)]
+    /// Cap on the code-map scanner's rayon pool. `2` pins the pool to a
+    /// conservative default that leaves headroom on 8 GiB machines; `0` (auto)
+    /// would use one worker per logical CPU. First scan wins for the process —
+    /// the pool is built once and its size is then fixed.
+    #[serde(default = "ResourcesConfig::default_scan_threads")]
     pub scan_threads: usize,
-    /// Cap on the ONNX embedding pool. `0` (auto) resolves to
-    /// `max(2, logical_cpus / 4)` via `crate::embeddings::resolve_embed_threads`
-    /// — a bounded fraction of cores so the embedder never pins the machine and
-    /// ORT arenas are not replicated across every core. This supersedes the
+    /// Cap on the ONNX embedding pool. `2` pins the pool to a conservative
+    /// default that bounds ORT arena replication on 8 GiB machines; `0` (auto)
+    /// would resolve to `max(2, logical_cpus / 4)`. This supersedes the
     /// deprecated `[documents].embed_max_threads`; see
     /// [`ResourcesConfig::effective_embed_threads`] for the precedence.
-    #[serde(default)]
+    #[serde(default = "ResourcesConfig::default_embed_threads")]
     pub embed_threads: usize,
-    /// Upper bound on documents extracted concurrently. `0` (auto) leaves the
-    /// dispatch unbounded. Enforced by a counting semaphore around document
-    /// extraction (`backpressure::acquire_doc_slot`).
+    /// Upper bound on documents extracted concurrently. `1` ensures only one
+    /// GLiNER/embedding spike can be in-flight at a time on 8 GiB machines; `0`
+    /// (auto) leaves the dispatch unbounded. Enforced by a counting semaphore
+    /// around document extraction (`backpressure::acquire_doc_slot`).
     ///
     /// Complementary to `max_footprint_mb` rather than redundant with it: a
     /// document extraction's spike (decoded page buffers, OCR bitmaps, an
     /// embedding batch) lands faster than the footprint sampler can observe it,
     /// so a memory ceiling alone reacts after the allocation. This bounds how
     /// many such spikes can overlap in the first place.
-    #[serde(default)]
+    #[serde(default = "ResourcesConfig::default_max_concurrent_documents")]
     pub max_concurrent_documents: usize,
-    /// Number of chunks the embedder submits to ONNX per batch. Larger batches
-    /// amortise per-call overhead at the cost of a higher transient memory
-    /// spike; 32 is a safe default across the preset models. Threaded into both
+    /// Number of chunks the embedder submits to ONNX per batch. `16` amortises
+    /// per-call overhead while keeping the transient memory spike low enough
+    /// for 8 GiB machines; 32 is the previous default. Threaded into both
     /// `SharedEmbedder` (code-search + query paths) and the document extractor's
     /// `EmbeddingConfig`.
     #[serde(default = "ResourcesConfig::default_embed_batch_size")]
@@ -103,17 +103,34 @@ pub struct ResourcesConfig {
 }
 
 impl ResourcesConfig {
-    /// Default embedding batch size. 32 balances ONNX per-call amortisation
-    /// against the transient memory spike of a larger batch.
-    fn default_embed_batch_size() -> usize {
-        32
+    /// Default scanner thread count. `2` leaves headroom on 8 GiB machines
+    /// while still providing parallelism for tree-sitter parsing.
+    fn default_scan_threads() -> usize {
+        2
     }
 
-    /// Default read-stack outline-cache budget. 256 MiB holds roughly 180k
-    /// files at the measured median, so every repo that fits keeps today's
-    /// pure-RAM read stack while a monorepo that does not is bounded.
+    /// Default ONNX embedder thread count. `2` bounds ORT arena replication
+    /// on 8 GiB machines; `0` (auto) would resolve to `max(2, logical_cpus / 4)`.
+    fn default_embed_threads() -> usize {
+        2
+    }
+
+    /// Default concurrent document limit. `1` ensures only one GLiNER/embedding
+    /// spike is in-flight at a time on 8 GiB machines.
+    fn default_max_concurrent_documents() -> usize {
+        1
+    }
+
+    /// Default embedding batch size. `16` amortises per-call overhead while
+    /// keeping the transient memory spike low enough for 8 GiB machines.
+    fn default_embed_batch_size() -> usize {
+        16
+    }
+
+    /// Default read-stack outline-cache budget. 128 MiB holds roughly 90k
+    /// files at the measured median, halving the default to fit 8 GiB machines.
     fn default_max_map_cache_mb() -> usize {
-        256
+        128
     }
 
     /// Resolve the effective ONNX embed-thread cap, honouring the deprecated
@@ -136,9 +153,9 @@ impl ResourcesConfig {
 impl Default for ResourcesConfig {
     fn default() -> Self {
         Self {
-            scan_threads: 0,
-            embed_threads: 0,
-            max_concurrent_documents: 0,
+            scan_threads: Self::default_scan_threads(),
+            embed_threads: Self::default_embed_threads(),
+            max_concurrent_documents: Self::default_max_concurrent_documents(),
             embed_batch_size: Self::default_embed_batch_size(),
             max_footprint_mb: MaxFootprint::default(),
             max_map_cache_mb: Self::default_max_map_cache_mb(),
@@ -312,12 +329,12 @@ mod tests {
     #[test]
     fn default_resources_config_has_expected_field_values() {
         let cfg = ResourcesConfig::default();
-        assert_eq!(cfg.scan_threads, 0);
-        assert_eq!(cfg.embed_threads, 0);
-        assert_eq!(cfg.max_concurrent_documents, 0);
-        assert_eq!(cfg.embed_batch_size, 32);
+        assert_eq!(cfg.scan_threads, 2);
+        assert_eq!(cfg.embed_threads, 2);
+        assert_eq!(cfg.max_concurrent_documents, 1);
+        assert_eq!(cfg.embed_batch_size, 16);
         assert_eq!(cfg.max_footprint_mb, MaxFootprint::Mebibytes(0));
-        assert_eq!(cfg.max_map_cache_mb, 256);
+        assert_eq!(cfg.max_map_cache_mb, 128);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }
 
@@ -330,19 +347,19 @@ mod tests {
     fn resources_toml_roundtrips_embed_batch_size_override() {
         let cfg: ResourcesConfig = toml::from_str("embed_batch_size = 8\n").expect("parse [resources] body");
         assert_eq!(cfg.embed_batch_size, 8);
-        assert_eq!(cfg.scan_threads, 0);
+        assert_eq!(cfg.scan_threads, 2);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }
 
     #[test]
     fn resources_empty_toml_falls_back_to_all_defaults() {
         let cfg: ResourcesConfig = toml::from_str("").expect("empty [resources] body");
-        assert_eq!(cfg.embed_batch_size, 32);
-        assert_eq!(cfg.scan_threads, 0);
-        assert_eq!(cfg.embed_threads, 0);
-        assert_eq!(cfg.max_concurrent_documents, 0);
+        assert_eq!(cfg.embed_batch_size, 16);
+        assert_eq!(cfg.scan_threads, 2);
+        assert_eq!(cfg.embed_threads, 2);
+        assert_eq!(cfg.max_concurrent_documents, 1);
         assert_eq!(cfg.max_footprint_mb, MaxFootprint::Mebibytes(0));
-        assert_eq!(cfg.max_map_cache_mb, 256);
+        assert_eq!(cfg.max_map_cache_mb, 128);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }
 
