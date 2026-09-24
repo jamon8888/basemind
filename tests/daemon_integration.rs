@@ -107,16 +107,31 @@ impl Drop for Daemon {
 }
 
 /// Connect a client whose Hello carries `root` as cwd, so the daemon auto-registers that workspace.
+///
+/// Respawn is refused rather than defaulted. `CommsClient::connect` wires
+/// `singleton::spawn_detached_daemon` into `request`'s single-shot reconnect, which fires exactly
+/// when a lifecycle test kills the broker. That resurrects a *detached* daemon this file's `Child`
+/// handles never track: it keeps the socket answering, so phase 2's `Daemon::start` sees an alive
+/// socket and returns a dead child, and its in-flight work holds the workspace store lock the
+/// second rescan needs — the CI symptom this avoids (both `full` legs parked in
+/// `sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly` until the 135-minute job
+/// timeout). A refused spawn surfaces as an ordinary `Err` on the in-flight RPC instead. ~keep
 async fn connect(socket: &Path, agent: &str, root: &Path) -> CommsClient {
     let paths = CommsPaths {
         comms_dir: socket.parent().expect("socket parent").to_path_buf(),
         socket_path: socket.to_path_buf(),
     };
-    CommsClient::connect(
+    CommsClient::connect_with_respawn(
         &paths,
         AgentId::parse(agent).expect("agent id"),
         None,
         Some(root.to_path_buf()),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "lifecycle tests never auto-respawn a daemon",
+            ))
+        },
     )
     .await
     .unwrap_or_else(|e| panic!("connect {agent}: {e}"))
@@ -718,9 +733,13 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     let daemon = Daemon::start(&comms_dir);
     let socket = daemon.socket().to_path_buf();
     let mut client = connect(&socket, "agent-sigterm-2", &repo).await;
-    let report = client
-        .rescan(repo.clone(), None, true, false)
+    // Bounded: `send_and_await` waits on the response frame forever, so a daemon that never ~keep
+    // answers parked this test for the rest of the 135-minute job budget instead of failing. The ~keep
+    // pass itself measures ~23s in a debug build, so 15 minutes is a diagnosis bound, not a ~keep
+    // performance assumption. ~keep
+    let report = tokio::time::timeout(Duration::from_secs(900), client.rescan(repo.clone(), None, true, false))
         .await
+        .expect("the post-interrupt full rescan never answered within 15 minutes")
         .expect("a full rescan after the interrupted pass must succeed");
     assert!(
         report.scanned >= HEAVY_FILES,
