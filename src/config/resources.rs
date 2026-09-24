@@ -141,6 +141,10 @@ impl ResourcesConfig {
     /// (resolved downstream by `crate::embeddings::resolve_embed_threads`). This
     /// lets existing configs that still set `[documents].embed_max_threads` keep
     /// working while new configs use the `[resources]` home for the knob.
+    ///
+    /// Table presence is handled one layer up: [`crate::config::parse_str`] copies
+    /// the alias into `embed_threads` when the file never sets that key, because
+    /// the app default is nonzero and would otherwise shadow the alias.
     pub fn effective_embed_threads(&self, deprecated_alias: usize) -> usize {
         if self.embed_threads != 0 {
             self.embed_threads
@@ -505,7 +509,9 @@ mod tests {
             ..ResourcesConfig::default()
         };
         assert_eq!(cfg.effective_embed_threads(8), 4);
-        // Default pins embed_threads=2 (8 GiB default), which wins over the alias.
+        // The standalone default pins embed_threads=2 (8 GiB default); it only reaches this
+        // resolver with an alias still set when the caller built the struct by hand —
+        // `parse_str` carries the alias across first when the file never sets the key.
         let cfg = ResourcesConfig::default();
         assert_eq!(cfg.effective_embed_threads(8), 2);
         // Explicit auto (0) falls through to the deprecated alias.

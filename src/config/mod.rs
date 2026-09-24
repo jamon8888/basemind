@@ -215,7 +215,21 @@ pub fn parse_str(raw: &str) -> Result<Config, ConfigError> {
     match schema_tag {
         "v1" | "https://basemind.dev/schema/v1.json" => {
             validate::validate_v1(&json_value)?;
-            serde_json::from_value::<ConfigV1>(json_value).map_err(ConfigError::Deserialize)
+            let mut config = serde_json::from_value::<ConfigV1>(json_value).map_err(ConfigError::Deserialize)?;
+            // A file that only knows `[documents].embed_max_threads` never sets
+            // `resources.embed_threads`, so `#[serde(default)]` fills in the nonzero app default and
+            // the resolver below never reaches the alias. Carry it across here, where key presence
+            // is still visible. An explicit `embed_threads = 0` means auto and falls through to the
+            // alias in the resolver anyway, so only key absence is handled here.
+            if config.documents.embed_max_threads != 0
+                && toml_value
+                    .get("resources")
+                    .and_then(|table| table.get("embed_threads"))
+                    .is_none()
+            {
+                config.resources.embed_threads = config.documents.embed_max_threads;
+            }
+            Ok(config)
         }
         other => Err(ConfigError::UnknownSchema(other.to_string())),
     }
@@ -287,6 +301,53 @@ mod tests {
         assert_eq!(
             overridden.resources.embed_batch_size, 8,
             "an explicit embed_batch_size = 8 is honored"
+        );
+    }
+
+    /// `#[serde(default)]` fills a missing `resources.embed_threads` with the nonzero app default,
+    /// which would silently retire the deprecated alias. `parse_str` carries the alias across only
+    /// when the key itself is absent, so all three precedence cases below stay distinguishable.
+    #[test]
+    fn deprecated_embed_threads_alias_survives_unset_resources_key() {
+        let alias_only = parse_str("\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n")
+            .expect("a documents-only config is valid");
+        assert_eq!(
+            alias_only
+                .resources
+                .effective_embed_threads(alias_only.documents.embed_max_threads),
+            8,
+            "a file that only sets the deprecated alias keeps it"
+        );
+
+        let with_other_resources = parse_str(
+            "\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n[resources]\nmax_footprint_mb = 6144\n",
+        )
+        .expect("[resources] max_footprint_mb is a valid field");
+        assert_eq!(
+            with_other_resources
+                .resources
+                .effective_embed_threads(with_other_resources.documents.embed_max_threads),
+            8,
+            "unrelated [resources] keys must not retire the alias"
+        );
+
+        let explicit =
+            parse_str("\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n[resources]\nembed_threads = 4\n")
+                .expect("[resources] embed_threads is a valid field");
+        assert_eq!(
+            explicit
+                .resources
+                .effective_embed_threads(explicit.documents.embed_max_threads),
+            4,
+            "an explicit nonzero [resources].embed_threads still wins"
+        );
+
+        let no_alias = parse_str("\"$schema\" = \"v1\"\n[resources]\nembed_batch_size = 8\n")
+            .expect("[resources] embed_batch_size is a valid field");
+        assert_eq!(
+            no_alias.resources.effective_embed_threads(0),
+            2,
+            "with the alias unset the 8 GiB default still applies"
         );
     }
 
