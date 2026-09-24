@@ -274,10 +274,10 @@ mod tests {
     fn resources_section_parses_embed_batch_size_and_defaults_when_absent() {
         let default_cfg = parse_str("\"$schema\" = \"v1\"\n").unwrap();
         assert_eq!(
-            default_cfg.resources.embed_batch_size, 32,
-            "embed_batch_size defaults to 32 when [resources] is absent"
+            default_cfg.resources.embed_batch_size, 16,
+            "embed_batch_size defaults to 16 when [resources] is absent"
         );
-        assert_eq!(default_cfg.resources.scan_threads, 0);
+        assert_eq!(default_cfg.resources.scan_threads, 2);
         assert_eq!(
             default_cfg.resources.document_models,
             crate::config::DocumentModelProfile::Full

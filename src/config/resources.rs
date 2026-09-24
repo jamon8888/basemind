@@ -505,7 +505,14 @@ mod tests {
             ..ResourcesConfig::default()
         };
         assert_eq!(cfg.effective_embed_threads(8), 4);
+        // Default pins embed_threads=2 (8 GiB default), which wins over the alias.
         let cfg = ResourcesConfig::default();
+        assert_eq!(cfg.effective_embed_threads(8), 2);
+        // Explicit auto (0) falls through to the deprecated alias.
+        let cfg = ResourcesConfig {
+            embed_threads: 0,
+            ..ResourcesConfig::default()
+        };
         assert_eq!(cfg.effective_embed_threads(8), 8);
         assert_eq!(cfg.effective_embed_threads(0), 0);
     }
