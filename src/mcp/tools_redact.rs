@@ -1,10 +1,11 @@
 //! The `redact_text` domain tool — redacts arbitrary text through the same
 //! xberg pipeline as document extraction.
 //!
-//! Flow: extract bytes as plain text (no redaction) → snapshot the original
-//! content → `redact_capturing_rehydration_map` (rewrites the document and
-//! captures the token map) → return `{redacted_text, rehydration_map,
-//! detections}` so the caller can store the map and send redacted text onward.
+//! Flow: obtain content (inline `text`, or `file_path` extracted by xberg —
+//! any format incl. images via OCR) → snapshot the original content →
+//! `redact_capturing_rehydration_map` (rewrites the document and captures the
+//! token map) → return `{redacted_text, rehydration_map, detections}` so the
+//! caller can store the map and send redacted text onward.
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,9 +22,13 @@ use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
-    /// Text to redact.
+    /// Text to redact. Mutually exclusive with `file_path`.
     #[serde(default)]
     pub text: String,
+    /// File to extract and redact instead of `text` — any format xberg
+    /// supports (PDF, Office, HTML, email, images via OCR). Filesystem path.
+    #[serde(default)]
+    pub file_path: Option<String>,
     /// PII categories to redact (for example `email`, `phone`). Empty = all
     /// categories supported by the engine.
     #[serde(default)]
@@ -43,7 +48,7 @@ pub struct RedactTextParams {
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
-        description = "Redact arbitrary text using the same pipeline as document extraction. Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -90,15 +95,41 @@ fn oversized_err(len: usize) -> McpError {
 }
 
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
-    if args.text.len() > MAX_BYTES {
-        return Err(oversized_err(args.text.len()));
-    }
-    if args.text.is_empty() {
-        return Err(McpError::internal_error(
-            "redact_text requires non-empty text".to_string(),
-            None,
-        ));
-    }
+    let input = match args.file_path.as_deref() {
+        Some(path) => {
+            if !args.text.is_empty() {
+                return Err(McpError::internal_error(
+                    "redact_text accepts either text or file_path, not both".to_string(),
+                    None,
+                ));
+            }
+            let meta = std::fs::metadata(path)
+                .map_err(|e| McpError::internal_error(format!("cannot read {path}: {e}"), None))?;
+            if !meta.is_file() {
+                return Err(McpError::internal_error(
+                    format!("{path} is not a regular file"),
+                    None,
+                ));
+            }
+            ExtractInput::from_uri(path.to_string())
+        }
+        None => {
+            if args.text.len() > MAX_BYTES {
+                return Err(oversized_err(args.text.len()));
+            }
+            if args.text.is_empty() {
+                return Err(McpError::internal_error(
+                    "redact_text requires non-empty text or file_path".to_string(),
+                    None,
+                ));
+            }
+            ExtractInput::from_bytes(
+                args.text.into_bytes(),
+                "text/plain",
+                Some("input.txt".to_string()),
+            )
+        }
+    };
 
     let strategy = match args.strategy.as_deref() {
         None | Some("token-replace") => RedactionStrategy::TokenReplace,
@@ -162,7 +193,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         ..Default::default()
     };
 
-    let input = ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()));
     let mut extraction = extract(input, &extraction_config)
         .await
         .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
@@ -170,6 +200,18 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .results
         .pop()
         .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?;
+    // Extracted content (e.g. OCR of a large image) must honor the same cap
+    // as inline text — checked after extraction because only then is the
+    // byte length known.
+    if doc.content.len() > MAX_BYTES {
+        return Err(oversized_err(doc.content.len()));
+    }
+    if doc.content.is_empty() {
+        return Err(McpError::internal_error(
+            "redact_text extracted no text from the given input".to_string(),
+            None,
+        ));
+    }
     let original = doc.content.clone();
 
     let map = redaction::redact_capturing_rehydration_map(&mut doc, &redaction_config)
@@ -203,3 +245,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "detections": detections
     })))
 }
+
+#[cfg(test)]
+#[path = "redact_file_tests.rs"]
+mod redact_file_tests;
