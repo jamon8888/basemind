@@ -52,7 +52,7 @@ impl Daemon {
             .env(http_frontend::HTTP_ADDR_ENV, "127.0.0.1:0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("spawn comms daemon");
         let daemon = Self {
@@ -107,16 +107,31 @@ impl Drop for Daemon {
 }
 
 /// Connect a client whose Hello carries `root` as cwd, so the daemon auto-registers that workspace.
+///
+/// Respawn is refused rather than defaulted. `CommsClient::connect` wires
+/// `singleton::spawn_detached_daemon` into `request`'s single-shot reconnect, which fires exactly
+/// when a lifecycle test kills the broker. That resurrects a *detached* daemon this file's `Child`
+/// handles never track: it keeps the socket answering, so phase 2's `Daemon::start` sees an alive
+/// socket and returns a dead child, and its in-flight work holds the workspace store lock the
+/// second rescan needs — the CI symptom this avoids (both `full` legs parked in
+/// `sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly` until the 135-minute job
+/// timeout). A refused spawn surfaces as an ordinary `Err` on the in-flight RPC instead. ~keep
 async fn connect(socket: &Path, agent: &str, root: &Path) -> CommsClient {
     let paths = CommsPaths {
         comms_dir: socket.parent().expect("socket parent").to_path_buf(),
         socket_path: socket.to_path_buf(),
     };
-    CommsClient::connect(
+    CommsClient::connect_with_respawn(
         &paths,
         AgentId::parse(agent).expect("agent id"),
         None,
         Some(root.to_path_buf()),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "lifecycle tests never auto-respawn a daemon",
+            ))
+        },
     )
     .await
     .unwrap_or_else(|e| panic!("connect {agent}: {e}"))
@@ -659,6 +674,15 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     std::fs::create_dir_all(&comms_dir).expect("mkdir comms");
     let repo = tmp.path().join("repo");
     init_heavy_git_repo(&repo, HEAVY_FILES, HEAVY_FNS_PER_FILE);
+    // Opt out of the footprint gate: `auto` resolves against the container's cgroup, which counts ~keep
+    // every process in the job rather than the daemon, so a shared CI runner sits over the ceiling, ~keep
+    // the scan drive collapses to a single worker, and this debug-build pass outlives its own ~keep
+    // diagnosis bound. This test covers lifecycle, not memory backpressure. ~keep
+    std::fs::write(
+        repo.join("basemind.toml"),
+        "\"$schema\" = \"v1\"\n\n[resources]\nmax_footprint_mb = \"off\"\n",
+    )
+    .expect("write workspace config");
 
     let socket = comms_socket_path(&comms_dir);
     let mut child = Command::new(BIN)
@@ -667,7 +691,7 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
         .env("BASEMIND_DATA_HOME", &comms_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn comms daemon");
     let ready_by = Instant::now() + Duration::from_secs(10);
@@ -718,10 +742,35 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     let daemon = Daemon::start(&comms_dir);
     let socket = daemon.socket().to_path_buf();
     let mut client = connect(&socket, "agent-sigterm-2", &repo).await;
-    let report = client
-        .rescan(repo.clone(), None, true, false)
-        .await
-        .expect("a full rescan after the interrupted pass must succeed");
+    // Bounded: `send_and_await` waits on the response frame forever, so a daemon that never ~keep
+    // answers parked this test for the rest of the 135-minute job budget instead of failing. The ~keep
+    // pass itself measures ~23s in a debug build, so 30 minutes is a diagnosis bound, not a ~keep
+    // performance assumption. ~keep
+    let report = match tokio::time::timeout(
+        Duration::from_secs(1800),
+        client.rescan(repo.clone(), None, true, false),
+    )
+    .await
+    {
+        Ok(result) => result.expect("a full rescan after the interrupted pass must succeed"),
+        Err(_) => {
+            // Separate "the daemon is wedged" from "only this link's in-flight rescan never
+            // returns": a fresh link that answers in time proves the reactor is alive and the
+            // blocking scan itself is what never finishes. ~keep
+            let probe = tokio::time::timeout(Duration::from_secs(30), async {
+                let alive = probe_alive(&socket);
+                let mut other = connect(&socket, "agent-sigterm-probe", &repo).await;
+                let detail = match tokio::time::timeout(Duration::from_secs(5), other.status()).await {
+                    Ok(Ok(_)) => "answered".to_string(),
+                    Ok(Err(error)) => format!("error: {error}"),
+                    Err(_) => "timed out".to_string(),
+                };
+                format!("daemon_alive={alive} fresh_link_status={detail}")
+            })
+            .await;
+            panic!("the post-interrupt full rescan never answered within 30 minutes: probe={probe:?}");
+        }
+    };
     assert!(
         report.scanned >= HEAVY_FILES,
         "the interrupted index must reopen cleanly and the full rescan cover every file, got scanned={}",

@@ -691,10 +691,10 @@ precise_resolution = true
 enabled = true
 # Embed documents for semantic search (ON — embeddings pay off on real prose / OCR).
 embed = true
-# Model preset: fast | balanced (default, 768-dim) | quality | multilingual.
+# Model preset: fast | balanced | quality | multilingual (default, 768-dim, 100+ langs).
 # Changing the preset forces a FULL RE-EMBED of the corpus (time + CPU): every document is
 # re-encoded at the new model's dimension.
-embedding_preset = "balanced"
+embedding_preset = "multilingual"
 # Documents that are extracted + indexed but never embedded (keyword-only).
 embed_exclude = []
 # Route archives (.zip/.tar/.jar/…) into the recursive extractor. Off by default so one archive

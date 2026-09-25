@@ -49,13 +49,13 @@ pub struct DocumentsConfig {
     #[serde(default = "DocumentsConfig::default_overlap")]
     #[schemars(range(min = 0))]
     pub overlap: usize,
-    /// Xberg embedding preset name. Defaults to "balanced".
+    /// Xberg embedding preset name. Defaults to "multilingual"
+    /// (multilingual-e5-base, 768-dim, 100+ languages).
     ///
-    /// EU/GDPR workspaces should opt into `embedding_preset = "multilingual"`
-    /// (multilingual-e5-base, 768-dim) instead. The default stays "balanced"
-    /// deliberately: the preset feeds the LanceDB `(dim, embedding_model,
-    /// schema_ver)` triple, so flipping it wipes and re-embeds every existing
-    /// workspace index — an opt-in, not a silent migration.
+    /// The preset feeds the LanceDB `(dim, embedding_model, schema_ver)` triple,
+    /// so changing it wipes and re-embeds every existing workspace index — pick
+    /// deliberately before indexing. Set `embedding_preset = "balanced"` for an
+    /// English-focused 768-dim alternative.
     #[serde(default = "DocumentsConfig::default_embedding_preset")]
     pub embedding_preset: String,
     /// Generate embeddings (`true`) or skip vector storage entirely (`false`).
@@ -120,7 +120,7 @@ impl DocumentsConfig {
         100
     }
     fn default_embedding_preset() -> String {
-        "fast".to_string()
+        "multilingual".to_string()
     }
     fn default_embed() -> bool {
         true
@@ -930,9 +930,9 @@ mod tests {
     }
 
     #[test]
-    fn embedding_preset_default_stays_balanced() {
-        // Flipping the preset changes the LanceDB dim triple and wipes every
-        // existing index — EU workspaces opt into "multilingual" explicitly.
-        assert_eq!(DocumentsConfig::default().embedding_preset, "balanced");
+    fn embedding_preset_default_is_multilingual() {
+        // Changing the preset changes the LanceDB dim triple and wipes every
+        // existing index — pick the default deliberately before first index.
+        assert_eq!(DocumentsConfig::default().embedding_preset, "multilingual");
     }
 }

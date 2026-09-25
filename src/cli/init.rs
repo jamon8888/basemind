@@ -93,10 +93,10 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # Embedding model preset. Changing it forces a FULL RE-EMBED of the corpus (time + CPU): every
 # document is re-encoded at the new model's dimension.
 #   fast        — smallest / fastest, lowest quality
-#   balanced    — default; 768-dim, good quality/cost tradeoff
+#   balanced    — English-focused 768-dim, good quality/cost tradeoff
 #   quality     — larger model, best English quality, slower
-#   multilingual— multilingual model for non-English corpora
-# embedding_preset = "balanced"
+#   multilingual— default; multilingual model for 100+ languages
+# embedding_preset = "multilingual"
 # Globs for documents that are still extracted + indexed but NOT embedded (keyword-only).
 # embed_exclude = []
 # Route archives (.zip/.tar/.jar/…) into the recursive archive extractor. Off by default so one
