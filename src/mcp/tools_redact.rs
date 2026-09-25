@@ -106,10 +106,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             let meta = std::fs::metadata(path)
                 .map_err(|e| McpError::internal_error(format!("cannot read {path}: {e}"), None))?;
             if !meta.is_file() {
-                return Err(McpError::internal_error(
-                    format!("{path} is not a regular file"),
-                    None,
-                ));
+                return Err(McpError::internal_error(format!("{path} is not a regular file"), None));
             }
             ExtractInput::from_uri(path.to_string())
         }
@@ -123,11 +120,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                     None,
                 ));
             }
-            ExtractInput::from_bytes(
-                args.text.into_bytes(),
-                "text/plain",
-                Some("input.txt".to_string()),
-            )
+            ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()))
         }
     };
 

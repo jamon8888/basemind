@@ -35,7 +35,10 @@ async fn text_param_still_redacts() {
         .expect("redact_text succeeds");
     let payload = json_of(&result);
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
-    assert!(!redacted.contains("alice@example.com"), "PII must be redacted: {redacted}");
+    assert!(
+        !redacted.contains("alice@example.com"),
+        "PII must be redacted: {redacted}"
+    );
     assert!(
         !payload["rehydration_map"].as_object().expect("map").is_empty(),
         "rehydration_map must capture the original"
