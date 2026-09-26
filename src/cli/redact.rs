@@ -39,6 +39,10 @@ pub struct RedactArgs {
     #[arg(long = "custom-pattern", value_name = "LABEL,REGEX")]
     pub custom_patterns: Vec<String>,
 
+    /// Local GLiNER2 model directory for person/organization/location NER. A missing dir degrades to pattern-only redaction.
+    #[arg(long, value_name = "DIR")]
+    pub ner_model_dir: Option<String>,
+
     /// Output machine-readable JSON regardless of TTY.
     #[arg(long)]
     pub json: bool,
@@ -79,6 +83,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         strategy: Some(args.strategy.clone()),
         custom_terms: parse_pairs(args.custom_terms.clone())?,
         custom_patterns: parse_pairs(args.custom_patterns.clone())?,
+        ner_model_dir: args.ner_model_dir.clone(),
     };
 
     let result = server

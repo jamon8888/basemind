@@ -43,6 +43,12 @@ pub struct RedactTextParams {
     /// Custom regex patterns to redact. Each entry is `["label", "regex"]`.
     #[serde(default)]
     pub custom_patterns: Vec<Vec<String>>,
+    /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
+    /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
+    /// person/organization/location mentions for redaction; a missing or
+    /// unloadable model degrades to pattern-only redaction instead of failing.
+    #[serde(default)]
+    pub ner_model_dir: Option<String>,
 }
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
@@ -137,7 +143,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         }
     };
 
-    let custom_terms: Vec<RedactionCustomTerm> = args
+    let mut custom_terms: Vec<RedactionCustomTerm> = args
         .custom_terms
         .into_iter()
         .filter_map(|t| {
@@ -169,18 +175,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
-    let basemind_config = RedactionConfig {
-        enabled: true,
-        categories: args.categories,
-        strategy,
-        custom_terms,
-        custom_patterns,
-        ..Default::default()
-    };
-    let redaction_config = basemind_config
-        .to_xberg()
-        .ok_or_else(|| McpError::internal_error("failed to convert redaction config".to_string(), None))?;
-
     let extraction_config = xberg::core::config::ExtractionConfig {
         redaction: None,
         ..Default::default()
@@ -207,6 +201,46 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     }
     let original = doc.content.clone();
 
+    // #37 GLiNER2: label person/organisation/location mentions before redaction.
+    // Every failure mode (missing model dir, unloadable model, inference error,
+    // build without `ner-candle`) degrades to pattern-only redaction.
+    let ner_entities = dedup_overlapping(run_ner(args.ner_model_dir.as_deref(), &original).await);
+    let ner_confidence: std::collections::HashMap<(u32, u32), f32> = ner_entities
+        .iter()
+        .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
+        .collect();
+    let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
+        .iter()
+        .map(|term| (term.label.clone(), term.value.clone()))
+        .collect();
+    for entity in &ner_entities {
+        let Some(label) = ner_label(&entity.category) else {
+            continue;
+        };
+        if entity.text.is_empty() {
+            continue;
+        }
+        if seen_terms.insert((label.to_string(), entity.text.clone())) {
+            custom_terms.push(RedactionCustomTerm {
+                label: label.to_string(),
+                value: entity.text.clone(),
+                case_sensitive: false,
+            });
+        }
+    }
+
+    let basemind_config = RedactionConfig {
+        enabled: true,
+        categories: args.categories,
+        strategy,
+        custom_terms,
+        custom_patterns,
+        ..Default::default()
+    };
+    let redaction_config = basemind_config
+        .to_xberg()
+        .ok_or_else(|| McpError::internal_error("failed to convert redaction config".to_string(), None))?;
+
     let map = redaction::redact_capturing_rehydration_map(&mut doc, &redaction_config)
         .await
         .map_err(|e| McpError::internal_error(format!("xberg redaction failed: {e}"), None))?;
@@ -215,18 +249,20 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let detections: Vec<serde_json::Value> = findings
         .iter()
         .map(|finding| {
-            let category = serde_json::to_value(&finding.category)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
             let start = finding.start as usize;
             let end = finding.end as usize;
-            serde_json::json!({
-                "category": category,
+            let mut detection = serde_json::json!({
+                "category": detection_category(&finding.category),
                 "start": start,
                 "end": end,
                 "text": original.get(start..end).unwrap_or("")
-            })
+            });
+            // Honest confidence: only NER-derived spans carry one, keyed by the
+            // exact span the model reported; anything else omits the field.
+            if let Some(confidence) = ner_confidence.get(&(finding.start, finding.end)) {
+                detection["confidence"] = serde_json::json!(confidence);
+            }
+            detection
         })
         .collect();
 
@@ -237,6 +273,85 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "rehydration_map": rehydration_map,
         "detections": detections
     })))
+}
+
+/// Plain-string detection category. Native PII categories serialise to
+/// `"person"` already; custom labels (NER terms, `--custom-term`) serialise to
+/// `{"custom": …}`, which naive `as_str` handling would report as "unknown".
+fn detection_category(category: &xberg::types::redaction::PiiCategory) -> String {
+    match serde_json::to_value(category) {
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(serde_json::Value::Object(map)) => map
+            .get("custom")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Entity category → the redaction label safe/ redaction claims. `None` for
+/// categories the pattern engine already covers or safe/ does not claim.
+fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<&'static str> {
+    use xberg::types::entity::EntityCategory;
+    match category {
+        EntityCategory::Person => Some("person"),
+        EntityCategory::Organization => Some("organization"),
+        EntityCategory::Location => Some("location"),
+        _ => None,
+    }
+}
+
+/// Keep the earliest, longest span and drop anything overlapping a kept span,
+/// so one mention redacts once (one token) even when categories disagree.
+fn dedup_overlapping(mut entities: Vec<xberg::types::entity::Entity>) -> Vec<xberg::types::entity::Entity> {
+    entities.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+    let mut kept: Vec<xberg::types::entity::Entity> = Vec::new();
+    'spans: for entity in entities {
+        for span in &kept {
+            if entity.start < span.end && span.start < entity.end {
+                continue 'spans;
+            }
+        }
+        kept.push(entity);
+    }
+    kept
+}
+
+/// Detect person/organisation/location mentions with GLiNER2. Without the
+/// `ner-candle` feature this logs once per call and returns no entities.
+#[cfg(feature = "ner-candle")]
+async fn run_ner(model_dir: Option<&str>, text: &str) -> Vec<xberg::types::entity::Entity> {
+    use xberg::text::ner::NerBackend;
+    use xberg::text::ner::candle::CandleBackend;
+    use xberg::types::entity::EntityCategory;
+    let Some(dir) = model_dir else { return Vec::new() };
+    let categories = [
+        EntityCategory::Person,
+        EntityCategory::Organization,
+        EntityCategory::Location,
+    ];
+    match CandleBackend::get_or_init(std::path::Path::new(dir), None) {
+        Ok(backend) => match backend.detect(text, &categories).await {
+            Ok(entities) => entities,
+            Err(error) => {
+                tracing::warn!(%error, "GLiNER2 NER failed; redacting pattern-only");
+                Vec::new()
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, dir, "GLiNER2 model unavailable; redacting pattern-only");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "ner-candle"))]
+async fn run_ner(model_dir: Option<&str>, _text: &str) -> Vec<xberg::types::entity::Entity> {
+    if let Some(dir) = model_dir {
+        tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
+    }
+    Vec::new()
 }
 
 #[cfg(test)]
