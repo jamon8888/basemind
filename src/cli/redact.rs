@@ -19,7 +19,7 @@ pub struct RedactArgs {
     #[arg(long, conflicts_with = "file")]
     pub text: Option<String>,
 
-    /// File to read and redact. Mutually exclusive with --text. Use `-` for stdin.
+    /// File to extract and redact (any xberg-supported format, incl. images via OCR). Mutually exclusive with --text. Use `-` for stdin.
     #[arg(long, conflicts_with = "text", value_name = "FILE")]
     pub file: Option<String>,
 
@@ -54,23 +54,27 @@ fn parse_pairs(raw: Vec<String>) -> Result<Vec<Vec<String>>> {
         .collect()
 }
 
-fn read_input(args: &RedactArgs) -> Result<String> {
+/// Returns `(text, file_path)`: exactly one of the two is populated. A real
+/// file path is passed through un-read so xberg extracts it (docx, pdf,
+/// images via OCR, …) instead of assuming UTF-8 text.
+fn read_input(args: &RedactArgs) -> Result<(String, Option<String>)> {
     match (&args.text, &args.file) {
-        (Some(t), None) => Ok(t.clone()),
+        (Some(t), None) => Ok((t.clone(), None)),
         (None, Some(f)) if f == "-" => {
             let mut buf = Vec::new();
             std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
-            Ok(String::from_utf8_lossy(&buf).into_owned())
+            Ok((String::from_utf8_lossy(&buf).into_owned(), None))
         }
-        (None, Some(path)) => std::fs::read_to_string(path).with_context(|| format!("read {}", path)),
+        (None, Some(path)) => Ok((String::new(), Some(path.clone()))),
         _ => anyhow::bail!("exactly one of --text or --file is required"),
     }
 }
 
 pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit, out: &mut impl Write) -> Result<()> {
-    let text = read_input(args)?;
+    let (text, file_path) = read_input(args)?;
     let params = RedactTextParams {
         text,
+        file_path,
         categories: args.categories.clone(),
         strategy: Some(args.strategy.clone()),
         custom_terms: parse_pairs(args.custom_terms.clone())?,
