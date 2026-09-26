@@ -229,22 +229,17 @@ mod tests {
         // Deserialize rather than build the struct: serde drops unknown fields,
         // which is exactly how a contract miss goes silent on the wire.
         let params: RedactTextParams =
-            serde_json::from_value(serde_json::json!({ "file_path": file.to_string_lossy() }))
-                .expect("params");
+            serde_json::from_value(serde_json::json!({ "file_path": file.to_string_lossy() })).expect("params");
 
         let result = run_redact(params).await.expect("file redaction");
         let wire = serde_json::to_string(&result).expect("serialize result");
         assert!(wire.contains("redacted_text"), "unexpected payload: {wire}");
-        assert!(
-            !wire.contains("jane.doe@example.com"),
-            "original email leaked: {wire}"
-        );
+        assert!(!wire.contains("jane.doe@example.com"), "original email leaked: {wire}");
     }
 
     #[tokio::test]
     async fn still_requires_some_input() {
-        let params: RedactTextParams =
-            serde_json::from_value(serde_json::json!({})).expect("params");
+        let params: RedactTextParams = serde_json::from_value(serde_json::json!({})).expect("params");
         let err = run_redact(params).await.expect_err("no input must fail");
         assert!(err.to_string().contains("non-empty"), "unexpected: {err}");
     }
