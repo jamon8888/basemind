@@ -24,6 +24,11 @@ pub struct RedactTextParams {
     /// Text to redact.
     #[serde(default)]
     pub text: String,
+    /// File to redact instead of `text`: extracted by xberg (format sniffed
+    /// from the path, including OCR for images) before redaction. `text` is
+    /// ignored when this is set.
+    #[serde(default)]
+    pub file_path: Option<String>,
     /// PII categories to redact (for example `email`, `phone`). Empty = all
     /// categories supported by the engine.
     #[serde(default)]
@@ -93,7 +98,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     if args.text.len() > MAX_BYTES {
         return Err(oversized_err(args.text.len()));
     }
-    if args.text.is_empty() {
+    if args.file_path.is_none() && args.text.is_empty() {
         return Err(McpError::internal_error(
             "redact_text requires non-empty text".to_string(),
             None,
@@ -162,7 +167,14 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         ..Default::default()
     };
 
-    let input = ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()));
+    let input = match &args.file_path {
+        Some(path) => ExtractInput::from_uri(path.clone()),
+        None => ExtractInput::from_bytes(
+            args.text.clone().into_bytes(),
+            "text/plain",
+            Some("input.txt".to_string()),
+        ),
+    };
     let mut extraction = extract(input, &extraction_config)
         .await
         .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
@@ -202,4 +214,38 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "rehydration_map": rehydration_map,
         "detections": detections
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn redacts_a_file_by_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("note.md");
+        std::fs::write(&file, "Reach me at jane.doe@example.com.\n").expect("write");
+
+        // Deserialize rather than build the struct: serde drops unknown fields,
+        // which is exactly how a contract miss goes silent on the wire.
+        let params: RedactTextParams =
+            serde_json::from_value(serde_json::json!({ "file_path": file.to_string_lossy() }))
+                .expect("params");
+
+        let result = run_redact(params).await.expect("file redaction");
+        let wire = serde_json::to_string(&result).expect("serialize result");
+        assert!(wire.contains("redacted_text"), "unexpected payload: {wire}");
+        assert!(
+            !wire.contains("jane.doe@example.com"),
+            "original email leaked: {wire}"
+        );
+    }
+
+    #[tokio::test]
+    async fn still_requires_some_input() {
+        let params: RedactTextParams =
+            serde_json::from_value(serde_json::json!({})).expect("params");
+        let err = run_redact(params).await.expect_err("no input must fail");
+        assert!(err.to_string().contains("non-empty"), "unexpected: {err}");
+    }
 }

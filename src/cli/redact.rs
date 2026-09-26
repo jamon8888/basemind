@@ -71,6 +71,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
     let text = read_input(args)?;
     let params = RedactTextParams {
         text,
+        file_path: None,
         categories: args.categories.clone(),
         strategy: Some(args.strategy.clone()),
         custom_terms: parse_pairs(args.custom_terms.clone())?,
