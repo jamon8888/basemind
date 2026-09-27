@@ -143,6 +143,28 @@ async fn oversized_extracted_content_errors() {
     assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
 }
 
+/// A raw file over the pre-extraction cap is rejected before xberg runs any
+/// PDF/image/OCR work — a sparse file proves the guard fires on the raw
+/// size alone, without paying for 64 MiB of content.
+#[tokio::test]
+async fn raw_file_size_capped_before_extraction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("huge.bin");
+    std::fs::File::create(&file)
+        .expect("create fixture")
+        .set_len(super::MAX_FILE_BYTES + 1)
+        .expect("extend to sparse size");
+
+    let err = run_redact(RedactTextParams {
+        text: String::new(),
+        file_path: Some(file.to_string_lossy().into_owned()),
+        ..text_params("")
+    })
+    .await
+    .expect_err("oversized raw file must fail before extraction");
+    assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
+}
+
 /// NER-derived labels (`person`, `location`, …) surface as plain string
 /// categories in detections — never the `{"custom": …}` object the serde
 /// default renders, which the app-side parser would report as "unknown".
@@ -214,6 +236,30 @@ fn overlapping_ner_spans_dedup_to_one_mention() {
     assert_eq!(kept[0].text, "Alice Smith");
     assert_eq!(kept[0].confidence, Some(0.97));
     assert_eq!(kept[1].text, "Acme");
+}
+
+/// NER spans redact whole words only: a short span like "US" must never
+/// corrupt unrelated words ("because"), and regex metacharacters in a span
+/// must be escaped, not interpreted.
+#[test]
+fn ner_span_patterns_are_boundary_aware_and_escaped() {
+    let us = regex::Regex::new(&super::ner_span_pattern("US")).expect("valid regex");
+    assert!(us.is_match("US policy"));
+    assert!(!us.is_match("because"), "span must not match inside a word");
+
+    let dotted = regex::Regex::new(&super::ner_span_pattern("Acme Corp.")).expect("metacharacters must be escaped");
+    assert!(dotted.is_match("at Acme Corp. HQ"));
+    assert!(
+        dotted.find("Acme CorpX HQ").is_none(),
+        "literal dot must not match any char"
+    );
+
+    let tagged = regex::Regex::new(&super::ner_span_pattern("#42")).expect("valid regex");
+    assert!(tagged.is_match("issue #42 today"), "leading punctuation needs no \\b");
+    assert!(
+        !tagged.is_match("issue #425"),
+        "trailing \\b still bounds the word edge"
+    );
 }
 
 /// Download-gated (#37): set `BASEMIND_NER_MODEL_DIR` to the staged GLiNER2

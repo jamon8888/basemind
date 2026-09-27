@@ -92,6 +92,10 @@ impl BasemindServer {
 }
 
 const MAX_BYTES: usize = 1 << 20; // 1 MiB
+/// Raw `file_path` input cap, checked before extraction. MAX_BYTES bounds only
+/// the extracted text; without this, a huge file reaches xberg's PDF/image/OCR
+/// work before the post-extraction check can reject it.
+const MAX_FILE_BYTES: u64 = 64 << 20; // 64 MiB
 
 fn oversized_err(len: usize) -> McpError {
     McpError::internal_error(
@@ -113,6 +117,12 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                 .map_err(|e| McpError::internal_error(format!("cannot read {path}: {e}"), None))?;
             if !meta.is_file() {
                 return Err(McpError::internal_error(format!("{path} is not a regular file"), None));
+            }
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(McpError::internal_error(
+                    format!("{path} too large: {} bytes (max {MAX_FILE_BYTES})", meta.len()),
+                    None,
+                ));
             }
             ExtractInput::from_uri(path.to_string())
         }
@@ -143,7 +153,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         }
     };
 
-    let mut custom_terms: Vec<RedactionCustomTerm> = args
+    let custom_terms: Vec<RedactionCustomTerm> = args
         .custom_terms
         .into_iter()
         .filter_map(|t| {
@@ -159,7 +169,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
-    let custom_patterns: Vec<RedactionCustomPattern> = args
+    let mut custom_patterns: Vec<RedactionCustomPattern> = args
         .custom_patterns
         .into_iter()
         .filter_map(|p| {
@@ -217,13 +227,15 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         let Some(label) = ner_label(&entity.category) else {
             continue;
         };
-        if entity.text.is_empty() {
+        if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
             continue;
         }
         if seen_terms.insert((label.to_string(), entity.text.clone())) {
-            custom_terms.push(RedactionCustomTerm {
+            // Boundary-aware regex, not a literal term: xberg matches terms as
+            // substrings, so a span like "US" would corrupt every "because".
+            custom_patterns.push(RedactionCustomPattern {
                 label: label.to_string(),
-                value: entity.text.clone(),
+                pattern: ner_span_pattern(&entity.text),
                 case_sensitive: false,
             });
         }
@@ -300,6 +312,26 @@ fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<&'static
         EntityCategory::Location => Some("location"),
         _ => None,
     }
+}
+
+/// NER spans shorter than this are dropped: even whole-word, case-insensitive
+/// hits on 1-2 char spans ("us", "go") are noise that would shred the mirror.
+const MIN_NER_SPAN_CHARS: usize = 3;
+
+/// Boundary-aware escaped pattern for a NER span, so matches stay whole-word.
+/// `\b` is emitted only at edges that start/end a word char — a span ending
+/// in punctuation ("Acme Corp.") needs no trailing `\b`, and one there would
+/// never match (no boundary exists between `.` and a space).
+fn ner_span_pattern(text: &str) -> String {
+    let escaped = regex::escape(text);
+    let start = if text.starts_with(is_regex_word) { r"\b" } else { "" };
+    let end = if text.ends_with(is_regex_word) { r"\b" } else { "" };
+    format!("{start}{escaped}{end}")
+}
+
+/// Mirrors the regex crate's `\w` (word char) definition for edge decisions.
+fn is_regex_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Keep the earliest, longest span and drop anything overlapping a kept span,
