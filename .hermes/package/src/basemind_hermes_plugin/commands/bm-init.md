@@ -7,7 +7,7 @@ argument-hint: [capabilities…]
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
 Content-Hash: blake3:e5682e8a1c3a00e1d15399c8b7d16a1cb2ce36f5c541da9c84b2104eeb4a6794
-Source-Hash: blake3:3ed4133f74e7685e8e6e1c0e625efe906590d6104dde79ee9fca6504a7128874
+Source-Hash: blake3:31ac15f30699f30d0dc59af1b4dd93c18a08fc45c4cac0b41d6f019110e4f246
 Schema-Version: v1
 -->
 

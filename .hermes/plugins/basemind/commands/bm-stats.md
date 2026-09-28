@@ -7,7 +7,7 @@ argument-hint: [today|1h|24h|all]
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
 Content-Hash: blake3:de8ef18a77f3c93ea82270ed4f99190e5e326150572aa185c5b5496f7b5c4df9
-Source-Hash: blake3:3ed4133f74e7685e8e6e1c0e625efe906590d6104dde79ee9fca6504a7128874
+Source-Hash: blake3:31ac15f30699f30d0dc59af1b4dd93c18a08fc45c4cac0b41d6f019110e4f246
 Schema-Version: v1
 -->
 
