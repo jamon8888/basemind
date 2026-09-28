@@ -184,6 +184,9 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             }
         })
         .collect();
+    // Phone formats xberg's built-in pattern misses (international `+CC`
+    // grouping, French pairs) — always on, like the pattern engine itself.
+    custom_patterns.extend(RedactionConfig::phone_patterns());
 
     let extraction_config = xberg::core::config::ExtractionConfig {
         redaction: None,

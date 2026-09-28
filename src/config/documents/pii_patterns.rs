@@ -5,6 +5,27 @@
 
 use super::RedactionCustomPattern;
 
+/// Phone formats xberg's built-in phone pattern misses. That pattern opens
+/// with `\b`, which never matches before a `+` preceded by a space, and it
+/// expects 3–4 digit blocks, so neither `+33 6 12 34 56 78` nor the French
+/// national `06 12 34 56 78` is detected. Kept tight to avoid dates/amounts:
+/// the international form needs a `+` and at least two further 2–4 digit
+/// groups; the national form is exactly `0X` plus four digit pairs.
+pub fn phone_patterns() -> Vec<RedactionCustomPattern> {
+    vec![
+        RedactionCustomPattern {
+            label: "phone".into(),
+            pattern: r"\+\d{1,3}[ .\-]?(?:\(0\)[ .\-]?)?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,5}\b".into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "phone".into(),
+            pattern: r"\b0[1-9](?:[ .\-]?\d{2}){4}\b".into(),
+            case_sensitive: false,
+        },
+    ]
+}
+
 /// Returns all EU national ID patterns as `RedactionCustomPattern` entries,
 /// ready to append to `custom_patterns`. These cover the 6 EU countries missing
 /// from xberg's built-in set: FR NIR, NL BSN, BE NISS, AT SVNR, IE PPS, PT NIF.
