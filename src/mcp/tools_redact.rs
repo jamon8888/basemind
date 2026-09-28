@@ -1,10 +1,11 @@
 //! The `redact_text` domain tool — redacts arbitrary text through the same
 //! xberg pipeline as document extraction.
 //!
-//! Flow: extract bytes as plain text (no redaction) → snapshot the original
-//! content → `redact_capturing_rehydration_map` (rewrites the document and
-//! captures the token map) → return `{redacted_text, rehydration_map,
-//! detections}` so the caller can store the map and send redacted text onward.
+//! Flow: obtain content (inline `text`, or `file_path` extracted by xberg —
+//! any format incl. images via OCR) → snapshot the original content →
+//! `redact_capturing_rehydration_map` (rewrites the document and captures the
+//! token map) → return `{redacted_text, rehydration_map, detections}` so the
+//! caller can store the map and send redacted text onward.
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -21,9 +22,13 @@ use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
-    /// Text to redact.
+    /// Text to redact. Mutually exclusive with `file_path`.
     #[serde(default)]
     pub text: String,
+    /// File to extract and redact instead of `text` — any format xberg
+    /// supports (PDF, Office, HTML, email, images via OCR). Filesystem path.
+    #[serde(default)]
+    pub file_path: Option<String>,
     /// PII categories to redact (for example `email`, `phone`). Empty = all
     /// categories supported by the engine.
     #[serde(default)]
@@ -38,12 +43,18 @@ pub struct RedactTextParams {
     /// Custom regex patterns to redact. Each entry is `["label", "regex"]`.
     #[serde(default)]
     pub custom_patterns: Vec<Vec<String>>,
+    /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
+    /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
+    /// person/organization/location mentions for redaction; a missing or
+    /// unloadable model degrades to pattern-only redaction instead of failing.
+    #[serde(default)]
+    pub ner_model_dir: Option<String>,
 }
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
-        description = "Redact arbitrary text using the same pipeline as document extraction. Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -81,6 +92,10 @@ impl BasemindServer {
 }
 
 const MAX_BYTES: usize = 1 << 20; // 1 MiB
+/// Raw `file_path` input cap, checked before extraction. MAX_BYTES bounds only
+/// the extracted text; without this, a huge file reaches xberg's PDF/image/OCR
+/// work before the post-extraction check can reject it.
+const MAX_FILE_BYTES: u64 = 64 << 20; // 64 MiB
 
 fn oversized_err(len: usize) -> McpError {
     McpError::internal_error(
@@ -90,15 +105,40 @@ fn oversized_err(len: usize) -> McpError {
 }
 
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
-    if args.text.len() > MAX_BYTES {
-        return Err(oversized_err(args.text.len()));
-    }
-    if args.text.is_empty() {
-        return Err(McpError::internal_error(
-            "redact_text requires non-empty text".to_string(),
-            None,
-        ));
-    }
+    let input = match args.file_path.as_deref() {
+        Some(path) => {
+            if !args.text.is_empty() {
+                return Err(McpError::internal_error(
+                    "redact_text accepts either text or file_path, not both".to_string(),
+                    None,
+                ));
+            }
+            let meta = std::fs::metadata(path)
+                .map_err(|e| McpError::internal_error(format!("cannot read {path}: {e}"), None))?;
+            if !meta.is_file() {
+                return Err(McpError::internal_error(format!("{path} is not a regular file"), None));
+            }
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(McpError::internal_error(
+                    format!("{path} too large: {} bytes (max {MAX_FILE_BYTES})", meta.len()),
+                    None,
+                ));
+            }
+            ExtractInput::from_uri(path.to_string())
+        }
+        None => {
+            if args.text.len() > MAX_BYTES {
+                return Err(oversized_err(args.text.len()));
+            }
+            if args.text.is_empty() {
+                return Err(McpError::internal_error(
+                    "redact_text requires non-empty text or file_path".to_string(),
+                    None,
+                ));
+            }
+            ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()))
+        }
+    };
 
     let strategy = match args.strategy.as_deref() {
         None | Some("token-replace") => RedactionStrategy::TokenReplace,
@@ -129,7 +169,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
-    let custom_patterns: Vec<RedactionCustomPattern> = args
+    let mut custom_patterns: Vec<RedactionCustomPattern> = args
         .custom_patterns
         .into_iter()
         .filter_map(|p| {
@@ -145,6 +185,62 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
+    let extraction_config = xberg::core::config::ExtractionConfig {
+        redaction: None,
+        ..Default::default()
+    };
+
+    let mut extraction = extract(input, &extraction_config)
+        .await
+        .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
+    let mut doc = extraction
+        .results
+        .pop()
+        .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?;
+    // Extracted content (e.g. OCR of a large image) must honor the same cap
+    // as inline text — checked after extraction because only then is the
+    // byte length known.
+    if doc.content.len() > MAX_BYTES {
+        return Err(oversized_err(doc.content.len()));
+    }
+    if doc.content.is_empty() {
+        return Err(McpError::internal_error(
+            "redact_text extracted no text from the given input".to_string(),
+            None,
+        ));
+    }
+    let original = doc.content.clone();
+
+    // #37 GLiNER2: label person/organisation/location mentions before redaction.
+    // Every failure mode (missing model dir, unloadable model, inference error,
+    // build without `ner-candle`) degrades to pattern-only redaction.
+    let ner_entities = dedup_overlapping(run_ner(args.ner_model_dir.as_deref(), &original).await);
+    let ner_confidence: std::collections::HashMap<(u32, u32), f32> = ner_entities
+        .iter()
+        .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
+        .collect();
+    let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
+        .iter()
+        .map(|term| (term.label.clone(), term.value.clone()))
+        .collect();
+    for entity in &ner_entities {
+        let Some(label) = ner_label(&entity.category) else {
+            continue;
+        };
+        if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
+            continue;
+        }
+        if seen_terms.insert((label.to_string(), entity.text.clone())) {
+            // Boundary-aware regex, not a literal term: xberg matches terms as
+            // substrings, so a span like "US" would corrupt every "because".
+            custom_patterns.push(RedactionCustomPattern {
+                label: label.to_string(),
+                pattern: ner_span_pattern(&entity.text),
+                case_sensitive: false,
+            });
+        }
+    }
+
     let basemind_config = RedactionConfig {
         enabled: true,
         categories: args.categories,
@@ -157,21 +253,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .to_xberg()
         .ok_or_else(|| McpError::internal_error("failed to convert redaction config".to_string(), None))?;
 
-    let extraction_config = xberg::core::config::ExtractionConfig {
-        redaction: None,
-        ..Default::default()
-    };
-
-    let input = ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()));
-    let mut extraction = extract(input, &extraction_config)
-        .await
-        .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
-    let mut doc = extraction
-        .results
-        .pop()
-        .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?;
-    let original = doc.content.clone();
-
     let map = redaction::redact_capturing_rehydration_map(&mut doc, &redaction_config)
         .await
         .map_err(|e| McpError::internal_error(format!("xberg redaction failed: {e}"), None))?;
@@ -180,18 +261,20 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let detections: Vec<serde_json::Value> = findings
         .iter()
         .map(|finding| {
-            let category = serde_json::to_value(&finding.category)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .unwrap_or_else(|| "unknown".to_string());
             let start = finding.start as usize;
             let end = finding.end as usize;
-            serde_json::json!({
-                "category": category,
+            let mut detection = serde_json::json!({
+                "category": detection_category(&finding.category),
                 "start": start,
                 "end": end,
                 "text": original.get(start..end).unwrap_or("")
-            })
+            });
+            // Honest confidence: only NER-derived spans carry one, keyed by the
+            // exact span the model reported; anything else omits the field.
+            if let Some(confidence) = ner_confidence.get(&(finding.start, finding.end)) {
+                detection["confidence"] = serde_json::json!(confidence);
+            }
+            detection
         })
         .collect();
 
@@ -203,3 +286,106 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "detections": detections
     })))
 }
+
+/// Plain-string detection category. Native PII categories serialise to
+/// `"person"` already; custom labels (NER terms, `--custom-term`) serialise to
+/// `{"custom": …}`, which naive `as_str` handling would report as "unknown".
+fn detection_category(category: &xberg::types::redaction::PiiCategory) -> String {
+    match serde_json::to_value(category) {
+        Ok(serde_json::Value::String(label)) => label,
+        Ok(serde_json::Value::Object(map)) => map
+            .get("custom")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Entity category → the redaction label safe/ redaction claims. `None` for
+/// categories the pattern engine already covers or safe/ does not claim.
+fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<&'static str> {
+    use xberg::types::entity::EntityCategory;
+    match category {
+        EntityCategory::Person => Some("person"),
+        EntityCategory::Organization => Some("organization"),
+        EntityCategory::Location => Some("location"),
+        _ => None,
+    }
+}
+
+/// NER spans shorter than this are dropped: even whole-word, case-insensitive
+/// hits on 1-2 char spans ("us", "go") are noise that would shred the mirror.
+const MIN_NER_SPAN_CHARS: usize = 3;
+
+/// Boundary-aware escaped pattern for a NER span, so matches stay whole-word.
+/// `\b` is emitted only at edges that start/end a word char — a span ending
+/// in punctuation ("Acme Corp.") needs no trailing `\b`, and one there would
+/// never match (no boundary exists between `.` and a space).
+fn ner_span_pattern(text: &str) -> String {
+    let escaped = regex::escape(text);
+    let start = if text.starts_with(is_regex_word) { r"\b" } else { "" };
+    let end = if text.ends_with(is_regex_word) { r"\b" } else { "" };
+    format!("{start}{escaped}{end}")
+}
+
+/// Mirrors the regex crate's `\w` (word char) definition for edge decisions.
+fn is_regex_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Keep the earliest, longest span and drop anything overlapping a kept span,
+/// so one mention redacts once (one token) even when categories disagree.
+fn dedup_overlapping(mut entities: Vec<xberg::types::entity::Entity>) -> Vec<xberg::types::entity::Entity> {
+    entities.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
+    let mut kept: Vec<xberg::types::entity::Entity> = Vec::new();
+    'spans: for entity in entities {
+        for span in &kept {
+            if entity.start < span.end && span.start < entity.end {
+                continue 'spans;
+            }
+        }
+        kept.push(entity);
+    }
+    kept
+}
+
+/// Detect person/organisation/location mentions with GLiNER2. Without the
+/// `ner-candle` feature this logs once per call and returns no entities.
+#[cfg(feature = "ner-candle")]
+async fn run_ner(model_dir: Option<&str>, text: &str) -> Vec<xberg::types::entity::Entity> {
+    use xberg::text::ner::NerBackend;
+    use xberg::text::ner::candle::CandleBackend;
+    use xberg::types::entity::EntityCategory;
+    let Some(dir) = model_dir else { return Vec::new() };
+    let categories = [
+        EntityCategory::Person,
+        EntityCategory::Organization,
+        EntityCategory::Location,
+    ];
+    match CandleBackend::get_or_init(std::path::Path::new(dir), None) {
+        Ok(backend) => match backend.detect(text, &categories).await {
+            Ok(entities) => entities,
+            Err(error) => {
+                tracing::warn!(%error, "GLiNER2 NER failed; redacting pattern-only");
+                Vec::new()
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, dir, "GLiNER2 model unavailable; redacting pattern-only");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "ner-candle"))]
+async fn run_ner(model_dir: Option<&str>, _text: &str) -> Vec<xberg::types::entity::Entity> {
+    if let Some(dir) = model_dir {
+        tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+#[path = "redact_file_tests.rs"]
+mod redact_file_tests;

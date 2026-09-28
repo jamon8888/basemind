@@ -107,7 +107,12 @@ code-intel = ["code-intel-js", "code-intel-stack"]
 agent-tui = []
 desktop-ui = []
 
-full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search"]
+# GLiNER2 candle NER backend for redact_text person/organization/location (#37).
+# Degrades to pattern-only redaction when the model dir is missing or the tool
+# is called without `ner_model_dir`.
+ner-candle = ["documents", "xberg/ner-candle-backend"]
+
+full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search", "ner-candle"]
 
 test-support = ["dep:tempfile"]
 
