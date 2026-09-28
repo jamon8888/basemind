@@ -304,3 +304,41 @@ async fn ner_model_dir_detects_entities_with_confidence() {
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
 }
+
+/// xberg's built-in phone pattern misses these formats (a `+` after a space
+/// defeats its leading `\b`; French numbers are written in digit pairs).
+#[tokio::test]
+async fn international_and_french_phone_formats_redact() {
+    for phone in [
+        "+33 6 12 34 56 78",
+        "+33612345678",
+        "06 12 34 56 78",
+        "06.12.34.56.78",
+        "+49 30 1234567",
+        "+44 20 7946 0958",
+        "+33 (0)1 42 68 53 00",
+    ] {
+        let text = format!("Appelez le {phone} demain");
+        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let payload = json_of(&result);
+        let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+        assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
+        let map = payload["rehydration_map"].as_object().expect("map");
+        assert!(
+            map.values().any(|v| v.as_str() == Some(phone)),
+            "rehydration map must hold {phone} verbatim: {map:?}"
+        );
+    }
+}
+
+/// The phone patterns must not swallow dates, amounts or short numbers.
+#[tokio::test]
+async fn phone_patterns_leave_dates_and_amounts_alone() {
+    let text = "Réunion le 28/09/2026 à 14:30, montant 1 234,56 €, dossier 2026-09-28, page 12";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    for kept in ["28/09/2026", "14:30", "1 234,56", "2026-09-28", "page 12"] {
+        assert!(redacted.contains(kept), "{kept} must stay: {redacted}");
+    }
+}

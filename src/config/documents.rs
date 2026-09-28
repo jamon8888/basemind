@@ -366,6 +366,10 @@ impl RedactionConfig {
     pub fn code_security_patterns() -> Vec<RedactionCustomPattern> {
         pii_patterns::code_security_patterns()
     }
+
+    pub fn phone_patterns() -> Vec<RedactionCustomPattern> {
+        pii_patterns::phone_patterns()
+    }
 }
 
 fn default_true() -> bool {
