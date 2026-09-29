@@ -45,8 +45,9 @@ pub struct RedactTextParams {
     pub custom_patterns: Vec<Vec<String>>,
     /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
     /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
-    /// person/organization/location mentions for redaction; a missing or
-    /// unloadable model degrades to pattern-only redaction instead of failing.
+    /// every entry in `GLI_NER2_PII_LABELS` plus `AI_ACT_NER_LABELS` for
+    /// redaction; a missing or unloadable model degrades to pattern-only
+    /// redaction instead of failing.
     #[serde(default)]
     pub ner_model_dir: Option<String>,
 }
@@ -233,16 +234,25 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
             continue;
         }
-        if seen_terms.insert((label.to_string(), entity.text.clone())) {
+        if seen_terms.insert((label.clone(), entity.text.clone())) {
             // Boundary-aware regex, not a literal term: xberg matches terms as
             // substrings, so a span like "US" would corrupt every "because".
             custom_patterns.push(RedactionCustomPattern {
-                label: label.to_string(),
+                label,
                 pattern: ner_span_pattern(&entity.text),
                 case_sensitive: false,
             });
         }
     }
+
+    // AI Act citations ride the same seam: exact literals, so a regex rather
+    // than a zero-shot label. Custom patterns are retained even when the caller
+    // asks for a narrow `categories` list (xberg keeps every `Custom` match).
+    custom_patterns.push(RedactionCustomPattern {
+        label: "ai_act_citation".to_string(),
+        pattern: AI_ACT_CITATION_REGEX.to_string(),
+        case_sensitive: false,
+    });
 
     let basemind_config = RedactionConfig {
         enabled: true,
@@ -305,17 +315,80 @@ fn detection_category(category: &xberg::types::redaction::PiiCategory) -> String
     }
 }
 
-/// Entity category → the redaction label safe/ redaction claims. `None` for
-/// categories the pattern engine already covers or safe/ does not claim.
-fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<&'static str> {
+/// Entity category → the redaction label safe/ redaction claims.
+///
+/// GLiNER2 is asked for `GLI_NER2_PII_LABELS` and `AI_ACT_NER_LABELS` as
+/// `Custom(label)`, so every span it finds arrives here under the label it
+/// was requested with. Only `person`, `organization`, `location` and `email`
+/// round-trip through `EntityCategory::from` to a named variant; `None` covers
+/// the remaining named variants (date, url, …) the model was never asked for.
+fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<String> {
     use xberg::types::entity::EntityCategory;
     match category {
-        EntityCategory::Person => Some("person"),
-        EntityCategory::Organization => Some("organization"),
-        EntityCategory::Location => Some("location"),
+        EntityCategory::Person => Some("person".to_string()),
+        EntityCategory::Organization => Some("organization".to_string()),
+        EntityCategory::Location => Some("location".to_string()),
+        EntityCategory::Email => Some("email".to_string()),
+        EntityCategory::Custom(label) if !label.is_empty() => Some(label.clone()),
         _ => None,
     }
 }
+
+/// The 42 labels `fastino/gliner2-privacy-filter-PII-multi` was trained on
+/// (7 languages: en, fr, es, de, it, pt, nl). GLiNER2 conditions on the label
+/// list given at inference time, so this list — not the model — decides what
+/// NER can find.
+#[cfg(feature = "ner-candle")]
+const GLI_NER2_PII_LABELS: &[&str] = &[
+    // person / names
+    "person", "full_name", "first_name", "middle_name", "last_name", "date_of_birth",
+    // contact / address
+    "email", "phone_number", "address", "street_address", "city", "state_or_region",
+    "postal_code", "country",
+    // government / tax IDs
+    "government_id", "national_id_number", "passport_number", "drivers_license_number",
+    "license_number", "tax_id", "tax_number",
+    // banking / payment
+    "bank_account", "account_number", "routing_number", "iban", "payment_card",
+    "card_number", "card_expiry", "card_cvv",
+    // digital identity
+    "username", "ip_address", "account_id", "sensitive_account_id",
+    // secrets / credentials
+    "password", "secret", "api_key", "access_token", "recovery_code",
+    // sensitive dates
+    "sensitive_date", "document_date", "expiration_date", "transaction_date",
+];
+
+/// EU AI Act terms the PII model never saw in training. Zero-shot, so they ride
+/// the same candle backend as the 42 PII labels — no separate model.
+///
+/// Spans, not concepts: a zero-shot label matches the text it names
+/// ("provider of the high-risk AI system"), which is why these read as
+/// `ai_act_<thing>` rather than a bare role word that would fire on every
+/// "cloud provider" in sight.
+#[cfg(feature = "ner-candle")]
+const AI_ACT_NER_LABELS: &[&str] = &[
+    // actor roles
+    "ai_act_provider",
+    "ai_act_deployer",
+    "ai_act_importer",
+    "ai_act_distributor",
+    "ai_act_notified_body",
+    "ai_act_authorised_representative",
+    // risk classes
+    "high_risk_ai_system",
+    "gpai_model",
+    "ai_act_systemic_risk",
+    // obligations & penalties
+    "ai_act_conformity_assessment",
+    "ai_act_technical_documentation",
+    "ai_act_market_surveillance",
+    "ai_act_penalty",
+];
+
+/// AI Act citation literals. Regex, not NER: these are exact strings, and a
+/// model adds nothing to an exact match.
+const AI_ACT_CITATION_REGEX: &str = r"\b(?:regulation\s+\(eu\)\s+\d{4}/\d{4}|ai\s+act)\b";
 
 /// NER spans shorter than this are dropped: even whole-word, case-insensitive
 /// hits on 1-2 char spans ("us", "go") are noise that would shred the mirror.
@@ -353,19 +426,24 @@ fn dedup_overlapping(mut entities: Vec<xberg::types::entity::Entity>) -> Vec<xbe
     kept
 }
 
-/// Detect person/organisation/location mentions with GLiNER2. Without the
-/// `ner-candle` feature this logs once per call and returns no entities.
+/// Detect PII and AI Act mentions with GLiNER2: the model's 42 trained PII
+/// labels plus `AI_ACT_NER_LABELS`, with `organization` and `location` kept as
+/// extra zero-shot labels so the three categories redaction claimed before #37
+/// keep working (neither is among the 42). Without the `ner-candle` feature
+/// this logs once per call and returns no entities.
 #[cfg(feature = "ner-candle")]
 async fn run_ner(model_dir: Option<&str>, text: &str) -> Vec<xberg::types::entity::Entity> {
     use xberg::text::ner::NerBackend;
     use xberg::text::ner::candle::CandleBackend;
     use xberg::types::entity::EntityCategory;
     let Some(dir) = model_dir else { return Vec::new() };
-    let categories = [
-        EntityCategory::Person,
-        EntityCategory::Organization,
-        EntityCategory::Location,
-    ];
+    let mut categories = vec![EntityCategory::Organization, EntityCategory::Location];
+    categories.extend(
+        GLI_NER2_PII_LABELS
+            .iter()
+            .chain(AI_ACT_NER_LABELS.iter())
+            .map(|label| EntityCategory::Custom((*label).to_string())),
+    );
     match CandleBackend::get_or_init(std::path::Path::new(dir), None) {
         Ok(backend) => match backend.detect(text, &categories).await {
             Ok(entities) => entities,
