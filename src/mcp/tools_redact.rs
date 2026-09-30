@@ -215,7 +215,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     }
     let original = doc.content.clone();
 
-    // #37 GLiNER2: label person/organisation/location mentions before redaction.
+    // #37 GLiNER2: label mentions before redaction — the model's 42 PII labels
+    // plus AI_ACT_NER_LABELS, with organization/location kept as extra
+    // zero-shot labels so the three categories redaction claimed before #37
+    // keep working (neither is among the 42).
     // Every failure mode (missing model dir, unloadable model, inference error,
     // build without `ner-candle`) degrades to pattern-only redaction.
     let ner_entities = dedup_overlapping(run_ner(args.ner_model_dir.as_deref(), &original).await);
@@ -418,9 +421,14 @@ const AI_ACT_NER_LABELS: &[&str] = &[
     "ai_act_penalty",
 ];
 
-/// AI Act citation literals. Regex, not NER: these are exact strings, and a
-/// model adds nothing to an exact match.
-const AI_ACT_CITATION_REGEX: &str = r"\b(?:regulation\s+\(eu\)\s+\d{4}/\d{4}|ai\s+act)\b";
+/// AI Act citation literals: the regulation's own number, `2024/1689`.
+/// Regex, not NER — an exact string, and a model adds nothing to an exact
+/// match. Scoped to that number instead of any `YYYY/NNNN` regulation or the
+/// bare phrase "AI Act", so ordinary prose ("the AI Act requires...") and
+/// other regulations (`2022/2065` = the Digital Services Act) pass through
+/// untouched. The AI Act's roles, obligations and penalties are zero-shot
+/// labels, not this pattern — see `AI_ACT_NER_LABELS`.
+const AI_ACT_CITATION_REGEX: &str = r"\b2024/1689\b";
 
 /// NER spans shorter than this are dropped: even whole-word, case-insensitive
 /// hits on 1-2 char spans ("us", "go") are noise that would shred the mirror.
