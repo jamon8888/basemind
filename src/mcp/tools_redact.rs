@@ -49,12 +49,18 @@ pub struct RedactTextParams {
     /// unloadable model degrades to pattern-only redaction instead of failing.
     #[serde(default)]
     pub ner_model_dir: Option<String>,
+    /// Fail with an error when NER did not run (no `ner_model_dir`, model
+    /// missing or unloadable, inference error, build without `ner-candle`)
+    /// instead of degrading to pattern-only redaction. For callers that must
+    /// not release text whose names, companies or places went undetected.
+    #[serde(default)]
+    pub require_ner: bool,
 }
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), and detections (category, start, end, text).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text), and ner_ran (false when NER did not run and only pattern redaction applied; set require_ner to fail instead).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -216,8 +222,15 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
 
     // #37 GLiNER2: label person/organisation/location mentions before redaction.
     // Every failure mode (missing model dir, unloadable model, inference error,
-    // build without `ner-candle`) degrades to pattern-only redaction.
-    let ner_entities = dedup_overlapping(run_ner(args.ner_model_dir.as_deref(), &original).await);
+    // build without `ner-candle`) degrades to pattern-only redaction, reported
+    // as `ner_ran: false` — or refused outright under `require_ner`.
+    let (ner_entities, ner_ran) = match run_ner(args.ner_model_dir.as_deref(), &original).await {
+        Ok(entities) => (dedup_overlapping(entities), true),
+        Err(reason) if args.require_ner => {
+            return Err(McpError::internal_error(format!("NER required but did not run: {reason}"), None));
+        }
+        Err(_) => (Vec::new(), false),
+    };
     let ner_confidence: std::collections::HashMap<(u32, u32), f32> = ner_entities
         .iter()
         .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
@@ -286,7 +299,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     Ok(CallToolResult::structured(serde_json::json!({
         "redacted_text": doc.content,
         "rehydration_map": rehydration_map,
-        "detections": detections
+        "detections": detections,
+        "ner_ran": ner_ran
     })))
 }
 
@@ -353,14 +367,18 @@ fn dedup_overlapping(mut entities: Vec<xberg::types::entity::Entity>) -> Vec<xbe
     kept
 }
 
-/// Detect person/organisation/location mentions with GLiNER2. Without the
-/// `ner-candle` feature this logs once per call and returns no entities.
+/// Detect person/organisation/location mentions with GLiNER2. `Ok` means the
+/// model ran (an empty list is then a real "nothing found"); `Err` carries why
+/// it did not, so callers can tell that apart from a clean result. Without the
+/// `ner-candle` feature this logs once per call and never runs.
 #[cfg(feature = "ner-candle")]
-async fn run_ner(model_dir: Option<&str>, text: &str) -> Vec<xberg::types::entity::Entity> {
+async fn run_ner(model_dir: Option<&str>, text: &str) -> Result<Vec<xberg::types::entity::Entity>, String> {
     use xberg::text::ner::NerBackend;
     use xberg::text::ner::candle::CandleBackend;
     use xberg::types::entity::EntityCategory;
-    let Some(dir) = model_dir else { return Vec::new() };
+    let Some(dir) = model_dir else {
+        return Err("no ner_model_dir given".to_string());
+    };
     let categories = [
         EntityCategory::Person,
         EntityCategory::Organization,
@@ -368,25 +386,25 @@ async fn run_ner(model_dir: Option<&str>, text: &str) -> Vec<xberg::types::entit
     ];
     match CandleBackend::get_or_init(std::path::Path::new(dir), None) {
         Ok(backend) => match backend.detect(text, &categories).await {
-            Ok(entities) => entities,
+            Ok(entities) => Ok(entities),
             Err(error) => {
                 tracing::warn!(%error, "GLiNER2 NER failed; redacting pattern-only");
-                Vec::new()
+                Err(format!("inference failed: {error}"))
             }
         },
         Err(error) => {
             tracing::warn!(%error, dir, "GLiNER2 model unavailable; redacting pattern-only");
-            Vec::new()
+            Err(format!("model unavailable: {error}"))
         }
     }
 }
 
 #[cfg(not(feature = "ner-candle"))]
-async fn run_ner(model_dir: Option<&str>, _text: &str) -> Vec<xberg::types::entity::Entity> {
+async fn run_ner(model_dir: Option<&str>, _text: &str) -> Result<Vec<xberg::types::entity::Entity>, String> {
     if let Some(dir) = model_dir {
         tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
     }
-    Vec::new()
+    Err("built without the ner-candle feature".to_string())
 }
 
 #[cfg(test)]

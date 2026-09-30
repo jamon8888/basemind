@@ -26,6 +26,7 @@ fn text_params(text: &str) -> RedactTextParams {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     }
 }
 
@@ -46,6 +47,39 @@ async fn ner_model_dir_missing_model_still_redacts() {
         "PII must still be redacted: {redacted}"
     );
     assert!(!payload["detections"].as_array().expect("detections").is_empty());
+}
+
+/// Callers that must not send anything unredacted need to tell "NER found
+/// nothing" from "NER never ran"; the payload says which.
+#[tokio::test]
+async fn ner_ran_is_false_when_the_model_is_unavailable() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let result = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            ..text_params("Reach me at alice@example.com today")
+        })
+        .await
+        .expect("degrades to pattern-only by default");
+        assert_eq!(json_of(&result)["ner_ran"], Value::Bool(false));
+    }
+}
+
+#[tokio::test]
+async fn require_ner_fails_instead_of_degrading() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let error = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            require_ner: true,
+            ..text_params("Alice Smith owes 10 000 EUR")
+        })
+        .await
+        .expect_err("require_ner must not fall back to pattern-only redaction");
+        assert!(
+            error.message.contains("NER required"),
+            "error names the cause: {}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]
@@ -301,6 +335,7 @@ async fn ner_model_dir_detects_entities_with_confidence() {
             .any(|d| d.get("confidence").and_then(|c| c.as_f64()).is_some()),
         "NER spans must carry confidence"
     );
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
 }

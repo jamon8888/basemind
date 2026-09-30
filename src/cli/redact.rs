@@ -84,6 +84,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         custom_terms: parse_pairs(args.custom_terms.clone())?,
         custom_patterns: parse_pairs(args.custom_patterns.clone())?,
         ner_model_dir: args.ner_model_dir.clone(),
+        require_ner: false,
     };
 
     let result = server
