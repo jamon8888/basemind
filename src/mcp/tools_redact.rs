@@ -341,22 +341,54 @@ fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<String> 
 #[cfg(feature = "ner-candle")]
 const GLI_NER2_PII_LABELS: &[&str] = &[
     // person / names
-    "person", "full_name", "first_name", "middle_name", "last_name", "date_of_birth",
+    "person",
+    "full_name",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "date_of_birth",
     // contact / address
-    "email", "phone_number", "address", "street_address", "city", "state_or_region",
-    "postal_code", "country",
+    "email",
+    "phone_number",
+    "address",
+    "street_address",
+    "city",
+    "state_or_region",
+    "postal_code",
+    "country",
     // government / tax IDs
-    "government_id", "national_id_number", "passport_number", "drivers_license_number",
-    "license_number", "tax_id", "tax_number",
+    "government_id",
+    "national_id_number",
+    "passport_number",
+    "drivers_license_number",
+    "license_number",
+    "tax_id",
+    "tax_number",
     // banking / payment
-    "bank_account", "account_number", "routing_number", "iban", "payment_card",
-    "card_number", "card_expiry", "card_cvv",
+    "bank_account",
+    "account_number",
+    "routing_number",
+    "iban",
+    "payment_card",
+    "card_number",
+    "card_expiry",
+    "card_cvv",
     // digital identity
-    "username", "ip_address", "account_id", "sensitive_account_id",
+    "username",
+    "ip_address",
+    "account_id",
+    "sensitive_account_id",
     // secrets / credentials
-    "password", "secret", "api_key", "access_token", "recovery_code",
+    "password",
+    "secret",
+    "api_key",
+    "access_token",
+    "recovery_code",
     // sensitive dates
-    "sensitive_date", "document_date", "expiration_date", "transaction_date",
+    "sensitive_date",
+    "document_date",
+    "expiration_date",
+    "transaction_date",
 ];
 
 /// EU AI Act terms the PII model never saw in training. Zero-shot, so they ride
