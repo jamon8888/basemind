@@ -114,6 +114,7 @@ async fn file_path_redacts_extracted_text() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect("redact_text succeeds");
@@ -135,6 +136,7 @@ async fn file_path_missing_file_errors() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("missing file must fail");
@@ -151,6 +153,7 @@ async fn text_and_file_path_together_rejected() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("both inputs must fail");
@@ -171,6 +174,7 @@ async fn oversized_extracted_content_errors() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("oversized extraction must fail");
