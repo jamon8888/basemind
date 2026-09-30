@@ -227,7 +227,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let (ner_entities, ner_ran) = match run_ner(args.ner_model_dir.as_deref(), &original).await {
         Ok(entities) => (dedup_overlapping(entities), true),
         Err(reason) if args.require_ner => {
-            return Err(McpError::internal_error(format!("NER required but did not run: {reason}"), None));
+            return Err(McpError::internal_error(
+                format!("NER required but did not run: {reason}"),
+                None,
+            ));
         }
         Err(_) => (Vec::new(), false),
     };
