@@ -74,6 +74,8 @@ fn read_input(args: &RedactArgs) -> Result<(String, Option<String>)> {
     }
 }
 
+/// Runs `basemind redact`: builds `RedactTextParams` from the CLI flags and
+/// calls the same `redact_text` tool method the MCP server exposes.
 pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit, out: &mut impl Write) -> Result<()> {
     let (text, file_path) = read_input(args)?;
     let params = RedactTextParams {

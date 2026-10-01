@@ -111,6 +111,11 @@ fn oversized_err(len: usize) -> McpError {
     )
 }
 
+/// Body of the `redact_text` tool: reads the inline text or extracts the
+/// file, turns NER mentions into boundary-aware custom patterns, then lets
+/// xberg redact them together with its own pattern detectors in one pass.
+/// When NER cannot run it falls back to pattern-only redaction and reports
+/// `ner_ran: false`, or returns an error if `require_ner` is set.
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
     let input = match args.file_path.as_deref() {
         Some(path) => {
@@ -520,6 +525,8 @@ async fn run_ner(model_dir: Option<&str>, text: &str) -> Result<Vec<xberg::types
     }
 }
 
+/// Stand-in for builds without `ner-candle`: NER never runs, so this always
+/// returns `Err` and the caller degrades or refuses per `require_ner`.
 #[cfg(not(feature = "ner-candle"))]
 async fn run_ner(model_dir: Option<&str>, _text: &str) -> Result<Vec<xberg::types::entity::Entity>, String> {
     if let Some(dir) = model_dir {

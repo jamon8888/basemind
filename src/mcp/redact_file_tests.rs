@@ -17,6 +17,7 @@ fn json_of(result: &CallToolResult) -> Value {
     panic!("tool returned no text content");
 }
 
+/// Inline-text params with every option at its default (no NER, not required).
 fn text_params(text: &str) -> RedactTextParams {
     RedactTextParams {
         text: text.to_string(),
@@ -64,6 +65,8 @@ async fn ner_ran_is_false_when_the_model_is_unavailable() {
     }
 }
 
+/// With `require_ner`, an unavailable model is an error, never a silent
+/// pattern-only result.
 #[tokio::test]
 async fn require_ner_fails_instead_of_degrading() {
     for dir in [None, Some("/nonexistent/gliner2".to_string())] {
