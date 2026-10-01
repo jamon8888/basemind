@@ -321,13 +321,25 @@ async fn ner_model_dir_detects_entities_with_confidence() {
         .iter()
         .map(|d| d["category"].as_str().unwrap_or("unknown"))
         .collect();
+    // The 42-label list makes GLiNER2 pick the most specific label it was
+    // given (`full_name`, `city`, …) rather than the generic `person` /
+    // `location`, so assert on the families.
+    const PERSON_LABELS: &[&str] = &["person", "full_name", "first_name", "last_name"];
+    const LOCATION_LABELS: &[&str] = &[
+        "location",
+        "city",
+        "address",
+        "street_address",
+        "country",
+        "state_or_region",
+    ];
     assert!(
-        categories.contains(&"person"),
-        "person must be detected: {categories:?}"
+        categories.iter().any(|c| PERSON_LABELS.contains(c)),
+        "a person label must be detected: {categories:?}"
     );
     assert!(
-        categories.contains(&"location"),
-        "location must be detected: {categories:?}"
+        categories.iter().any(|c| LOCATION_LABELS.contains(c)),
+        "a location label must be detected: {categories:?}"
     );
     assert!(
         !categories.contains(&"unknown"),
