@@ -381,3 +381,33 @@ async fn phone_patterns_leave_dates_and_amounts_alone() {
         assert!(redacted.contains(kept), "{kept} must stay: {redacted}");
     }
 }
+
+/// The AI Act citation pattern matches the regulation's own number and
+/// nothing else: prose that merely names the act, and every other EU
+/// regulation, must survive untouched.
+#[tokio::test]
+async fn ai_act_citation_redacts_only_the_2024_1689_number() {
+    let text = "Per the AI Act, Regulation (EU) 2024/1689 applies; see also Regulation (EU) 2022/2065.";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        !redacted.contains("2024/1689"),
+        "AI Act citation must be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("the AI Act"),
+        "prose naming the act must stay: {redacted}"
+    );
+    assert!(
+        redacted.contains("2022/2065"),
+        "other regulations must stay: {redacted}"
+    );
+    let detections = payload["detections"].as_array().expect("detections");
+    assert!(
+        detections
+            .iter()
+            .any(|detection| detection["category"] == "ai_act_citation"),
+        "the citation must surface as ai_act_citation: {detections:?}"
+    );
+}
