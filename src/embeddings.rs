@@ -58,6 +58,22 @@ pub fn embed_pool(max_threads: usize) -> &'static rayon::ThreadPool {
     })
 }
 
+/// Run `work` on the bounded embed pool and return its result.
+///
+/// Every embed call goes through here rather than `embed_pool(..).install(..)`. Called from a
+/// worker of another rayon pool (the scanner's), `install` does not park the caller: while it
+/// waits it keeps running that pool's jobs. A scan worker holding the document slot would then
+/// start the next document and wait forever for a slot it holds itself (basemind#30). The call is
+/// therefore made from a short-lived plain thread, so the scan worker blocks without taking on
+/// more work.
+pub fn on_embed_pool<R: Send>(max_threads: usize, work: impl FnOnce() -> R + Send) -> R {
+    let pool = embed_pool(max_threads);
+    std::thread::scope(|scope| match scope.spawn(|| pool.install(work)).join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
 /// Loaded, ready-to-query embedding engine. `Clone` is cheap (config is stack-only).
 #[derive(Clone)]
 pub struct SharedEmbedder {
@@ -148,7 +164,7 @@ impl SharedEmbedder {
         if text.is_empty() {
             return Err(anyhow!("embed: input text must not be empty"));
         }
-        embed_pool(self.max_embed_threads).install(|| {
+        on_embed_pool(self.max_embed_threads, || {
             let mut results = xberg::embeddings::embed_texts(&[text], &self.config)
                 .with_context(|| format!("embed_texts(preset={})", self.model_name))?;
             results
@@ -170,7 +186,7 @@ impl SharedEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        embed_pool(self.max_embed_threads).install(|| {
+        on_embed_pool(self.max_embed_threads, || {
             xberg::embeddings::embed_texts(texts, &self.config)
                 .with_context(|| format!("embed_texts(preset={}, batch={})", self.model_name, texts.len()))
         })
