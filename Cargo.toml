@@ -115,10 +115,12 @@ ner-candle = ["documents", "xberg/ner-candle-backend"]
 full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search", "ner-candle"]
 
 # Minimal feature set for hacienda integration:
-# - intelligence: base ORT + lancedb + arrow + futures
+# - documents: xberg document extraction + redaction (required by ner-candle)
+# - memory: agent memory put/get/search (shared memory system)
 # - code-search: semantic code search (basemind code semantic/chunk)
 # - ner-candle: GLiNER2 NER for redact_text (requires documents)
-hacienda = ["intelligence", "code-search", "ner-candle"]
+# Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
+hacienda = ["documents", "memory", "code-search", "ner-candle"]
 
 test-support = ["dep:tempfile"]
 
