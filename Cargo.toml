@@ -114,6 +114,12 @@ ner-candle = ["documents", "xberg/ner-candle-backend"]
 
 full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search", "ner-candle"]
 
+# Minimal feature set for hacienda integration:
+# - intelligence: base ORT + lancedb + arrow + futures
+# - code-search: semantic code search (basemind code semantic/chunk)
+# - ner-candle: GLiNER2 NER for redact_text (requires documents)
+hacienda = ["intelligence", "code-search", "ner-candle"]
+
 test-support = ["dep:tempfile"]
 
 ort-dynamic = ["xberg?/ort-dynamic"]
