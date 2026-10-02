@@ -17,6 +17,7 @@ fn json_of(result: &CallToolResult) -> Value {
     panic!("tool returned no text content");
 }
 
+/// Inline-text params with every option at its default (no NER, not required).
 fn text_params(text: &str) -> RedactTextParams {
     RedactTextParams {
         text: text.to_string(),
@@ -26,6 +27,7 @@ fn text_params(text: &str) -> RedactTextParams {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     }
 }
 
@@ -46,6 +48,41 @@ async fn ner_model_dir_missing_model_still_redacts() {
         "PII must still be redacted: {redacted}"
     );
     assert!(!payload["detections"].as_array().expect("detections").is_empty());
+}
+
+/// Callers that must not send anything unredacted need to tell "NER found
+/// nothing" from "NER never ran"; the payload says which.
+#[tokio::test]
+async fn ner_ran_is_false_when_the_model_is_unavailable() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let result = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            ..text_params("Reach me at alice@example.com today")
+        })
+        .await
+        .expect("degrades to pattern-only by default");
+        assert_eq!(json_of(&result)["ner_ran"], Value::Bool(false));
+    }
+}
+
+/// With `require_ner`, an unavailable model is an error, never a silent
+/// pattern-only result.
+#[tokio::test]
+async fn require_ner_fails_instead_of_degrading() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let error = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            require_ner: true,
+            ..text_params("Alice Smith owes 10 000 EUR")
+        })
+        .await
+        .expect_err("require_ner must not fall back to pattern-only redaction");
+        assert!(
+            error.message.contains("NER required"),
+            "error names the cause: {}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]
@@ -80,6 +117,7 @@ async fn file_path_redacts_extracted_text() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect("redact_text succeeds");
@@ -101,6 +139,7 @@ async fn file_path_missing_file_errors() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("missing file must fail");
@@ -117,6 +156,7 @@ async fn text_and_file_path_together_rejected() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("both inputs must fail");
@@ -137,6 +177,7 @@ async fn oversized_extracted_content_errors() {
         custom_terms: vec![],
         custom_patterns: vec![],
         ner_model_dir: None,
+        require_ner: false,
     })
     .await
     .expect_err("oversized extraction must fail");
@@ -283,13 +324,25 @@ async fn ner_model_dir_detects_entities_with_confidence() {
         .iter()
         .map(|d| d["category"].as_str().unwrap_or("unknown"))
         .collect();
+    // The 42-label list makes GLiNER2 pick the most specific label it was
+    // given (`full_name`, `city`, …) rather than the generic `person` /
+    // `location`, so assert on the families.
+    const PERSON_LABELS: &[&str] = &["person", "full_name", "first_name", "last_name"];
+    const LOCATION_LABELS: &[&str] = &[
+        "location",
+        "city",
+        "address",
+        "street_address",
+        "country",
+        "state_or_region",
+    ];
     assert!(
-        categories.contains(&"person"),
-        "person must be detected: {categories:?}"
+        categories.iter().any(|c| PERSON_LABELS.contains(c)),
+        "a person label must be detected: {categories:?}"
     );
     assert!(
-        categories.contains(&"location"),
-        "location must be detected: {categories:?}"
+        categories.iter().any(|c| LOCATION_LABELS.contains(c)),
+        "a location label must be detected: {categories:?}"
     );
     assert!(
         !categories.contains(&"unknown"),
@@ -301,6 +354,7 @@ async fn ner_model_dir_detects_entities_with_confidence() {
             .any(|d| d.get("confidence").and_then(|c| c.as_f64()).is_some()),
         "NER spans must carry confidence"
     );
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
 }
