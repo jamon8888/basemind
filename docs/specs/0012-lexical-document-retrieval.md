@@ -391,9 +391,17 @@ therefore comes from the storage layer **below** the data home: LUKS on Linux, F
 BitLocker on Windows. This is a deployment requirement for any deployment that stores documents,
 not a basemind feature.
 
-Enforcement posture (refuse vs. warn, verification point, per-platform coverage) is decided in #45,
-which also owns ADR-0013. Constraint on any solution retained there: encryption must not make
-retrieval unusable.
+The scope is the whole of `cache_root()` — `cache/blobs/` (which holds extracted text), every
+per-workspace Lance store, the registry snapshot, and the `.chunk.msgpack` sidecars. Encrypting a
+subdirectory is not an accepted configuration.
+
+Enforcement: when `redaction.enabled = true` and the volume cannot be verified, the scan **warns
+loudly**; hard refusal exists only behind an explicit opt-in. macOS and Windows verify authoritatively
+(FileVault, BitLocker), Linux is best-effort, and `unknown` is never reported as `not encrypted` —
+otherwise every container, CI runner and network mount warns, and a warning that always fires is a
+warning nobody reads. The check runs at scan and its verdict is surfaced in `basemind doctor`.
+
+See [ADR-0013](../adr/0013-encryption-at-rest-comes-from-the-volume.md).
 
 - Table rename `documents` → `documents_v2` means existing workspaces keep serving v1 rows until
   rescan; `memory documents` reads v2 when present and falls back to v1 with a warning.

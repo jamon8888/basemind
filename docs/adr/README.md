@@ -54,6 +54,8 @@ them.
 | [0010](0010-branch-integration-release-strategy.md) | Branch, integration & release strategy | Accepted |
 | [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign | Accepted |
 | [0012](0012-multi-lane-document-retrieval.md) | Multi-lane document retrieval — multi-lane, embeddings optional | Accepted |
+| [0013](0013-encryption-at-rest-comes-from-the-volume.md) | Encryption at rest comes from the volume, enforced as a deployment requirement | Accepted |
 
 Implementation specs live in [`../specs/`](../specs/). ADR-0012's spec is
-[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md).
+[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). ADR-0013
+constrains that spec's §14.0 rather than adding a new one.
