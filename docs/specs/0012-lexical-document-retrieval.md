@@ -132,33 +132,50 @@ post-filtered in Rust (`src/mcp/memory.rs:638-710`), which silently shrinks the 
 
 ### 7.1 Tokenizers
 
-Primary lexical index:
+Two properties of the builder shape every call below, and both are easy to get wrong.
 
-```
-FtsIndexBuilder::default()
-    .with_base_tokenizer("simple")     // explicit: never set tokenizer_name, it locks customization
-    .with_language("English")          // drives stem + stop-word behaviour
-    .with_stem(true)
-    .with_remove_stop_words(true)
-    .with_ascii_folding(true)          // FR/ES matters: "société" → "societe"
-    .with_max_token_length(64)         // default 40 truncates long Spanish/French tokens
-    .with_custom_stop_words(["pursuant","herein","hereto","aforesaid","wherein",
-                             "notwithstanding","provided that","hereinafter","thereunder"])
+The builder is `lancedb::index::scalar::FtsIndexBuilder`, an alias of `InvertedIndexParams`
+(`lance-index-10.0.0/src/scalar/inverted/tokenizer.rs:49`). **Its methods carry no `with_` prefix** —
+`with_position` is the sole exception among its 30 public methods. The rest are `base_tokenizer`,
+`language`, `stem`, `remove_stop_words`, `ascii_folding`, `max_token_length`, `custom_stop_words`,
+`ngram_min_length`, `ngram_max_length`. And **`language` returns `Result<Self>`, not `Self`**
+(`tokenizer.rs:675`), so it breaks a fluent chain: assembly resumes after a `?`, and the
+`Result` has to be handled wherever the builder is built.
+
+Primary lexical index, over `text` and `heading_path`:
+
+```rust
+let fts = FtsIndexBuilder::default()
+    .base_tokenizer("simple".to_string())   // explicit: do not rely on a default
+    .language("English")?                  // drives stem + stop-word behaviour
+    .stem(true)
+    .remove_stop_words(true)
+    .ascii_folding(true)                    // FR/ES matters: "société" → "societe"
+    .max_token_length(Some(64))             // default 40 truncates long Spanish/French tokens
+    .custom_stop_words(Some(vec![
+        "pursuant".into(), "herein".into(), "hereto".into(), "aforesaid".into(),
+        "wherein".into(), "notwithstanding".into(), "provided that".into(),
+        "hereinafter".into(), "thereunder".into(),
+    ]));
 ```
 
 Citation index, on `cites` only:
 
-```
-FtsIndexBuilder::default()
-    .with_base_tokenizer("ngram")
-    .with_ngram_min_length(3)
-    .with_ngram_max_length(3)
-    .with_remove_stop_words(false)
-    .with_stem(false)
+```rust
+let cites = FtsIndexBuilder::default()
+    .base_tokenizer("ngram".to_string())
+    .ngram_min_length(3)
+    .ngram_max_length(3)
+    .remove_stop_words(false)
+    .stem(false);
 ```
 
 Why: n-gram is what makes `362` reach `§ 362(a)(1)` and `2-24-1234` reach `No. 2-24-1234`. Keep it
 off `text` — trigram indexing of full prose is large and noisy.
+
+`base_tokenizer` is deliberately not a configuration key. The two indexes need different tokenizers,
+so no single setting could govern both: which tokenizer an index gets is the content of this
+section, not a setting (§10).
 
 ### 7.2 Phrase queries — a decision, not an assumption
 
@@ -168,10 +185,14 @@ queries, so:
 
 - Phase 3 builds a **third** index, `text_phrase`, with `with_position = true` and
   `remove_stop_words = false`, over a position-preserving copy of the chunk text.
+- **That index must be word-tokenized, never n-gram.** The documentation of `with_position` states
+  outright that it "doesn't work with `ngram` tokenizer" (`tokenizer.rs:685`), so `text_phrase`
+  cannot reuse the citation index's tokenizer. Stated explicitly because the obvious
+  implementation — take the `cites` builder from §7.1 and add `with_position(true)` — compiles and
+  produces a silently empty phrase index.
 - The query path routes a quoted span to `text_phrase` and merges its hits into the `exact` lane.
-- If index size on the target corpus is unacceptable, the config flag
-  `[documents.fts].phrase_index = false` drops the lane and the MCP layer reports
-  `phrase_unsupported` rather than silently ignoring quotes.
+- If index size on the target corpus is unacceptable, the build skips the phrase index and the MCP
+  layer reports `phrase_unsupported` rather than silently ignoring quotes.
 
 ### 7.3 Build cadence
 
@@ -180,7 +201,9 @@ queries, so:
   continuously-written stores (rule of thumb from LanceDB docs: ~100k row changes or 20
   modification ops). Unindexed rows fall back to a flat scan, so a missed `optimize()` shows up as
   a latency cliff, not a correctness bug.
-- Track `index_stats().num_unindexed_rows`; warn above a configurable threshold.
+- Track `index_stats().num_unindexed_rows`; warn above a build-cadence threshold, 50k unindexed rows
+  by default. Cadence and thresholds are build settings, not tokenizer parameters, so they are not
+  part of `[documents.fts]` (§10).
 - Never `fast_search()`: for legal work a silently missing filing is a wrong answer.
 
 ## 8. Query path
@@ -286,18 +309,14 @@ per_document_cap = 3
 max_relaxations = 3
 
 [documents.fts]
-enabled = true
-phrase_index = true
 ngram_min_length = 3
 ngram_max_length = 3
 stem = true
 remove_stop_words = true
 ascii_folding = true
 max_token_length = 64
-language = "English"
+stemmer_language = "English"
 custom_stop_words = ["pursuant", "herein", ...]
-optimize_every_rows = 100_000
-unindexed_rows_warn_threshold = 50_000
 
 [documents.citations]
 extract = true
@@ -309,6 +328,19 @@ Every key gets `#[serde(default)]` so older TOML files keep loading, per the mod
 regenerate with `cargo test --features full --test config_schema -- --ignored regenerate_schema`
 and re-enable `schema_snapshot_matches_derived` (currently `#[ignore]`d — fix that in the same
 change, it is the guard that makes config drift visible).
+
+`[documents.fts]` holds only what maps to a real `InvertedIndexParams` field. Three things were
+deliberately kept out of it:
+
+- **`stemmer_language`, not `language`.** `[documents].language` already exists and is a
+  *detection* table (`auto_detect`, `min_confidence`, `detect_multiple`, `preferred_languages`).
+  Two different `language` keys of different shapes at different depths is a trap; the stemmer's
+  language is named for what it does. Note that the detection table is largely inert today —
+  `preferred_languages` is documented as reserved, and the xberg release in use does not honour a
+  preferred-language hint.
+- **No `enabled`.** `[documents].enabled` is already the master switch for the tier.
+- **No cadence keys.** `optimize_every_rows` and `unindexed_rows_warn_threshold` are build-cadence
+  settings, not tokenizer parameters; they belong to §7.3, which now carries their defaults.
 
 Module-size cap (`.ai-rulez/rules/module-size-cap.md`): `src/config/documents.rs` is already
 near its limit, so `[documents.fusion]` / `[documents.fts]` / `[documents.citations]` go in a new
