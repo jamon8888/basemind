@@ -1,8 +1,9 @@
-# ADR-0012: Multi-lane document retrieval — lexical-first, vector-optional
+# ADR-0012: Multi-lane document retrieval — multi-lane, embeddings optional
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-06
-- **Deciders:** jamon8888 (proposer)
+- **Accepted:** 2026-10-06, via wayfinder ticket jamon8888/basemind#36
+- **Deciders:** jamon8888 (proposer and decider)
 - **Related:** ADR-0008 (documents ↔ code graph), ADR-0011 (MCP tool surface)
 
 ## Context
@@ -38,7 +39,9 @@ Two further facts shape the decision:
    party names, and quoted case names — high-precision lexical lookups. Published benchmarks agree
    lexical retrieval is not a fallback for this domain: on CUAD, BM25 reaches nDCG@10 0.245 vs
    0.133 for a dense bi-encoder (BGE-small), and equal-weight RRF over both lands at 0.230 —
-   *below* BM25 alone, because RRF gives a weak lane equal say.
+   *below* BM25 alone, because RRF gives a weak lane equal say. These figures are quoted from
+   third-party sources and have **not** been reproduced in this repository; the weights in this ADR
+   are a starting point to be measured, not a result.
 2. **Reranking needs no corpus embeddings.** The cross-encoder rerank already runs at query time
    over hits only (`src/mcp/memory.rs:554-578`, preset `bge-reranker-v2-m3`, `top_k = 20`,
    `enabled = false` by default). It is query×chunk ONNX inference, so it is fully available to an
@@ -51,7 +54,7 @@ that adding config keys invalidates `schema/basemind-config-v1.schema.json`, who
 
 ## Decision
 
-Document retrieval becomes a **multi-lane, lexical-first** design in which embeddings are
+Document retrieval becomes a **multi-lane** design in which embeddings are
 optional rather than load-bearing.
 
 1. **Add a native lexical lane to the documents tier**, mirroring the code tier: BM25 over chunk
@@ -63,6 +66,17 @@ optional rather than load-bearing.
    Booleans and `OR` are unavailable in the FTS query string, so quoted-phrase support is a
    separate decision (an index with `with_position = true` and `remove_stop_words = false`), not an
    assumption.
+
+   **Precondition — redaction.** This lane presupposes that the identifiers it indexes are
+   retrievable in clear text. Under `redaction.strategy = "token_replace"` — the default strategy —
+   the stored `text` column is pseudonymised (`[PERSON_1]`), reversible only through the encrypted
+   rehydration map keyed by `rehydration_ref` (`src/extract/doc.rs:490`). A keyword lane over
+   pseudonymised text cannot match `Smith v. Acme`. Making the exact lane work therefore requires
+   indexing `cites` from pre-redaction text, which stores clear-text identifiers on disk beside
+   pseudonymised content. That is a confidentiality trade-off, not a retrieval detail, and it is
+   **not settled by this ADR**: the lexical lanes assume redaction is off, and the `token_replace`
+   case is owned by #7 (query masking at the inference boundary) and #12. Re-dating this decision
+   requires resolving the `cites` index question first.
 3. **Add scalar facet lanes** — `section`, `doc_type`, `jurisdiction`, `court`, `date` — as
    prefilterable columns. Section rows follow the facets/issues/decision/reasoning decomposition,
    which per-section weighting with score normalization beats plain union RRF on legal retrieval.

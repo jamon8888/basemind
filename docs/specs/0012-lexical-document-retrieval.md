@@ -1,4 +1,4 @@
-# Spec 0012: Multi-lane document retrieval (lexical-first, vector-optional)
+# Spec 0012: Multi-lane document retrieval (multi-lane, embeddings optional)
 
 - **Status:** Draft — implements [ADR-0012](../adr/0012-multi-lane-document-retrieval.md)
 - **Date:** 2026-10-06
