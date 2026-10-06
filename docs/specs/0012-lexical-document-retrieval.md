@@ -110,7 +110,7 @@ New table name `documents_v2`; the v1 table is left on disk and dropped by the e
 | `doc_type` | Utf8 | no | `pleading`, `contract`, `memo`, `email`, `statute`, `exhibit`, `web`, `unknown` |
 | `section` | Utf8 | no | `caption`, `facts`, `issues`, `argument`, `holding`, `reasoning`, `signature`, `body` |
 | `heading_path` | Utf8 | no | Markdown heading breadcrumb, e.g. `IV. TERMINATION > 4. Convenience` |
-| `cites` | List<Utf8> | no | normalized identifiers: statute cites, docket numbers, case short names |
+| `cites` | List<Utf8> | no | normalized identifiers: statute cites, docket numbers, case short names. **Self-references excluded** — the document's own caption and its own docket number are not citations of authority and are never indexed in clear (see ADR-0012 precondition, ticket #44) |
 | `jurisdiction` | Utf8 | yes | ISO-ish code when detectable |
 | `doc_date` | Utf8 | yes | ISO-8601 `YYYY-MM-DD`; lexically sortable, avoids date-type filter cost |
 | `text` | Utf8 | no | chunk text (snippet returned to caller) |
@@ -382,6 +382,19 @@ are the starting point to be measured, not a claim.
 
 ## 14. Migration, ops, rollback
 
+### 14.0 At-rest encryption (requirement, not option)
+
+The Lance store holds chunk text, `cites`, facet columns and FTS postings. It is written **in
+clear** — LanceDB OSS has no at-rest encryption, and Lance requires plaintext to build FTS indexes
+and run vector search, so column-level encryption is not an available answer. Encryption at rest
+therefore comes from the storage layer **below** the data home: LUKS on Linux, FileVault on macOS,
+BitLocker on Windows. This is a deployment requirement for any deployment that stores documents,
+not a basemind feature.
+
+Enforcement posture (refuse vs. warn, verification point, per-platform coverage) is decided in #45,
+which also owns ADR-0013. Constraint on any solution retained there: encryption must not make
+retrieval unusable.
+
 - Table rename `documents` → `documents_v2` means existing workspaces keep serving v1 rows until
   rescan; `memory documents` reads v2 when present and falls back to v1 with a warning.
 - Reindex triggers: any tokenizer/`FtsIndexBuilder` change, `embedding_preset` change (existing
@@ -402,7 +415,7 @@ are the starting point to be measured, not a claim.
 | `documents_v2` breaks `store_gc` / compaction paths | Phase 0 includes the GC audit; GC must not treat v2 as garbage |
 | Schema snapshot drift | Re-enable `schema_snapshot_matches_derived` in the same PR |
 | Rerank ONNX download on first use | Already opt-in per call; document the download, keep `enabled = false` override |
-| Redaction (`token_replace`) breaks identifier search | Index `cites` from **pre-redaction** text; keep `rehydration_ref` unchanged |
+| Redaction (`token_replace`) breaks identifier search | Index `cites` from **pre-redaction** text, **excluding self-references** (own caption, own docket number), so the clear-text column holds public authority only. `rehydration_ref` unchanged. Residual risk is egress, not at rest — handled by #7. At-rest protection is a volume requirement, tracked in #45 |
 | Legal stop-word removal harms exact phrase recall | Two-index split (§7.2): stemmed/stop-worded index for topical recall, position index for exact recall |
 
 ## 16. Open questions

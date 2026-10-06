@@ -74,9 +74,11 @@ optional rather than load-bearing.
    pseudonymised text cannot match `Smith v. Acme`. Making the exact lane work therefore requires
    indexing `cites` from pre-redaction text, which stores clear-text identifiers on disk beside
    pseudonymised content. That is a confidentiality trade-off, not a retrieval detail, and it is
-   **not settled by this ADR**: the lexical lanes assume redaction is off, and the `token_replace`
-   case is owned by #7 (query masking at the inference boundary) and #12. Re-dating this decision
-   requires resolving the `cites` index question first.
+   **not settled by this ADR**, and was resolved separately: #44 excludes self-references (a
+   document's own caption and docket number) from `cites`, so the clear-text column holds public
+   authority only and the residual risk is egress rather than at rest — egress being #7's domain
+   (query masking at the inference boundary). At-rest encryption for the store is a separate,
+   deployment-level requirement tracked in #45 and ADR-0013.
 3. **Add scalar facet lanes** — `section`, `doc_type`, `jurisdiction`, `court`, `date` — as
    prefilterable columns. Section rows follow the facets/issues/decision/reasoning decomposition,
    which per-section weighting with score normalization beats plain union RRF on legal retrieval.
