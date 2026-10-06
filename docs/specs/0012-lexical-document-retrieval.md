@@ -198,11 +198,23 @@ queries, so:
    that searched outside `scope` would leak across matters with no observable symptom, so this is a
    correctness requirement, not a style note (#40).
 
-   `scope` resolves to the repository's own scope or one of its own `web:<host>` siblings, never to
-   an arbitrary caller-named string: `resolve_doc_scope` (`src/mcp/memory.rs:486-487`) returns the
-   requested value verbatim today, which is what makes scraped pages reachable but also what lets a
-   caller name another repository's scope. Constraining it to the repository and its `web:*`
-   siblings keeps the behaviour that fix was made for and removes the arbitrary read (#40).
+   **On this lane**, `scope` resolves to the repository's own scope or one of its own `web:<host>`
+   siblings, never to an arbitrary caller-named string: `resolve_doc_scope`
+   (`src/mcp/memory.rs:486-488`) returns the requested value verbatim today, which is what makes
+   scraped pages reachable but also what lets a caller name another repository's scope. Constraining
+   it to the repository and its `web:*` siblings keeps the behaviour that fix was made for and
+   removes the arbitrary read (#40).
+
+   **That constraint is on `resolve_doc_scope`, not on `scope` in general.** It states which
+   caller-named scopes the documents lane will honour; it is not a rule about how a caller may narrow
+   retrieval. The two are different code paths today. `resolve_doc_scope` has exactly one production
+   caller — `run_search_documents` (`src/mcp/memory.rs:522`) — and `documents` is the only tier that
+   accepts a caller-supplied scope (`src/mcp/types_documents.rs:28-34`). The code lane accepts none:
+   `CodeParams` (`src/mcp/types_code.rs:32-128`) has no `scope` field, and its semantic lane reads
+   the daemon-wide `state.shared.scope` (`src/mcp/helpers_code_search.rs:347`), computed once per
+   server. A caller-side scope selector there would change the daemon's shape rather than refine a
+   predicate, so it is out of scope for this spec; whether to add one is the integration's decision
+   (#53, and hacienda-cowork #15).
 3. **Exact lane.** `full_text_search` over the `cites` n-gram index (and `text_phrase` for quoted
    spans). No fuzziness here — typo tolerance corrupts statute numbers. Allow fuzziness 1 only on a
    party-name lane if one is added later.
