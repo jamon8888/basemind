@@ -103,7 +103,7 @@ New table name `documents_v2`; the v1 table is left on disk and dropped by the e
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
-| `scope` | Utf8 | no | unchanged — isolation boundary |
+| `scope` | Utf8 | no | unchanged — **retrieval partition, not a confidentiality boundary**. It is derived from the repository (`MemoryScopeStrategy`, `src/config/v1.rs:360-368`), so it cannot separate two repositories. The confidentiality question is #7's, not this spec's (#40) |
 | `path` | Utf8 | no | unchanged |
 | `chunk_idx` | UInt32 | no | unchanged |
 | `mime_type` | Utf8 | no | unchanged |
@@ -192,6 +192,17 @@ queries, so:
 2. **Facet prefilter.** Build `only_if` from `scope` (mandatory) plus any of
    `mime_type` / `doc_type` / `jurisdiction` / `section` / date range. Prefilter, not postfilter:
    postfilter can return fewer than `limit` rows when top-k is mostly filtered out.
+
+   **The scope predicate applies to every lane, not only the vector one.** Steps 3, 4 and 5 are FTS
+   queries and must carry the same predicate; Lance supports a filter on a full-text query. A lane
+   that searched outside `scope` would leak across matters with no observable symptom, so this is a
+   correctness requirement, not a style note (#40).
+
+   `scope` resolves to the repository's own scope or one of its own `web:<host>` siblings, never to
+   an arbitrary caller-named string: `resolve_doc_scope` (`src/mcp/memory.rs:486-487`) returns the
+   requested value verbatim today, which is what makes scraped pages reachable but also what lets a
+   caller name another repository's scope. Constraining it to the repository and its `web:*`
+   siblings keeps the behaviour that fix was made for and removes the arbitrary read (#40).
 3. **Exact lane.** `full_text_search` over the `cites` n-gram index (and `text_phrase` for quoted
    spans). No fuzziness here — typo tolerance corrupts statute numbers. Allow fuzziness 1 only on a
    party-name lane if one is added later.
