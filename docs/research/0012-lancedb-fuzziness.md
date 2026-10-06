@@ -127,11 +127,12 @@ Three consequences worth writing down:
    `"Smtih" → "Smith"` is distance 2 and will *not* be caught by `fuzziness = 1`. This is confirmed
    by the official docs wording, "the classic Levenshtein distance"
    (<https://docs.lancedb.com/search/full-text-search>), and by the type used at the call site.
-3. **It operates on bytes**, since the FST keys are bytes (`fst::Map<Vec<u8>>`). For accented
-   party names (`ascii_folding` is on for the primary index per spec §7.1), a single changed
-   non-ASCII character can cost 2 UTF-8 byte edits, i.e. a `fuzziness = 1` budget is consumed by
-   one character. *(This is a reading of the byte-oriented key type plus `ascii_folding`; it was not
-   measured — see "Not established".)*
+3. **It operates on bytes**, since the FST keys are bytes — `TokenMap::Fst(fst::Map<Vec<u8>>)`
+   (`lance-index-10.0.0/src/scalar/inverted/index.rs:3066`). For accented party names
+   (`ascii_folding` is on for the primary index per spec §7.1), a single changed non-ASCII
+   character can cost 2 UTF-8 byte edits, i.e. a `fuzziness = 1` budget is consumed by one character.
+   *(This is a reading of the byte-oriented key type plus `ascii_folding`; it was not measured —
+   see "Not established".)*
 
 ### 1.5 Fuzziness requires an FST token set
 
@@ -206,16 +207,33 @@ impl LanceTokenizer for TextTokenizer {
 
 So on the `cites` index (spec §7.1: `base_tokenizer("ngram")`, `ngram_min_length(3)`,
 `ngram_max_length(3)`), the query string is itself n-grammed and edit distance is computed **over
-3-character trigrams**, not over the identifier. Traced by hand through
-`StutteringIterator` (`lance-tokenizer-10.0.0/src/ngram_tokenizer.rs:120-183`):
+3-character trigrams**, not over the identifier.
 
-- `"362"` → exactly **one** token, `"362"`.
-- `"2-24-1234"` → seven tokens: `2-2`, `-24`, `24-`, `4-1`, `-12`, `123`, `234`.
-- `"ab"` (shorter than `min_gram`) → **zero** tokens: `StutteringIterator::new` sets
-  `min_gram = 1, max_gram = 0` when the frontier count is `<= min_gram`, so `next()` returns `None`
-  immediately. A query shorter than the n-gram width silently yields nothing — no error, no fuzzy
-  rescue.
-- Every emitted n-gram carries `position = 0` (`ngram_tokenizer.rs:100`).
+The tokenization below was **executed**, not merely read. There is no Rust toolchain in this
+environment, so `CodepointFrontiers` (`ngram_tokenizer.rs:187-216`), `StutteringIterator::new`
+(`:133-157`), `StutteringIterator::next` (`:164-183`) and `NgramTokenStream::advance` (`:97-111`)
+were ported line-for-line to Python and run at `min_gram = max_gram = 3`:
+
+| Query | Tokens emitted |
+| --- | --- |
+| `362` | 1 — `['362']` |
+| `3621` | 2 — `['362', '621']` |
+| `2-24-1234` | 7 — `['2-2', '-24', '24-', '4-1', '-12', '123', '234']` |
+| `Smith` | 3 — `['Smi', 'mit', 'ith']` |
+| `ab` | **0** |
+| `a` | **0** |
+
+- A query shorter than `min_gram` is not "partially matched" — it matches nothing at all.
+  `StutteringIterator::new` sets `min_gram = 1, max_gram = 0` when the frontier count is
+  `<= min_gram` (`:136-144`), so `next()` hits `if self.max_gram < self.min_gram { return None }`
+  (`:177-179`) and the stream ends immediately. A query shorter than the n-gram width silently yields
+  **zero** tokens — no error, and no fuzzy rescue, because fuzzy expansion runs over the token list
+  that is now empty.
+- `Smith` → `Smi, mit, ith` is the general case, and it is the whole problem in three tokens: the
+  unit being compared is a 3-character window, so "one typo in `Smith`" is not expressible as a
+  distance on any single token.
+- Every emitted n-gram carries `position = 0` (`ngram_tokenizer.rs:100`), so position-based phrase
+  matching is not available on this lane either.
 
 Fuzzy expansion then runs on that token list (`InvertedIndex::expand_fuzzy_tokens`,
 `index.rs:1007-1044`), expanding **each token independently** and re-using its position.
@@ -310,14 +328,19 @@ So the selected terms are **the lexicographically smallest `max_expansions` in-v
 within the requested edit distance. Every term past the cut is dropped **silently** — no warning, no
 error, no partial-result signal.
 
-This matters because the budget is small relative to the neighbourhood:
+This matters because the budget is smaller than the neighbourhood. The distance-≤1 ball was
+**enumerated exactly** (generate all single substitutions / insertions / deletions, then verify every
+element with a real Levenshtein implementation — pure Python, no crate needed):
 
-- A 3-character token over a 10-symbol alphabet has ≥ 27 substitutions + ~40 insertions + 3 deletions
-  at distance ≤ 1 (≈70), i.e. **larger than the default `max_expansions = 50` before any vocabulary
-  filtering**. On the `cites` trigram index this is the normal case.
-- A 6-letter word over a 26-symbol alphabet has ≈ 150 substitutions + 182 insertions + 6 deletions
-  (≈338) at distance ≤ 1. A real corpus of surnames intersects that with a much smaller set, so the
-  budget may or may not bite — **this is corpus-dependent and I did not measure it**.
+- 3-character token over a 10-symbol alphabet (`362`): 27 substitutions + 37 distinct insertions +
+  3 deletions = **67** distinct strings. (A naive `3·9 + 4·10 + 3 = 70` double-counts 3
+  insertion/deletion collisions.) **67 > 50**, so the default `max_expansions` truncates *before any
+  vocabulary filtering*. On the `cites` trigram index this is the normal case.
+- 6-letter word over a 26-symbol alphabet (`porter`): 150 + 176 + 6 = **332** distinct strings.
+  **332 > 50** by a wide margin.
+- Both figures are **upper bounds on what survives vocabulary filtering**, not measurements of what
+  does. A real corpus of surnames intersects that with a much smaller set, so the budget may or may
+  not bite on a word lane — **this is corpus-dependent and I did not measure it**.
 - Because truncation is lexicographic, the cut is **not** "closest first". A high-frequency exact
   neighbour whose spelling sorts late is dropped in favour of an irrelevant one that sorts early.
 
@@ -360,9 +383,20 @@ dropping candidates — the §7.3 failure. This test is the direct analogue of
 if it keeps its conditional.
 
 **(d) Corruption control, for the `cites` lane specifically.** Query the **bare** citation token, the
-way §8.1 normalization produces it — not the whole citation string, since a full-string query shares
-trigrams (`"(a)"`, `"(1)"`) across near-neighbours and is ambiguous at *any* setting. Plant two rows,
-`§ 362(a)(1)` and `§ 363(a)(1)`. Assert:
+way §8 step 1 (Normalize) produces it — not the whole citation string, since a full-string query is
+ambiguous at *any* setting. Running the §2 tokenizer over the two near-neighbours:
+
+```
+"§ 362(a)(1)" -> ['§ 3', ' 36', '362', '62(', '2(a', '(a)', 'a)(', ')(1', '(1)']
+"§ 363(a)(1)" -> ['§ 3', ' 36', '363', '63(', '3(a', '(a)', 'a)(', ')(1', '(1)']
+                 ^^^^^^^^^ 6 of 9 trigrams shared
+```
+
+Six of nine trigrams are common to both citations, and the same six are common to *every* pair in
+the `§ 3NN` family. Because the default operator is `Or` (§2, point 2), a full-string query matches
+on shared trigrams alone. That is a property of the lane's tokenizer, independent of `fuzziness` —
+which is why the test below plants both rows rather than trusting a whole-string assertion. Plant
+`§ 362(a)(1)` and `§ 363(a)(1)`, then assert:
 
 1. `fuzziness = 0`, query `362` → row 1 returned, row 2 not.
 2. `fuzziness = 1`, query a one-substitution typo of `362` (e.g. `462`) → row 1 returned.
@@ -457,10 +491,17 @@ undesirable but semantically void (§2), since that is the non-obvious part.
 
 ## Not established (honest gaps)
 
-- **No measurement was possible.** There is no Rust toolchain in the environment used for this note,
-  so I could not build `lancedb 0.37.1` and run any of the tests proposed in §3.4, nor measure
-  latency, index size, or expansion counts. Every claim above is read from source or docs, not
-  measured. The trigram trace in §2 is a hand-trace of `StutteringIterator`, not an executed test.
+- **No Rust toolchain in this environment, so nothing was compiled or benchmarked.** I could not
+  build `lancedb 0.37.1` and run any of the tests proposed in §3.4, nor measure latency, index size,
+  or expansion counts. Every API claim above is read from source or docs, not measured against a
+  running index.
+  - Two things *were* executed, in Python, because they depend on algorithms rather than on a Rust
+    toolchain: the n-gram tokenizer traces in §2 and §3.4(d), ported line-for-line from
+    `lance-tokenizer-10.0.0/src/ngram_tokenizer.rs`; and the distance-≤1 ball counts in §3.3,
+    enumerated and then verified element-by-element against a Levenshtein implementation. These are
+    ports and pure combinatorics, **not** the compiled crate — they confirm the algorithms as read,
+    not the crate as linked.
+  - The Levenshtein ball counts are **worst-case alphabet counts**, not in-vocabulary counts.
 - **The real size of the distance-1 in-vocabulary neighbourhood** for a party-name corpus — i.e. how
   often `max_expansions = 50` actually truncates — is corpus-dependent and unmeasured. §3.3 gives the
   worst-case arithmetic for the alphabet; the intersection with a real vocabulary is unknown.
@@ -475,14 +516,16 @@ undesirable but semantically void (§2), since that is the non-obvious part.
   (`src/lance/mod.rs:204` connects to a local `uri`), so this was not pursued.
 - **Bonus, out of this ticket's scope but material:** spec §7.1's builder calls are not callable on
   0.37.1. `FtsIndexBuilder::default()` exists (`InvertedIndexParams::default()` →
-  `new("simple", English)`, `tokenizer.rs:532-536`), but the methods shown in the spec —
-  `with_base_tokenizer`, `with_language`, `with_stem`, `with_remove_stop_words`, `with_ascii_folding`,
-  `with_max_token_length`, `with_custom_stop_words`, `with_ngram_min_length`, `with_ngram_max_length` —
-  are not in the 0.37.1 builder surface (`tokenizer.rs:639-834`). The real names drop the `with_`
-  prefix: `base_tokenizer`, `language`, `stem`, `remove_stop_words`, `ascii_folding`,
-  `max_token_length`, `custom_stop_words`, `ngram_min_length`, `ngram_max_length`
-  (`with_position` *does* keep the prefix). Flagging it because §7.1 is the sibling section of the one
-  under review and the same pin governs both. **Not verified by compilation** — no toolchain.
+  `new("simple", English)`, `tokenizer.rs:532-536`), but `with_position` is the **only**
+  `with_`-prefixed method in the entire `tokenizer.rs` (`:687`). So `with_base_tokenizer`,
+  `with_language`, `with_stem`, `with_remove_stop_words`, `with_ascii_folding`,
+  `with_max_token_length`, `with_custom_stop_words`, `with_ngram_min_length`, and
+  `with_ngram_max_length` — all shown in §7.1 — do not exist. The real names drop the `with_` prefix:
+  `base_tokenizer`, `language`, `stem`, `remove_stop_words`, `ascii_folding`, `max_token_length`,
+  `custom_stop_words`, `ngram_min_length`, `ngram_max_length` (builder surface `:639-834`). Flagging
+  it because §7.1 is the sibling section of the one under review and the same pin governs both.
+  **Not verified by compilation** — no toolchain — but the absence of the `with_` names is a
+  single-grep fact about the crate source, so it does not depend on building anything.
 
 ---
 
@@ -496,11 +539,17 @@ repository's own code.
 | 1 | `lancedb 0.37.1` crate source — <https://crates.io/crates/lancedb/0.37.1> (`src/query.rs:453,574`; `src/index/scalar.rs:63-66`; `src/table/datafusion/udtf/fts.rs:568-597,1592-1625`; `Cargo.toml:310-313`) |
 | 2 | `lance-index 10.0.0` crate source — `src/scalar.rs:98-176`; `src/scalar/inverted/query.rs:12-71,283-376,803-813`; `src/scalar/inverted/index.rs:519-523,871-890,998-1044,2393-2424`; `src/scalar/inverted/tokenizer.rs:532-536,639-834,910-1010`; `src/scalar/inverted/tokenizer/document_tokenizer.rs:54-66,110-126`; `src/scalar/inverted.rs:40-67` |
 | 3 | `lance 10.0.0` crate source — `src/io/exec/fts.rs:386-394` |
-| 4 | `lance-tokenizer 10.0.0` crate source — `src/ngram_tokenizer.rs:76-183` |
-| 5 | docs.rs, `lancedb 0.37.1` — <https://docs.rs/lancedb/0.37.1/lancedb/query/struct.Query.html>, <https://docs.rs/lancedb/0.37.1/lancedb/index/scalar/struct.MatchQuery.html>, <https://docs.rs/lancedb/0.37.1/lancedb/index/scalar/struct.FullTextSearchQuery.html> |
+| 4 | `lance-tokenizer 10.0.0` crate source — `src/ngram_tokenizer.rs:76-216` |
+| 5 | docs.rs, `lancedb 0.37.1` — <https://docs.rs/lancedb/0.37.1/lancedb/query/struct.Query.html>, <https://docs.rs/lancedb/0.37.1/lancedb/index/scalar/struct.MatchQuery.html>, <https://docs.rs/lancedb/0.37.1/lancedb/index/scalar/struct.FullTextSearchQuery.html>. The 0.37.1 dependency panel independently lists `lance-index =10.0.0`, confirming the `=10.0.0` pin in source #1. |
 | 6 | Official LanceDB docs — <https://docs.lancedb.com/search/full-text-search> ("Fuzzy Search" and "Search for Substring" sections), <https://docs.lancedb.com/indexing/fts-index> (FTS parameters) |
 | 7 | basemind repo — `Cargo.toml:170`, `Cargo.lock:8243-8246`, `src/search/rrf.rs:7-36,75-109`, `src/search/exact.rs:22-36,54-84`, `src/index/mod.rs:455-471`, `src/mcp/helpers_files.rs:4-9,112-117,154-159`, `src/lance/mod.rs:204` |
 | 8 | Spec branch `spec/lexical-document-retrieval` — `docs/specs/0012-lexical-document-retrieval.md` §7.1 (l.133-161), §7.3 (l.176-184), §8 step 3 (l.206-208) |
+
+Every `path:line` reference in sources 1–4 and 7–8 was re-verified against the extracted crate
+source and the working tree. Two claims in this note were additionally **executed**, in Python,
+because they depend only on algorithms and not on a Rust toolchain: the §2/§3.4(d) n-gram
+tokenizer traces (ported line-for-line from source #4) and the §3.3 distance-≤1 ball enumeration.
+These are ports and combinatorics, not the compiled crate.
 
 No blog post, benchmark, or third-party comparison is cited as authority for any API claim here.
 Nothing in this note rests on a secondary source.
