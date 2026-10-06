@@ -159,11 +159,16 @@ In `.basemind/basemind.toml`:
 ```toml
 [documents]
 enabled = true
-embed = true  # set to false to disable embeddings (keyword search only)
+embed = true  # set to false to skip writing embeddings — there is no keyword lane yet
 
 [documents.reranker]
 enabled = true  # cross-encoder reranking for document chunks
 ```
+
+Document retrieval is vector-only today. Setting `embed = false` does **not** fall back to keyword
+search: there is no full-text index on the documents table, so the query has nothing lexical to
+match, and it is still embedded and sent to the vector lane regardless. A lexical lane is being
+specified in [issue #33](https://github.com/jamon8888/basemind/issues/33).
 
 ## Discipline
 
