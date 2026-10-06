@@ -52,3 +52,8 @@ them.
 | [0008](0008-documents-code-graph.md) | Documents ↔ code graph | Accepted |
 | [0009](0009-rationale-decision-nodes.md) | Rationale / decision nodes | Accepted |
 | [0010](0010-branch-integration-release-strategy.md) | Branch, integration & release strategy | Accepted |
+| [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign | Accepted |
+| [0012](0012-multi-lane-document-retrieval.md) | Multi-lane document retrieval — lexical-first, vector-optional | Proposed |
+
+Implementation specs live in [`../specs/`](../specs/). ADR-0012's spec is
+[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md).
