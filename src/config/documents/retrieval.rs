@@ -225,7 +225,10 @@ impl Default for CitationsConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{CitationsConfig, DocumentsConfig, FtsConfig, FusionConfig};
+    // `super` is this file's own re-export set; `DocumentsConfig` lives one level up, in
+    // `config::documents`.
+    use super::super::DocumentsConfig;
+    use super::{CitationsConfig, FtsConfig, FusionConfig};
 
     /// The defaults must match the spec's §5 / §7.1 / §10 tables, because they are what a user gets
     /// with no config at all. If these drift, the documented defaults are a lie.
