@@ -311,6 +311,41 @@ queries, so:
 Pagination: existing `next_cursor` semantics carry `(lane ranks, last row id)`; cursors must be
 invalidated by any index rebuild (see `with_row_id`).
 
+### 8.9 Scope coverage — what applies to scraped content
+
+The documents tier serves two scopes with different provenance, and the lanes do not treat them
+alike. `scope` is the ingestion partition, so coverage is a per-scope property, not a per-tier one:
+
+| Scope | `heading_path` | `cites` | `doc_type` | `section` | keyword | vector | exact |
+|---|---|---|---|---|---|---|---|
+| repo | yes | yes | curated or absent (§6.1) | rules (§9.1) | yes | yes | yes |
+| `web:<host>` | yes | **no**, unless overridden | `web` | absent | yes | yes | **no** |
+
+**Scraped content is Markdown, so the structural half is identical.** `crawlberg` emits Markdown and
+`xberg::chunking::chunk_text` reads it the same way the scanner reads a file on disk, so `heading_path`
+is populated for web rows exactly as it is for repo rows. That is why `web` is a first-class scope
+rather than a degraded one: the tier is not split, the row shape is not split, and `replace_document`
+already takes the scope as a parameter (`src/web/ingest.rs`).
+
+**`cites` is not extracted for scraped content, by default.** The `exact` lane indexes `cites` with
+an n-gram index, and on an arbitrary page "§ 362" or "2-24-1234" is layout noise, not a reference to
+authority — filling that index with page furniture degrades a fusion lane rather than boosting it.
+`web_scrape` is a general-purpose tool, so it cannot assume the caller scraped a page because it counts
+as legal authority.
+
+**A caller who does scrape an authority can say so.** `WebScrapeParams.scope`
+(`src/mcp/types_web.rs:54-57`) already exists, is already documented as *"Override to share a scope
+across many hosts or to namespace per project"*, and already reaches `resolve_doc_scope`. Naming the
+scope `web:authority` is the channel; the spec needs only to say that a non-default web scope opts into
+`cites` extraction and therefore into the `exact` lane. No new parameter, no new subsystem.
+
+**The facets are not the problem they were.** `doc_type`, `section`, `jurisdiction` and `doc_date` are
+all nullable (§6.1), and §6.1's rule is that a facet predicate on a null value does not constrain. A
+scraped page carrying `doc_type = web` with `section = NULL` therefore narrows nothing and breaks
+nothing: it does not disturb the Phase 4 exit criterion that a selective facet return exactly `limit`
+rows. `doc_type = web` is not an inference either — the provenance is `web_scrape`, so the value is
+known by construction, which is why `web` is in the §6 vocabulary.
+
 ## 9. Extraction and chunking defaults
 
 | Key | Current | Proposed | Why |
