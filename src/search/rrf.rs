@@ -17,21 +17,84 @@ use ahash::{AHashMap, AHashSet};
 /// close in contribution, so no single lane dominates on rank-1 alone.
 pub const DEFAULT_RRF_K: f32 = 60.0;
 
-/// Weight for the exact/symbol lane. Higher than the others because an identifier-shaped query that
-/// matches a defined symbol is a high-precision signal — the chunk that *defines* the symbol should
-/// win ties against a merely lexical or semantic co-occurrence.
-pub const WEIGHT_EXACT: f32 = 2.0;
-/// Weight for the vector (semantic) lane.
-pub const WEIGHT_VECTOR: f32 = 1.0;
-/// Weight for the keyword (BM25) lane.
-pub const WEIGHT_KEYWORD: f32 = 1.0;
-
 /// Stable lane names, surfaced as per-hit `matched_lanes` provenance in `search_code` responses.
 pub const LANE_EXACT: &str = "exact";
 /// Vector (semantic) lane name.
 pub const LANE_VECTOR: &str = "vector";
 /// Keyword (BM25) lane name.
 pub const LANE_KEYWORD: &str = "keyword";
+/// Facet lane name. A facet lane prefilters without scoring, so it contributes a rank over the
+/// surviving set rather than a scored match — the documents tier fuses it like any other lane.
+pub const LANE_FACET: &str = "facet";
+
+/// Per-lane weights for [`rrf_fuse_detailed`].
+///
+/// The defaults are the code tier's current values, unchanged, so code-search ranking is exactly
+/// what it was before this struct existed. They are deliberately **not** the documents tier's
+/// spec §5 values: those are a separate, provisional set that the evaluation harness has yet to
+/// justify, and swapping them in here would silently change the tier that ships today. Construct
+/// [`FusionWeights::document_lanes`] explicitly when you want that set.
+///
+/// Note there is another weights struct in the tree — `src/pii.rs`'s `RrfWeights`, holding
+/// 3.0/2.0/1.0, which are the §5 values. It has no production reader. If you are here looking for
+/// "the weights struct", that is why you found it, and adopting its values will change code-search
+/// ranking and break `search_code_hybrid_ranks_exact_symbol_first`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FusionWeights {
+    /// Exact / identifier lane.
+    pub exact: f32,
+    /// Vector (semantic) lane.
+    pub vector: f32,
+    /// Keyword (BM25 / lexical) lane.
+    pub keyword: f32,
+    /// Facet prefilter lane — rank over the surviving set, not a scored match.
+    pub facet: f32,
+}
+
+impl FusionWeights {
+    /// The code tier's shipped weights. Exact is highest because an identifier-shaped query that
+    /// matches a defined symbol is high-precision: the chunk that *defines* the symbol should win
+    /// ties against a lexical or semantic co-occurrence.
+    pub const fn code_lanes() -> Self {
+        Self {
+            exact: 2.0,
+            vector: 1.0,
+            keyword: 1.0,
+            facet: 0.0,
+        }
+    }
+
+    /// Spec 0012 §5's document-tier weights. **Provisional** — the evaluation harness has not run,
+    /// so these are the direction of the argument, not a measurement. `facet: 1.0` is a rank over
+    /// the prefiltered set, not a score; the facet lane prefilters without scoring.
+    pub const fn document_lanes() -> Self {
+        Self {
+            exact: 3.0,
+            keyword: 2.0,
+            facet: 1.0,
+            vector: 1.0,
+        }
+    }
+
+    /// The weight for a lane by name. Unknown lanes weigh 0, which makes them inert in the fusion
+    /// rather than a silent panic — a tier that names a lane this build does not know about loses
+    /// that lane instead of the whole query.
+    pub fn for_lane(&self, name: &str) -> f32 {
+        match name {
+            LANE_EXACT => self.exact,
+            LANE_VECTOR => self.vector,
+            LANE_KEYWORD => self.keyword,
+            LANE_FACET => self.facet,
+            _ => 0.0,
+        }
+    }
+}
+
+impl Default for FusionWeights {
+    fn default() -> Self {
+        Self::code_lanes()
+    }
+}
 
 /// One ranked lane's contribution to the fusion: its name, chunk ids (best-first), and weight.
 pub struct FusionLane<'a> {
@@ -172,6 +235,117 @@ mod tests {
         let empty: Vec<String> = Vec::new();
         assert!(rrf_fuse(&[FusionLane::new(LANE_KEYWORD, &empty, 1.0)], DEFAULT_RRF_K).is_empty());
         assert!(rrf_fuse(&[], DEFAULT_RRF_K).is_empty());
+    }
+
+    /// An empty lane must leave the fused order **untouched**, not merely produce an empty result.
+    ///
+    /// The existing test above covers only the all-empty case. The property that matters in
+    /// production is the mixed one: `hybrid` runs its lanes best-effort and a lane that failed or
+    /// matched nothing must not perturb the survivors. If an empty lane contributed a zero-weight
+    /// score entry — or worse, a rank — every other lane's ordering would shift and a degraded
+    /// lane would silently rewrite results.
+    #[test]
+    fn an_empty_lane_leaves_the_fused_order_of_the_others_unchanged() {
+        let empty: Vec<String> = Vec::new();
+        let exact = ids(&["h:aaa", "h:bbb"]);
+        let vector = ids(&["h:ccc", "h:aaa"]);
+
+        let without = rrf_fuse(
+            &[
+                FusionLane::new(LANE_EXACT, &exact, 2.0),
+                FusionLane::new(LANE_VECTOR, &vector, 1.0),
+            ],
+            DEFAULT_RRF_K,
+        );
+        let with = rrf_fuse(
+            &[
+                FusionLane::new(LANE_EXACT, &exact, 2.0),
+                // Inert: a failed or all-filtered lane arrives here with no ids.
+                FusionLane::new(LANE_VECTOR, &empty, 1.0),
+                FusionLane::new(LANE_KEYWORD, &vector, 1.0),
+            ],
+            DEFAULT_RRF_K,
+        );
+
+        assert_eq!(without.len(), 3, "three distinct chunks across the two live lanes");
+        assert_eq!(
+            with.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            without.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            "adding an empty lane must not reorder or rescore anything"
+        );
+    }
+
+    /// The documents tier's spec §5 weights are reachable without touching the code tier's.
+    ///
+    /// Two sets of weights are called "the documented weights" and they disagree, so both are pinned
+    /// here. `default()` must stay the code tier's values: swapping in §5's would change the tier
+    /// that ships today, and `search_code_hybrid_ranks_exact_symbol_first` would catch it — but only
+    /// once someone ran it, which is not a reason to leave the distinction implicit.
+    #[test]
+    fn code_weights_are_the_default_and_document_weights_are_separate() {
+        let code = FusionWeights::default();
+        assert_eq!(
+            (code.exact, code.keyword, code.vector),
+            (2.0, 1.0, 1.0),
+            "the code tier's shipped weights: exact highest, keyword and vector equal"
+        );
+
+        let docs = FusionWeights::document_lanes();
+        assert_eq!(
+            (docs.exact, docs.keyword, docs.facet, docs.vector),
+            (3.0, 2.0, 1.0, 1.0)
+        );
+
+        assert_ne!(
+            FusionWeights::default(),
+            FusionWeights::document_lanes(),
+            "the two sets must not collapse into one"
+        );
+    }
+
+    /// A four-lane fusion at spec §5 weights, asserted against an explicitly constructed struct so
+    /// the test cannot pass by reading `default()`.
+    #[test]
+    fn four_lane_fusion_at_document_weights() {
+        let w = FusionWeights::document_lanes();
+        let exact = ids(&["h:one"]);
+        let keyword = ids(&["h:one", "h:two"]);
+        let facet = ids(&["h:one", "h:two", "h:three"]);
+        let vector = ids(&["h:four"]);
+
+        let fused = rrf_fuse_detailed(
+            &[
+                FusionLane::new(LANE_EXACT, &exact, w.exact),
+                FusionLane::new(LANE_KEYWORD, &keyword, w.keyword),
+                FusionLane::new(LANE_FACET, &facet, w.facet),
+                FusionLane::new(LANE_VECTOR, &vector, w.vector),
+            ],
+            DEFAULT_RRF_K,
+        );
+
+        assert_eq!(fused.len(), 4, "all four lanes contribute");
+        assert_eq!(fused[0].chunk_id, "h:one", "the chunk every lane ranked first wins");
+        // Rank-only: a lane that contributes one chunk scores the same as any other such lane,
+        // whatever its weight. h:four is the vector lane's only hit, at rank 1.
+        let four = fused.iter().find(|f| f.chunk_id == "h:four").expect("h:four present");
+        let score = four.score;
+        assert!(score > 0.0, "the vector lane's rank-1 hit scores above zero");
+        assert!(
+            fused.iter().all(|f| f.score >= score || f.chunk_id != "h:one"),
+            "h:one accumulates four lanes and must not rank below a single-lane hit"
+        );
+    }
+
+    /// An unknown lane name weighs zero rather than panicking, so a tier naming a lane this build
+    /// does not know loses that lane instead of the whole query.
+    #[test]
+    fn an_unknown_lane_name_weighs_zero() {
+        let w = FusionWeights::code_lanes();
+        assert_eq!(w.for_lane(LANE_EXACT), 2.0);
+        assert_eq!(w.for_lane(LANE_VECTOR), 1.0);
+        assert_eq!(w.for_lane(LANE_KEYWORD), 1.0);
+        assert_eq!(w.for_lane(LANE_FACET), 0.0, "code tier has no facet lane");
+        assert_eq!(w.for_lane("phrase"), 0.0, "a lane this build does not know is inert");
     }
 
     #[test]
