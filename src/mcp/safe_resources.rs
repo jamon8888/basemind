@@ -24,6 +24,8 @@ const MAX_RESOURCE_BYTES: u64 = 1 << 20;
 /// A mirror this large is not a folder an agent browses; stop listing rather than stall.
 const MAX_LISTED: usize = 5_000;
 const MAX_DEPTH: usize = 32;
+/// Directories visited per listing. The file cap alone does not bound a tree of many empty folders.
+const MAX_DIRS: usize = 2_000;
 
 fn safe_dir(root: &Path) -> PathBuf {
     root.join("safe")
@@ -34,7 +36,11 @@ fn safe_dir(root: &Path) -> PathBuf {
 pub(crate) fn list(root: &Path) -> ListResourcesResult {
     let base = safe_dir(root);
     let mut found: Vec<(String, u64)> = Vec::new();
-    walk(&base, &base, 0, &mut found);
+    // A `safe` that is a link is not the mirror: it may point at the originals.
+    if is_plain_directory(&base) {
+        let mut visited = 0;
+        walk(&base, &base, 0, &mut visited, &mut found);
+    }
     found.sort();
     let resources = found
         .into_iter()
@@ -48,10 +54,11 @@ pub(crate) fn list(root: &Path) -> ListResourcesResult {
     ListResourcesResult::with_all_items(resources)
 }
 
-fn walk(base: &Path, dir: &Path, depth: usize, found: &mut Vec<(String, u64)>) {
-    if depth > MAX_DEPTH || found.len() >= MAX_LISTED {
+fn walk(base: &Path, dir: &Path, depth: usize, visited: &mut usize, found: &mut Vec<(String, u64)>) {
+    if depth > MAX_DEPTH || found.len() >= MAX_LISTED || *visited >= MAX_DIRS {
         return;
     }
+    *visited += 1;
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -65,7 +72,7 @@ fn walk(base: &Path, dir: &Path, depth: usize, found: &mut Vec<(String, u64)>) {
         };
         let path = entry.path();
         if kind.is_dir() {
-            walk(base, &path, depth + 1, found);
+            walk(base, &path, depth + 1, visited, found);
         } else if kind.is_file() {
             let Ok(relative) = path.strip_prefix(base) else {
                 continue;
@@ -77,6 +84,32 @@ fn walk(base: &Path, dir: &Path, depth: usize, found: &mut Vec<(String, u64)>) {
             found.push((relative, size));
         }
     }
+}
+
+/// True for a real directory, false for a missing path, a file, or a symlink (even one to a directory).
+fn is_plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Open `path` and confirm it is the very file that was validated.
+///
+/// The path was resolved and checked a moment ago, but a path can be re-pointed in between: the
+/// agent may write under `safe/_drafts`, so it can swap a file for a link to an original while a
+/// read is in flight. Comparing the opened descriptor with the validated file's identity closes
+/// that window. (Unix only: std exposes no stable file identity on Windows.)
+fn open_checked(path: &Path, validated: &fs::Metadata) -> std::io::Result<fs::File> {
+    let file = fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = validated;
+    Ok(file)
 }
 
 /// `a/b.md` with forward slashes, or `None` for a name that is not valid UTF-8.
@@ -100,6 +133,12 @@ fn mime_for(relative: &str) -> &'static str {
 pub(crate) fn read(root: &Path, uri: &str) -> Result<ReadResourceResult, ErrorData> {
     let relative = relative_from_uri(uri)?;
     let base = safe_dir(root);
+    // Refuse a linked `safe` before canonicalizing it: the link target would become the permitted base.
+    match fs::symlink_metadata(&base) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(outside_safe()),
+        Err(_) => return Err(not_found(uri)),
+    }
     let base = fs::canonicalize(&base).map_err(|_| not_found(uri))?;
     let target = fs::canonicalize(base.join(&relative)).map_err(|_| not_found(uri))?;
     // The resolved path, not the requested one: this is what catches a symlink that points out.
@@ -113,7 +152,13 @@ pub(crate) fn read(root: &Path, uri: &str) -> Result<ReadResourceResult, ErrorDa
     if metadata.len() > MAX_RESOURCE_BYTES {
         return Err(too_large(uri));
     }
-    let file = fs::File::open(&target).map_err(|_| not_found(uri))?;
+    let file = open_checked(&target, &metadata).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            outside_safe()
+        } else {
+            not_found(uri)
+        }
+    })?;
     // Bounded again at read time: the file may have grown since the metadata call.
     let mut bytes = Vec::new();
     file.take(MAX_RESOURCE_BYTES + 1)
@@ -254,5 +299,59 @@ mod tests {
             assert!(relative_from_uri(uri).is_err(), "{uri} must be refused");
         }
         assert_eq!(relative_from_uri("basemind://safe/a/b.md").unwrap(), "a/b.md");
+    }
+
+    #[test]
+    fn listing_stops_after_a_bounded_number_of_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("safe");
+        // Many directories, almost no files: the file cap alone never trips.
+        for index in 0..(MAX_DIRS + 500) {
+            fs::create_dir_all(base.join(format!("d{index}"))).unwrap();
+        }
+        fs::write(base.join("d0/only.md"), "x").unwrap();
+        let mut found = Vec::new();
+        let mut visited = 0;
+        walk(&base, &base, 0, &mut visited, &mut found);
+        assert!(
+            visited <= MAX_DIRS,
+            "visited {visited} directories, budget is {MAX_DIRS}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_safe_directory_that_is_a_link_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("original.txt"), "ORIGINAL-SECRET").unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("safe")).unwrap();
+        assert!(
+            list(dir.path()).resources.is_empty(),
+            "a linked safe/ must list nothing"
+        );
+        assert!(
+            read(dir.path(), "basemind://safe/original.txt").is_err(),
+            "a linked safe/ must read nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_link_after_validation_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inside.md");
+        let secret = dir.path().join("outside.txt");
+        fs::write(&path, "inside").unwrap();
+        fs::write(&secret, "ORIGINAL-SECRET").unwrap();
+        let validated = fs::metadata(&path).unwrap();
+        // Between the check and the open, another process replaces the file with a link out.
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&secret, &path).unwrap();
+        let error = open_checked(&path, &validated).expect_err("the swapped file must not be opened");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        // Untouched file: the check passes.
+        let intact = dir.path().join("intact.md");
+        fs::write(&intact, "ok").unwrap();
+        assert!(open_checked(&intact, &fs::metadata(&intact).unwrap()).is_ok());
     }
 }

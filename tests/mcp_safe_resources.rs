@@ -228,3 +228,16 @@ async fn a_workspace_without_safe_lists_nothing_and_reads_nothing() {
     assert!(service.list_all_resources().await.expect("resources/list").is_empty());
     assert!(read(&service, "basemind://safe/original.txt").await.is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_safe_directory_that_links_to_the_workspace_serves_nothing() {
+    basemind::store::init_isolated_cache();
+    let dir = tempfile::tempdir().expect("tempdir");
+    git(dir.path(), &["init", "-q"]);
+    std::fs::write(dir.path().join("original.txt"), "ORIGINAL-SECRET").unwrap();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("safe")).unwrap();
+    let service = client(dir.path()).await;
+    assert!(service.list_all_resources().await.expect("resources/list").is_empty());
+    assert!(read(&service, "basemind://safe/original.txt").await.is_err());
+}
