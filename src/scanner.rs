@@ -405,7 +405,7 @@ pub fn scan_with_observer(
         report.cancelled = true;
         flush_code_map(store)?;
         run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, &scope, driven.doc_batches);
+            flush_doc_batches_if_any(store, config, driven.doc_batches);
         });
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, driven.code_batches);
@@ -466,7 +466,7 @@ pub fn scan_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, &scope, doc_batches);
+            flush_doc_batches_if_any(store, config, doc_batches);
         });
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
@@ -485,7 +485,7 @@ pub fn scan_with_observer(
 
     advance(&mut breadcrumb, PHASE_LANES, None);
     run_optional_lane(LANE_DOC_BATCHES, || {
-        flush_doc_batches_if_any(store, config, &scope, doc_batches);
+        flush_doc_batches_if_any(store, config, doc_batches);
     });
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
@@ -675,7 +675,7 @@ pub fn scan_paths_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, &scope, doc_batches);
+            flush_doc_batches_if_any(store, config, doc_batches);
         });
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
@@ -690,7 +690,7 @@ pub fn scan_paths_with_observer(
     });
 
     run_optional_lane(LANE_DOC_BATCHES, || {
-        flush_doc_batches_if_any(store, config, &scope, doc_batches);
+        flush_doc_batches_if_any(store, config, doc_batches);
     });
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
@@ -749,7 +749,7 @@ fn derive_scope(root: &Path, source: &ScanSource<'_>) -> String {
 
 /// Push the buffered document batches into LanceDB. No-op without the `documents` feature.
 #[cfg(feature = "documents")]
-fn flush_doc_batches_if_any(store: &mut Store, config: &Config, scope: &str, batches: Vec<PendingDocBatchOpt>) {
+fn flush_doc_batches_if_any(store: &mut Store, config: &Config, batches: Vec<PendingDocBatchOpt>) {
     if batches.is_empty() {
         return;
     }
@@ -763,7 +763,7 @@ fn flush_doc_batches_if_any(store: &mut Store, config: &Config, scope: &str, bat
 }
 
 #[cfg(not(feature = "documents"))]
-fn flush_doc_batches_if_any(_store: &mut Store, _config: &Config, _scope: &str, _batches: Vec<PendingDocBatchOpt>) {}
+fn flush_doc_batches_if_any(_store: &mut Store, _config: &Config, _batches: Vec<PendingDocBatchOpt>) {}
 
 /// Purge `documents` LanceDB rows + `doc_files` entries for docs removed since the last scan. Called
 /// after the batch flush so it reuses an already-open LanceStore. Only referenced under `documents`.
