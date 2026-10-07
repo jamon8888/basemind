@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
+use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -204,6 +205,13 @@ pub struct DocChunk {
     /// Embedding vector. Empty when chunking ran without an embedding config.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedding: Vec<f32>,
+    /// Markdown heading breadcrumb this chunk sits under, e.g. `IV. TERMINATION > 4. Convenience`.
+    ///
+    /// Computed unconditionally, not behind `embed`: the lexical lane indexes it, and a
+    /// lexical-only store (`embed = false`) is exactly where it is most needed and exactly where
+    /// the dense-only path would have skipped it. Empty for a chunk with no heading context.
+    #[serde(default)]
+    pub heading_path: String,
 }
 
 /// Caller-supplied knobs for document extraction.
@@ -657,6 +665,35 @@ fn dense_retrieval_text<'a>(content: &'a str, heading_context: Option<&xberg::ty
     }
 }
 
+/// The breadcrumb a chunk sits under, or `""` when it has no heading context.
+///
+/// Rendered from `context.headings` rather than by calling
+/// `xberg::chunking::render_heading_breadcrumb`, which takes the source content and appends the
+/// chunk body after the breadcrumb — so it returns `"# Guide > ## Setup\n\n<the body>"`, not a
+/// breadcrumb. xberg already has the right function for this (`builder::heading_path_from_context`)
+/// but it is `pub(crate)`, so it is not reachable from here.
+///
+/// The format matches `render_heading_breadcrumb`'s prefix exactly, so the stored column and the
+/// dense input describe the same path with the same spelling. Note this is **not** what spec 0012
+/// §6 shows: the spec's `IV. TERMINATION > 4. Convenience` does not correspond to any rendering,
+/// real or intended.
+fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> String {
+    let Some(context) = heading_context.filter(|c| !c.headings.is_empty()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (i, heading) in context.headings.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" > ");
+        }
+        for _ in 0..heading.level {
+            out.push('#');
+        }
+        let _ = write!(out, " {}", heading.text);
+    }
+    out
+}
+
 fn prepare_doc_chunk(
     content: String,
     byte_start: usize,
@@ -664,12 +701,18 @@ fn prepare_doc_chunk(
     heading_context: Option<&xberg::types::HeadingContext>,
     embed_requested: bool,
 ) -> (DocChunk, Option<String>) {
+    // The breadcrumb used to be computed only when an embed was requested, so a lexical-only store
+    // (`embed = false`) never had it — the configuration where the lexical lane is the *only* lane
+    // and this column is the whole structural signal. `dense_retrieval_text` is untouched: it still
+    // inlines the breadcrumb with the body, which is what the embedder wants.
+    let heading_path = heading_path_of(heading_context);
     let dense_input = embed_requested.then(|| dense_retrieval_text(&content, heading_context).into_owned());
     let chunk = DocChunk {
         byte_start: u32::try_from(byte_start).unwrap_or(u32::MAX),
         byte_end: u32::try_from(byte_end).unwrap_or(u32::MAX),
         text: content,
         embedding: Vec::new(),
+        heading_path,
     };
     (chunk, dense_input)
 }
@@ -745,6 +788,11 @@ fn metadata_pairs(metadata: &xberg::types::Metadata) -> Vec<(String, String)> {
         _ => Vec::new(),
     }
 }
+
+/// `heading_path` tests live in a subdirectory by the 1000-line module cap
+/// (`tests/max_lines.rs`), the same shape `scanner_docs` uses for its tests.
+#[cfg(test)]
+mod heading_path_tests;
 
 #[cfg(test)]
 mod tests {

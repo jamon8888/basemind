@@ -7,6 +7,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod pii_patterns;
+mod retrieval;
+
+pub use retrieval::{CitationsConfig, FtsConfig, FusionConfig};
 
 /// Top-level `[documents]` table. Each sub-config has `#[serde(default)]` so
 /// adding a new tier never breaks older TOML files.
@@ -99,6 +102,15 @@ pub struct DocumentsConfig {
     /// Response wire format for the document MCP tools.
     #[serde(default)]
     pub output: OutputConfig,
+    /// RRF fusion parameters for multi-lane retrieval (`[documents.fusion]`).
+    #[serde(default)]
+    pub fusion: FusionConfig,
+    /// Tokenizer settings for the lexical index (`[documents.fts]`).
+    #[serde(default)]
+    pub fts: FtsConfig,
+    /// Identifier extraction for the exact lane (`[documents.citations]`).
+    #[serde(default)]
+    pub citations: CitationsConfig,
     /// Maximum number of threads dedicated to ONNX embedding. `0` means
     /// "auto = max(2, logical_cpus / 4)" — a bounded fraction of available
     /// cores so the embedder never pins the machine. Both the document and
@@ -162,6 +174,9 @@ impl Default for DocumentsConfig {
             redaction: RedactionConfig::default(),
             ocr: OcrConfig::default(),
             output: OutputConfig::default(),
+            fusion: FusionConfig::default(),
+            fts: FtsConfig::default(),
+            citations: CitationsConfig::default(),
             embed_max_threads: 0,
         }
     }

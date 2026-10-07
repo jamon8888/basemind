@@ -23,6 +23,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
             byte_end: 5,
             text: "hello".to_string(),
             embedding: vec![0.0_f32; 768],
+            heading_path: String::new(),
         }],
         embedding_model: "balanced".to_string(),
         embedding_dim: 768,
@@ -93,6 +94,7 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
             byte_end: i as u32 + 1,
             text: format!("chunk {i}"),
             embedding: vec![0.0_f32; embedding_dim as usize],
+            heading_path: String::new(),
         })
         .collect();
     FileMapDoc {
