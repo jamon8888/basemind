@@ -91,25 +91,49 @@ fn is_plain_directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
+/// The identity of the file at `target`, taken WITHOUT following a link, or a refusal.
+///
+/// `target` was resolved a moment ago, but the agent may write under `safe/_drafts` and swap a file
+/// for a link to an original while a read is in flight. `fs::metadata` would follow such a link and
+/// record the original's identity as if it were the validated file's, so the identity is read with
+/// `symlink_metadata`: a link at this point is refused, and a later swap cannot match it.
+fn validated_file_identity(target: &Path, uri: &str) -> Result<fs::Metadata, ErrorData> {
+    let metadata = fs::symlink_metadata(target).map_err(|_| not_found(uri))?;
+    if metadata.file_type().is_symlink() {
+        return Err(outside_safe());
+    }
+    if !metadata.is_file() {
+        return Err(ErrorData::invalid_params("not a file", Some(json!({ "uri": uri }))));
+    }
+    Ok(metadata)
+}
+
 /// Open `path` and confirm it is the very file that was validated.
 ///
-/// The path was resolved and checked a moment ago, but a path can be re-pointed in between: the
-/// agent may write under `safe/_drafts`, so it can swap a file for a link to an original while a
-/// read is in flight. Comparing the opened descriptor with the validated file's identity closes
-/// that window. (Unix only: std exposes no stable file identity on Windows.)
+/// On Unix the final component is opened with `O_NOFOLLOW`, so a link swapped in after validation
+/// fails to open instead of being followed, and with `O_NONBLOCK`, so a FIFO swapped in cannot hang
+/// the thread. The opened descriptor's device and inode are then compared with the validated file's,
+/// which also catches a directory on the way that was swapped for a link. Windows keeps the static
+/// checks only: std exposes no stable file identity there.
 fn open_checked(path: &Path, validated: &fs::Metadata) -> std::io::Result<fs::File> {
-    let file = fs::File::open(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
         let opened = file.metadata()?;
         if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
             return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         }
+        Ok(file)
     }
     #[cfg(not(unix))]
-    let _ = validated;
-    Ok(file)
+    {
+        let _ = validated;
+        fs::File::open(path)
+    }
 }
 
 /// `a/b.md` with forward slashes, or `None` for a name that is not valid UTF-8.
@@ -145,18 +169,17 @@ pub(crate) fn read(root: &Path, uri: &str) -> Result<ReadResourceResult, ErrorDa
     if !target.starts_with(&base) {
         return Err(outside_safe());
     }
-    let metadata = fs::metadata(&target).map_err(|_| not_found(uri))?;
-    if !metadata.is_file() {
-        return Err(ErrorData::invalid_params("not a file", Some(json!({ "uri": uri }))));
-    }
+    let metadata = validated_file_identity(&target, uri)?;
     if metadata.len() > MAX_RESOURCE_BYTES {
         return Err(too_large(uri));
     }
+    // Only a missing file is "not found": a refused follow (ELOOP) or an identity mismatch is the
+    // path having been re-pointed, and says so.
     let file = open_checked(&target, &metadata).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            outside_safe()
-        } else {
+        if error.kind() == std::io::ErrorKind::NotFound {
             not_found(uri)
+        } else {
+            outside_safe()
         }
     })?;
     // Bounded again at read time: the file may have grown since the metadata call.
@@ -343,15 +366,73 @@ mod tests {
         let secret = dir.path().join("outside.txt");
         fs::write(&path, "inside").unwrap();
         fs::write(&secret, "ORIGINAL-SECRET").unwrap();
-        let validated = fs::metadata(&path).unwrap();
+        let validated = validated_file_identity(&path, "u").unwrap();
         // Between the check and the open, another process replaces the file with a link out.
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&secret, &path).unwrap();
-        let error = open_checked(&path, &validated).expect_err("the swapped file must not be opened");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            open_checked(&path, &validated).is_err(),
+            "the swapped file must not be opened"
+        );
         // Untouched file: the check passes.
         let intact = dir.path().join("intact.md");
         fs::write(&intact, "ok").unwrap();
-        assert!(open_checked(&intact, &fs::metadata(&intact).unwrap()).is_ok());
+        assert!(open_checked(&intact, &validated_file_identity(&intact, "u").unwrap()).is_ok());
+    }
+
+    /// The sequence from the review: the file is swapped for a link BEFORE its identity is taken, so
+    /// an identity read through the link would be the original's and the comparison would pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_place_of_the_file_is_refused_even_if_its_identity_were_read_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("swapped.md");
+        let secret = dir.path().join("outside.txt");
+        fs::write(&secret, "ORIGINAL-SECRET").unwrap();
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        // The identity is not taken through a link ...
+        assert!(
+            validated_file_identity(&link, "u").is_err(),
+            "a link must not yield an identity"
+        );
+        // ... and even the mistake of following it does not let the open through: the open itself
+        // refuses to follow a link.
+        let followed = fs::metadata(&link).unwrap();
+        assert!(
+            open_checked(&link, &followed).is_err(),
+            "O_NOFOLLOW must refuse to open a link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn something_that_is_not_a_regular_file_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validated_file_identity(dir.path(), "u").is_err(), "a directory");
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(validated_file_identity(&fifo, "u").is_err(), "a FIFO");
+    }
+
+    /// `O_NOFOLLOW` only covers the last path component. A directory on the way swapped for a link
+    /// still redirects the open, and only the inode comparison catches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_on_the_way_swapped_for_a_link_is_caught_by_the_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("a");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(inside.join("f.md"), "inside").unwrap();
+        fs::write(elsewhere.join("f.md"), "ORIGINAL-SECRET").unwrap();
+        let path = inside.join("f.md");
+        let validated = validated_file_identity(&path, "u").unwrap();
+        // The directory is replaced by a link to another one holding a file of the same name.
+        fs::remove_dir_all(&inside).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &inside).unwrap();
+        let error = open_checked(&path, &validated).expect_err("the redirected open must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }
