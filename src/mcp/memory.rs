@@ -136,7 +136,22 @@ pub(super) async fn lance_store_lexical(state: &ServerState) -> Result<Arc<crate
         .cloned()
         .map_err(|e| McpError::internal_error(e.clone(), None))
 }
+
+/// Run the lexical lane on the `spawn_blocking` thread.
 ///
+/// Named rather than inlined because that closure must be `'static`; building the term list and
+/// the scope predicate inside it keeps the borrowed config out of the captured environment.
+fn basemind_lexical(
+    lance: &crate::lance::LanceStore,
+    terms: &[String],
+    predicate: &str,
+    limit: usize,
+    max_relaxations: u32,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_relaxed_on(lance, terms, predicate, limit, max_relaxations)
+}
+
+/// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
 /// existing record" and stamp different `created_at` values, and their two-phase
@@ -558,31 +573,75 @@ pub(super) async fn run_search_documents(
     };
 
     let limit = params.limit.unwrap_or(10).min(100) as usize;
-    let embedding = embed_query(state, &params.query).await?;
-    let lance = lance_store(state).await?;
     let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
-    let mime = params.mime_type.clone();
-    let hits_raw =
-        tokio::task::spawn_blocking(move || lance.search_documents(&scope, embedding, limit, mime.as_deref()))
-            .await
-            .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
-            .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
-    let mut hits: Vec<DocumentSearchHit> = hits_raw
-        .into_iter()
-        .map(|h| DocumentSearchHit {
-            path: h.path,
-            chunk_idx: h.chunk_idx,
-            text: h.text,
-            mime_type: h.mime_type,
-            byte_start: h.byte_start,
-            byte_end: h.byte_end,
-            distance: h.distance,
-            rerank_score: None,
-            keywords: Vec::new(),
-            entities: Vec::new(),
-            summary: None,
+
+    // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
+    // reaching for it would embed the query and download a model to answer a question that does
+    // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
+    // lane, and it answers through a store opened without an embedder.
+    let lexical_only = !state.shared.config.documents.embed;
+    let retrieval_mode = if lexical_only { "lexical" } else { "vector" };
+
+    let mut hits: Vec<DocumentSearchHit> = if lexical_only {
+        let fts = &state.shared.config.documents.fts;
+        let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
+        let lance = lance_store_lexical(state).await?;
+        let query = params.query.clone();
+        let scope_for_lane = scope.clone();
+        let hits_raw = tokio::task::spawn_blocking(move || {
+            let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+            let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)
         })
-        .collect();
+        .await
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
+        let _ = fts;
+        hits_raw
+            .into_iter()
+            .map(|h| DocumentSearchHit {
+                path: h.path,
+                chunk_idx: h.chunk_idx,
+                text: h.text,
+                mime_type: h.mime_type,
+                byte_start: h.byte_start,
+                byte_end: h.byte_end,
+                // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
+                distance: 0.0,
+                rerank_score: None,
+                keywords: Vec::new(),
+                entities: Vec::new(),
+                summary: None,
+            })
+            .collect()
+    } else {
+        let embedding = embed_query(state, &params.query).await?;
+        let lance = lance_store(state).await?;
+        let mime = params.mime_type.clone();
+        let scope_for_lane = scope.clone();
+        let hits_raw = tokio::task::spawn_blocking(move || {
+            lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
+        hits_raw
+            .into_iter()
+            .map(|h| DocumentSearchHit {
+                path: h.path,
+                chunk_idx: h.chunk_idx,
+                text: h.text,
+                mime_type: h.mime_type,
+                byte_start: h.byte_start,
+                byte_end: h.byte_end,
+                distance: h.distance,
+                rerank_score: None,
+                keywords: Vec::new(),
+                entities: Vec::new(),
+                summary: None,
+            })
+            .collect()
+    };
 
     attach_doc_metadata(
         state,
