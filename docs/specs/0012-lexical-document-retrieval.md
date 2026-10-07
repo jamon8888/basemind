@@ -350,10 +350,18 @@ known by construction, which is why `web` is in the §6 vocabulary.
 
 | Key | Current | Proposed | Why |
 |---|---|---|---|
-| `max_characters` | 800 | 1800 | BM25 length normalization punishes small chunks; 800 chars splits statutes mid-subsection. Claim-level legal RAG reports recall rising with chunk size (600 tokens / 120 overlap). |
-| `overlap` | 100 | 220 | ~12% — keeps §/subsection boundaries whole without inflating index size. |
+| `max_characters` | 800 | 1800 | **Provisional, pending §13.** A third-party ablation (arXiv 2605.21071, §17) reports recall rising with chunk size in claim-level legal RAG, at 600 tokens / 120 overlap. That study is external and its parameters are not this corpus's; it is the direction of the evidence, not a measurement of this store. The original draft also claimed "800 chars splits statutes mid-subsection" — that is unsourced and is not repeated here. |
+| `overlap` | 100 | 220 | **Provisional, pending §13.** ~12% of `max_characters` — keeps §/subsection boundaries whole without inflating index size. |
 | `chunker_type` | `Markdown` | `Markdown` (unchanged) | heading structure survives; feeds `heading_path`. |
 | `max_chunks_per_document` | 2000 | 2000 | fine; guard only. |
+
+**A note on chunk size and the `cites` lane.** The exact lane indexes the whole `cites` column of each
+chunk with an n-gram index, and the usual worry about chunk size is that a small chunk splits a
+citation across two chunks and loses the exact match. **Going from 800 to 1800 makes that less likely,
+not more** — a longer chunk holds a reference whole more often. The real cost of a larger chunk on this
+lane is the opposite: more strings inside a long chunk *resemble* citations, so the n-gram index picks
+up page furniture and markup. The exact lane's sensitivity to chunk size is a **noise** question, not
+a splitting one, and §13 is the place to measure it.
 | `max_pages` | 500 | 500 | fine; scanned bundles may need more. |
 | `extraction_timeout_secs` | 600 | 900 | OCR-bound extraction of large bundles. |
 | `reranker.enabled` | `false` | `true` | works without corpus vectors; largest precision win available. |
