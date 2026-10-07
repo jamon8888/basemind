@@ -22,7 +22,8 @@ use crate::embeddings::SharedEmbedder;
 use crate::extract::{FileMapL1, FileMapL2, SCHEMA_VER};
 use crate::lance::CodeRow;
 use crate::scanner::EmbedMode;
-use crate::search::bm25::{ChunkPosting, build_chunk_postings};
+use crate::search::bm25::ChunkPosting;
+use crate::search::bm25_postings::build_chunk_postings;
 use crate::store::Store;
 
 /// Per-file deferred-LanceDB-write descriptor for the code-search tier. Built inside the parallel

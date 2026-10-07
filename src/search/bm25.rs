@@ -18,7 +18,6 @@ use std::cmp::Ordering;
 
 use ahash::{AHashMap, AHashSet};
 
-use crate::chunk::CodeChunk;
 use crate::index::{IndexDb, keys};
 
 /// Upper bound on a single token's byte length. Tokens longer than this (minified blobs, base64
@@ -73,7 +72,7 @@ fn for_each_token(text: &str, mut f: impl FnMut(&str)) {
 /// Allocates a `String` key only on a token's first occurrence (via `get_mut`-then-`insert`), not on
 /// every repeat — repeats are the common case in code (keywords, an identifier used many times), and
 /// this runs in the scanner's per-file hot loop.
-fn tokenize_counts(text: &str) -> AHashMap<String, u32> {
+pub(crate) fn tokenize_counts(text: &str) -> AHashMap<String, u32> {
     let mut counts: AHashMap<String, u32> = AHashMap::new();
     for_each_token(text, |tok| {
         if let Some(count) = counts.get_mut(tok) {
@@ -92,24 +91,6 @@ fn tokenize_query(query: &str) -> Vec<String> {
         seen.insert(tok.to_string());
     });
     seen.into_iter().collect()
-}
-
-/// Build the BM25 postings for a file's chunks. `doclen` is the total token count (with repetition);
-/// `terms` are the distinct `(term, tf)` pairs. Called from the scanner's parallel per-file worker.
-pub fn build_chunk_postings(chunks: &[CodeChunk]) -> Vec<ChunkPosting> {
-    chunks
-        .iter()
-        .map(|c| {
-            let counts = tokenize_counts(&c.searchable_text);
-            let doclen: u32 = counts.values().copied().sum();
-            let terms: Vec<(String, u32)> = counts.into_iter().collect();
-            ChunkPosting {
-                chunk_id: c.chunk_id.clone(),
-                doclen,
-                terms,
-            }
-        })
-        .collect()
 }
 
 /// BM25 inverse document frequency for a term appearing in `df` of `n` documents. Uses the
@@ -191,6 +172,9 @@ pub fn bm25_search(db: &IndexDb, query: &str, limit: usize) -> Vec<Bm25Hit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests need `CodeChunk` here: posting construction moved to `bm25_postings`, which
+    // is what stays behind `code-search`. This module is the scoring half.
+    use crate::chunk::CodeChunk;
 
     fn chunk(chunk_id: &str, searchable_text: &str) -> CodeChunk {
         CodeChunk {
