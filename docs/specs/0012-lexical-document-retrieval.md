@@ -170,9 +170,29 @@ would serve display only. An inferred value that *can* be prefiltered is the del
 There is no third option that is both cheap and safe.
 
 Curation cost is per dossier and **visible**: an uncurated dossier is one whose facets are absent,
-which a reader can see. The assignment channel is the integration's call (Hacienda-cowork #15);
+which a reader can see. The assignment channel is the integration's call (hacienda-cowork #15);
 an ingest parameter and a path-to-kind mapping are the two that survive the fact that `safe/`
 mirrors are generated `.md` files that no human edits.
+
+### 6.2 `MemoryScopeStrategy` is a decoration — do not extend it
+
+`MemoryScopeStrategy` (`src/config/v1.rs:360-368`) has two variants, `GitRemoteWithFallback` and
+`WorkdirOnly`, and **no reader**. `scope_key` (`src/git/remote.rs:26`) takes no config argument and
+always prefers the normalized remote URL, falling back to the workdir realpath;
+`shared_state` calls it with no configuration at all. `config.memory.scope_strategy` is inert, while
+the JSON schema and the public website both present `workdir_only` as a working setting — so a
+`basemind.toml` carrying it loads, changes nothing, and says nothing.
+
+This is recorded here because it is a trap for the work this spec implies. The obvious place to hang a
+subtree scope (§6.1, and #53) would be a new variant on that enum — which would extend code that
+nothing reads. **Do not.** Adding `SubSpace` to an enum with no reader produces a third dead variant
+and a second lie in the schema. Whether `WorkdirOnly` is ever wired, and whether the enum is removed
+or deprecated, is a separate decision on a separate card; this spec's only stake is the negative one.
+
+The fix to the false documentation is a docs-and-config change, deliberately **outside** this spec
+branch — the same treatment as the `embed = false` keyword-search claim corrected in PR #46. A
+correction to documentation that is live on the website today does not belong in a specification PR,
+and merging this spec must not wait on it.
 
 ## 7. Index build
 
