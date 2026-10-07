@@ -17,8 +17,7 @@ use super::types_code::{CodeSearchHit, GetChunkParams, GetChunkResponse, SearchC
 use crate::search::bm25::bm25_search;
 use crate::search::exact::exact_lane_chunk_ids;
 use crate::search::rrf::{
-    DEFAULT_RRF_K, FusionLane, LANE_EXACT, LANE_KEYWORD, LANE_VECTOR, WEIGHT_EXACT, WEIGHT_KEYWORD, WEIGHT_VECTOR,
-    rrf_fuse_detailed,
+    DEFAULT_RRF_K, FusionLane, FusionWeights, LANE_EXACT, LANE_KEYWORD, LANE_VECTOR, rrf_fuse_detailed,
 };
 use crate::store::Store;
 
@@ -164,11 +163,15 @@ async fn hybrid_hits(
     let exact_ids = lanes.exact;
 
     let store = state.shared.store.read().await;
+    // `FusionWeights::default()` is the code tier's shipped weights, so this is the same fusion
+    // the three constants expressed. Weights are not configurable yet: they would be constants with
+    // extra steps until the evaluation harness exists to justify them.
+    let weights = FusionWeights::default();
     let fused = rrf_fuse_detailed(
         &[
-            FusionLane::new(LANE_EXACT, &exact_ids, WEIGHT_EXACT),
-            FusionLane::new(LANE_VECTOR, &vector_ids, WEIGHT_VECTOR),
-            FusionLane::new(LANE_KEYWORD, &keyword_ids, WEIGHT_KEYWORD),
+            FusionLane::new(LANE_EXACT, &exact_ids, weights.exact),
+            FusionLane::new(LANE_VECTOR, &vector_ids, weights.vector),
+            FusionLane::new(LANE_KEYWORD, &keyword_ids, weights.keyword),
         ],
         DEFAULT_RRF_K,
     );
