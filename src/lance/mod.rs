@@ -551,7 +551,11 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
-        if r.embedding.len() != usize::from(dim) {
+        // An empty `embedding` means the scan ran with `embed = false`: the row is lexical-only and
+        // the vector column is null. A *non-empty* vector of the wrong length is still a bug — that
+        // one would silently misalign the index — so the length check survives for the case that can
+        // actually be wrong.
+        if !r.embedding.is_empty() && r.embedding.len() != usize::from(dim) {
             return Err(anyhow!(
                 "documents row embedding dim {} does not match store dim {}",
                 r.embedding.len(),
@@ -569,10 +573,14 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Some(value) => rehydration_ref.append_value(value),
             None => rehydration_ref.append_null(),
         }
-        for v in &r.embedding {
-            embedding.values().append_value(*v);
+        if r.embedding.is_empty() {
+            embedding.append(false);
+        } else {
+            for v in &r.embedding {
+                embedding.values().append_value(*v);
+            }
+            embedding.append(true);
         }
-        embedding.append(true);
     }
 
     let schema = documents_schema(dim);
@@ -875,6 +883,11 @@ pub fn now_micros() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Documents-tier row/schema tests live in a subdirectory, by the 1000-line cap
+    /// (`tests/max_lines.rs`), matching how `scanner_docs` keeps its tests. Nested here so they
+    /// still reach the private `build_documents_batch` through `super::*`.
+    mod documents_unit_tests;
 
     fn sentinel(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("sentinel");

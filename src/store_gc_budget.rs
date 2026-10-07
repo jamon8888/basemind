@@ -45,6 +45,17 @@ const BUDGET_ORPHAN_GRACE: Duration = Duration::ZERO;
 /// may inspect caches written by a richer binary than the one currently running.
 const LANCE_WORKSPACE_DIR: &str = "lance";
 
+/// Lance tables the cache budget may delete. Deliberately *not* `memory.lance`: it holds
+/// user-authored memory, and budget enforcement must never delete it.
+///
+/// These are literals rather than `crate::lance::schema::*` because that module is gated on
+/// `intelligence`, and a thinner binary must still be able to evict what a richer one wrote. The
+/// cost is that a renamed or added table is silently **omitted** — never deleted wrongly, but never
+/// evicted either, so the workspace never returns under budget and the leak has no symptom until
+/// someone goes looking for it. `lance_evictable_tables_match_the_schema_constants` closes that gap:
+/// it fails the build if this list and the real table names diverge.
+const LANCE_EVICTABLE_TABLES: &[&str] = &["documents", "doc_links", "code_chunks"];
+
 /// Filename of the persisted last-GC state, in the machine-global cache root (next to `blobs/`
 /// and `workspaces/`).
 pub const GC_STATE_FILE: &str = "gc-state.json";
@@ -383,18 +394,21 @@ fn evict_workspace(dir: &Path) -> Result<Option<u64>, GcError> {
 /// Derived state that can be rebuilt from source. Stable identity, the workspace marker, and the
 /// `memory.lance` table are intentionally absent: budget enforcement must never rotate an agent's
 /// identity or delete user-authored memory.
-fn rebuildable_workspace_paths(workspace: &Path) -> [PathBuf; 8] {
+fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
     let lance = workspace.join(LANCE_WORKSPACE_DIR);
-    [
+    let mut paths = vec![
         workspace.join(crate::store::VIEWS_DIR),
         workspace.join("git-cache"),
         workspace.join(crate::git_history::GIT_HISTORY_DIR),
         workspace.join("status.json"),
         workspace.join("telemetry.jsonl"),
-        lance.join("documents.lance"),
-        lance.join("code_chunks.lance"),
-        lance.join("doc_links.lance"),
-    ]
+    ];
+    paths.extend(
+        LANCE_EVICTABLE_TABLES
+            .iter()
+            .map(|table| lance.join(format!("{table}.lance"))),
+    );
+    paths
 }
 
 fn remove_cache_path(path: &Path) -> Result<(), GcError> {
@@ -454,6 +468,37 @@ mod tests {
     use super::*;
     use crate::store::{FileEntry, INDEX_FILE, Index, VIEWS_DIR, ensure_workspace_marker};
     use std::fs;
+
+    /// `LANCE_EVICTABLE_TABLES` is literals so a thinner binary can still evict what a richer one
+    /// wrote. The cost is that a renamed or added table is silently *omitted* — never evicted, never
+    /// reported, no symptom. This is the guard that makes the omission loud: it fails the build the
+    /// moment the eviction list and the real table names diverge.
+    #[cfg(feature = "intelligence")]
+    #[test]
+    fn lance_evictable_tables_match_the_schema_constants() {
+        use crate::lance::schema::{CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE, MEMORY_TABLE};
+
+        let mut expected = vec![DOCUMENTS_TABLE];
+        #[cfg(feature = "documents")]
+        expected.push(DOC_LINKS_TABLE);
+        #[cfg(feature = "code-search")]
+        expected.push(CODE_CHUNKS_TABLE);
+
+        let mut actual: Vec<&str> = LANCE_EVICTABLE_TABLES.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "LANCE_EVICTABLE_TABLES has drifted from the real table names. A table missing here is \
+             never evicted under cache pressure — the workspace never returns under budget and the \
+             leak is invisible. Update the list when a table is added or renamed."
+        );
+        assert!(
+            !LANCE_EVICTABLE_TABLES.contains(&MEMORY_TABLE),
+            "memory.lance holds user-authored memory and must never be evictable"
+        );
+    }
 
     /// Seed `<workspaces>/<key>/` with a marker + a working view whose index references `stem`,
     /// then force every activity-bearing file's mtime to `age` ago.

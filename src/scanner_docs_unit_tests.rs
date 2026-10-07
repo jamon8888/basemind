@@ -146,6 +146,12 @@ fn pending_from_doc_marks_a_failed_embed_as_attempted_not_embedded() {
     let off = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, false, false);
     assert!(off.embedded, "embed off leaves the requirement trivially satisfied");
     assert!(!off.embed_attempted, "embed off ran no attempt");
+    assert!(
+        off.emit_rows,
+        "a lexical-only scan must still emit rows: `embed = false` stores a null vector, \
+         and refusing here is what made `flush_document_batches` a no-op for every batch on a \
+         lexical-only store — text included"
+    );
 
     let reused = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, true);
     assert!(

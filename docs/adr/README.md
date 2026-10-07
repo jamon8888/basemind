@@ -55,7 +55,9 @@ them.
 | [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign | Accepted |
 | [0012](0012-multi-lane-document-retrieval.md) | Multi-lane document retrieval — multi-lane, embeddings optional | Accepted |
 | [0013](0013-encryption-at-rest-comes-from-the-volume.md) | Encryption at rest comes from the volume, enforced as a deployment requirement | Accepted |
+| [0014](0014-tier-routing-is-declared-by-the-caller.md) | Tier routing is declared by the caller, not inferred by basemind | Proposed |
 
 Implementation specs live in [`../specs/`](../specs/). ADR-0012's spec is
 [`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). ADR-0013
-constrains that spec's §14.0 rather than adding a new one.
+constrains that spec's §14.0 rather than adding a new one. ADR-0014 governs which tier a path is
+indexed in, which is the question the spec's `documents` tier assumes rather than answers.
