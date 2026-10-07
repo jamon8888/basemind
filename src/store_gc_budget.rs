@@ -390,16 +390,6 @@ fn evict_workspace(dir: &Path) -> Result<Option<u64>, GcError> {
 /// workspace never comes back under budget, and the leak has no symptom until someone goes looking
 /// for it. Deriving the names turns that omission into a compile error.
 fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
-    use crate::lance::schema::{CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE};
-
-    let lance = workspace.join(LANCE_WORKSPACE_DIR);
-    let evictable = [
-        DOCUMENTS_TABLE.to_string(),
-        DOC_LINKS_TABLE.to_string(),
-        #[cfg(feature = "code-search")]
-        CODE_CHUNKS_TABLE.to_string(),
-    ];
-
     let mut paths = vec![
         workspace.join(crate::store::VIEWS_DIR),
         workspace.join("git-cache"),
@@ -407,7 +397,24 @@ fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
         workspace.join("status.json"),
         workspace.join("telemetry.jsonl"),
     ];
-    paths.extend(evictable.iter().map(|table| lance.join(format!("{table}.lance"))));
+
+    // Gated on `intelligence`, not just per-table: the whole `lance` module is behind that feature,
+    // so without it there are no Lance tables on disk and nothing to evict. `MEMORY_TABLE` is
+    // deliberately never listed — see the doc comment above.
+    #[cfg(feature = "intelligence")]
+    {
+        use crate::lance::schema::{CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE};
+        let lance = workspace.join(LANCE_WORKSPACE_DIR);
+        let evictable = [
+            DOCUMENTS_TABLE.to_string(),
+            #[cfg(feature = "documents")]
+            DOC_LINKS_TABLE.to_string(),
+            #[cfg(feature = "code-search")]
+            CODE_CHUNKS_TABLE.to_string(),
+        ];
+        paths.extend(evictable.iter().map(|table| lance.join(format!("{table}.lance"))));
+    }
+
     paths
 }
 
