@@ -174,6 +174,9 @@ impl Default for DocumentsConfig {
             redaction: RedactionConfig::default(),
             ocr: OcrConfig::default(),
             output: OutputConfig::default(),
+            fusion: FusionConfig::default(),
+            fts: FtsConfig::default(),
+            citations: CitationsConfig::default(),
             embed_max_threads: 0,
         }
     }
