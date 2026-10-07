@@ -154,6 +154,16 @@ which is what "this facet was curated where it matters, and is simply absent els
 mean. The same reasoning applies to `section`: null means the chunk was not decomposed, and a
 caller filtering on `holding` must still receive the non-decomposed chunks rather than lose them.
 
+**A value outside the vocabulary is treated as absent, not as an error and not as a mismatch.** Two
+distinct cases, same handling. A caller *filtering* on `doc_type = 'statut'` — with one `t` — has
+made a typo, and must not receive an empty result that reads as "no statute in this matter"; the
+filter matches nothing curated and the call degrades to unfiltered on that facet, which is the same
+answer the null branch gives. A caller *passing* `statut` at ingest has made the same typo, and the
+column is stored null rather than a value no vocabulary contains, so the row joins the absent set
+instead of forming a one-member facet that no filter can ever match. A closed vocabulary that is
+enforced only on the read side produces rows that are invisible to every query; enforcing it on the
+write side turns a typo into absence, which is the recoverable direction.
+
 This is also why inference is rejected rather than deferred. An inferred value that cannot be
 prefiltered is not usable for retrieval at all — §5 gives the facet lane no scoring role — so it
 would serve display only. An inferred value that *can* be prefiltered is the deletion case above.
