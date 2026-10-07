@@ -11,10 +11,13 @@ use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
-use lancedb::query::ExecutableQuery;
+// `full_text_search` is on the `QueryBase` trait, not inherent on `Query` — without this import
+// the method does not resolve, and the error names `struct lancedb::query::Query`, which points at
+// the type rather than at the missing trait in scope.
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::Table;
 
-use crate::config::documents::FtsConfig;
+use crate::config::FtsConfig;
 
 use super::LanceStore;
 
@@ -215,6 +218,9 @@ pub async fn search_relaxed(
 ) -> Result<Vec<LexicalHit>> {
     let mut remaining: Vec<String> = terms.to_vec();
     let mut union: Vec<LexicalHit> = Vec::new();
+    // `(&str, u32).to_owned()` is `(&str, u32)`, not `(String, u32)`: `ToOwned` on `&str` has
+    // `Owned = str`. The path is cloned explicitly so the key owns its string and the `hits` vector
+    // can move on.
     let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
     let mut rounds = 0u32;
 
@@ -222,7 +228,7 @@ pub async fn search_relaxed(
         let query = remaining.join(" ");
         if !query.trim().is_empty() {
             for hit in search_lexical(table, &query, scope_predicate, limit).await? {
-                if seen.insert(hit.identity().to_owned()) {
+                if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                     union.push(hit);
                 }
             }
