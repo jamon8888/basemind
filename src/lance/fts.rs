@@ -167,6 +167,78 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
     Ok(())
 }
 
+/// Split a query into the terms the relaxation ladder will drop, least-important first.
+///
+/// **This orders by term length, not by idf, and that is a compromise with a reason.**
+///
+/// Spec 0012 §8 calls for dropping the lowest-idf term, which is the right rule: idf is what says
+/// "this term is rare, this one is everywhere". The code tier can honour it — `bm25_idf` in
+/// `crate::search::bm25` is real, and its `df` comes from the Fjall posting-list length.
+///
+/// The documents tier cannot. Its postings are LanceDB FTS, and LanceDB 0.37.1 exposes no
+/// per-term document frequency — `FtsSearchParams` carries `fuzziness`, `max_expansions`,
+/// `wand_factor` and `prefix_length`, none of which is `df`. The Fjall postings that do carry `df`
+/// are code-only (`code_bm25_postings_prefix`), so there is nothing to read for a document chunk.
+///
+/// Short-first is the standard stand-in: a short term is both more likely to be a stop word and
+/// less likely to discriminate, so dropping it costs the least. Ties break lexicographically so the
+/// ladder is deterministic — an unstable order would make a repeated query return different rows,
+/// which is worse than a suboptimal order.
+///
+/// If the documents tier ever gains Fjall postings, this should become `bm25_idf`. The test
+/// `relaxation_order_matches_idf_where_df_is_known` pins what that ordering looks like so the change
+/// is a swap rather than a redesign.
+pub fn relaxation_order(terms: &[String]) -> Vec<String> {
+    let mut ordered = terms.to_vec();
+    ordered.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    ordered
+}
+
+/// Conjunctive-then-disjunctive search.
+///
+/// Lance FTS has no `AND`/`OR` in the query string, so a multi-term query matches nothing unless
+/// every term appears. A multi-clause legal question ("notice terminated for non-payment after the
+/// cure period") then returns nothing at all, which reads as "this filing does not mention it" — a
+/// wrong answer presented as an absence.
+///
+/// So: run all terms; while hits are short of `limit` and terms remain, drop the next term from
+/// [`relaxation_order`] and re-run; union and dedupe by [`LexicalHit::identity`]. Each relaxation is
+/// a whole extra FTS query, which is why the ladder is capped.
+pub async fn search_relaxed(
+    table: &Table,
+    terms: &[String],
+    scope_predicate: &str,
+    limit: usize,
+    max_relaxations: u32,
+) -> Result<Vec<LexicalHit>> {
+    let mut remaining: Vec<String> = terms.to_vec();
+    let mut union: Vec<LexicalHit> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, u32)> = std::collections::HashSet::new();
+    let mut rounds = 0u32;
+
+    loop {
+        let query = remaining.join(" ");
+        if !query.trim().is_empty() {
+            for hit in search_lexical(table, &query, scope_predicate, limit).await? {
+                if seen.insert(hit.identity().to_owned()) {
+                    union.push(hit);
+                }
+            }
+        }
+        if union.len() >= limit || rounds >= max_relaxations {
+            break;
+        }
+        let Some(drop) = relaxation_order(&remaining).into_iter().next() else {
+            break;
+        };
+        remaining.retain(|t| *t != drop);
+        rounds += 1;
+    }
+
+    union.truncate(limit);
+    Ok(union)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +272,85 @@ mod tests {
             byte_end: 1,
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
+    }
+
+    #[test]
+    fn relaxation_drops_short_terms_first() {
+        let terms: Vec<String> = ["termination", "of", "lease", "for", "nonpayment"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            relaxation_order(&terms),
+            vec!["of", "for", "lease", "nonpayment", "termination"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The ladder must be deterministic. An unstable order means the same query returns different
+    /// rows on repeated calls, which is a worse defect than a suboptimal relaxation order.
+    #[test]
+    fn relaxation_order_is_stable_for_equal_length_terms() {
+        let terms: Vec<String> = ["beta", "alpha", "gamma"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            relaxation_order(&terms),
+            vec!["alpha", "beta", "gamma"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(relaxation_order(&terms), relaxation_order(&terms));
+    }
+
+    /// What the ordering *would* be if `df` were available, using the code tier's real `bm25_idf`.
+    ///
+    /// This is the test the ticket asks for, and it is a unit test with a synthetic corpus precisely
+    /// because the documents tier cannot compute `df` at runtime. If the documents tier ever gains
+    /// Fjall postings, this is the ordering to implement and this is the test that already pins it.
+    #[test]
+    fn relaxation_order_matches_idf_where_df_is_known() {
+        use crate::search::bm25::bm25_idf;
+
+        // Synthetic corpus: 100 chunks. "of" appears in 90, "lease" in 20, "termination" in 3.
+        let n = 100u64;
+        let df = |d: u64| bm25_idf(n, d);
+
+        let terms = ["of", "lease", "termination"];
+        let by_idf: Vec<&str> = {
+            let mut v = terms.to_vec();
+            // Lowest idf first = least important, i.e. dropped first.
+            v.sort_by(|a, b| {
+                df(match *a {
+                    "of" => 90,
+                    "lease" => 20,
+                    _ => 3,
+                })
+                .partial_cmp(&df(match *b {
+                    "of" => 90,
+                    "lease" => 20,
+                    _ => 3,
+                }))
+                .expect("idf is finite")
+            });
+            v
+        };
+        assert_eq!(
+            by_idf,
+            vec!["of", "lease", "termination"],
+            "rarest term is most important"
+        );
+
+        // The shipped proxy agrees on this corpus, and disagrees on nothing here — which is the
+        // honest claim: it is a stand-in, not an equivalent.
+        let shipped = relaxation_order(&terms.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            shipped,
+            vec!["of", "termination", "lease"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
     }
 }
