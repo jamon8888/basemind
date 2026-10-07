@@ -16,6 +16,8 @@ use lancedb::table::Table;
 
 use crate::config::documents::FtsConfig;
 
+use super::LanceStore;
+
 /// Name of the FTS index over `text` + `heading_path`.
 ///
 /// Named because a table carries one index per column set, and `index_stats` takes a name.
@@ -237,6 +239,60 @@ pub async fn search_relaxed(
 
     union.truncate(limit);
     Ok(union)
+}
+
+/// Build the keyword index and compact the table, on this store's runtime.
+///
+/// Called **once**, after every document batch is written — not per file. `create_index` on a table
+/// still being written is a rewrite, so per-file indexing would rebuild the index once per document,
+/// which on a large corpus is the dominant cost of indexing rather than a detail.
+///
+/// `optimize()` follows and is not cosmetic: rows written since the last optimize fall back to a
+/// flat scan, so a missed optimize is a latency cliff rather than a correctness bug. This is also
+/// why `fast_search()` is forbidden elsewhere on the documents path — a silently missing filing is a
+/// wrong answer, whereas a slow one is merely annoying.
+pub fn build_index_after_ingest(store: &LanceStore, cfg: &FtsConfig) -> Result<()> {
+    use crate::lance::schema::DOCUMENTS_TABLE;
+    use lancedb::query::ExecutableQuery;
+    use lancedb::table::OptimizeAction;
+
+    store.inner.rt().block_on(async {
+        let table = store
+            .inner
+            .connection
+            .open_table(DOCUMENTS_TABLE)
+            .execute()
+            .await
+            .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+        ensure_keyword_index(&table, cfg).await?;
+        table
+            .optimize(OptimizeAction::All)
+            .await
+            .context("optimize documents table after ingest")?;
+        anyhow::Ok(())
+    })
+}
+
+/// Run the relaxed lexical search on this store's runtime, with the caller's scope predicate.
+pub fn search_relaxed_on(
+    store: &LanceStore,
+    terms: &[String],
+    scope_predicate: &str,
+    limit: usize,
+    max_relaxations: u32,
+) -> Result<Vec<LexicalHit>> {
+    use crate::lance::schema::DOCUMENTS_TABLE;
+
+    store.inner.rt().block_on(async {
+        let table = store
+            .inner
+            .connection
+            .open_table(DOCUMENTS_TABLE)
+            .execute()
+            .await
+            .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+        search_relaxed(&table, terms, scope_predicate, limit, max_relaxations).await
+    })
 }
 
 #[cfg(test)]

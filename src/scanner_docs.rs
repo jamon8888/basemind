@@ -649,6 +649,41 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
     inserted
 }
 
+/// Build the keyword index over the rows just written, then compact.
+///
+/// Called once per flush, after every batch. Per-file indexing would rebuild the index once per
+/// document, which on a large corpus dwarfs the extraction cost.
+///
+/// Best-effort and warned, not fatal: a missing lexical index degrades the query path to
+/// vector-only, whereas failing the scan would lose the embeddings that *were* just written. An
+/// index that silently did not build is the failure worth watching for, so it is logged at warn.
+pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::config::Config) {
+    if !config.documents.enabled {
+        return;
+    }
+    let model = config.documents.embedding_preset.clone();
+    let dim = match preset_dim(&model) {
+        Ok(dim) => dim,
+        Err(error) => {
+            tracing::warn!(?error, preset = %model, "documents FTS index skipped: unknown preset");
+            return;
+        }
+    };
+    let lance = match store.lance_or_open(dim, &model) {
+        Ok(s) => s.clone(),
+        Err(error) => {
+            tracing::warn!(?error, "documents FTS index skipped: could not open the Lance store");
+            return;
+        }
+    };
+    if let Err(error) = crate::lance::fts::build_index_after_ingest(&lance, &config.documents.fts) {
+        tracing::warn!(
+            ?error,
+            "documents FTS index build failed; keyword search will miss rows until the next scan"
+        );
+    }
+}
+
 /// Choose the LanceDB scope for a document. Repo files keep the scan-wide `default_scope`;
 /// external-root files (absolute key, see [`crate::path::RelPath::is_external`]) are scoped
 /// `path:<extra_root>` so they group under the out-of-repo tree they came from rather than the
