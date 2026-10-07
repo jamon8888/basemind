@@ -1,6 +1,7 @@
 # Spec 0012: Multi-lane document retrieval (multi-lane, embeddings optional)
 
-- **Status:** Draft — implements [ADR-0012](../adr/0012-multi-lane-document-retrieval.md)
+- **Status:** Accepted — implements [ADR-0012](../adr/0012-multi-lane-document-retrieval.md). Every
+  decision this spec leaves open is closed; implementation is tracked in #56–#62.
 - **Date:** 2026-10-06
 - **Scope:** `documents` and `memory`-documents retrieval paths, the documents LanceDB table, the
   `[documents]` config tree, and the shared BM25/RRF modules.
@@ -324,8 +325,23 @@ queries, so:
    (`path#byte_start-byte_end`), plus a `retrieval_mode` field (`lexical` / `hybrid` / `vector`)
    so callers and tests can tell which lanes ran.
 
-Pagination: existing `next_cursor` semantics carry `(lane ranks, last row id)`; cursors must be
-invalidated by any index rebuild (see `with_row_id`).
+**Pagination does not exist on this tier, and building it is its own piece of work.** An earlier
+draft of this section claimed "existing `next_cursor` semantics carry `(lane ranks, last row id)`" and
+that cursors are invalidated by any index rebuild "see `with_row_id`". Both halves were false (#50):
+`SearchDocumentsParams` has no `cursor` field at all — the response says so outright — and
+`with_row_id` **appears nowhere in the repository**, so the named mitigation had no referent.
+
+`_rowid` could not carry a cursor across a rebuild anyway. It is a row address, and a basemind reindex
+is a `remove_dir_all` followed by a rebuild whose reissued identifiers **collide** with the pre-wipe
+ones while designating different chunks: the cursor would resume into the wrong document with no
+error. What is needed is a **generation token**, in the shape the git and code tiers already use for
+`cursor_invalidated` — except keyed on an index generation rather than a HEAD sha.
+
+That token requires a field that does not exist: the tokenizer configuration has no entry in the
+store metadata, so changing the tokenizer leaves a stale index with no error and no rebuild, while
+`embedding_preset` and the schema version are both recorded and both force a wipe on mismatch. Adding
+the FTS knobs to the recorded metadata is what makes a tokenizer change a detected reindex rather than
+a silent one.
 
 ### 8.9 Scope coverage — what applies to scraped content
 
@@ -535,13 +551,18 @@ near its limit, so `[documents.fusion]` / `[documents.fts]` / `[documents.citati
 Each phase lands independently with its own tests and is safe to stop after.
 
 **Phase 0 — honesty and unblocking.** Make `documents_schema` accept `Option<u16>` with a nullable
-`embedding` column so a lexical-only store can exist. Correct the two website claims that promise
-keyword search under `embed = false` (`document-search.mdx:162`, `configuration.mdx:157`) to
-describe actual behaviour until Phase 2 ships. Regenerate and re-enable
+`embedding` column so a lexical-only store can exist, **and remove the embedder-dimension early
+return in `flush_document_batches`** (`src/scanner_docs.rs:572-578`), which today bails with `0`
+before any row is built whenever no batch carries a dimension — so a store configured with
+`embed = false` writes no rows at all, text included. A nullable embedding column without this is a
+store that opens and stays empty forever. Regenerate and re-enable
 `tests/config_schema.rs::schema_snapshot_matches_derived`. Audit `src/store_gc*.rs` for
 `documents_v2` handling.
-*Exit:* a build with `[documents] embed = false` creates a valid, empty lexical-only table, and no
-public doc claims a lane that does not exist.
+Correct the two website claims that promise keyword search under `embed = false`
+(`document-search.mdx:162`, `configuration.mdx:157`) — landed separately in PR #46, not in this
+branch.
+*Exit:* a build with `[documents] embed = false` creates a valid lexical-only table **and a scan
+writes rows into it with a null `embedding`**, and no public doc claims a lane that does not exist.
 
 **Phase 1 — shared fusion.** Move `rrf.rs` + BM25 scoring behind `intelligence`, add `Lane`,
 `FusionWeights`, `LaneProvenance`; keep code-tier weights as defaults so code search ranking is
@@ -549,12 +570,19 @@ unchanged. New units: lane-weight defaults, empty-lane behaviour, tie-break stab
 *Exit:* existing code-search smoke tests pass unchanged; a unit test fuses four lanes and asserts
 the documented weights.
 
-**Phase 2 — lexical lane.** FTS index on `text` + `heading_path` after the document pass,
-`optimize()` cadence, `search_documents_lexical` with conjunctive-then-disjunctive fallback and
-§10 config keys. Correct the website docs to describe the lane that now exists. New smoke:
-`tests/document_fts_smoke.rs` (lexical-only query in an empty-`BASEMIND_DATA_HOME` store — proves
-no embedder is constructed).
+**Phase 2 — lexical lane.** `heading_path` column written at scan (it falls out of the Markdown the
+chunker already emits — `render_heading_breadcrumb` is already called for the dense embedding input,
+§9.1) and FTS indexed on `text` + `heading_path` after the document pass, `optimize()` cadence,
+`search_documents_lexical` with conjunctive-then-disjunctive fallback and §10 config keys. Correct
+the website docs to describe the lane that now exists, superseding PR #46's "there is no lexical lane
+yet" wording. New smoke: `tests/document_fts_smoke.rs` (lexical-only query in an
+empty-`BASEMIND_DATA_HOME` store — proves no embedder is constructed).
 *Exit:* a lexical-only store answers topical queries; `embed = false` is documented truthfully.
+
+**Why `heading_path` is written here and not in Phase 4.** §7.1, §8 step 4 and this phase all index
+it, so an ordering that created it in Phase 4 would have Phase 2 index a column that does not exist.
+It is also the column that separates a topical search from a bag-of-words one, and it is the cheapest
+structural signal in the schema. Phase 4 writes the *curated* facets — the ones that cost something.
 
 **Phase 3 — exact and phrase lanes.** `cites` extraction at ingest, n-gram index, quoted-span
 routing to the `text_phrase` position index, phrase-unsupported reporting. New smoke:
@@ -563,8 +591,8 @@ case name.
 *Exit:* `§362(a)(1)`, `2-24-1234`, and `"Smith v. Acme"` each resolve in one query.
 
 **Phase 4 — facets and schema v2 columns.** `doc_type`, `section`, `jurisdiction`, `doc_date`,
-`heading_path`, `keywords`, `entities`, `summary` written at scan; scalar indexes; in-store
-prefilter replacing the Rust post-filter; MCP hit gains `matched_lanes`, `lane_ranks`,
+`keywords`, `entities`, `summary` written at scan (`heading_path` landed in Phase 2); scalar indexes;
+in-store prefilter replacing the Rust post-filter; MCP hit gains `matched_lanes`, `lane_ranks`,
 `retrieval_mode`, `citation`.
 *Exit:* `entity_category` / `keywords_contains` return exactly `limit` rows when selective; result
 count no longer depends on top-k luck.
