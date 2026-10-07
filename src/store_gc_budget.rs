@@ -390,7 +390,7 @@ fn evict_workspace(dir: &Path) -> Result<Option<u64>, GcError> {
 /// workspace never comes back under budget, and the leak has no symptom until someone goes looking
 /// for it. Deriving the names turns that omission into a compile error.
 fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
-    use crate::lance::schema::{CODE_CHUNKS_TABLE, DOCUMENTS_TABLE, DOC_LINKS_TABLE};
+    use crate::lance::schema::{CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE};
 
     let lance = workspace.join(LANCE_WORKSPACE_DIR);
     let evictable = [

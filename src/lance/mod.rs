@@ -1010,7 +1010,11 @@ mod tests {
         }];
         let batch = build_documents_batch(384, &rows).expect("a lexical-only row is not an error");
         let column = batch.column_by_name("embedding").expect("embedding column");
-        assert_eq!(column.null_count(), 1, "the vector column carries a null, not an empty list");
+        assert_eq!(
+            column.null_count(),
+            1,
+            "the vector column carries a null, not an empty list"
+        );
         assert_eq!(batch.num_rows(), 1, "the row is written; text included");
     }
 

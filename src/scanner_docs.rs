@@ -459,10 +459,10 @@ fn pending_from_doc(
         );
     }
     // A lexical-only scan (`embed = false`) still emits rows — it stores a null vector, not no row.
-// That is the whole point of the nullable column. An embed that was *requested and came back empty*
-// is a different case and keeps emitting nothing: that document is unembeddable, it stays
-// `embedded: false` so the next scan retries it, and writing a vectorless row for it would blur the
-// two states the reuse fast-path depends on.
+    // That is the whole point of the nullable column. An embed that was *requested and came back empty*
+    // is a different case and keeps emitting nothing: that document is unembeddable, it stays
+    // `embedded: false` so the next scan retries it, and writing a vectorless row for it would blur the
+    // two states the reuse fast-path depends on.
     let have_vectors = embedding_dim > 0;
     let emit_rows = (!embed || have_vectors) && chunk_count > 0 && !over_cap;
     PendingDocBatch {
