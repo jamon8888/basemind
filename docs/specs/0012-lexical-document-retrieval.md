@@ -1,0 +1,729 @@
+# Spec 0012: Multi-lane document retrieval (multi-lane, embeddings optional)
+
+- **Status:** Accepted — implements [ADR-0012](../adr/0012-multi-lane-document-retrieval.md). Every
+  decision this spec leaves open is closed; implementation is tracked in #56–#62.
+- **Date:** 2026-10-06
+- **Scope:** `documents` and `memory`-documents retrieval paths, the documents LanceDB table, the
+  `[documents]` config tree, and the shared BM25/RRF modules.
+- **Feature gates:** `documents` (required), `intelligence` (LanceDB), `code-search` (today the
+  only gate on the shared fusion code — this spec removes that coupling).
+
+---
+
+## 1. Problem
+
+Retrieval quality for documents is bounded by a single embedding model, and an embedding-free
+deployment cannot retrieve documents at all. Concretely, three defects:
+
+1. **No lexical lane.** `search_documents` is `vector_search` only (`src/lance/mod.rs:315`).
+2. **Embedding is mandatory in practice.** `documents_schema` makes `embedding` non-nullable
+   (`src/lance/schema.rs:22-38`) and every query embeds first (`src/mcp/memory.rs:379`), so
+   `[documents] embed = false` yields no retrieval. The published docs claim otherwise
+   (`website/src/content/docs/capabilities/document-search.mdx:162`,
+   `website/src/content/docs/reference/configuration.mdx:157`).
+3. **Facets are post-filtered in Rust.** `entity_category` / `keywords_contains` filter hits after
+   retrieval (`src/mcp/memory.rs:638-710`) because keywords, entities, and summary live in the Fjall
+   sidecar, not in the LanceDB row.
+
+Why this matters for a legal-facing product: the dominant query is an *identifier* — docket
+number, statute cite, party, quoted case name — not a topic. Benchmarks on legal corpora show
+BM25 ahead of dense retrieval (CUAD nDCG@10: BM25 0.245, dense bi-encoder 0.133), and naive
+equal-weight RRF (0.230) landing *below* BM25 alone because a weak lane gets equal say. Fusion
+weights are therefore a correctness concern, not a tuning nicety.
+
+## 2. Current state, mapped
+
+| Concern | Location | Behaviour |
+|---|---|---|
+| Document KNN | `src/lance/mod.rs:315` `search_documents` | `table.vector_search(query)` + `only_if(scope, mime_type)` |
+| Document schema | `src/lance/schema.rs:22-38` | `scope, path, chunk_idx, mime_type, text, byte_start, byte_end, rehydration_ref, embedding`; `embedding` non-nullable; `dim` required |
+| Query embedding | `src/mcp/memory.rs:27,379` | ONNX embed per query; `memory search` and `memory documents` both |
+| Code BM25 lane | `src/search/bm25.rs` | Okapi `k1 = 1.2`, `b = 0.75`, `MAX_TERM_LEN = 80`, lowercase + split on non-alphanumeric, no stop-words, no stemming |
+| Fusion | `src/search/rrf.rs` | `DEFAULT_RRF_K = 60`; weights exact 2.0 / vector 1.0 / keyword 1.0; `matched_lanes`, `lane_ranks` |
+| Feature gates | `src/search/mod.rs:7-13` | `bm25`, `exact`, `rrf` all `#[cfg(feature = "code-search")]` |
+| Chunking | `src/config/documents.rs`, `src/extract/doc.rs:280` | `max_characters = 800`, `overlap = 100`, `chunker_type = Markdown` |
+| Rerank | `src/mcp/memory.rs:498-580`, `src/config/enrichment.rs:13` | query-time cross-encoder, preset `bge-reranker-v2-m3`, `top_k = 20`, `enabled = false` |
+| Keywords | `src/config/enrichment.rs:102` | `enabled = false`, `max_keywords = 10`, `min_score = 0.0`, `ngram_range = [1, 3]` |
+| NER | `src/config/documents.rs` (`NerConfig`) | `enabled = false`, `custom_labels` supported (GLiNER zero-shot) |
+| MCP hit shape | `src/mcp/types_documents.rs:59` | `path, chunk_idx, text, mime_type, byte_start, byte_end, distance, rerank_score, keywords, entities, summary` |
+| Config snapshot | `schema/basemind-config-v1.schema.json`, `tests/config_schema.rs` | snapshot test is `#[ignore]`d with a "out of sync" note |
+
+## 3. Goals
+
+- **G1** Document retrieval works with embeddings disabled (lexical + facets + rerank) and is
+  strictly better than today with them enabled.
+- **G2** Identifier lookups (docket, cite, party, quoted case name) resolve in one query.
+- **G3** Every hit states which lane(s) surfaced it.
+- **G4** One fusion implementation shared by the code and document tiers.
+- **G5** Config knobs for chunking, tokenizer, and lanes, all documented and schema-regenerable.
+- **G6** Documented behaviour matches implemented behaviour.
+
+## 4. Non-goals
+
+- Replacing LanceDB or introducing a second retrieval store.
+- Learned sparse retrieval (SPLADE) — revisit only if `FtsIndexBuilder` measurably underperforms.
+- Replacing the code tier's hand-rolled BM25 with LanceDB FTS (out of scope; different row model).
+- Provider-hosted rerankers (offline-first).
+- Any change to the MCP tool *names*; only wire fields are added.
+
+## 5. Target architecture
+
+Four lanes over one table, fused by RRF, then reranked.
+
+| Lane | Source | Signal | RRF weight |
+|---|---|---|---|
+| `exact` | `cites` column, n-gram FTS index | normalized identifier substring match | 3.0 |
+| `keyword` | `text` + `heading_path` FTS index (BM25) | topical lexical match | 2.0 |
+| `facet` | scalar columns, prefiltered not scored | doc type / jurisdiction / date / section | 1.0 (rank of surviving set) |
+| `vector` | `embedding`, IVF_FLAT/PQ | paraphrase similarity | 1.0 |
+
+`k = 60` unchanged. Weights are the ADR decision: keyword above vector because legal lexical
+retrieval measurably outperforms dense, and exact above both because an identifier match is a
+high-precision signal (the same reasoning the code tier already encodes at weight 2.0 for its exact
+lane). Weights become configurable (`[documents.fusion]`) only after the evaluation harness in §13
+exists — otherwise they are constants with a comment pointing at the benchmark.
+
+Dataflow:
+
+```text
+query
+ ├─ normalize (case-fold, citation split, stop-word trim, quoted-phrase extraction)
+ ├─ lane: exact   → FTS(ngram) over cites          ─┐
+ ├─ lane: keyword → FTS(stem, stopwords) over text ─┤→ RRF(k=60, weights §5)
+ ├─ lane: facet   → prefilter on scalar columns    ─┤
+ ├─ lane: vector  → vector_search (if rows exist)  ─┘
+ ├─ per-document cap (≤3 chunks/doc), byte-span overlap dedupe
+ ├─ rerank top `reranker.top_k` (cross-encoder, no corpus vectors)
+ └─ emit hits with `matched_lanes` + `lane_ranks` + `citation`/`byte_span`
+```
+
+## 6. Schema changes (`documents_v2`)
+
+New table name `documents_v2`; the v1 table is left on disk and dropped by the existing GC
+(`src/store_gc*.rs`) once v2 is healthy. `documents_schema(dim: Option<u16>)`:
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `scope` | Utf8 | no | unchanged — **retrieval partition, not a confidentiality boundary**. It is derived from the repository (`MemoryScopeStrategy`, `src/config/v1.rs:360-368`), so it cannot separate two repositories. The confidentiality question is #7's, not this spec's (#40) |
+| `path` | Utf8 | no | unchanged |
+| `chunk_idx` | UInt32 | no | unchanged |
+| `mime_type` | Utf8 | no | unchanged |
+| `doc_type` | Utf8 | **yes** | nullable; curated or absent, never inferred (§6.1). `pleading`, `contract`, `memo`, `email`, `statute`, `exhibit`, `web` |
+| `section` | Utf8 | **yes** | nullable; absent means the chunk was not decomposed. `caption`, `facts`, `issues`, `argument`, `holding`, `reasoning`, `signature` |
+| `heading_path` | Utf8 | no | Markdown heading breadcrumb, e.g. `IV. TERMINATION > 4. Convenience` |
+| `cites` | List<Utf8> | no | normalized identifiers: statute cites, docket numbers, case short names. **Self-references excluded** — the document's own caption and its own docket number are not citations of authority and are never indexed in clear (see ADR-0012 precondition, ticket #44) |
+| `jurisdiction` | Utf8 | yes | ISO-ish code when detectable |
+| `doc_date` | Utf8 | yes | ISO-8601 `YYYY-MM-DD`; lexically sortable, avoids date-type filter cost |
+| `text` | Utf8 | no | chunk text (snippet returned to caller) |
+| `byte_start` / `byte_end` | UInt32 | no | unchanged — citation anchors |
+| `keywords` | List<Utf8> | yes | lifted out of the Fjall sidecar so it can filter in-store |
+| `entities` | List<Utf8> | yes | `category:value` pairs, e.g. `PERSON:Acme Corp` |
+| `summary` | Utf8 | yes | lifted from sidecar |
+| `rehydration_ref` | Utf8 | yes | unchanged |
+| `embedding` | FixedSizeList\<Float32, DIM\> | **yes** | nullable; `None` on a lexical-only store |
+
+Indexes: FTS on `text` and `heading_path`; n-gram FTS on `cites`; scalar indexes on `scope`,
+`path`, `mime_type`, `doc_type`, `section`, `jurisdiction`, `doc_date`.
+
+Rationale for lifting `keywords` / `entities` / `summary` into the row: today they can only be
+post-filtered in Rust (`src/mcp/memory.rs:638-710`), which silently shrinks the candidate set
+*after* top-k. In-row they become prefilterable, and `summary` becomes a boostable lexical field.
+
+### 6.1 `doc_type` is curated, and absent is not a value
+
+`doc_type` is **written by the caller at ingest or not at all**. It is never inferred. Two reasons,
+and the second is the load-bearing one.
+
+**A wrong `doc_type` is not noise, it is a deletion.** The facet lane prefilters and does not score
+(§5), so a facet predicate runs before any lane produces a candidate. A document whose `doc_type`
+does not match is absent from the candidate set, and no later lane and no amount of fusion can
+recover it. A guessed value therefore does not merely add noise to a ranking — it **removes the
+correct filing**, with no observable symptom. §7.3 sets the standard this violates: a silently
+missing filing is a wrong answer.
+
+**Absence must therefore degrade to "no filter on this facet", never to "matches nothing".** That is
+why the column is nullable and why `unknown` is gone from the vocabulary: a not-null column with an
+"I don't know" bucket conflates *absence* with *membership*. With `unknown` in place, the query
+`doc_type = 'contract'` returns the contracts somebody classified, not the contracts — and the
+unclassified ones vanish with no signal. A caller that filters on a nullable facet gets
+
+```sql
+doc_type IS NULL OR doc_type = 'contract'
+```
+
+which is what "this facet was curated where it matters, and is simply absent elsewhere" has to
+mean. The same reasoning applies to `section`: null means the chunk was not decomposed, and a
+caller filtering on `holding` must still receive the non-decomposed chunks rather than lose them.
+
+**A value outside the vocabulary is treated as absent, not as an error and not as a mismatch.** Two
+distinct cases, same handling. A caller *filtering* on `doc_type = 'statut'` — with one `t` — has
+made a typo, and must not receive an empty result that reads as "no statute in this matter"; the
+filter matches nothing curated and the call degrades to unfiltered on that facet, which is the same
+answer the null branch gives. A caller *passing* `statut` at ingest has made the same typo, and the
+column is stored null rather than a value no vocabulary contains, so the row joins the absent set
+instead of forming a one-member facet that no filter can ever match. A closed vocabulary that is
+enforced only on the read side produces rows that are invisible to every query; enforcing it on the
+write side turns a typo into absence, which is the recoverable direction.
+
+This is also why inference is rejected rather than deferred. An inferred value that cannot be
+prefiltered is not usable for retrieval at all — §5 gives the facet lane no scoring role — so it
+would serve display only. An inferred value that *can* be prefiltered is the deletion case above.
+There is no third option that is both cheap and safe.
+
+Curation cost is per dossier and **visible**: an uncurated dossier is one whose facets are absent,
+which a reader can see. The assignment channel is the integration's call (hacienda-cowork #15);
+an ingest parameter and a path-to-kind mapping are the two that survive the fact that `safe/`
+mirrors are generated `.md` files that no human edits.
+
+### 6.2 `MemoryScopeStrategy` is a decoration — do not extend it
+
+`MemoryScopeStrategy` (`src/config/v1.rs:360-368`) has two variants, `GitRemoteWithFallback` and
+`WorkdirOnly`, and **no reader**. `scope_key` (`src/git/remote.rs:26`) takes no config argument and
+always prefers the normalized remote URL, falling back to the workdir realpath;
+`shared_state` calls it with no configuration at all. `config.memory.scope_strategy` is inert, while
+the JSON schema and the public website both present `workdir_only` as a working setting — so a
+`basemind.toml` carrying it loads, changes nothing, and says nothing.
+
+This is recorded here because it is a trap for the work this spec implies. The obvious place to hang a
+subtree scope (§6.1, and #53) would be a new variant on that enum — which would extend code that
+nothing reads. **Do not.** Adding `SubSpace` to an enum with no reader produces a third dead variant
+and a second lie in the schema. Whether `WorkdirOnly` is ever wired, and whether the enum is removed
+or deprecated, is a separate decision on a separate card; this spec's only stake is the negative one.
+
+The fix to the false documentation is a docs-and-config change, deliberately **outside** this spec
+branch — the same treatment as the `embed = false` keyword-search claim corrected in PR #46. A
+correction to documentation that is live on the website today does not belong in a specification PR,
+and merging this spec must not wait on it.
+
+## 7. Index build
+
+### 7.1 Tokenizers
+
+Two properties of the builder shape every call below, and both are easy to get wrong.
+
+The builder is `lancedb::index::scalar::FtsIndexBuilder`, an alias of `InvertedIndexParams`
+(`lance-index-10.0.0/src/scalar/inverted/tokenizer.rs:49`). **Its methods carry no `with_` prefix** —
+`with_position` is the sole exception among its 30 public methods. The rest are `base_tokenizer`,
+`language`, `stem`, `remove_stop_words`, `ascii_folding`, `max_token_length`, `custom_stop_words`,
+`ngram_min_length`, `ngram_max_length`. And **`language` returns `Result<Self>`, not `Self`**
+(`tokenizer.rs:675`), so it breaks a fluent chain: assembly resumes after a `?`, and the
+`Result` has to be handled wherever the builder is built.
+
+Primary lexical index, over `text` and `heading_path`:
+
+```rust
+let fts = FtsIndexBuilder::default()
+    .base_tokenizer("simple".to_string())   // explicit: do not rely on a default
+    .language("English")?                  // drives stem + stop-word behaviour
+    .stem(true)
+    .remove_stop_words(true)
+    .ascii_folding(true)                    // FR/ES matters: "société" → "societe"
+    .max_token_length(Some(64))             // default 40 truncates long Spanish/French tokens
+    .custom_stop_words(Some(vec![
+        "pursuant".into(), "herein".into(), "hereto".into(), "aforesaid".into(),
+        "wherein".into(), "notwithstanding".into(), "provided that".into(),
+        "hereinafter".into(), "thereunder".into(),
+    ]));
+```
+
+Citation index, on `cites` only:
+
+```rust
+let cites = FtsIndexBuilder::default()
+    .base_tokenizer("ngram".to_string())
+    .ngram_min_length(3)
+    .ngram_max_length(3)
+    .remove_stop_words(false)
+    .stem(false);
+```
+
+Why: n-gram is what makes `362` reach `§ 362(a)(1)` and `2-24-1234` reach `No. 2-24-1234`. Keep it
+off `text` — trigram indexing of full prose is large and noisy.
+
+`base_tokenizer` is deliberately not a configuration key. The two indexes need different tokenizers,
+so no single setting could govern both: which tokenizer an index gets is the content of this
+section, not a setting (§10).
+
+### 7.2 Phrase queries — a decision, not an assumption
+
+Lance-native FTS accepts a phrase query **only** if the index was built with `with_position = true`
+**and** `remove_stop_words = false`. Quoted case names (`"Smith v. Acme"`) are common in legal
+queries, so:
+
+- Phase 3 builds a **third** index, `text_phrase`, with `with_position = true` and
+  `remove_stop_words = false`, over a position-preserving copy of the chunk text.
+- **That index must be word-tokenized, never n-gram.** The documentation of `with_position` states
+  outright that it "doesn't work with `ngram` tokenizer" (`tokenizer.rs:685`), so `text_phrase`
+  cannot reuse the citation index's tokenizer. Stated explicitly because the obvious
+  implementation — take the `cites` builder from §7.1 and add `with_position(true)` — compiles and
+  produces a silently empty phrase index.
+- The query path routes a quoted span to `text_phrase` and merges its hits into the `exact` lane.
+- If index size on the target corpus is unacceptable, the build skips the phrase index and the MCP
+  layer reports `phrase_unsupported` rather than silently ignoring quotes.
+
+### 7.3 Build cadence
+
+- Build indexes after the document pass completes, not per file.
+- Call `table.optimize(OptimizeAction::All)` after every ingest batch and on a cadence for
+  continuously-written stores (rule of thumb from LanceDB docs: ~100k row changes or 20
+  modification ops). Unindexed rows fall back to a flat scan, so a missed `optimize()` shows up as
+  a latency cliff, not a correctness bug.
+- Track `index_stats().num_unindexed_rows`; warn above a build-cadence threshold, 50k unindexed rows
+  by default. Cadence and thresholds are build settings, not tokenizer parameters, so they are not
+  part of `[documents.fts]` (§10).
+- Never `fast_search()`: for legal work a silently missing filing is a wrong answer.
+
+## 8. Query path
+
+1. **Normalize.** Case-fold; extract quoted spans; split citation-shaped tokens (§, U.S.C., C.F.R.,
+   `No.`, `v.`, `§`, `¶`); trim legal boilerplate stop-words; keep every numeric/docket token.
+   Normalization is shared with ingest so index and query tokenize identically — `lancedb::tokenize`
+   is used to assert that in a test (§13), not to hand-stem queries.
+2. **Facet prefilter.** Build `only_if` from `scope` (mandatory) plus any of
+   `mime_type` / `doc_type` / `jurisdiction` / `section` / date range. Prefilter, not postfilter:
+   postfilter can return fewer than `limit` rows when top-k is mostly filtered out.
+
+   **The scope predicate applies to every lane, not only the vector one.** Steps 3, 4 and 5 are FTS
+   queries and must carry the same predicate; Lance supports a filter on a full-text query. A lane
+   that searched outside `scope` would leak across matters with no observable symptom, so this is a
+   correctness requirement, not a style note (#40).
+
+   **On this lane**, `scope` resolves to the repository's own scope or one of its own `web:<host>`
+   siblings, never to an arbitrary caller-named string: `resolve_doc_scope`
+   (`src/mcp/memory.rs:486-488`) returns the requested value verbatim today, which is what makes
+   scraped pages reachable but also what lets a caller name another repository's scope. Constraining
+   it to the repository and its `web:*` siblings keeps the behaviour that fix was made for and
+   removes the arbitrary read (#40).
+
+   **That constraint is on `resolve_doc_scope`, not on `scope` in general.** It states which
+   caller-named scopes the documents lane will honour; it is not a rule about how a caller may narrow
+   retrieval. The two are different code paths today. `resolve_doc_scope` has exactly one production
+   caller — `run_search_documents` (`src/mcp/memory.rs:522`) — and `documents` is the only tier that
+   accepts a caller-supplied scope (`src/mcp/types_documents.rs:28-34`). The code lane accepts none:
+   `CodeParams` (`src/mcp/types_code.rs:32-128`) has no `scope` field, and its semantic lane reads
+   the daemon-wide `state.shared.scope` (`src/mcp/helpers_code_search.rs:347`), computed once per
+   server. A caller-side scope selector there would change the daemon's shape rather than refine a
+   predicate, so it is out of scope for this spec; whether to add one is the integration's decision
+   (#53, and hacienda-cowork #15).
+3. **Exact lane.** `full_text_search` over the `cites` n-gram index (and `text_phrase` for quoted
+   spans). No fuzziness here — typo tolerance corrupts statute numbers. Allow fuzziness 1 only on a
+   party-name lane if one is added later.
+4. **Keyword lane.** `full_text_search` over `text` + `heading_path`.
+5. **Conjunctive-then-disjunctive fallback.** Lance FTS has no `AND`/`OR` in the query string. Run
+   all terms; while `hits < limit` and terms remain, drop the lowest-idf term and re-run; union the
+   results (dedupe by `(scope, path, chunk_idx)`). This is the standard high-recall BM25 pattern and
+   is what rescues multi-clause legal questions. Cap at 3 relaxations to bound latency.
+6. **Vector lane.** Only when `embedding` is non-null for the scope and `[documents] embed = true`.
+   Skip cleanly otherwise — never embed the query in a lexical-only store.
+7. **Fuse.** `rrf_fuse_detailed` with the weights in §5. Retain per-lane ranks.
+8. **Post-fusion shaping.** Per-document cap (default 3 chunks, `[documents].max_hits_per_document`);
+   drop hits whose `byte_span` overlaps an already-selected hit by more than 50%. `heading_path` is
+   the structural signal here and is near-always populated. Section-intent is **not** applied here —
+   it is a rerank tie-break (§8.10).
+9. **Rerank and emit.** Rerank the top `[documents.reranker].top_k` with the cross-encoder, then
+   trim to `limit`. Emit `matched_lanes`, `lane_ranks`, `rerank_score`, `citation` string
+   (`path#byte_start-byte_end`), plus a `retrieval_mode` field (`lexical` / `hybrid` / `vector`)
+   so callers and tests can tell which lanes ran.
+
+**Pagination does not exist on this tier, and building it is its own piece of work.** An earlier
+draft of this section claimed "existing `next_cursor` semantics carry `(lane ranks, last row id)`" and
+that cursors are invalidated by any index rebuild "see `with_row_id`". Both halves were false (#50):
+`SearchDocumentsParams` has no `cursor` field at all — the response says so outright — and
+`with_row_id` **appears nowhere in the repository**, so the named mitigation had no referent.
+
+`_rowid` could not carry a cursor across a rebuild anyway. It is a row address, and a basemind reindex
+is a `remove_dir_all` followed by a rebuild whose reissued identifiers **collide** with the pre-wipe
+ones while designating different chunks: the cursor would resume into the wrong document with no
+error. What is needed is a **generation token**, in the shape the git and code tiers already use for
+`cursor_invalidated` — except keyed on an index generation rather than a HEAD sha.
+
+That token requires a field that does not exist: the tokenizer configuration has no entry in the
+store metadata, so changing the tokenizer leaves a stale index with no error and no rebuild, while
+`embedding_preset` and the schema version are both recorded and both force a wipe on mismatch. Adding
+the FTS knobs to the recorded metadata is what makes a tokenizer change a detected reindex rather than
+a silent one.
+
+### 8.9 Scope coverage — what applies to scraped content
+
+The documents tier serves two scopes with different provenance, and the lanes do not treat them
+alike. `scope` is the ingestion partition, so coverage is a per-scope property, not a per-tier one:
+
+| Scope | `heading_path` | `cites` | `doc_type` | `section` | keyword | vector | exact |
+|---|---|---|---|---|---|---|---|
+| repo | yes | yes | curated or absent (§6.1) | rules (§9.1) | yes | yes | yes |
+| `web:<host>` | yes | **no**, unless overridden | `web` | absent | yes | yes | **no** |
+
+**Scraped content is Markdown, so the structural half is identical.** `crawlberg` emits Markdown and
+`xberg::chunking::chunk_text` reads it the same way the scanner reads a file on disk, so `heading_path`
+is populated for web rows exactly as it is for repo rows. That is why `web` is a first-class scope
+rather than a degraded one: the tier is not split, the row shape is not split, and `replace_document`
+already takes the scope as a parameter (`src/web/ingest.rs`).
+
+**`cites` is not extracted for scraped content, by default.** The `exact` lane indexes `cites` with
+an n-gram index, and on an arbitrary page "§ 362" or "2-24-1234" is layout noise, not a reference to
+authority — filling that index with page furniture degrades a fusion lane rather than boosting it.
+`web_scrape` is a general-purpose tool, so it cannot assume the caller scraped a page because it counts
+as legal authority.
+
+**A caller who does scrape an authority can say so.** `WebScrapeParams.scope`
+(`src/mcp/types_web.rs:54-57`) already exists, is already documented as *"Override to share a scope
+across many hosts or to namespace per project"*, and already reaches `resolve_doc_scope`. Naming the
+scope `web:authority` is the channel; the spec needs only to say that a non-default web scope opts into
+`cites` extraction and therefore into the `exact` lane. No new parameter, no new subsystem.
+
+**The facets are not the problem they were.** `doc_type`, `section`, `jurisdiction` and `doc_date` are
+all nullable (§6.1), and §6.1's rule is that a facet predicate on a null value does not constrain. A
+scraped page carrying `doc_type = web` with `section = NULL` therefore narrows nothing and breaks
+nothing: it does not disturb the Phase 4 exit criterion that a selective facet return exactly `limit`
+rows. `doc_type = web` is not an inference either — the provenance is `web_scrape`, so the value is
+known by construction, which is why `web` is in the §6 vocabulary.
+
+### 8.10 The section-intent boost is a rerank tie-break, not a lane and not a filter
+
+§8 step 8 used to prefer hits whose `section` matched the query's detected intent. That sentence is
+gone, and this is where the decision it encoded now lives.
+
+**It is not a fifth lane.** `section` is a scalar column. §5 gives the facet lane a prefiltering role
+and explicitly no scoring role, and a lane that RRF could weight would have to be *scored* — which
+would make `section` load-bearing in the ranking, the opposite of what §6.1 and §9.1 decided. It is
+also not a boost term inside the fused score: `rrf_fuse_detailed` reads only ranks
+(`src/search/rrf.rs:5-6` — *score-scale-agnostic, it only reads ranks*), so a term scaled in
+score-space has nowhere to attach without inverting the per-lane normalisation the fusion depends on.
+
+**It is not a filter.** Dropping hits whose `section` does not match the intent is the §7.3 failure
+verbatim: a relevant passage inside a mislabelled section disappears with no symptom. §6.1 forbids the
+same thing for `doc_type`, and the argument does not weaken because the column is different.
+
+**It is a tie-break inside rerank.** After the cross-encoder has scored the top
+`[documents.reranker].top_k`, two hits at effectively the same score are separated by whether `section`
+matches the detected intent. Nothing is filtered; the loser is still emitted, just ordered lower. That
+is the only position where the signal can exist without contradicting §5, §6.1 or §7.3.
+
+**Intent detection is a small static mapping, in code.** A handful of legally-specific query patterns
+map to a `section` — "what did the court rule", "holding", "what was decided" → `holding`; "the facts",
+"background" → `facts`. Not a model, not a config key: the mapping is a product of legal phrasing, the
+same way the heading aliases of §9.1 are, and §5's note that fusion weights are a correctness concern
+does not extend to it. It is deliberately reversible — the reranker already sees both query and chunk
+and may learn the intent implicitly, so if §13 shows the mapping earns nothing, it is removed rather
+than tuned.
+
+**A null `section` is neither boosted nor penalised.** The tie-break compares hits whose `section` is
+present *and* matches; a chunk that was never decomposed does not enter the comparison at all. This is
+§6.1's rule applied one step downstream: absence is a normal state, not a defect, and penalising it
+would reintroduce the deletion §6.1 removed — just as a ranking penalty instead of a filter.
+
+## 9. Extraction and chunking defaults
+
+| Key | Current | Proposed | Why |
+|---|---|---|---|
+| `max_characters` | 800 | 1800 | **Provisional, pending §13.** A third-party ablation (arXiv 2605.21071, §17) reports recall rising with chunk size in claim-level legal RAG, at 600 tokens / 120 overlap. That study is external and its parameters are not this corpus's; it is the direction of the evidence, not a measurement of this store. The original draft also claimed "800 chars splits statutes mid-subsection" — that is unsourced and is not repeated here. |
+| `overlap` | 100 | 220 | **Provisional, pending §13.** ~12% of `max_characters` — keeps §/subsection boundaries whole without inflating index size. |
+| `chunker_type` | `Markdown` | `Markdown` (unchanged) | heading structure survives; feeds `heading_path`. |
+| `max_chunks_per_document` | 2000 | 2000 | fine; guard only. |
+| `max_pages` | 500 | 500 | fine; scanned bundles may need more. |
+| `extraction_timeout_secs` | 600 | 900 | OCR-bound extraction of large bundles. |
+| `reranker.enabled` | `false` | `true` | works without corpus vectors; largest precision win available. |
+| `reranker.top_k` | 20 | 40 | over-fetch before rerank. |
+| `keywords.enabled` | `false` | `false` | doc-level yaKe/raKe keywords are a *filter*, not a BM25 field; precision collapses if concatenated into `text`. |
+| `ner.enabled` | `false` | `true` (opt-in per deployment) | populates `entities`; `custom_labels` for `CaseName`, `DocketNumber`, `Citation`, `StatutorySection`, `Court`, `Judge`, `PartyName`. |
+| `summarization.enabled` | `false` | `true`, `extractive` | boosts recall when fused as its own field (party names in the summary are matched explicitly by BM25 in published legal work). No LLM, no tokens. |
+| OCR | off unless configured | on for scans | OCR quality caps lexical quality; no BM25 tuning recovers a bad extraction. |
+
+**A note on chunk size and the `cites` lane.** The exact lane indexes the whole `cites` column of each
+chunk with an n-gram index, and the usual worry about chunk size is that a small chunk splits a
+citation across two chunks and loses the exact match. **Going from 800 to 1800 makes that less likely,
+not more** — a longer chunk holds a reference whole more often. The real cost of a larger chunk on this
+lane is the opposite: more strings inside a long chunk *resemble* citations, so the n-gram index picks
+up page furniture and markup. The exact lane's sensitivity to chunk size is a **noise** question, not
+a splitting one, and §13 is the place to measure it.
+
+```toml
+[documents]
+max_characters = 1800
+overlap = 220
+extract_archives = false          # keep off: one archive can explode chunk + index growth
+
+[documents.reranker]
+enabled = true
+top_k = 40
+
+[documents.summarization]
+enabled = true
+strategy = "extractive"
+
+[documents.ner]
+enabled = true
+custom_labels = ["CaseName", "DocketNumber", "Citation", "StatutorySection", "Court", "Judge", "PartyName"]
+```
+
+### 9.1 Section decomposition — deterministic rules, `[llm]` reserved
+
+`section` is assigned by **rule, over the heading breadroom the chunker already emits**, never by an
+LLM pass. `[llm]` is left inert.
+
+The decision turned on what `section` is worth now that it is nullable (§6.1). Its absence costs
+almost nothing: the §8.2 facet prefilter skips a null facet, and the §8.8 boost is a ranking
+preference that the fusion and the reranker can absorb. A *wrong* `section` costs a wrong boost — a
+ranking that is slightly off, not a document that is gone. That is a different currency from a wrong
+`doc_type`, which deletes the filing outright. Spending a model call per chunk, and the ingest
+reproducibility that comes with it, to fill a column whose absence is already graceful is the wrong
+trade.
+
+**The failure mode is null, never a guess.** A document the rules do not recognize gets
+`section = NULL` on every chunk, and nothing else: no implicit `body`, no positional fallback, no
+ordinal. This is the same rule §6.1 gives `doc_type`, and for the same reason — a rule set that
+*guesses* is worse than no rule set, because a guessed label produces a confident boost on a passage
+that has nothing to do with it. If the rules had to produce a value to avoid a gap, they would
+reintroduce the defect #39 just corrected, in another shape.
+
+**`[llm]` is where a pass would go, and it is already plumbed.** `ConfigV1.llm`
+(`src/config/v1.rs:52`) is the shared, off-by-default LLM block that already backs ner-llm,
+summarization-llm, reranker-llm and VLM OCR; `to_xberg()` returns `None` on an empty model, so an
+unset `[llm]` short-circuits any pass. A future section-decomposition LLM is one more consumer of an
+existing seam, not a new subsystem. It is not specified here because nothing needs it yet.
+
+**The §7.3 determinism standard does not extend here.** §7.3 refuses `fast_search()` because a
+silently missing filing is a wrong answer — it protects *recall*, the absence of results. It does not
+make every derived datum bit-reproducible between two ingests; that reading would forbid the reranker,
+the keywords and the NER, all non-deterministic and all accepted elsewhere in this spec. A
+non-reproducible advisory column costs reproducibility of *measurements*, and §13 has no measurements
+yet.
+
+**The two columns are different axes, and the spec should say so.** `heading_path` is *positional*
+(`IV. TERMINATION > 4. Convenience`) and falls out of the Markdown the chunker already sees, so it is
+near-free and near-always populated. `section` is a *role* (`caption`, `facts`, `issues`, `argument`,
+`holding`, `reasoning`, `signature`) — a judgment about what a passage does, which is the part no
+heading rule can derive with confidence. `heading_path` is the load-bearing one; `section` is a
+best-effort boost on top of it. Where they disagree, `heading_path` wins.
+
+## 10. Configuration surface (new keys)
+
+```toml
+[documents.fusion]
+k = 60.0
+weight_exact = 3.0
+weight_keyword = 2.0
+weight_facet = 1.0
+weight_vector = 1.0
+per_document_cap = 3
+max_relaxations = 3
+
+[documents.fts]
+ngram_min_length = 3
+ngram_max_length = 3
+stem = true
+remove_stop_words = true
+ascii_folding = true
+max_token_length = 64
+stemmer_language = "English"
+custom_stop_words = ["pursuant", "herein", ...]
+
+[documents.citations]
+extract = true
+max_per_chunk = 64
+```
+
+Every key gets `#[serde(default)]` so older TOML files keep loading, per the module convention in
+`src/config/documents.rs`. Adding these invalidates `schema/basemind-config-v1.schema.json`;
+regenerate with `cargo test --features full --test config_schema -- --ignored regenerate_schema`
+and re-enable `schema_snapshot_matches_derived` (currently `#[ignore]`d — fix that in the same
+change, it is the guard that makes config drift visible).
+
+`[documents.fts]` holds only what maps to a real `InvertedIndexParams` field. Three things were
+deliberately kept out of it:
+
+- **`stemmer_language`, not `language`.** `[documents].language` already exists and is a
+  *detection* table (`auto_detect`, `min_confidence`, `detect_multiple`, `preferred_languages`).
+  Two different `language` keys of different shapes at different depths is a trap; the stemmer's
+  language is named for what it does. Note that the detection table is largely inert today —
+  `preferred_languages` is documented as reserved, and the xberg release in use does not honour a
+  preferred-language hint.
+- **No `enabled`.** `[documents].enabled` is already the master switch for the tier.
+- **No cadence keys.** `optimize_every_rows` and `unindexed_rows_warn_threshold` are build-cadence
+  settings, not tokenizer parameters; they belong to §7.3, which now carries their defaults.
+
+Module-size cap (`.ai-rulez/rules/module-size-cap.md`): `src/config/documents.rs` is already
+near its limit, so `[documents.fusion]` / `[documents.fts]` / `[documents.citations]` go in a new
+`src/config/documents/retrieval.rs` alongside the existing `pii_patterns.rs`.
+
+## 11. Delivery phases
+
+Each phase lands independently with its own tests and is safe to stop after.
+
+**Phase 0 — honesty and unblocking.** Make `documents_schema` accept `Option<u16>` with a nullable
+`embedding` column so a lexical-only store can exist, **and remove the embedder-dimension early
+return in `flush_document_batches`** (`src/scanner_docs.rs:572-578`), which today bails with `0`
+before any row is built whenever no batch carries a dimension — so a store configured with
+`embed = false` writes no rows at all, text included. A nullable embedding column without this is a
+store that opens and stays empty forever. Regenerate and re-enable
+`tests/config_schema.rs::schema_snapshot_matches_derived`. Audit `src/store_gc*.rs` for
+`documents_v2` handling.
+Correct the two website claims that promise keyword search under `embed = false`
+(`document-search.mdx:162`, `configuration.mdx:157`) — landed separately in PR #46, not in this
+branch.
+*Exit:* a build with `[documents] embed = false` creates a valid lexical-only table **and a scan
+writes rows into it with a null `embedding`**, and no public doc claims a lane that does not exist.
+
+**Phase 1 — shared fusion.** Move `rrf.rs` + BM25 scoring behind `intelligence`, add `Lane`,
+`FusionWeights`, `LaneProvenance`; keep code-tier weights as defaults so code search ranking is
+unchanged. New units: lane-weight defaults, empty-lane behaviour, tie-break stability.
+*Exit:* existing code-search smoke tests pass unchanged; a unit test fuses four lanes and asserts
+the documented weights.
+
+**Phase 2 — lexical lane.** `heading_path` column written at scan (it falls out of the Markdown the
+chunker already emits — `render_heading_breadcrumb` is already called for the dense embedding input,
+§9.1) and FTS indexed on `text` + `heading_path` after the document pass, `optimize()` cadence,
+`search_documents_lexical` with conjunctive-then-disjunctive fallback and §10 config keys. Correct
+the website docs to describe the lane that now exists, superseding PR #46's "there is no lexical lane
+yet" wording. New smoke: `tests/document_fts_smoke.rs` (lexical-only query in an
+empty-`BASEMIND_DATA_HOME` store — proves no embedder is constructed).
+*Exit:* a lexical-only store answers topical queries; `embed = false` is documented truthfully.
+
+**Why `heading_path` is written here and not in Phase 4.** §7.1, §8 step 4 and this phase all index
+it, so an ordering that created it in Phase 4 would have Phase 2 index a column that does not exist.
+It is also the column that separates a topical search from a bag-of-words one, and it is the cheapest
+structural signal in the schema. Phase 4 writes the *curated* facets — the ones that cost something.
+
+**Phase 3 — exact and phrase lanes.** `cites` extraction at ingest, n-gram index, quoted-span
+routing to the `text_phrase` position index, phrase-unsupported reporting. New smoke:
+`tests/document_fusion_smoke.rs` — docket query ranks the exact lane first, quote query resolves the
+case name.
+*Exit:* `§362(a)(1)`, `2-24-1234`, and `"Smith v. Acme"` each resolve in one query.
+
+**Phase 4 — facets and schema v2 columns.** `doc_type`, `section`, `jurisdiction`, `doc_date`,
+`keywords`, `entities`, `summary` written at scan (`heading_path` landed in Phase 2); scalar indexes;
+in-store prefilter replacing the Rust post-filter; MCP hit gains `matched_lanes`, `lane_ranks`,
+`retrieval_mode`, `citation`.
+*Exit:* `entity_category` / `keywords_contains` return exactly `limit` rows when selective; result
+count no longer depends on top-k luck.
+
+**Phase 5 — quality and tuning.** Rerank on by default with `top_k = 40`; per-document cap and
+byte-span overlap dedupe; section-intent boost; build the evaluation harness (§13) and settle the
+weights and chunk sizes on the real matter corpus.
+*Exit:* a written benchmark result justifying every weight and default in §5 and §9 — and a
+documented decision to change any of them.
+
+## 12. Shared fusion refactor
+
+- Move `src/search/rrf.rs` and the scoring half of `src/search/bm25.rs` behind `#[cfg(feature =
+  "intelligence")]`; keep the code-tier *indexing* half (postings build/write) under
+  `code-search`. Genericize `build_chunk_postings(&[CodeChunk])` into a `posting_text(&str) ->
+  Vec<(String, u32)>` entry point so the documents tier reuses tokenization rules rather than
+  copying them.
+- One `Lane` enum (`Exact`, `Keyword`, `Facet`, `Vector`) and one `FusionWeights` struct replace the
+  three `WEIGHT_*` constants, with the code tier's current values as the default so existing code
+  search ranking is unchanged (regression-checked by the existing smoke tests).
+- `matched_lanes` / `lane_ranks` become a shared `LaneProvenance` struct returned by both tiers.
+
+## 13. Test plan
+
+Unit (Bun-free, `cargo test --lib`):
+
+- Tokenizer: `§ 362(a)(1)`, `C.F.R.`, `No. 2-24-1234`, `Smith v. Acme`, `"quoted phrase"`,
+  accented FR/ES tokens, boilerplate stop-words. Assert ingest and query tokenization agree by
+  comparing against `lancedb::tokenize(query, &builder)`.
+- Normalizer: quote extraction, citation splitting, idf-ordered relaxation (assert the term order
+  is preserved from the BM25 idf formula).
+- Fusion: known lane ranks → expected fused order; empty lanes contribute nothing; stable tie-break
+  on `chunk_id`; per-document cap and 50% byte-span overlap dedupe.
+- Schema: `documents_schema(None)` builds, `embedding` is nullable, `documents_v2` field list
+  matches this spec.
+
+Integration / smoke (`tests/`, existing `*_smoke.rs` convention):
+
+- `tests/document_fts_smoke.rs` — index a small fixture corpus, assert a lexical-only query returns
+  the expected path with `retrieval_mode = "lexical"` and no embedder is ever constructed
+  (guard the "no ONNX model download" property by pointing `BASEMIND_DATA_HOME` at an empty dir).
+- `tests/document_fusion_smoke.rs` — lexical + vector fixtures, assert keyword outranks vector on a
+  lexical-overlap query and exact outranks both on a docket-number query.
+- `tests/mcp_smoke.rs` extension — `memory documents` with `entity_category` / `keywords_contains`
+  now prefilters in-store (assert `num_unindexed_rows` untouched and result count == limit when a
+  selective facet is supplied).
+- `tests/config_schema.rs` — snapshot regenerated and no longer `#[ignore]`d.
+
+Evaluation harness (new, `tests/legal_eval/` or `benches/`): BM25 vs dense vs RRF vs
+rerank, reporting Recall@k / MRR / nDCG@k per lane and post-fusion, over LegalBench-RAG
+(CUAD / ContractNLI / PrivacyQA) and, if useful, COLIEE. Weight and chunk-size decisions in §5
+and §9 are **not** finalized until this harness runs on the real matter corpus; the defaults above
+are the starting point to be measured, not a claim.
+
+## 14. Migration, ops, rollback
+
+### 14.0 At-rest encryption (requirement, not option)
+
+The Lance store holds chunk text, `cites`, facet columns and FTS postings. It is written **in
+clear** — LanceDB OSS has no at-rest encryption, and Lance requires plaintext to build FTS indexes
+and run vector search, so column-level encryption is not an available answer. Encryption at rest
+therefore comes from the storage layer **below** the data home: LUKS on Linux, FileVault on macOS,
+BitLocker on Windows. This is a deployment requirement for any deployment that stores documents,
+not a basemind feature.
+
+The scope is the whole of `cache_root()` — `cache/blobs/` (which holds extracted text), every
+per-workspace Lance store, the registry snapshot, and the `.chunk.msgpack` sidecars. Encrypting a
+subdirectory is not an accepted configuration.
+
+Enforcement: when `redaction.enabled = true` and the volume cannot be verified, the scan **warns
+loudly**; hard refusal exists only behind an explicit opt-in. macOS and Windows verify authoritatively
+(FileVault, BitLocker), Linux is best-effort, and `unknown` is never reported as `not encrypted` —
+otherwise every container, CI runner and network mount warns, and a warning that always fires is a
+warning nobody reads. The check runs at scan and its verdict is surfaced in `basemind doctor`.
+
+See [ADR-0013](../adr/0013-encryption-at-rest-comes-from-the-volume.md).
+
+- Table rename `documents` → `documents_v2` means existing workspaces keep serving v1 rows until
+  rescan; `memory documents` reads v2 when present and falls back to v1 with a warning.
+- Reindex triggers: any tokenizer/`FtsIndexBuilder` change, `embedding_preset` change (existing
+  behaviour), schema bump. Same wipe semantics as `embedding_preset` — surfaced at scan time, not
+  silently.
+- Rollback: drop `documents_v2`, repoint reads at `documents`. No data loss (extraction is cached
+  in `.chunk.msgpack` sidecars), only re-embed cost if vectors were involved.
+- Perf: FTS index adds disk and build time proportional to chunk count. `max_chunks_per_document`
+  stays the blast-radius control; `optimize()` cadence is the read-latency control.
+
+## 15. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Trigram `cites` index inflates store size | Scoped to one short column; `[documents.citations].extract = false` escape hatch |
+| `with_position` phrase index is large | Separate table-level index, config-gated, disabled by measurement if too big |
+| Fusion weights regress code search | Code-tier defaults preserved; existing smoke tests assert unchanged order |
+| `documents_v2` breaks `store_gc` / compaction paths | Phase 0 includes the GC audit; GC must not treat v2 as garbage |
+| Schema snapshot drift | Re-enable `schema_snapshot_matches_derived` in the same PR |
+| Rerank ONNX download on first use | Already opt-in per call; document the download, keep `enabled = false` override |
+| Redaction (`token_replace`) breaks identifier search | Index `cites` from **pre-redaction** text, **excluding self-references** (own caption, own docket number), so the clear-text column holds public authority only. `rehydration_ref` unchanged. Residual risk is egress, not at rest — handled by #7. At-rest protection is a volume requirement, tracked in #45 |
+| Legal stop-word removal harms exact phrase recall | Two-index split (§7.2): stemmed/stop-worded index for topical recall, position index for exact recall |
+
+## 16. Open questions
+
+1. ~~Is `bge-reranker-v2-m3` the right reranker for citation-heavy queries, or should a
+   citation-aware cross-encoder be evaluated?~~ **Answered (#38): `bge-reranker-v2-m3` stays the
+   default.** It is the existing preset, reranks hits at query time with no corpus embeddings, and is
+   a flag flip rather than a schema change. A citation-aware cross-encoder stays a candidate for a
+   future benchmark comparison; the decision is provisional until one exists.
+2. ~~Should `doc_type` be user-supplied at scan time for a curated corpus, or inferred?~~ **Answered
+   (#39): curated or absent, never inferred — see §6.1.** A not-null `doc_type` with an `unknown`
+   bucket conflated absence with membership, and because the facet lane prefilters without scoring,
+   a wrong value deletes the document from the candidate set rather than adding noise. `doc_type` and
+   `section` are nullable; a facet filter on a null value must not constrain.
+3. Do we need cross-workspace/cross-matter retrieval (a global citation index) as a separate tier,
+   or is per-scope isolation sufficient for v1?
+4. ~~Section decomposition: xberg emits Markdown, not labeled legal sections. Rule-based heading
+   heuristics, or an optional LLM pass behind `[llm]`?~~ **Answered (#41): deterministic rules, no LLM
+   pass — see §9.1.** `section` is nullable now, so its absence is graceful and an LLM pass would pay a
+   model call and ingest non-reproducibility for an advisory column. Rules fail to null, never to a
+   guess. `[llm]` is left inert but already plumbed (`ConfigV1.llm`) for a future pass. The two
+   columns are different axes: `heading_path` is positional and near-always populated, `section` is a
+   role label, and the breadcrumb wins where they disagree.
+
+## 17. References
+
+- LanceDB FTS index and tokenizer options — <https://docs.lancedb.com/indexing/fts-index>
+- LanceDB hybrid search + `RRFReranker` — <https://docs.lancedb.com/search/hybrid-search>
+- lancedb Rust API: `Index::FTS`, `FtsIndexBuilder`, `Query::full_text_search`,
+  `lancedb::rerankers::rrf::RRFReranker`, `lancedb::tokenize` — <https://docs.rs/lancedb/0.37.1/lancedb/>
+- xberg configuration reference (chunking, keywords, NER, reranker, OCR) — <https://docs.xberg.io/reference/configuration>
+- Legal retrieval benchmark (BM25 vs dense vs RRF vs rerank on CUAD) — <https://github.com/Akshitha024/legal-retrieval-benchmark>
+- Section-weighted hybrid retrieval for legal cases — <https://arxiv.org/html/2606.03138v1>
+- Claim-level RAG for law: chunk size / overlap ablation — <https://arxiv.org/html/2605.21071v1>
+- Legal BM25 reliability study — <https://aclanthology.org/2025.nllp-1.3.pdf>
+- ADR-0012 — [`../adr/0012-multi-lane-document-retrieval.md`](../adr/0012-multi-lane-document-retrieval.md)
