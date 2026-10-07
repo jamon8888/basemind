@@ -296,13 +296,9 @@ queries, so:
    Skip cleanly otherwise — never embed the query in a lexical-only store.
 7. **Fuse.** `rrf_fuse_detailed` with the weights in §5. Retain per-lane ranks.
 8. **Post-fusion shaping.** Per-document cap (default 3 chunks, `[documents].max_hits_per_document`);
-   drop hits whose `byte_span` overlaps an already-selected hit by more than 50%; prefer hits whose
-   `section` matches the query's detected intent (`holding` for "what did the court rule"). This is a
-   **boost, not a filter** — and it must stay one. `section` is nullable (§6.1), so a chunk that was
-   never decomposed simply earns no boost; filtering on it instead would drop every non-decomposed
-   chunk from a query that happens to name an intent, which is the deletion failure §6.1 describes.
-   `heading_path` is the structural signal here and is near-always populated; `section` is an
-   advisory role label on top of it, and where the two disagree the breadcrumb wins (§9.1).
+   drop hits whose `byte_span` overlaps an already-selected hit by more than 50%. `heading_path` is
+   the structural signal here and is near-always populated. Section-intent is **not** applied here —
+   it is a rerank tie-break (§8.10).
 9. **Rerank and emit.** Rerank the top `[documents.reranker].top_k` with the cross-encoder, then
    trim to `limit`. Emit `matched_lanes`, `lane_ranks`, `rerank_score`, `citation` string
    (`path#byte_start-byte_end`), plus a `retrieval_mode` field (`lexical` / `hybrid` / `vector`)
@@ -345,6 +341,40 @@ scraped page carrying `doc_type = web` with `section = NULL` therefore narrows n
 nothing: it does not disturb the Phase 4 exit criterion that a selective facet return exactly `limit`
 rows. `doc_type = web` is not an inference either — the provenance is `web_scrape`, so the value is
 known by construction, which is why `web` is in the §6 vocabulary.
+
+### 8.10 The section-intent boost is a rerank tie-break, not a lane and not a filter
+
+§8 step 8 used to prefer hits whose `section` matched the query's detected intent. That sentence is
+gone, and this is where the decision it encoded now lives.
+
+**It is not a fifth lane.** `section` is a scalar column. §5 gives the facet lane a prefiltering role
+and explicitly no scoring role, and a lane that RRF could weight would have to be *scored* — which
+would make `section` load-bearing in the ranking, the opposite of what §6.1 and §9.1 decided. It is
+also not a boost term inside the fused score: `rrf_fuse_detailed` reads only ranks
+(`src/search/rrf.rs:5-6` — *score-scale-agnostic, it only reads ranks*), so a term scaled in
+score-space has nowhere to attach without inverting the per-lane normalisation the fusion depends on.
+
+**It is not a filter.** Dropping hits whose `section` does not match the intent is the §7.3 failure
+verbatim: a relevant passage inside a mislabelled section disappears with no symptom. §6.1 forbids the
+same thing for `doc_type`, and the argument does not weaken because the column is different.
+
+**It is a tie-break inside rerank.** After the cross-encoder has scored the top
+`[documents.reranker].top_k`, two hits at effectively the same score are separated by whether `section`
+matches the detected intent. Nothing is filtered; the loser is still emitted, just ordered lower. That
+is the only position where the signal can exist without contradicting §5, §6.1 or §7.3.
+
+**Intent detection is a small static mapping, in code.** A handful of legally-specific query patterns
+map to a `section` — "what did the court rule", "holding", "what was decided" → `holding`; "the facts",
+"background" → `facts`. Not a model, not a config key: the mapping is a product of legal phrasing, the
+same way the heading aliases of §9.1 are, and §5's note that fusion weights are a correctness concern
+does not extend to it. It is deliberately reversible — the reranker already sees both query and chunk
+and may learn the intent implicitly, so if §13 shows the mapping earns nothing, it is removed rather
+than tuned.
+
+**A null `section` is neither boosted nor penalised.** The tie-break compares hits whose `section` is
+present *and* matches; a chunk that was never decomposed does not enter the comparison at all. This is
+§6.1's rule applied one step downstream: absence is a normal state, not a defect, and penalising it
+would reintroduce the deletion §6.1 removed — just as a ranking penalty instead of a filter.
 
 ## 9. Extraction and chunking defaults
 
