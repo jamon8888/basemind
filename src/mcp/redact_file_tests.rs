@@ -426,3 +426,83 @@ async fn ai_act_citation_redacts_only_the_2024_1689_number() {
         "the citation must surface as ai_act_citation: {detections:?}"
     );
 }
+
+// Offsets index the text the caller sent (#70). Inline text used to go through
+// xberg's plain-text extractor, which trims every paragraph, collapses blank-line
+// runs, turns CRLF into LF and folds decomposed accents, then reported offsets on
+// that rewritten text. A caller mapping spans back onto its own string was off by
+// the amount the extractor removed.
+
+/// Redacts `text` with no NER and returns the detections whose text is `needle`,
+/// asserting each one indexes `text` itself (UTF-8 bytes), not an extracted copy.
+async fn assert_spans_index_the_input(text: &str, needle: &str) -> Value {
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let detections = payload["detections"].as_array().expect("detections");
+    let found: Vec<&Value> = detections
+        .iter()
+        .filter(|d| d["text"].as_str().is_some_and(|t| t.contains(needle)))
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "no detection covers {needle:?} in {text:?}: {detections:?}"
+    );
+    for detection in found {
+        let start = detection["start"].as_u64().expect("start") as usize;
+        let end = detection["end"].as_u64().expect("end") as usize;
+        let slice = text.as_bytes().get(start..end).unwrap_or_default();
+        assert_eq!(
+            std::str::from_utf8(slice).unwrap_or("<not on a char boundary>"),
+            detection["text"].as_str().expect("detection text"),
+            "[{start},{end}) does not index the input {text:?}"
+        );
+    }
+    payload
+}
+
+#[tokio::test]
+async fn offsets_hold_with_leading_whitespace() {
+    for text in [
+        " Contact: jane.roe@exemple.fr merci",
+        "   Contact: jane.roe@exemple.fr merci",
+        "\n\nContact: jane.roe@exemple.fr merci",
+    ] {
+        assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+    }
+}
+
+#[tokio::test]
+async fn offsets_hold_after_blank_line_runs_and_indented_paragraphs() {
+    for text in [
+        "Intro\n\n\n\nContact: jane.roe@exemple.fr merci",
+        "Intro\n\n   Contact: jane.roe@exemple.fr merci",
+        "Intro   \n\nContact: jane.roe@exemple.fr merci",
+    ] {
+        assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+    }
+}
+
+#[tokio::test]
+async fn offsets_hold_with_windows_line_endings() {
+    assert_spans_index_the_input("Intro\r\nContact: jane.roe@exemple.fr\r\nmerci", "jane.roe@exemple.fr").await;
+}
+
+#[tokio::test]
+async fn offsets_hold_after_decomposed_accents() {
+    // "Hélène" written as e + combining accent: 2 bytes per mark.
+    let text = "Prénom H\u{65}\u{301}l\u{65}\u{300}ne Dubreuil écrit: jane.roe@exemple.fr";
+    assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+}
+
+#[tokio::test]
+async fn redacted_text_keeps_the_surrounding_text_verbatim() {
+    let text = "  Intro\r\n\r\n\r\nContact: jane.roe@exemple.fr merci\n\n";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let redacted = json_of(&result)["redacted_text"]
+        .as_str()
+        .expect("redacted_text")
+        .to_string();
+    assert!(redacted.starts_with("  Intro\r\n\r\n\r\nContact: "), "{redacted:?}");
+    assert!(redacted.ends_with(" merci\n\n"), "{redacted:?}");
+    assert!(!redacted.contains("jane.roe@exemple.fr"), "{redacted:?}");
+}

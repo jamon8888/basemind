@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::BasemindServer;
 use super::helpers::record_call;
 use xberg::text::redaction;
-use xberg::{ExtractInput, extract};
+use xberg::{ExtractInput, ExtractedDocument, extract};
 
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 
@@ -61,7 +61,7 @@ pub struct RedactTextParams {
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text), and ner_ran (false when NER did not run and only pattern redaction applied; set require_ner to fail instead).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), and ner_ran (false when NER did not run and only pattern redaction applied; set require_ner to fail instead).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -111,13 +111,24 @@ fn oversized_err(len: usize) -> McpError {
     )
 }
 
+/// Where the text to redact comes from.
+enum Source {
+    /// A file xberg extracts (any format).
+    File(Box<ExtractInput>),
+    /// Text the caller sent. It is used as is: xberg's plain-text extractor
+    /// trims every paragraph, collapses blank-line runs, turns CRLF into LF and
+    /// folds decomposed accents, so offsets reported on its output no longer
+    /// index what the caller sent (#70).
+    Inline(String),
+}
+
 /// Body of the `redact_text` tool: reads the inline text or extracts the
 /// file, turns NER mentions into boundary-aware custom patterns, then lets
 /// xberg redact them together with its own pattern detectors in one pass.
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
-    let input = match args.file_path.as_deref() {
+    let source = match args.file_path.as_deref() {
         Some(path) => {
             if !args.text.is_empty() {
                 return Err(McpError::internal_error(
@@ -136,7 +147,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                     None,
                 ));
             }
-            ExtractInput::from_uri(path.to_string())
+            Source::File(Box::new(ExtractInput::from_uri(path.to_string())))
         }
         None => {
             if args.text.len() > MAX_BYTES {
@@ -148,7 +159,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                     None,
                 ));
             }
-            ExtractInput::from_bytes(args.text.into_bytes(), "text/plain", Some("input.txt".to_string()))
+            Source::Inline(args.text)
         }
     };
 
@@ -205,13 +216,24 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         ..Default::default()
     };
 
-    let mut extraction = extract(input, &extraction_config)
-        .await
-        .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
-    let mut doc = extraction
-        .results
-        .pop()
-        .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?;
+    let mut doc = match source {
+        Source::File(input) => {
+            let mut extraction = extract(*input, &extraction_config)
+                .await
+                .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
+            extraction
+                .results
+                .pop()
+                .ok_or_else(|| McpError::internal_error("xberg returned no extracted document".to_string(), None))?
+        }
+        Source::Inline(text) => {
+            // The struct has private fields, so it is built by default and then filled in.
+            let mut doc = ExtractedDocument::default();
+            doc.content = text;
+            doc.mime_type = "text/plain".into();
+            doc
+        }
+    };
     // Extracted content (e.g. OCR of a large image) must honor the same cap
     // as inline text — checked after extraction because only then is the
     // byte length known.
