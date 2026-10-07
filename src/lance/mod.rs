@@ -14,6 +14,10 @@
 #[cfg(feature = "documents")]
 mod doc_links;
 pub mod schema;
+/// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
+/// (`tests/max_lines.rs`).
+#[cfg(any(test, feature = "test-support"))]
+mod test_support;
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;
@@ -487,30 +491,6 @@ impl LanceStore {
                 decode_code_chunk_hits(&batch, &mut hits)?;
             }
             anyhow::Ok(hits)
-        })
-    }
-
-    /// Count rows in the documents table, optionally filtered by a SQL predicate.
-    ///
-    /// Test-facing only. Nothing in the product needs a row count, and putting one on the public
-    /// surface would be a promise to keep it accurate across compaction. It exists because the
-    /// scope-mismatch defect it guards is *invisible* without it: a document whose rows were
-    /// written under one scope and deleted under another still searches fine and still reports
-    /// success — the duplicate only shows up as a count.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn count_documents(&self, filter: Option<&str>) -> Result<usize> {
-        self.inner.rt().block_on(async {
-            let table = self
-                .inner
-                .connection
-                .open_table(schema::DOCUMENTS_TABLE)
-                .execute()
-                .await
-                .with_context(|| format!("open {} table", schema::DOCUMENTS_TABLE))?;
-            table
-                .count_rows(filter.map(str::to_string))
-                .await
-                .context("count documents rows")
         })
     }
 }
