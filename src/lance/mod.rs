@@ -547,7 +547,11 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
-        if r.embedding.len() != usize::from(dim) {
+        // An empty `embedding` means the scan ran with `embed = false`: the row is lexical-only and
+        // the vector column is null. A *non-empty* vector of the wrong length is still a bug — that
+        // one would silently misalign the index — so the length check survives for the case that can
+        // actually be wrong.
+        if !r.embedding.is_empty() && r.embedding.len() != usize::from(dim) {
             return Err(anyhow!(
                 "documents row embedding dim {} does not match store dim {}",
                 r.embedding.len(),
@@ -565,10 +569,14 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Some(value) => rehydration_ref.append_value(value),
             None => rehydration_ref.append_null(),
         }
-        for v in &r.embedding {
-            embedding.values().append_value(*v);
+        if r.embedding.is_empty() {
+            embedding.append(false);
+        } else {
+            for v in &r.embedding {
+                embedding.values().append_value(*v);
+            }
+            embedding.append(true);
         }
-        embedding.append(true);
     }
 
     let schema = documents_schema(dim);
@@ -967,6 +975,61 @@ mod tests {
         };
         wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
         assert!(!keep.exists(), "a schema_ver bump should wipe the store");
+    }
+
+    #[test]
+    fn documents_embedding_column_is_nullable_for_a_lexical_only_store() {
+        use crate::lance::schema::documents_schema;
+        let schema = documents_schema(384);
+        let field = schema.field_with_name("embedding").expect("embedding column exists");
+        assert!(
+            field.is_nullable(),
+            "embedding must be nullable: `embed = false` stores a null vector, not no row"
+        );
+        // The dimension still comes from the preset. A lexical-only store is not a dim-less store:
+        // `memory` and `code_chunks` are created in the same connection and both need a concrete
+        // dimension, so `embed = false` means "do not run the embedder", not "no model configured".
+        assert!(matches!(
+            field.data_type(),
+            arrow_schema::DataType::FixedSizeList(_, size) if *size == 384
+        ));
+    }
+
+    #[test]
+    fn a_vectorless_document_row_builds_with_a_null_embedding() {
+        let rows = vec![DocumentRow {
+            scope: "repo:x".to_string(),
+            path: "safe/a.md".to_string(),
+            chunk_idx: 0,
+            mime_type: "text/markdown".to_string(),
+            text: "clause de résiliation".to_string(),
+            byte_start: 0,
+            byte_end: 21,
+            rehydration_ref: None,
+            embedding: Vec::new(),
+        }];
+        let batch = build_documents_batch(384, &rows).expect("a lexical-only row is not an error");
+        let column = batch.column_by_name("embedding").expect("embedding column");
+        assert_eq!(column.null_count(), 1, "the vector column carries a null, not an empty list");
+        assert_eq!(batch.num_rows(), 1, "the row is written; text included");
+    }
+
+    #[test]
+    fn a_wrong_length_vector_is_still_rejected() {
+        // The nullable column must not become a hole: a row that *claims* a vector of the wrong
+        // length would misalign the index silently, which is worse than an error.
+        let rows = vec![DocumentRow {
+            scope: "repo:x".to_string(),
+            path: "safe/a.md".to_string(),
+            chunk_idx: 0,
+            mime_type: "text/markdown".to_string(),
+            text: "t".to_string(),
+            byte_start: 0,
+            byte_end: 1,
+            rehydration_ref: None,
+            embedding: vec![0.0_f32; 7],
+        }];
+        assert!(build_documents_batch(384, &rows).is_err());
     }
 
     #[test]

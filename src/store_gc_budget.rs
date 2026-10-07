@@ -383,18 +383,32 @@ fn evict_workspace(dir: &Path) -> Result<Option<u64>, GcError> {
 /// Derived state that can be rebuilt from source. Stable identity, the workspace marker, and the
 /// `memory.lance` table are intentionally absent: budget enforcement must never rotate an agent's
 /// identity or delete user-authored memory.
-fn rebuildable_workspace_paths(workspace: &Path) -> [PathBuf; 8] {
+///
+/// The Lance table names come from the same constants that *create* the tables, not from literals
+/// spelled out here. A hardcoded `documents.lance` rots silently the moment a table is renamed or
+/// added: the new table is not deleted wrongly, it is **omitted** — so it is never evicted, the
+/// workspace never comes back under budget, and the leak has no symptom until someone goes looking
+/// for it. Deriving the names turns that omission into a compile error.
+fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
+    use crate::lance::schema::{CODE_CHUNKS_TABLE, DOCUMENTS_TABLE, DOC_LINKS_TABLE};
+
     let lance = workspace.join(LANCE_WORKSPACE_DIR);
-    [
+    let evictable = [
+        DOCUMENTS_TABLE.to_string(),
+        DOC_LINKS_TABLE.to_string(),
+        #[cfg(feature = "code-search")]
+        CODE_CHUNKS_TABLE.to_string(),
+    ];
+
+    let mut paths = vec![
         workspace.join(crate::store::VIEWS_DIR),
         workspace.join("git-cache"),
         workspace.join(crate::git_history::GIT_HISTORY_DIR),
         workspace.join("status.json"),
         workspace.join("telemetry.jsonl"),
-        lance.join("documents.lance"),
-        lance.join("code_chunks.lance"),
-        lance.join("doc_links.lance"),
-    ]
+    ];
+    paths.extend(evictable.iter().map(|table| lance.join(format!("{table}.lance"))));
+    paths
 }
 
 fn remove_cache_path(path: &Path) -> Result<(), GcError> {
