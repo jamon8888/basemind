@@ -107,8 +107,8 @@ New table name `documents_v2`; the v1 table is left on disk and dropped by the e
 | `path` | Utf8 | no | unchanged |
 | `chunk_idx` | UInt32 | no | unchanged |
 | `mime_type` | Utf8 | no | unchanged |
-| `doc_type` | Utf8 | no | `pleading`, `contract`, `memo`, `email`, `statute`, `exhibit`, `web`, `unknown` |
-| `section` | Utf8 | no | `caption`, `facts`, `issues`, `argument`, `holding`, `reasoning`, `signature`, `body` |
+| `doc_type` | Utf8 | **yes** | nullable; curated or absent, never inferred (§6.1). `pleading`, `contract`, `memo`, `email`, `statute`, `exhibit`, `web` |
+| `section` | Utf8 | **yes** | nullable; absent means the chunk was not decomposed. `caption`, `facts`, `issues`, `argument`, `holding`, `reasoning`, `signature` |
 | `heading_path` | Utf8 | no | Markdown heading breadcrumb, e.g. `IV. TERMINATION > 4. Convenience` |
 | `cites` | List<Utf8> | no | normalized identifiers: statute cites, docket numbers, case short names. **Self-references excluded** — the document's own caption and its own docket number are not citations of authority and are never indexed in clear (see ADR-0012 precondition, ticket #44) |
 | `jurisdiction` | Utf8 | yes | ISO-ish code when detectable |
@@ -127,6 +127,42 @@ Indexes: FTS on `text` and `heading_path`; n-gram FTS on `cites`; scalar indexes
 Rationale for lifting `keywords` / `entities` / `summary` into the row: today they can only be
 post-filtered in Rust (`src/mcp/memory.rs:638-710`), which silently shrinks the candidate set
 *after* top-k. In-row they become prefilterable, and `summary` becomes a boostable lexical field.
+
+### 6.1 `doc_type` is curated, and absent is not a value
+
+`doc_type` is **written by the caller at ingest or not at all**. It is never inferred. Two reasons,
+and the second is the load-bearing one.
+
+**A wrong `doc_type` is not noise, it is a deletion.** The facet lane prefilters and does not score
+(§5), so a facet predicate runs before any lane produces a candidate. A document whose `doc_type`
+does not match is absent from the candidate set, and no later lane and no amount of fusion can
+recover it. A guessed value therefore does not merely add noise to a ranking — it **removes the
+correct filing**, with no observable symptom. §7.3 sets the standard this violates: a silently
+missing filing is a wrong answer.
+
+**Absence must therefore degrade to "no filter on this facet", never to "matches nothing".** That is
+why the column is nullable and why `unknown` is gone from the vocabulary: a not-null column with an
+"I don't know" bucket conflates *absence* with *membership*. With `unknown` in place, the query
+`doc_type = 'contract'` returns the contracts somebody classified, not the contracts — and the
+unclassified ones vanish with no signal. A caller that filters on a nullable facet gets
+
+```sql
+doc_type IS NULL OR doc_type = 'contract'
+```
+
+which is what "this facet was curated where it matters, and is simply absent elsewhere" has to
+mean. The same reasoning applies to `section`: null means the chunk was not decomposed, and a
+caller filtering on `holding` must still receive the non-decomposed chunks rather than lose them.
+
+This is also why inference is rejected rather than deferred. An inferred value that cannot be
+prefiltered is not usable for retrieval at all — §5 gives the facet lane no scoring role — so it
+would serve display only. An inferred value that *can* be prefiltered is the deletion case above.
+There is no third option that is both cheap and safe.
+
+Curation cost is per dossier and **visible**: an uncurated dossier is one whose facets are absent,
+which a reader can see. The assignment channel is the integration's call (Hacienda-cowork #15);
+an ingest parameter and a path-to-kind mapping are the two that survive the fact that `safe/`
+mirrors are generated `.md` files that no human edits.
 
 ## 7. Index build
 
@@ -251,7 +287,10 @@ queries, so:
 7. **Fuse.** `rrf_fuse_detailed` with the weights in §5. Retain per-lane ranks.
 8. **Post-fusion shaping.** Per-document cap (default 3 chunks, `[documents].max_hits_per_document`);
    drop hits whose `byte_span` overlaps an already-selected hit by more than 50%; prefer hits whose
-   `section` matches the query's detected intent (`holding` for "what did the court rule").
+   `section` matches the query's detected intent (`holding` for "what did the court rule"). This is a
+   **boost, not a filter** — and it must stay one. `section` is nullable (§6), so a chunk that was
+   never decomposed simply earns no boost; filtering on it instead would drop every non-decomposed
+   chunk from a query that happens to name an intent, which is the deletion failure §6.1 describes.
 9. **Rerank and emit.** Rerank the top `[documents.reranker].top_k` with the cross-encoder, then
    trim to `limit`. Emit `matched_lanes`, `lane_ranks`, `rerank_score`, `citation` string
    (`path#byte_start-byte_end`), plus a `retrieval_mode` field (`lexical` / `hybrid` / `vector`)
@@ -483,10 +522,16 @@ See [ADR-0013](../adr/0013-encryption-at-rest-comes-from-the-volume.md).
 
 ## 16. Open questions
 
-1. Is `bge-reranker-v2-m3` the right reranker for citation-heavy queries, or should a
-   citation-aware cross-encoder be evaluated?
-2. Should `doc_type` be user-supplied at scan time for a curated corpus, or inferred? Inference is
-   cheap but noisy; a curated `doc_type` is a much stronger facet.
+1. ~~Is `bge-reranker-v2-m3` the right reranker for citation-heavy queries, or should a
+   citation-aware cross-encoder be evaluated?~~ **Answered (#38): `bge-reranker-v2-m3` stays the
+   default.** It is the existing preset, reranks hits at query time with no corpus embeddings, and is
+   a flag flip rather than a schema change. A citation-aware cross-encoder stays a candidate for a
+   future benchmark comparison; the decision is provisional until one exists.
+2. ~~Should `doc_type` be user-supplied at scan time for a curated corpus, or inferred?~~ **Answered
+   (#39): curated or absent, never inferred — see §6.1.** A not-null `doc_type` with an `unknown`
+   bucket conflated absence with membership, and because the facet lane prefilters without scoring,
+   a wrong value deletes the document from the candidate set rather than adding noise. `doc_type` and
+   `section` are nullable; a facet filter on a null value must not constrain.
 3. Do we need cross-workspace/cross-matter retrieval (a global citation index) as a separate tier,
    or is per-scope isolation sufficient for v1?
 4. Section decomposition: xberg emits Markdown, not labeled legal sections. Rule-based heading
