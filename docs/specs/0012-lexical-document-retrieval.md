@@ -298,9 +298,11 @@ queries, so:
 8. **Post-fusion shaping.** Per-document cap (default 3 chunks, `[documents].max_hits_per_document`);
    drop hits whose `byte_span` overlaps an already-selected hit by more than 50%; prefer hits whose
    `section` matches the query's detected intent (`holding` for "what did the court rule"). This is a
-   **boost, not a filter** — and it must stay one. `section` is nullable (§6), so a chunk that was
+   **boost, not a filter** — and it must stay one. `section` is nullable (§6.1), so a chunk that was
    never decomposed simply earns no boost; filtering on it instead would drop every non-decomposed
    chunk from a query that happens to name an intent, which is the deletion failure §6.1 describes.
+   `heading_path` is the structural signal here and is near-always populated; `section` is an
+   advisory role label on top of it, and where the two disagree the breadcrumb wins (§9.1).
 9. **Rerank and emit.** Rerank the top `[documents.reranker].top_k` with the cross-encoder, then
    trim to `limit`. Emit `matched_lanes`, `lane_ranks`, `rerank_score`, `citation` string
    (`path#byte_start-byte_end`), plus a `retrieval_mode` field (`lexical` / `hybrid` / `vector`)
@@ -344,6 +346,46 @@ strategy = "extractive"
 enabled = true
 custom_labels = ["CaseName", "DocketNumber", "Citation", "StatutorySection", "Court", "Judge", "PartyName"]
 ```
+
+### 9.1 Section decomposition — deterministic rules, `[llm]` reserved
+
+`section` is assigned by **rule, over the heading breadroom the chunker already emits**, never by an
+LLM pass. `[llm]` is left inert.
+
+The decision turned on what `section` is worth now that it is nullable (§6.1). Its absence costs
+almost nothing: the §8.2 facet prefilter skips a null facet, and the §8.8 boost is a ranking
+preference that the fusion and the reranker can absorb. A *wrong* `section` costs a wrong boost — a
+ranking that is slightly off, not a document that is gone. That is a different currency from a wrong
+`doc_type`, which deletes the filing outright. Spending a model call per chunk, and the ingest
+reproducibility that comes with it, to fill a column whose absence is already graceful is the wrong
+trade.
+
+**The failure mode is null, never a guess.** A document the rules do not recognize gets
+`section = NULL` on every chunk, and nothing else: no implicit `body`, no positional fallback, no
+ordinal. This is the same rule §6.1 gives `doc_type`, and for the same reason — a rule set that
+*guesses* is worse than no rule set, because a guessed label produces a confident boost on a passage
+that has nothing to do with it. If the rules had to produce a value to avoid a gap, they would
+reintroduce the defect #39 just corrected, in another shape.
+
+**`[llm]` is where a pass would go, and it is already plumbed.** `ConfigV1.llm`
+(`src/config/v1.rs:52`) is the shared, off-by-default LLM block that already backs ner-llm,
+summarization-llm, reranker-llm and VLM OCR; `to_xberg()` returns `None` on an empty model, so an
+unset `[llm]` short-circuits any pass. A future section-decomposition LLM is one more consumer of an
+existing seam, not a new subsystem. It is not specified here because nothing needs it yet.
+
+**The §7.3 determinism standard does not extend here.** §7.3 refuses `fast_search()` because a
+silently missing filing is a wrong answer — it protects *recall*, the absence of results. It does not
+make every derived datum bit-reproducible between two ingests; that reading would forbid the reranker,
+the keywords and the NER, all non-deterministic and all accepted elsewhere in this spec. A
+non-reproducible advisory column costs reproducibility of *measurements*, and §13 has no measurements
+yet.
+
+**The two columns are different axes, and the spec should say so.** `heading_path` is *positional*
+(`IV. TERMINATION > 4. Convenience`) and falls out of the Markdown the chunker already sees, so it is
+near-free and near-always populated. `section` is a *role* (`caption`, `facts`, `issues`, `argument`,
+`holding`, `reasoning`, `signature`) — a judgment about what a passage does, which is the part no
+heading rule can derive with confidence. `heading_path` is the load-bearing one; `section` is a
+best-effort boost on top of it. Where they disagree, `heading_path` wins.
 
 ## 10. Configuration surface (new keys)
 
@@ -544,8 +586,13 @@ See [ADR-0013](../adr/0013-encryption-at-rest-comes-from-the-volume.md).
    `section` are nullable; a facet filter on a null value must not constrain.
 3. Do we need cross-workspace/cross-matter retrieval (a global citation index) as a separate tier,
    or is per-scope isolation sufficient for v1?
-4. Section decomposition: xberg emits Markdown, not labeled legal sections. Rule-based heading
-   heuristics, or an optional LLM pass behind `[llm]`?
+4. ~~Section decomposition: xberg emits Markdown, not labeled legal sections. Rule-based heading
+   heuristics, or an optional LLM pass behind `[llm]`?~~ **Answered (#41): deterministic rules, no LLM
+   pass — see §9.1.** `section` is nullable now, so its absence is graceful and an LLM pass would pay a
+   model call and ingest non-reproducibility for an advisory column. Rules fail to null, never to a
+   guess. `[llm]` is left inert but already plumbed (`ConfigV1.llm`) for a future pass. The two
+   columns are different axes: `heading_path` is positional and near-always populated, `section` is a
+   role label, and the breadcrumb wins where they disagree.
 
 ## 17. References
 
