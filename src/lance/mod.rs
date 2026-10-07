@@ -14,6 +14,10 @@
 #[cfg(feature = "documents")]
 mod doc_links;
 pub mod schema;
+/// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
+/// (`tests/max_lines.rs`).
+#[cfg(any(test, feature = "test-support"))]
+mod test_support;
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;

@@ -53,8 +53,9 @@ pub(crate) struct PendingDocBatch {
     /// content-addressed. The flush re-reads that blob to rebuild rows on demand.
     pub blob_hash: String,
     /// LanceDB scope stamped onto this file's emitted rows (the repo scope, or `path:<extra_root>`
-    /// for an external-root document). The delete predicate uses the scan-wide scope, mirroring the
-    /// pre-streaming behavior; only the inserted rows carry this per-file scope.
+    /// for an external-root document). **Both** the delete predicate and the inserted rows use it:
+    /// they must match or the delete targets a scope the rows were never written under, and stale
+    /// rows accumulate on every re-extraction. `scanner_doc_links` has always done this.
     pub doc_scope: String,
     /// Number of chunks indexed (zero is valid — xberg may yield no chunks
     /// when the file body is empty or below the chunk threshold).
@@ -568,12 +569,7 @@ pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::
 ///
 /// Returns the number of files for which rows were written. Errors are logged and skipped on a
 /// per-file basis so one malformed embedding doesn't abort the scan.
-pub(crate) fn flush_document_batches(
-    store: &mut Store,
-    scope: &str,
-    batches: Vec<PendingDocBatch>,
-    embedding_model: &str,
-) -> usize {
+pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocBatch>, embedding_model: &str) -> usize {
     // Rows are emitted for a lexical-only scan too: `embed = false` stores a null vector, it does not
     // suppress the row. The dimension comes from the configured preset, not from a batch — on a
     // lexical-only scan no batch carries one, and requiring one here is what used to make the whole
@@ -639,7 +635,7 @@ pub(crate) fn flush_document_batches(
         if rows.is_empty() {
             continue;
         }
-        match lance.replace_document(scope, &batch.rel_path, rows) {
+        match lance.replace_document(&batch.doc_scope, &batch.rel_path, rows) {
             Ok(()) => inserted += 1,
             Err(error) => {
                 tracing::warn!(
@@ -656,8 +652,13 @@ pub(crate) fn flush_document_batches(
 /// Choose the LanceDB scope for a document. Repo files keep the scan-wide `default_scope`;
 /// external-root files (absolute key, see [`crate::path::RelPath::is_external`]) are scoped
 /// `path:<extra_root>` so they group under the out-of-repo tree they came from rather than the
-/// repository's own doc scope. Retrieval is unaffected — `search_documents` has no scope filter —
-/// so this only partitions storage.
+/// repository's own doc scope.
+///
+/// `scope` is a retrieval partition, and every reader must honour it: `search_documents` filters on
+/// it unconditionally (`src/lance/mod.rs`), so a row under `path:<root>` is only returned to a caller
+/// that asks for that scope. An earlier version of this comment claimed "`search_documents` has no
+/// scope filter — so this only partitions storage", which was false and had been for long enough to
+/// justify the write/delete mismatch described on `PendingDocBatch::doc_scope`.
 pub(crate) fn doc_scope_for<'a>(
     rel: &str,
     default_scope: &'a str,
