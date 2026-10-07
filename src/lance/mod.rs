@@ -13,6 +13,9 @@
 
 #[cfg(feature = "documents")]
 mod doc_links;
+/// Lexical index build and query for the documents tier; out of line by the line cap.
+#[cfg(feature = "documents")]
+pub mod fts;
 pub mod schema;
 /// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
 /// (`tests/max_lines.rs`).
