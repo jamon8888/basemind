@@ -757,6 +757,9 @@ fn flush_doc_batches_if_any(store: &mut Store, config: &Config, scope: &str, bat
     // `batches`, and links are independent of embeddings (they persist even when embed is off).
     crate::scanner_doc_links::flush_doc_links(store, config, &batches);
     let _ = flush_document_batches(store, batches, &config.documents.embedding_preset);
+    // The keyword index is built once, after every row above is written — rebuilding it per file
+    // would cost more than the extraction did.
+    crate::scanner_docs::ensure_document_fts_index(store, config);
 }
 
 #[cfg(not(feature = "documents"))]

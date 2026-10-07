@@ -94,7 +94,48 @@ pub(super) async fn lance_store(state: &ServerState) -> Result<Arc<crate::lance:
         .map_err(|e| McpError::internal_error(e.clone(), None))
 }
 
-/// Per-`(scope, key)` write serialization for `memory_put`.
+/// The Lance store opened **without** constructing an embedder.
+///
+/// [`lance_store`] eagerly loads the ONNX embedder (`SharedEmbedder::load`) and derives the store's
+/// dimension from it, so every caller pays for a model download even when it only wants to read
+/// rows. For the lexical lane that is the whole cost of the query and none of the benefit: the
+/// answer does not depend on a vector.
+///
+/// The dimension is resolved from the configured preset by name instead
+/// ([`crate::scanner_docs::preset_dim`]), which is the same lookup the scanner uses. It refuses to
+/// guess for an unknown preset, so an unresolvable preset errors here exactly as it would during a
+/// scan — rather than opening a store at a wrong dimension and triggering a wipe.
+///
+/// Shares the same `state.shared.lance` cache as [`lance_store`], so the two paths cannot open the
+/// directory at different dimensions: whichever runs first wins, and a mismatch is caught by
+/// `LanceStore::open`'s `wipe_on_mismatch` rather than producing two stores.
+#[cfg(feature = "documents")]
+pub(super) async fn lance_store_lexical(state: &ServerState) -> Result<Arc<crate::lance::LanceStore>, McpError> {
+    let preset = state.shared.config.documents.embedding_preset.clone();
+    let dim = crate::scanner_docs::preset_dim(&preset)
+        .map_err(|e| McpError::internal_error(format!("resolve embedding preset '{preset}': {e}"), None))?;
+    state
+        .shared
+        .lance
+        .get_or_try_init(|| async {
+            let lance_dir = state
+                .shared
+                .store
+                .read()
+                .await
+                .basemind_dir
+                .join(crate::store::LANCE_DIR);
+            let model_for_open = preset.clone();
+            tokio::task::spawn_blocking(move || crate::lance::LanceStore::open(&lance_dir, dim, &model_for_open))
+                .await
+                .map_err(|e| format!("lance open join: {e}"))?
+                .map(Arc::new)
+                .map_err(|e| format!("open LanceStore: {e}"))
+        })
+        .await
+        .cloned()
+        .map_err(|e| McpError::internal_error(e.clone(), None))
+}
 ///
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
