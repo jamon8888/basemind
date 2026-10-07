@@ -108,14 +108,24 @@ fn validated_file_identity(target: &Path, uri: &str) -> Result<fs::Metadata, Err
     Ok(metadata)
 }
 
-/// Open `path` and confirm it is the very file that was validated.
+/// Open `path` and confirm that what was opened is the validated file and lies under `base`.
 ///
-/// On Unix the final component is opened with `O_NOFOLLOW`, so a link swapped in after validation
-/// fails to open instead of being followed, and with `O_NONBLOCK`, so a FIFO swapped in cannot hang
-/// the thread. The opened descriptor's device and inode are then compared with the validated file's,
-/// which also catches a directory on the way that was swapped for a link. Windows keeps the static
-/// checks only: std exposes no stable file identity there.
-fn open_checked(path: &Path, validated: &fs::Metadata) -> std::io::Result<fs::File> {
+/// Every check before the open goes through the path, and a path can be re-pointed between any two
+/// of them: the agent may write under `safe/_drafts`, so it can swap a file, or a directory on the
+/// way to it, for a link to an original while a read is in flight. So the decisive checks are made
+/// on what was actually opened:
+///
+/// - the final component is opened with `O_NOFOLLOW` (a link swapped in fails to open) and
+///   `O_NONBLOCK` (a FIFO swapped in cannot hang the thread);
+/// - the descriptor's device and inode must match the validated file's;
+/// - the descriptor's real path, asked of the OS, must lie under `base`. This is the check that
+///   catches a swapped intermediate directory, which the two above cannot: a path through a link to
+///   another directory resolves consistently to a file that is really somewhere else.
+///
+/// On a Unix that cannot report a descriptor's path the last check is skipped; where it can but
+/// fails, the open is refused. Windows keeps the static checks only: std exposes no stable file
+/// identity or handle path there.
+fn open_checked(path: &Path, validated: &fs::Metadata, base: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -127,13 +137,50 @@ fn open_checked(path: &Path, validated: &fs::Metadata) -> std::io::Result<fs::Fi
         if opened.dev() != validated.dev() || opened.ino() != validated.ino() {
             return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         }
+        match opened_path(&file) {
+            Ok(real) if real.starts_with(base) => {}
+            Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            // Cannot say where the descriptor really points: do not serve it.
+            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        }
         Ok(file)
     }
     #[cfg(not(unix))]
     {
-        let _ = validated;
+        let _ = (validated, base);
         fs::File::open(path)
     }
+}
+
+/// Where an open descriptor really points, as the OS reports it.
+#[cfg(target_os = "linux")]
+fn opened_path(file: &fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Where an open descriptor really points, as the OS reports it.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX bytes into `buffer`, which
+    // is exactly that long, for a descriptor that stays open for the whole call.
+    let status = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+    if status == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let length = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+    buffer.truncate(length);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// Where an open descriptor really points: this Unix cannot say.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn opened_path(_file: &fs::File) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 /// `a/b.md` with forward slashes, or `None` for a name that is not valid UTF-8.
@@ -175,7 +222,7 @@ pub(crate) fn read(root: &Path, uri: &str) -> Result<ReadResourceResult, ErrorDa
     }
     // Only a missing file is "not found": a refused follow (ELOOP) or an identity mismatch is the
     // path having been re-pointed, and says so.
-    let file = open_checked(&target, &metadata).map_err(|error| {
+    let file = open_checked(&target, &metadata, &base).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             not_found(uri)
         } else {
@@ -278,6 +325,12 @@ fn encode_path(relative: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A canonical path: the OS reports a descriptor's real path, which has no links in it.
+    #[cfg(unix)]
+    fn canonical(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap()
+    }
+
     #[test]
     fn percent_decode_handles_utf8_and_refuses_malformed_input() {
         assert_eq!(
@@ -371,13 +424,20 @@ mod tests {
         fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&secret, &path).unwrap();
         assert!(
-            open_checked(&path, &validated).is_err(),
+            open_checked(&path, &validated, &canonical(dir.path())).is_err(),
             "the swapped file must not be opened"
         );
         // Untouched file: the check passes.
         let intact = dir.path().join("intact.md");
         fs::write(&intact, "ok").unwrap();
-        assert!(open_checked(&intact, &validated_file_identity(&intact, "u").unwrap()).is_ok());
+        assert!(
+            open_checked(
+                &intact,
+                &validated_file_identity(&intact, "u").unwrap(),
+                &canonical(dir.path())
+            )
+            .is_ok()
+        );
     }
 
     /// The sequence from the review: the file is swapped for a link BEFORE its identity is taken, so
@@ -399,7 +459,7 @@ mod tests {
         // refuses to follow a link.
         let followed = fs::metadata(&link).unwrap();
         assert!(
-            open_checked(&link, &followed).is_err(),
+            open_checked(&link, &followed, &canonical(dir.path())).is_err(),
             "O_NOFOLLOW must refuse to open a link"
         );
     }
@@ -432,7 +492,45 @@ mod tests {
         // The directory is replaced by a link to another one holding a file of the same name.
         fs::remove_dir_all(&inside).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &inside).unwrap();
-        let error = open_checked(&path, &validated).expect_err("the redirected open must be refused");
+        let error =
+            open_checked(&path, &validated, &canonical(dir.path())).expect_err("the redirected open must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// The sequence from the second review round: the intermediate directory is swapped for a link
+    /// BEFORE the identity is taken, so the identity belongs to the file the link leads to and the
+    /// inode comparison cannot tell. Only the real path of what was opened gives it away.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_intermediate_directory_swapped_before_the_identity_is_caught_by_the_containment_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(safe.join("sub")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(safe.join("sub/file.md"), "inside").unwrap();
+        fs::write(elsewhere.join("file.md"), "ORIGINAL-SECRET").unwrap();
+        let base = canonical(&safe);
+        // What `read` holds once the path has been resolved and found to be under safe/.
+        let path = base.join("sub/file.md");
+        fs::remove_dir_all(safe.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, safe.join("sub")).unwrap();
+        // The identity is taken through the intermediate link: it is the outside file's, and valid.
+        let identity = validated_file_identity(&path, "u").expect("identity through an intermediate link");
+        let error = open_checked(&path, &identity, &base).expect_err("the file really opened lies outside safe/");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_file_inside_the_base_passes_the_containment_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        fs::create_dir_all(safe.join("sub")).unwrap();
+        fs::write(safe.join("sub/file.md"), "inside").unwrap();
+        let base = canonical(&safe);
+        let path = base.join("sub/file.md");
+        let identity = validated_file_identity(&path, "u").unwrap();
+        assert!(open_checked(&path, &identity, &base).is_ok());
     }
 }
