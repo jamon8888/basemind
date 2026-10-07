@@ -259,7 +259,6 @@ pub async fn search_relaxed(
 /// wrong answer, whereas a slow one is merely annoying.
 pub fn build_index_after_ingest(store: &LanceStore, cfg: &FtsConfig) -> Result<()> {
     use crate::lance::schema::DOCUMENTS_TABLE;
-    use lancedb::query::ExecutableQuery;
     use lancedb::table::OptimizeAction;
 
     store.inner.rt().block_on(async {
