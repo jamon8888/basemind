@@ -18,7 +18,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `byte_start` UInt32   chunk start byte offset in the original document
 /// - `byte_end`  UInt32    chunk end byte offset
 /// - `rehydration_ref`  UTF-8    nullable vault key for the document's encrypted rehydration map
-/// - `embedding` FixedSizeList<Float32, DIM>  the embedding vector
+/// - `embedding` FixedSizeList<Float32, DIM>  the embedding vector, **nullable** — `embed = false`
+///   stores null rather than omitting the column, so a lexical-only store and a vector store share
+///   one schema and one `wipe_on_mismatch` path. The dimension still comes from the configured
+///   `embedding_preset`: `embed = false` means "do not run the embedder", not "no model configured",
+///   and the sibling `memory` / `code_chunks` tables in the same connection need a concrete dim
+///   regardless. Nothing is written into the column on a lexical-only store.
 pub fn documents_schema(dim: u16) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("scope", DataType::Utf8, false),
@@ -32,7 +37,7 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), i32::from(dim)),
-            false,
+            true,
         ),
     ]))
 }

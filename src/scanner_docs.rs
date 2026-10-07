@@ -458,7 +458,13 @@ fn pending_from_doc(
             "document exceeds max_chunks_per_document; caching blob but skipping vector rows"
         );
     }
-    let emit_rows = embed && embedding_dim > 0 && chunk_count > 0 && !over_cap;
+    // A lexical-only scan (`embed = false`) still emits rows — it stores a null vector, not no row.
+    // That is the whole point of the nullable column. An embed that was *requested and came back empty*
+    // is a different case and keeps emitting nothing: that document is unembeddable, it stays
+    // `embedded: false` so the next scan retries it, and writing a vectorless row for it would blur the
+    // two states the reuse fast-path depends on.
+    let have_vectors = embedding_dim > 0;
+    let emit_rows = (!embed || have_vectors) && chunk_count > 0 && !over_cap;
     PendingDocBatch {
         rel_path: rel.to_string(),
         blob_hash: blob_hash.to_string(),
@@ -568,26 +574,16 @@ pub(crate) fn flush_document_batches(
     batches: Vec<PendingDocBatch>,
     embedding_model: &str,
 ) -> usize {
-    let mut inserted = 0usize;
-    let Some(dim) = batches
-        .iter()
-        .find(|b| b.emit_rows && b.embedding_dim > 0)
-        .map(|b| b.embedding_dim)
-    else {
+    // Rows are emitted for a lexical-only scan too: `embed = false` stores a null vector, it does not
+    // suppress the row. The dimension comes from the configured preset, not from a batch — on a
+    // lexical-only scan no batch carries one, and requiring one here is what used to make the whole
+    // flush a no-op before a single row was built.
+    let emit = batches.iter().any(|b| b.emit_rows);
+    if !emit {
         return 0;
-    };
-
-    match preset_dim(embedding_model) {
-        Ok(expected) if expected != dim => {
-            tracing::error!(
-                preset = %embedding_model,
-                expected,
-                actual = dim,
-                "preset/runtime dim mismatch — refusing to write document batch"
-            );
-            return 0;
-        }
-        Ok(_) => {}
+    }
+    let dim = match preset_dim(embedding_model) {
+        Ok(dim) => dim,
         Err(error) => {
             tracing::error!(
                 ?error,
@@ -596,7 +592,25 @@ pub(crate) fn flush_document_batches(
             );
             return 0;
         }
+    };
+    // Every emitting batch that carries vectors must agree with the preset's dimension. A lexical-only
+    // batch carries none, so the previous "find a batch with a dimension" lookup could not express
+    // this: it both gated the whole flush and skipped the check whenever it found nothing.
+    if let Some(actual) = batches
+        .iter()
+        .filter(|b| b.emit_rows && b.embedding_dim > 0)
+        .map(|b| b.embedding_dim)
+        .find(|actual| *actual != dim)
+    {
+        tracing::error!(
+            preset = %embedding_model,
+            expected = dim,
+            actual,
+            "preset/runtime dim mismatch — refusing to write document batch"
+        );
+        return 0;
     }
+    let mut inserted = 0usize;
 
     let lance = match store.lance_or_open(dim, embedding_model) {
         Ok(s) => s.clone(),
