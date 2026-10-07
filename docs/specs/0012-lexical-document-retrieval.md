@@ -84,7 +84,7 @@ exists — otherwise they are constants with a comment pointing at the benchmark
 
 Dataflow:
 
-```
+```text
 query
  ├─ normalize (case-fold, citation split, stop-word trim, quoted-phrase extraction)
  ├─ lane: exact   → FTS(ngram) over cites          ─┐
@@ -404,14 +404,6 @@ would reintroduce the deletion §6.1 removed — just as a ranking penalty inste
 | `overlap` | 100 | 220 | **Provisional, pending §13.** ~12% of `max_characters` — keeps §/subsection boundaries whole without inflating index size. |
 | `chunker_type` | `Markdown` | `Markdown` (unchanged) | heading structure survives; feeds `heading_path`. |
 | `max_chunks_per_document` | 2000 | 2000 | fine; guard only. |
-
-**A note on chunk size and the `cites` lane.** The exact lane indexes the whole `cites` column of each
-chunk with an n-gram index, and the usual worry about chunk size is that a small chunk splits a
-citation across two chunks and loses the exact match. **Going from 800 to 1800 makes that less likely,
-not more** — a longer chunk holds a reference whole more often. The real cost of a larger chunk on this
-lane is the opposite: more strings inside a long chunk *resemble* citations, so the n-gram index picks
-up page furniture and markup. The exact lane's sensitivity to chunk size is a **noise** question, not
-a splitting one, and §13 is the place to measure it.
 | `max_pages` | 500 | 500 | fine; scanned bundles may need more. |
 | `extraction_timeout_secs` | 600 | 900 | OCR-bound extraction of large bundles. |
 | `reranker.enabled` | `false` | `true` | works without corpus vectors; largest precision win available. |
@@ -420,6 +412,14 @@ a splitting one, and §13 is the place to measure it.
 | `ner.enabled` | `false` | `true` (opt-in per deployment) | populates `entities`; `custom_labels` for `CaseName`, `DocketNumber`, `Citation`, `StatutorySection`, `Court`, `Judge`, `PartyName`. |
 | `summarization.enabled` | `false` | `true`, `extractive` | boosts recall when fused as its own field (party names in the summary are matched explicitly by BM25 in published legal work). No LLM, no tokens. |
 | OCR | off unless configured | on for scans | OCR quality caps lexical quality; no BM25 tuning recovers a bad extraction. |
+
+**A note on chunk size and the `cites` lane.** The exact lane indexes the whole `cites` column of each
+chunk with an n-gram index, and the usual worry about chunk size is that a small chunk splits a
+citation across two chunks and loses the exact match. **Going from 800 to 1800 makes that less likely,
+not more** — a longer chunk holds a reference whole more often. The real cost of a larger chunk on this
+lane is the opposite: more strings inside a long chunk *resemble* citations, so the n-gram index picks
+up page furniture and markup. The exact lane's sensitivity to chunk size is a **noise** question, not
+a splitting one, and §13 is the place to measure it.
 
 ```toml
 [documents]

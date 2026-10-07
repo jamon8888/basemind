@@ -118,14 +118,14 @@ regenerated and re-enabled.
   not answer the embedding-free case.
 - **Point the document tier at the existing Fjall BM25 keyspaces.** Rejected: those postings are
   built from code chunks (`build_chunk_postings` takes `&[CodeChunk]`), are content-addressed per
-   source file, and carry `max_chunks_per_file` caps tuned for source files. Documents need
-   chunk-level FTS with facets, inside LanceDB, next to the rows results are served from.
+  source file, and carry `max_chunks_per_file` caps tuned for source files. Documents need
+  chunk-level FTS with facets, inside LanceDB, next to the rows results are served from.
 - **Add a third-party sparse/lexical engine (SPLADE-style) beside LanceDB.** Rejected for now: it
-   reintroduces a corpus-side model download and a second store to keep in sync, which is exactly
-   the cost this decision removes. `FtsIndexBuilder` covers the requirement.
+  reintroduces a corpus-side model download and a second store to keep in sync, which is exactly
+  the cost this decision removes. `FtsIndexBuilder` covers the requirement.
 - **Drop embeddings from documents entirely.** Rejected: the semantic lane earns its place on
   paraphrase queries ("can they break the lease" vs "termination for convenience"). Demote and
-   weight it, do not delete it.
+  weight it, do not delete it.
 - **Correct the documentation and stop.** Rejected: the doc/behavior gap is real, but it is a
   symptom. A correction without a lane leaves the product weaker than advertised.
 
