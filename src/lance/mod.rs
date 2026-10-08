@@ -855,7 +855,11 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
 }
 
 /// Single-quote escape for the simple SQL-literal predicates we use.
-fn escape_sql_literal(s: &str) -> String {
+///
+/// `pub(crate)` because the documents lexical lane builds its own scope predicate
+/// (`src/mcp/memory.rs`) rather than going through a store method, and must escape
+/// the scope the same way every predicate here does.
+pub(crate) fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 

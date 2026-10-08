@@ -580,10 +580,8 @@ pub(super) async fn run_search_documents(
     // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
-    let retrieval_mode = if lexical_only { "lexical" } else { "vector" };
 
     let mut hits: Vec<DocumentSearchHit> = if lexical_only {
-        let fts = &state.shared.config.documents.fts;
         let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
@@ -596,7 +594,6 @@ pub(super) async fn run_search_documents(
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
-        let _ = fts;
         hits_raw
             .into_iter()
             .map(|h| DocumentSearchHit {
