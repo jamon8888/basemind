@@ -66,9 +66,13 @@ fn a_delete_under_the_wrong_scope_leaves_the_old_rows_behind() {
     let stale = store
         .count_documents(Some(&format!("scope = '{SCAN_SCOPE}'")))
         .expect("count by scan scope");
+    // Nothing lands under the delete's scope: `replace_document` writes rows carrying their *own*
+    // `scope` field, and the row below is built with `DOC_SCOPE`. The delete aimed at `SCAN_SCOPE`
+    // matched no row, which is the whole point — see the total assertion.
     assert_eq!(
-        stale, 1,
-        "the row landed under the scan-wide scope, as the mismatched delete implies"
+        stale, 0,
+        "the mismatched delete wrote nothing under {SCAN_SCOPE}, so the leaked row is still \
+         readable under its own scope {DOC_SCOPE}"
     );
     assert_eq!(
         total, 2,

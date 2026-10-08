@@ -51,25 +51,42 @@ fn config_with_embeddings_off() -> Config {
     cfg
 }
 
-/// Extraction with `embed = false` still produces chunk text, and every chunk carries the heading
+/// Extraction with `embed = false` still produces chunk text, and later chunks carry the heading
 /// breadcrumb the keyword index depends on.
 ///
 /// The breadcrumb assertion is the one that would catch the regression this whole tier rests on: it
 /// used to be computed only when an embed was requested, so the lexical-only store — the one
 /// configuration where the breadcrumb is the only structural signal — had none.
+///
+/// `max_characters` is pulled well under the body length on purpose. A breadcrumb describes the
+/// headings *preceding* a chunk, so a fixture short enough to stay one chunk always yields `""` —
+/// it starts at byte 0, before any heading. That is correct behaviour, not the regression.
+///
+/// **This test only proves the ATX case, and that is narrower than it looks.** `IV. TERMINATION` in
+/// the fixture below is *not* a heading here — xberg's `build_heading_map` only recognises ATX and
+/// setext, so numbered legal section headings contribute nothing to the breadcrumb. That is #78,
+/// and it is unresolved: on a corpus that structures sections as `IV.` / `4.1` rather than `##`,
+/// the second indexed column of the keyword lane is largely empty. Do not read a green run of this
+/// file as "breadcrumbs work on legal documents".
 #[test]
 fn lexical_only_extraction_yields_text_and_heading_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("notice.md");
     std::fs::write(
         &path,
-        b"IV. TERMINATION\n\nThe landlord may terminate for non-payment.\n\n## Cure period\n\nThirty days to cure.\n",
+        b"IV. TERMINATION\n\nThe landlord may terminate for non-payment at any time once the cure \
+          period has expired. This clause is drawn broadly and does not excuse a late payment.\n\n\
+          ## Cure period\n\nThirty days to cure. The landlord must serve written notice on the tenant \
+          before terminating for non-payment, and the period runs from the date the notice is \
+          received, not the date it is sent.\n",
     )
     .expect("write fixture");
 
     let doc_cfg = DocConfig {
         embed: false,
         embedding_preset: None,
+        max_characters: 90,
+        overlap: 20,
         ..DocConfig::default()
     };
     let doc = extract_doc(&path, Some("text/markdown"), &doc_cfg).expect("extract");
@@ -83,10 +100,17 @@ fn lexical_only_extraction_yields_text_and_heading_paths() {
         doc.embedding_dim == 0,
         "and no dimension, because the embedder never ran"
     );
+    // Asserted on `## Cure period`, the one ATX heading in the fixture. The numbered
+    // `IV. TERMINATION` is deliberately not asserted on — it renders no breadcrumb at all (#78).
     assert!(
-        doc.chunks.iter().any(|c| c.heading_path.contains("Termination")),
+        doc.chunks.iter().any(|c| c.heading_path.contains("Cure period")),
         "heading_path is populated without an embed request; got {:?}",
         doc.chunks.iter().map(|c| &c.heading_path).collect::<Vec<_>>()
+    );
+    assert!(
+        doc.chunks.len() > 1,
+        "the fixture must force a split, or no chunk can follow a heading; got {} chunk(s)",
+        doc.chunks.len()
     );
 }
 

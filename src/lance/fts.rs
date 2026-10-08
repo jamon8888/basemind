@@ -352,12 +352,16 @@ mod tests {
 
     /// The ladder must be deterministic. An unstable order means the same query returns different
     /// rows on repeated calls, which is a worse defect than a suboptimal relaxation order.
+    ///
+    /// "Equal length" in the name does not hold: `beta` is four bytes, `alpha` and `gamma` are
+    /// five. Length therefore places `beta` first and lexicographic order breaks the tie between
+    /// the other two. The fixture is kept because the tie-break is what this test is for.
     #[test]
     fn relaxation_order_is_stable_for_equal_length_terms() {
         let terms: Vec<String> = ["beta", "alpha", "gamma"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
             relaxation_order(&terms),
-            vec!["alpha", "beta", "gamma"]
+            vec!["beta", "alpha", "gamma"]
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
@@ -403,12 +407,14 @@ mod tests {
             "rarest term is most important"
         );
 
-        // The shipped proxy agrees on this corpus, and disagrees on nothing here — which is the
-        // honest claim: it is a stand-in, not an equivalent.
+        // The shipped proxy agrees with IDF on this corpus: length and rarity point the same way for
+        // all three terms, so the proxy is a stand-in that happens to hold here, not an
+        // equivalent. That it would not hold in general is why the ladder is a relaxation and
+        // not a substitute for ranking.
         let shipped = relaxation_order(&terms.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(
             shipped,
-            vec!["of", "termination", "lease"]
+            vec!["of", "lease", "termination"]
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()

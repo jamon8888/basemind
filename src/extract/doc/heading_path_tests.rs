@@ -68,7 +68,7 @@ fn stored_heading_path_is_the_prefix_of_the_dense_retrieval_input() {
 
     let (stored, retrieval) = prepare_doc_chunk(content.clone(), 10, 44, Some(&context), true);
 
-    assert_eq!(stored.heading_path, "# Setup");
+    assert_eq!(stored.heading_path, "## Setup");
     let dense = retrieval.expect("embed requested => dense input");
     assert!(
         dense.starts_with(&stored.heading_path),

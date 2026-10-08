@@ -584,6 +584,12 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             None => rehydration_ref.append_null(),
         }
         if r.embedding.is_empty() {
+            // `FixedSizeListBuilder::finish` asserts `values.len() == len * list_len`, so a
+            // null slot still owes the child array `dim` values — `append(false)` only writes
+            // the null buffer and does not pad. Without this the lexical-only path panics inside
+            // arrow instead of writing the row. The values are never read: the null buffer is
+            // what marks the slot absent, and `null_count()` is what the test reads.
+            embedding.values().append_nulls(dim as usize);
             embedding.append(false);
         } else {
             for v in &r.embedding {
