@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use basemind::config::{Config, ConfigV1};
+use basemind::config::Config;
 use basemind::extract::doc::{DocConfig, extract_doc};
 use basemind::lance::{DocumentRow, LanceStore};
 
@@ -44,7 +44,9 @@ fn row(scope: &str, path: &str, text: &str) -> Vec<DocumentRow> {
 }
 
 fn config_with_embeddings_off() -> Config {
-    let mut cfg = Config::from_v1(ConfigV1::with_defaults());
+    // `Config` is a type alias for `ConfigV1` (src/config/mod.rs), so the defaults are read off
+    // that one type — there is no `from_v1` to call.
+    let mut cfg = Config::with_defaults();
     cfg.documents.embed = false;
     cfg
 }
