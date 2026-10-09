@@ -234,21 +234,17 @@ fn a_heading_only_term_finds_its_chunk() {
 
     basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
 
-    let hits = basemind::lance::fts::search_relaxed_on(
-        &store,
-        &["arbitration".to_string()],
-        "scope = 'repo:test'",
-        10,
-        0,
-    )
-    .expect("lexical search");
+    let hits =
+        basemind::lance::fts::search_relaxed_on(&store, &["arbitration".to_string()], "scope = 'repo:test'", 10, 0)
+            .expect("lexical search");
 
     assert!(
         !hits.is_empty(),
         "a term that appears only in a heading must still be found; the heading index is not reachable"
     );
     assert_eq!(
-        hits[0].path, "safe/lease.md",
+        hits[0].path,
+        "safe/lease.md",
         "the chunk whose breadcrumb carries the term must rank in; got {:?}",
         hits.iter().map(|h| &h.path).collect::<Vec<_>>()
     );
