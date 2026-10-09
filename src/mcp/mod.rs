@@ -81,6 +81,7 @@ mod prompts;
 #[cfg(feature = "memory")]
 pub(crate) mod proposals_ops;
 mod router_cache;
+mod safe_resources;
 mod savings;
 mod server_handler;
 mod shared_state;

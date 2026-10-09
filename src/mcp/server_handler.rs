@@ -6,11 +6,12 @@
 use rmcp::ServerHandler;
 use rmcp::model::{
     CacheScope, CompleteRequestParams, CompleteResult, GetPromptRequestParams, GetPromptResponse, ListPromptsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::tool_handler;
 
-use super::{BasemindServer, lean, notifications, tasks};
+use super::{BasemindServer, lean, notifications, safe_resources, tasks};
 
 /// SEP-2549 cache TTL advertised on `tools/list` and `prompts/list`. The advertised tool and prompt
 /// sets are fixed for the lifetime of a server process (they change only with the binary/schema, not
@@ -173,6 +174,35 @@ impl ServerHandler for BasemindServer {
         self.prompt_router.get_prompt(prompt_context).await
     }
 
+    /// `resources/list`: the redacted `safe/` mirror of a hacienda Safe workspace, and nothing else.
+    /// An agent whose shell is confined to that folder reads it through here.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ListResourcesResult, rmcp::ErrorData> {
+        let root = self.state.shared.root.clone();
+        tokio::task::spawn_blocking(move || safe_resources::list(&root))
+            .await
+            .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/list task failed: {error}"), None))
+    }
+
+    /// `resources/read`: one file under `safe/` as text. Every path that could reach outside it
+    /// (`..`, absolute, encoded separators, a symlink pointing out) is refused; see
+    /// [`safe_resources`].
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
+        let root = self.state.shared.root.clone();
+        let uri = request.uri;
+        let result = tokio::task::spawn_blocking(move || safe_resources::read(&root, &uri))
+            .await
+            .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/read task failed: {error}"), None))??;
+        Ok(result.into())
+    }
+
     /// `logging/setLevel`: record the minimum severity the client wants. Subsequent log
     /// notifications (e.g. from `rescan`) are gated on this threshold.
     #[allow(deprecated)]
@@ -205,6 +235,7 @@ impl ServerHandler for BasemindServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
+                .enable_resources()
                 .enable_completions()
                 .enable_logging()
                 .enable_tasks()
