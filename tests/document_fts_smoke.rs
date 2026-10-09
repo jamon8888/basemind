@@ -161,7 +161,16 @@ fn a_lexical_only_store_answers_a_topical_query() {
     // The index is built on the same path the scanner uses, from the same config.
     basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
 
-    let terms: Vec<String> = ["terminate", "lease", "nonpayment"]
+    // `payment`, not `nonpayment`. The corpus says `non-payment`, and the tokenizer splits that
+    // into `non` + `payment`, so `nonpayment` is a term no row can ever carry — the strict round
+    // matches nothing *and so does every relaxed round*, because the ladder drops terms until one
+    // matches, and this one never can. Measured against `lancedb 0.37.1` with the lane's tokenizer
+    // on this exact corpus: `nonpayment` → `[]`, `payment` → both rows carrying it.
+    //
+    // The test asserted only that the lane finds something, so it could not tell "the lane is
+    // broken" from "the query is unanswerable" — and it was the second, which is why it went red
+    // only now, after the index started being built at all.
+    let terms: Vec<String> = ["terminate", "lease", "payment"]
         .iter()
         .map(|s| s.to_string())
         .collect();
