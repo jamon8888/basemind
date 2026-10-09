@@ -185,6 +185,11 @@ pub fn rrf_fuse(lanes: &[FusionLane<'_>], k: f32) -> Vec<(String, f32)> {
 mod tests {
     use super::*;
 
+    /// The code tier's shipped weights, as a local shorthand. These tests assert code-search
+    /// behaviour, so they read the code tier's set — not the documents tier's spec §5 values,
+    /// which are a separate provisional set.
+    const W: FusionWeights = FusionWeights::code_lanes();
+
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -212,8 +217,8 @@ mod tests {
         let keyword = ids(&["h:other", "h:def"]);
         let fused = rrf_fuse(
             &[
-                FusionLane::new(LANE_EXACT, &exact, WEIGHT_EXACT),
-                FusionLane::new(LANE_KEYWORD, &keyword, WEIGHT_KEYWORD),
+                FusionLane::new(LANE_EXACT, &exact, W.exact),
+                FusionLane::new(LANE_KEYWORD, &keyword, W.keyword),
             ],
             DEFAULT_RRF_K,
         );
@@ -369,8 +374,8 @@ mod tests {
         let keyword = ids(&["h:1"]);
         let fused = rrf_fuse_detailed(
             &[
-                FusionLane::new(LANE_EXACT, &exact, WEIGHT_EXACT),
-                FusionLane::new(LANE_KEYWORD, &keyword, WEIGHT_KEYWORD),
+                FusionLane::new(LANE_EXACT, &exact, W.exact),
+                FusionLane::new(LANE_KEYWORD, &keyword, W.keyword),
             ],
             DEFAULT_RRF_K,
         );

@@ -81,6 +81,12 @@ pub struct DocumentRow {
     pub chunk_idx: u32,
     pub mime_type: String,
     pub text: String,
+    /// The Markdown heading breadcrumb this chunk sits under, `""` when it has none.
+    ///
+    /// Carried all the way to the table because the keyword lane indexes it. It used to stop at
+    /// [`crate::extract::doc::DocChunk`]: the extractor computed it, and nothing downstream ever
+    /// read it, so the index built over a column that did not exist.
+    pub heading_path: String,
     pub byte_start: u32,
     pub byte_end: u32,
     /// Vault key for the document's encrypted rehydration map. `None` until
@@ -555,6 +561,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
     let mut text = StringBuilder::new();
+    let mut heading_path = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
     let mut byte_end = UInt32Builder::new();
     let mut rehydration_ref = StringBuilder::new();
@@ -577,6 +584,10 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
         text.append_value(&r.text);
+        // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
+        // so `""` is what "no breadcrumb" reads back as, and the tokenizer sees an empty document
+        // rather than a missing value.
+        heading_path.append_value(&r.heading_path);
         byte_start.append_value(r.byte_start);
         byte_end.append_value(r.byte_end);
         match &r.rehydration_ref {
@@ -584,6 +595,12 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             None => rehydration_ref.append_null(),
         }
         if r.embedding.is_empty() {
+            // `FixedSizeListBuilder::finish` asserts `values.len() == len * list_len`, so a
+            // null slot still owes the child array `dim` values — `append(false)` only writes
+            // the null buffer and does not pad. Without this the lexical-only path panics inside
+            // arrow instead of writing the row. The values are never read: the null buffer is
+            // what marks the slot absent, and `null_count()` is what the test reads.
+            embedding.values().append_nulls(dim as usize);
             embedding.append(false);
         } else {
             for v in &r.embedding {
@@ -602,6 +619,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
             Arc::new(text.finish()),
+            Arc::new(heading_path.finish()),
             Arc::new(byte_start.finish()),
             Arc::new(byte_end.finish()),
             Arc::new(rehydration_ref.finish()),
@@ -855,7 +873,11 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
 }
 
 /// Single-quote escape for the simple SQL-literal predicates we use.
-fn escape_sql_literal(s: &str) -> String {
+///
+/// `pub(crate)` because the documents lexical lane builds its own scope predicate
+/// (`src/mcp/memory.rs`) rather than going through a store method, and must escape
+/// the scope the same way every predicate here does.
+pub(crate) fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
