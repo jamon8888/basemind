@@ -12,22 +12,27 @@
 //! `lancedb-0.37.1/src/table/create_index.rs:117` both reject `columns.len() != 1` outright, and
 //! neither is behind a feature flag or a version guard. So this is two `create_index` calls.
 //!
-//! The query side needs no matching change. `search_lexical` names no column, and Lance resolves
-//! that by discovering every FTS-indexed column (`fts_indexed_columns` in
-//! `lance-10.0.0/src/dataset/scanner.rs`) and building a `MultiMatchQuery` over all of them; the
-//! planner unions the per-column results, dedupes by row id and keeps the higher score. Adding a
-//! third indexed column later needs no change here at all.
+//! **The query side needed a matching change, and not finding that out locally cost a red CI
+//! run.** The belief was that naming no column would do: Lance resolves a columnless query by
+//! discovering every FTS-indexed column (`fts_indexed_columns`, `lance-10.0.0/src/dataset/scanner.rs:3368`)
+//! and building a `MultiMatchQuery` over all of them. That resolution does happen — but
+//! `MultiMatchQuery` compiles to `UnionExec` (`scanner.rs:3437-3451`), so it is an **OR**. A row
+//! matching in `text` satisfies the query even when `heading_path` matches nothing, which makes the
+//! lane disjunctive across columns and silently disables [`search_relaxed`], whose entire purpose is
+//! to relax an over-strict conjunction. `Operator::And` is per-member and does not prevent this.
+//! So `search_lexical` runs one conjunctive query per column and unions the results itself. See
+//! `keyword_query_on`.
 //!
-//! **What that costs, stated plainly:** the union takes a *maximum*, not a sum. A chunk that
-//! matches weakly on its heading and strongly on its body scores the same as one that matches only
-//! on its heading. A true composite index would have added the two contributions. `MultiMatchQuery`
+//! **What that union costs, stated plainly:** it takes a *maximum*, not a sum. A chunk that matches
+//! weakly on its heading and strongly on its body scores the same as one that matches only on its
+//! heading. A true composite index would have added the two contributions. `MultiMatchQuery`
 //! exposes `try_with_boosts` if real corpora show this needs weighting; nothing is weighted today
 //! because nothing has been measured yet.
 
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use lancedb::index::Index;
-use lancedb::index::scalar::{FtsIndexBuilder, FullTextSearchQuery};
+use lancedb::index::scalar::{FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, Operator};
 // `full_text_search` is on the `QueryBase` trait, not inherent on `Query` — without this import
 // the method does not resolve, and the error names `struct lancedb::query::Query`, which points at
 // the type rather than at the missing trait in scope.
@@ -137,33 +142,96 @@ impl LexicalHit {
     }
 }
 
-/// Run one lexical query over `text` + `heading_path`.
+/// Build the conjunctive keyword-lane query for `terms` against one column.
+///
+/// Called once per indexed column; [`search_lexical`] runs them all and unions the results.
+///
+/// **This cannot be left to Lance's column auto-discovery.** `fill_fts_query_column`
+/// (`lance-index-10.0.0/src/scalar/inverted/query.rs:848`) handles a query that names no column by
+/// discovering every FTS-indexed column and calling `MultiMatchQuery::try_new`, which builds a
+/// **fresh** `MatchQuery` per column from `terms` alone. Anything else set on the incoming query —
+/// the operator, the fuzziness — is discarded on that path, and the result is a union rather than a
+/// conjunction. So both settings, and the single-column shape, are established here.
+///
+/// Two settings, both deliberate:
+///
+/// - **`Operator::And`.** `MatchQuery::new` defaults to `Or` (`query.rs:333`). Left at the default,
+///   a question like *"notice terminated for non-payment after the cure period"* matches any
+///   document containing any one of those words, and the conjunction [`search_relaxed`] is built to
+///   relax has nothing to relax: it is already disjunctive. `And` is what makes a multi-term query
+///   answer about its subject rather than about its most distinctive word.
+/// - **`fuzziness: Some(0)`, set explicitly.** The exactness this tier needs for identifier-shaped
+///   tokens comes from `MatchQuery::new` defaulting to `Some(0)`, not from anything this code does —
+///   the previous comment claimed the absence of a setting was the reason, which was wrong, and
+///   `MatchQuery::auto_fuzziness` returns 1 for 3–5 byte tokens and 2 beyond, which would put typo
+///   tolerance on exactly the tokens that must match exactly. Stating it makes the guarantee ours
+///   rather than a side effect of a default that can change under us.
+///
+/// **One query per column, not a `MultiMatchQuery` over both.** `MultiMatchQuery` compiles to
+/// `UnionExec` (`lance-10.0.0/src/dataset/scanner.rs:3437-3451`) — a union, i.e. an **OR** across its
+/// member queries. The operator is per-`MatchQuery`, so `And` inside each member makes a row match
+/// only if it carries every term *in that column*; the union between members then matches a row that
+/// carries every term in *either* column. With one column that is a conjunction. With two it is a
+/// disjunction, and [`search_relaxed`] — whose entire purpose is to relax an over-strict
+/// conjunction — degenerates: the first round already returns rows that the ladder would have gone on
+/// to find, and every later round can only re-find them. `relaxation_rescues_a_query_whose_terms_do_not_all_appear`
+/// fails on exactly this, and it failed silently while the lane had one column.
+///
+/// So each column is queried on its own and the caller unions the results. That is one extra FTS
+/// query per round, against a ladder that already re-ran the whole query per relaxation.
+pub fn keyword_query_on(column: &str, terms: &str) -> Result<FullTextSearchQuery> {
+    let match_query = MatchQuery::new(terms.to_string())
+        .with_column(Some(column.to_string()))
+        .with_operator(Operator::And)
+        .with_fuzziness(Some(0));
+    Ok(FullTextSearchQuery::new_query(FtsQuery::Match(match_query)))
+}
+
+/// Run one lexical query over `text` + `heading_path`, as a union of one conjunctive query per column.
 ///
 /// `scope_predicate` is a caller-supplied SQL predicate and is **not optional**: the facet and scope
 /// rules are the caller's to get right, and a lane that searched outside its scope would leak across
 /// matters with no observable symptom. `only_if` is what makes this lane obey the same scope
 /// predicate the vector lane does.
 ///
-/// No fuzziness is configured here, and that is deliberate: `FtsQuery::auto_fuzziness` returns 1 for
-/// 3–5 byte tokens and 2 beyond, so reaching for the library's helper would silently introduce typo
-/// tolerance on exactly the short identifier-shaped tokens this tier must match exactly.
+/// The union keeps the higher score per row, which is a maximum across columns rather than a sum —
+/// see the module docs.
 pub async fn search_lexical(
     table: &Table,
     query: &str,
     scope_predicate: &str,
     limit: usize,
 ) -> Result<Vec<LexicalHit>> {
-    let q = table
-        .query()
-        .full_text_search(FullTextSearchQuery::new(query.to_string()))
-        .only_if(scope_predicate)
-        .limit(limit);
-    let mut stream = q.execute().await.context("run lexical search")?;
-    let mut hits = Vec::new();
-    while let Some(batch) = stream.try_next().await.context("stream lexical batch")? {
-        decode_lexical_hits(&batch, &mut hits)?;
+    let mut best: std::collections::HashMap<(String, u32), LexicalHit> = std::collections::HashMap::new();
+    for column in KEYWORD_COLUMNS {
+        let q = table
+            .query()
+            .full_text_search(keyword_query_on(column, query)?)
+            .only_if(scope_predicate)
+            .limit(limit);
+        let mut stream = q
+            .execute()
+            .await
+            .with_context(|| format!("run lexical search on {column}"))?;
+        let mut hits = Vec::new();
+        while let Some(batch) = stream.try_next().await.context("stream lexical batch")? {
+            decode_lexical_hits(&batch, &mut hits)?;
+        }
+        for hit in hits {
+            best.entry(hit.identity().to_owned())
+                .and_modify(|existing| {
+                    if hit.score > existing.score {
+                        existing.score = hit.score;
+                    }
+                })
+                .or_insert(hit);
+        }
     }
-    Ok(hits)
+    let mut out: Vec<LexicalHit> = best.into_values().collect();
+    // `HashMap` iteration order is arbitrary, so sort to keep results deterministic across runs.
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.identity().cmp(b.identity())));
+    out.truncate(limit);
+    Ok(out)
 }
 
 fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHit>) -> Result<()> {
@@ -238,14 +306,23 @@ pub fn relaxation_order(terms: &[String]) -> Vec<String> {
 
 /// Conjunctive-then-disjunctive search.
 ///
-/// Lance FTS has no `AND`/`OR` in the query string, so a multi-term query matches nothing unless
-/// every term appears. A multi-clause legal question ("notice terminated for non-payment after the
-/// cure period") then returns nothing at all, which reads as "this filing does not mention it" — a
-/// wrong answer presented as an absence.
+/// [`keyword_query_on`] asks for `Operator::And`, so the first round is a true conjunction and a
+/// multi-clause legal question ("notice terminated for non-payment after the cure period") matches
+/// only documents that really carry all of it. Too strict on its own: if one term is absent from a
+/// document, that document is excluded even when it plainly answers the question, and to a user
+/// that reads as "this filing does not mention it" — a wrong answer presented as an absence.
 ///
 /// So: run all terms; while hits are short of `limit` and terms remain, drop the next term from
 /// [`relaxation_order`] and re-run; union and dedupe by [`LexicalHit::identity`]. Each relaxation is
-/// a whole extra FTS query, which is why the ladder is capped.
+/// a whole extra FTS query per indexed column, which is why the ladder is capped.
+///
+/// **This ladder only means anything because the conjunction holds.** At Lance's default `Or` the
+/// first round is already disjunctive and every later round can only add rows the first one already
+/// covered, so the function degenerates into a single OR query with extra steps — which is what it
+/// did until the operator was set. It degenerated a second time, differently, when a second column
+/// was indexed: a `MultiMatchQuery` over both columns is a union, so `And` on each member could not
+/// save it. `relaxation_rescues_a_query_whose_terms_do_not_all_appear` is the test that holds this
+/// honest, and it is why that query shape is asserted as well as the operator.
 pub async fn search_relaxed(
     table: &Table,
     terms: &[String],
@@ -381,6 +458,51 @@ mod tests {
     /// `identity` is the dedupe key across relaxation rounds. Two hits are the same chunk when path
     /// and chunk index agree — the first three columns of the table, and the only ones guaranteed
     /// non-null, so this is the key that cannot silently conflate two distinct chunks.
+    /// Every column the lane indexes must be a conjunct of its own query, matched exactly.
+    ///
+    /// Both settings are invisible in the result shape, so nothing else would catch a regression:
+    /// a lane that silently fell back to `Or` still returns hits, still returns the right hits for a
+    /// single-term query, and still passes every smoke test whose terms all appear in one row. The
+    /// difference only shows on a multi-term query, which is why it is asserted on the query object.
+    ///
+    /// The query must also be a single-column `Match`, never a `MultiMatch`. `MultiMatch` is a union
+    /// (`UnionExec`), so a `MultiMatch` over two columns makes the lane disjunctive *across* columns
+    /// and silently disables the relaxation ladder. That is precisely the regression this shape
+    /// assertion exists to catch, and it shipped once: the query was a `MultiMatch` over
+    /// `["text", "heading_path"]`, `Operator::And` was set on every member, and the assertions
+    /// below all passed — because with one indexed column a `MultiMatch` of one *is* a conjunction.
+    /// Asserting the variant, not only the members, is what makes the mistake fail where it is
+    /// made.
+    #[test]
+    fn the_keyword_query_is_conjunctive_exact_and_single_column() {
+        for column in KEYWORD_COLUMNS {
+            let query = keyword_query_on(column, "terminate lease").expect("query builds");
+            assert_eq!(
+                query.columns(),
+                std::collections::HashSet::from([column.to_string()]),
+                "each query must name exactly one column, or the union makes it disjunctive"
+            );
+            let FtsQuery::Match(match_query) = query.query else {
+                panic!(
+                    "a MultiMatch over the indexed columns is a union, not a conjunction; \
+                     relaxation_rescues_a_query_whose_terms_do_not_all_appear depends on this"
+                );
+            };
+            assert_eq!(
+                match_query.operator,
+                Operator::And,
+                "column {column:?} would otherwise match any one term, and the ladder would have \
+                 nothing to relax"
+            );
+            assert_eq!(
+                match_query.fuzziness,
+                Some(0),
+                "column {column:?} must match exactly: a 3-byte token gets fuzziness 1 by default, \
+                 which would let `368` reach `362`"
+            );
+        }
+    }
+
     #[test]
     fn identity_is_path_and_chunk_index() {
         let hit = LexicalHit {

@@ -250,6 +250,60 @@ fn a_heading_only_term_finds_its_chunk() {
     );
 }
 
+/// Two terms split across body and heading still need relaxation to find anything.
+///
+/// This is the case `relaxation_rescues_a_query_whose_terms_do_not_all_appear` cannot see, because
+/// every row there has an empty breadcrumb — with one indexed column the two tests are the same
+/// test. Here `cure` is in the body and `arbitration` is only in the heading, and no single column
+/// carries both.
+///
+/// It exists because the conjunction used to be lost *across* columns. The lane issued one
+/// `MultiMatchQuery` over `["text", "heading_path"]`, which Lance compiles to `UnionExec` — an OR. A
+/// row whose body matched `cure` satisfied the whole query regardless of the heading, so round one
+/// returned it and the ladder had nothing left to relax into. Setting `Operator::And` on each member
+/// did not help: the operator is per-column and the union is between columns. The lane now runs one
+/// conjunctive query per column and unions the results, which is what makes this pass.
+#[test]
+fn a_query_split_across_body_and_heading_still_needs_relaxation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = config_with_embeddings_off();
+    let store = LanceStore::open(dir.path(), DIM, "balanced").expect("open store");
+
+    // No column carries both terms: `cure` is body-only, `arbitration` is heading-only.
+    store
+        .replace_document(
+            "repo:test",
+            "safe/lease.md",
+            row_with_heading(
+                "repo:test",
+                "safe/lease.md",
+                "The cure period runs thirty days.",
+                "# Dispute resolution > ## Arbitration",
+            ),
+        )
+        .expect("write row");
+
+    basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
+
+    let terms: Vec<String> = ["cure", "arbitration"].iter().map(|s| s.to_string()).collect();
+
+    let strict =
+        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 0).expect("strict search");
+    assert!(
+        strict.is_empty(),
+        "neither column carries both terms, so the strict conjunction must match nothing; got {:?}",
+        strict.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+
+    let relaxed =
+        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 2).expect("relaxed search");
+    assert_eq!(
+        relaxed.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+        vec!["safe/lease.md"],
+        "relaxing to one term must find the chunk that carries the other in its heading"
+    );
+}
+
 /// The relaxation actually rescues a multi-term query that matches nothing conjunctively.
 ///
 /// Without this, `search_relaxed` could pass by returning the right rows for a query where every
