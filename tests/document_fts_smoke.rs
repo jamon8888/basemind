@@ -250,60 +250,6 @@ fn a_heading_only_term_finds_its_chunk() {
     );
 }
 
-/// Two terms split across body and heading still need relaxation to find anything.
-///
-/// This is the case `relaxation_rescues_a_query_whose_terms_do_not_all_appear` cannot see, because
-/// every row there has an empty breadcrumb — with one indexed column the two tests are the same
-/// test. Here `cure` is in the body and `arbitration` is only in the heading, and no single column
-/// carries both.
-///
-/// It exists because the conjunction used to be lost *across* columns. The lane issued one
-/// `MultiMatchQuery` over `["text", "heading_path"]`, which Lance compiles to `UnionExec` — an OR. A
-/// row whose body matched `cure` satisfied the whole query regardless of the heading, so round one
-/// returned it and the ladder had nothing left to relax into. Setting `Operator::And` on each member
-/// did not help: the operator is per-column and the union is between columns. The lane now runs one
-/// conjunctive query per column and unions the results, which is what makes this pass.
-#[test]
-fn a_query_split_across_body_and_heading_still_needs_relaxation() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = config_with_embeddings_off();
-    let store = LanceStore::open(dir.path(), DIM, "balanced").expect("open store");
-
-    // No column carries both terms: `cure` is body-only, `arbitration` is heading-only.
-    store
-        .replace_document(
-            "repo:test",
-            "safe/lease.md",
-            row_with_heading(
-                "repo:test",
-                "safe/lease.md",
-                "The cure period runs thirty days.",
-                "# Dispute resolution > ## Arbitration",
-            ),
-        )
-        .expect("write row");
-
-    basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
-
-    let terms: Vec<String> = ["cure", "arbitration"].iter().map(|s| s.to_string()).collect();
-
-    let strict =
-        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 0).expect("strict search");
-    assert!(
-        strict.is_empty(),
-        "neither column carries both terms, so the strict conjunction must match nothing; got {:?}",
-        strict.iter().map(|h| &h.path).collect::<Vec<_>>()
-    );
-
-    let relaxed =
-        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 2).expect("relaxed search");
-    assert_eq!(
-        relaxed.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
-        vec!["safe/lease.md"],
-        "relaxing to one term must find the chunk that carries the other in its heading"
-    );
-}
-
 /// The relaxation actually rescues a multi-term query that matches nothing conjunctively.
 ///
 /// Without this, `search_relaxed` could pass by returning the right rows for a query where every
@@ -346,6 +292,85 @@ fn relaxation_rescues_a_query_whose_terms_do_not_all_appear() {
     // And the union is deduped: a document reached by two rounds is one hit.
     let ids: std::collections::HashSet<_> = relaxed.iter().map(|h| h.identity().to_owned()).collect();
     assert_eq!(ids.len(), relaxed.len(), "no duplicates across relaxation rounds");
+}
+
+/// The relaxation ladder still has work to do once a second column is indexed.
+///
+/// `relaxation_rescues_a_query_whose_terms_do_not_all_appear` cannot see this: every row there has
+/// an empty breadcrumb, so with `heading_path` carrying nothing the two columns behave as one and the
+/// two tests are the same test. That is exactly how a two-column regression would hide.
+///
+/// Here the terms are split across columns — `cure` is body-only, `arbitration` is heading-only — so
+/// no single column of any row carries both. The strict round must therefore match nothing, and the
+/// ladder must reach the row by dropping `cure` and querying `arbitration` against the heading index.
+///
+/// **This is the test that pins down whether the lane is a conjunction across columns.** If the query
+/// were a plain union over columns, the strict round would return `lease.md` immediately and the
+/// first assertion fails. Measured on `lancedb 0.37.1` / `lance 10.0.0`, it does not: a `MultiMatch`
+/// unions *columns*, and each member still applies its own `And` over *terms*.
+#[test]
+fn a_query_split_across_body_and_heading_still_needs_relaxation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = config_with_embeddings_off();
+    let store = LanceStore::open(dir.path(), DIM, "balanced").expect("open store");
+
+    // `arbitration` appears in no body text anywhere in this corpus; `cure` in no breadcrumb.
+    store
+        .replace_document(
+            "repo:test",
+            "safe/lease.md",
+            row_with_heading(
+                "repo:test",
+                "safe/lease.md",
+                "The cure period runs thirty days.",
+                "# Dispute resolution > ## Arbitration",
+            ),
+        )
+        .expect("write row");
+    // A decoy that shares neither term with the query, and has its own breadcrumb.
+    store
+        .replace_document(
+            "repo:test",
+            "safe/deed.md",
+            row_with_heading(
+                "repo:test",
+                "safe/deed.md",
+                "The vendor grants the freehold subject to the covenants.",
+                "# Grant > ## Title",
+            ),
+        )
+        .expect("write row");
+
+    basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
+
+    let terms: Vec<String> = ["cure", "arbitration"].iter().map(|s| (*s).to_string()).collect();
+
+    let strict =
+        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 0).expect("strict search");
+    assert!(
+        strict.is_empty(),
+        "no column of any row carries both terms, so the strict round must match nothing; got {:?}",
+        strict.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+
+    // relaxation_order is (len, lexicographic): `cure` (4) before `arbitration` (11). One round is
+    // enough — dropping `cure` leaves `arbitration`, which the heading index answers.
+    let relaxed =
+        basemind::lance::fts::search_relaxed_on(&store, &terms, "scope = 'repo:test'", 10, 2).expect("relaxed search");
+    assert!(
+        !relaxed.is_empty(),
+        "relaxation must reach the row whose heading carries the surviving term"
+    );
+    assert_eq!(
+        relaxed[0].path,
+        "safe/lease.md",
+        "the heading index must be the one that answers; got {:?}",
+        relaxed.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+    assert!(
+        !relaxed.iter().any(|h| h.path == "safe/deed.md"),
+        "a document sharing no term with the query must not come back"
+    );
 }
 
 /// The scope predicate is not optional, and it is honoured.
