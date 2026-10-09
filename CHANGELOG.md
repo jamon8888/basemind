@@ -8,6 +8,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [0.33.0] - 2026-10-09
+
+> **Minor release — keyword search for documents.** Semantic search over documents is on by
+> default, and keyword search now exists alongside it. **They are not combined yet:** the two lanes
+> never run together, so there is no fusion, and results are not better than either lane alone.
+> *If you rely on keyword search:* it works. *If you rely on multi-lane ranking:* that is Phase 4 and
+> is not here. Read *Breaking changes* before upgrading — every workspace re-indexes once.
+
+### Breaking changes
+
+1. **Every existing workspace re-indexes from scratch on first scan after upgrading.** `RELEASE_MINOR`
+   advances 32 → 33, which advances `MEMORY_SCHEMA_VER`, and this release adds the `heading_path`
+   column to the Arrow schema independently. Either alone invalidates the on-disk LanceDB directory;
+   both together are decisive. The rebuild is automatic and destructive — the lance directory is
+   wiped and rewritten — but the **first scan after upgrading is a full one**, and search answers
+   poorly until it completes. On a large repository, plan for that scan before you need search.
+2. **The keyword index is built as two single-column indexes, not one over both.** Lance refuses
+   composite inverted indexes outright, so `text` and `heading_path` are indexed separately and a
+   query that names no column resolves across both. Ranking across the two takes a *maximum*, not a
+   sum: a chunk matching weakly on its heading and strongly on its body scores the same as one
+   matching only on its heading. Single-column was already the only option; it is now also what the
+   code says, so the old comment claiming a two-column index was describing something that could not
+   be built.
+
+### Added
+
+- **Keyword search over the documents store.** `[documents] embed = false` gives a lexical-only
+  store: chunks are chunked and written, and the FTS index over `text` + `heading_path` is built
+  once per flush and `optimize(All)`'d after. A conjunctive→disjunctive relaxation ladder rescues
+  multi-term queries whose terms do not all appear, ordered `(len, lexicographic)` and capped.
+- **`heading_path` is persisted per chunk** and reaches the table. The extractor has always computed
+  the Markdown heading breadcrumb; it stopped at `DocChunk` and nothing downstream read it, so the
+  keyword index was built over a column that did not exist. ATX and setext headings only.
+- **`safe/` mirror over MCP `resources/list` and `resources/read`**, as `basemind://safe/<path>`, with
+  a bounded listing, a refusal to follow a linked `safe/`, `O_NOFOLLOW` on open, an identity check
+  on the opened file to catch a swapped intermediate directory, and a traversal guard. ([#55])
+
+### Changed
+
+- **The keyword lane asks for a conjunction, and did not before.** `MatchQuery::new` defaults to
+  `Or`, and nothing in this lane overrode it, so a multi-term query matched any document containing
+  any one of its terms — and the relaxation ladder written to relax an over-strict conjunction had
+  nothing to relax, because the first round was already disjunctive. It is now `And` per indexed
+  column, which is what makes the ladder mean anything. **This changes results:** a document that
+  used to come back on one matching word may no longer, and comes back instead once the ladder has
+  dropped a term. Single-term queries are unaffected. Fuzziness is now pinned to `Some(0)` rather
+  than left to a library default, so identifier-shaped tokens keep matching exactly.
+
+### Fixed
+
+- **A lexical-only scan now writes rows.** With `[documents] embed = false`, extraction produced a
+  row whose embedding was absent and the write panicked on the first batch, so a store configured
+  for keyword search held nothing. ([#65])
+- **Documents are deleted under the scope their rows were written under.** The delete path used a
+  different scope than the write, so a replaced or removed document left its rows behind. ([#66])
+- **The arrow-on-missing-embedding crash** that made lexical-only scanning unusable. ([#73])
+- **The keyword index is rebuilt when the tokenizer changes.** The store's `meta.json` does not record
+  the tokenizer config, so a changed tokenizer previously left a stale index in place with no rebuild
+  and no warning. Indexes are now named for the column they cover and dropped before creation, which
+  makes the stale-index branch reachable at all — it compared `list_indices` against a name Lance had
+  derived on its own and the code never asked for.
+- **`redact_text` offsets index the text the caller sent**, not the extractor's rewritten text. ([#74])
+- **Compilation under `--features full`.** `main` had not compiled since #73: three `fts.rs` errors,
+  an unused scope parameter, and five test-only breaks across `rrf.rs` and the smoke tests. Eight
+  commits had landed red as a result. ([#75], [#76])
+
+### Known limitations
+
+- **Semantic and keyword search do not fuse.** `run_search_documents` is
+  `if lexical_only { FTS } else { vector KNN }` — one lane or the other, chosen by config, never
+  both. `FusionWeights::document_lanes()` exists and nothing calls it. A query does not get the
+  union of the two rankings. Phase 4.
+- **No statute-number or exact-phrase lane.** `§ 362(a)(1)` and quoted citations are what legal
+  retrieval most needs and are precisely what a tokenizing index cannot do. That needs an n-gram
+  index. Phase 3, and the single most valuable thing missing from this release.
+- **`heading_path` is empty for most real legal documents.** xberg recognises Markdown ATX and setext
+  headings only, so a PDF whose sections read `IV. TERMINATION` as plain text produces an empty
+  breadcrumb for every chunk, and the heading half of the keyword index has nothing to match. The
+  heading lane works; recognising numbered headings in extracted prose does not. Tracked as #78.
+- **No facets.** `doc_type`, `jurisdiction` and `citation` are Phase 4.
+- **A chunk that matches only on its breadcrumb can outrank one that matches only on its body.** The
+  union takes a maximum. `MultiMatchQuery::try_with_boosts` exists if a real corpus shows this needs
+  weighting; nothing is weighted today because nothing has been measured.
+
+### Not in this release
+
+Phases 0 and 2 of ADR-0012 plus the compile unblock. Phases 1 (RRF fusion), 3 (`exact` / phrase
+lanes) and 4 (facets) are designed and unimplemented. Rehydration of PII at query time is not
+designed at all; see issues #7–#12.
+
+[#7]: https://github.com/jamon8888/basemind/issues/7
+[#12]: https://github.com/jamon8888/basemind/issues/12
+[#55]: https://github.com/jamon8888/basemind/pull/55
+[#65]: https://github.com/jamon8888/basemind/pull/65
+[#66]: https://github.com/jamon8888/basemind/pull/66
+[#73]: https://github.com/jamon8888/basemind/pull/73
+[#74]: https://github.com/jamon8888/basemind/pull/74
+[#75]: https://github.com/jamon8888/basemind/pull/75
+[#76]: https://github.com/jamon8888/basemind/pull/76
+
 ## [0.26.0] - 2026-09-01
 
 > **Minor release — cache rebuild, breaking changes, and a security fix.** Read *Breaking changes*
