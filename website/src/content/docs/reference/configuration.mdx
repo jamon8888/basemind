@@ -120,7 +120,7 @@ max_chunks_per_document = 2000
 | Key | Type | Notes |
 |---|---|---|
 | `enabled` | bool | Enable/disable document indexing. Requires the model files, which download on first use. |
-| `embed` | bool | Generate vector embeddings for semantic search. Set `false` to keep full-text only. |
+| `embed` | bool | Generate vector embeddings for document search. Set `false` for a lexical-only store: chunks are written without vectors and document search runs the keyword lane (full-text over chunk text and heading breadcrumb). The two lanes are selected by this flag, never fused — see [document search](../capabilities/document-search.mdx). |
 | `embedding_preset` | string | Named embedding model preset used to embed chunks. |
 | `max_chunks_per_document` | integer | Cap on chunks embedded per document, so one pathological file can't explode a scan. |
 | `mime_allowlist` | array of strings | Restrict extraction to specific MIME types (empty = accept all supported types). |
@@ -154,7 +154,7 @@ document_models = "code_only"
 | `embed_batch_size` | integer | `32` | Number of chunks the embedder submits to ONNX per batch. Larger batches amortize per-call overhead at the cost of a higher transient memory spike; lower it to shrink that spike. |
 | `max_concurrent_documents` | integer | `0` | Upper bound on documents extracted concurrently. `0` (auto) leaves dispatch unbounded. Parsed today; enforcement is a later iteration — memory is bounded in the meantime by `max_footprint_mb` rather than by an in-flight document count. |
 | `max_footprint_mb` | integer | `0` | Best-effort ceiling on process physical footprint, in mebibytes (macOS `phys_footprint`, which counts compressed + swapped-out pages; a no-op elsewhere). `0` disables the gate. When set, the `FootprintGate` samples the footprint at the document-extraction and code-chunk embedding admit points and parks over-ceiling workers on a bounded backoff. It never fails a scan: an unreadable sample or a sustained overshoot admits anyway after a capped wait, so the ceiling shapes the peak rather than enforcing a hard invariant. |
-| `document_models` | enum | `full` | Which model families run during document extraction. `full` runs every configured post-processor. `code_only` keeps embeddings but forces keyword extraction, NER, and summarization off and disables OCR. `none` also drops embeddings — documents are still extracted for text + metadata (keyword search) but never routed to any model. `[documents].enabled = false` remains the zero-cost total short-circuit. |
+| `document_models` | enum | `full` | Which model families run during document extraction. `full` runs every configured post-processor. `code_only` keeps embeddings but forces keyword extraction, NER, and summarization off and disables OCR. `none` also drops embeddings — enrichment and OCR are off and no model runs, but documents are still chunked, so with `embed = false` the keyword lane still has chunk text and heading breadcrumbs to match. `[documents].enabled = false` remains the zero-cost total short-circuit. |
 
 ### `[code_search]` Section
 

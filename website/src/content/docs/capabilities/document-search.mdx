@@ -159,11 +159,26 @@ In `.basemind/basemind.toml`:
 ```toml
 [documents]
 enabled = true
-embed = true  # set to false to disable embeddings (keyword search only)
+embed = true  # set to false for a lexical-only store: no embeddings, keyword search instead
 
 [documents.reranker]
 enabled = true  # cross-encoder reranking for document chunks
 ```
+
+With `embed = false` the store holds no vectors, so document search runs the **keyword lane**: a
+full-text index over each chunk's text and its Markdown heading breadcrumb, with a relaxation ladder
+that drops query terms when the strict conjunction matches nothing. Nothing is embedded and no
+embedding model is downloaded to answer a query that does not need one.
+
+The two lanes are **chosen by this setting, not combined**. A store is either lexical-only or
+vector-backed; there is no configuration that runs both and fuses their rankings. If you want
+semantic recall, leave `embed = true`.
+
+The heading breadcrumb is recognised from Markdown `#` headings (and setext underlines) only. A
+document whose sections are plain prose — a PDF whose divisions read `IV. TERMINATION` rather than
+`## Termination` — produces an empty breadcrumb for every chunk, and the keyword lane then matches on
+chunk text alone. There is also no statute-number or quoted-phrase lane: `§ 362(a)(1)` is tokenised
+like any other text, so it matches loosely rather than exactly.
 
 ## Discipline
 
