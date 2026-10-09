@@ -502,6 +502,7 @@ fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
             chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
             mime_type: mime_owned.clone(),
             text: chunk.text,
+            heading_path: chunk.heading_path,
             byte_start: chunk.byte_start,
             byte_end: chunk.byte_end,
             rehydration_ref: rehydration_ref.clone(),

@@ -102,6 +102,10 @@ pub fn index_page(
             chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
             mime_type: mime_type.to_string(),
             text: chunk.content.clone(),
+            // Web pages are chunked as plain text: there is no heading structure to carry down, so
+            // the breadcrumb is empty rather than absent. The column is non-null and the keyword
+            // lane indexes it, so it has to be written as `""` and not skipped.
+            heading_path: String::new(),
             byte_start,
             byte_end,
             rehydration_ref: None,

@@ -39,6 +39,7 @@ fn a_vectorless_document_row_builds_with_a_null_embedding() {
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
         text: "clause de résiliation".to_string(),
+        heading_path: String::new(),
         byte_start: 0,
         byte_end: 21,
         rehydration_ref: None,
@@ -54,6 +55,37 @@ fn a_vectorless_document_row_builds_with_a_null_embedding() {
     assert_eq!(batch.num_rows(), 1, "the row is written; text included");
 }
 
+/// The heading breadcrumb must reach the table.
+///
+/// It did not, for the whole life of the keyword lane: the extractor computed `heading_path` onto
+/// `DocChunk` and `build_doc_rows` dropped it on the floor, so `documents_schema` never had the
+/// column and the index built over it named a column that did not exist. This asserts the write,
+/// which is the half that was missing and the half the end-to-end smoke test then failed to notice.
+#[test]
+fn the_heading_breadcrumb_is_written_to_the_batch() {
+    let rows = vec![DocumentRow {
+        scope: "repo:x".to_string(),
+        path: "safe/a.md".to_string(),
+        chunk_idx: 0,
+        mime_type: "text/markdown".to_string(),
+        text: "Trente jours pour cure.".to_string(),
+        heading_path: "# Résiliation > ## Préavis".to_string(),
+        byte_start: 0,
+        byte_end: 23,
+        rehydration_ref: None,
+        embedding: Vec::new(),
+    }];
+    let batch = build_documents_batch(384, &rows).expect("build batch");
+    let column = batch
+        .column_by_name("heading_path")
+        .expect("the documents table has a heading_path column")
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("heading_path is a string column");
+    assert_eq!(column.value(0), "# Résiliation > ## Préavis");
+    assert_eq!(column.null_count(), 0, "an absent breadcrumb is empty, never null");
+}
+
 /// The nullable column must not become a hole. A row that *claims* a vector of the wrong length
 /// would misalign the index silently, which is worse than an error.
 #[test]
@@ -64,6 +96,7 @@ fn a_wrong_length_vector_is_still_rejected() {
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
         text: "t".to_string(),
+        heading_path: String::new(),
         byte_start: 0,
         byte_end: 1,
         rehydration_ref: None,

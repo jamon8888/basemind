@@ -35,12 +35,22 @@ fn row(scope: &str, path: &str, text: &str) -> Vec<DocumentRow> {
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
         text: text.to_string(),
+        // No heading on the fixtures that assert on body text: a breadcrumb here would make a
+        // heading match indistinguishable from a body match.
+        heading_path: String::new(),
         byte_start: 0,
         byte_end: text.len() as u32,
         rehydration_ref: None,
         // Null, not zero-filled: this is a lexical-only store and the vector column must prove it.
         embedding: Vec::new(),
     }]
+}
+
+/// The same row with a heading breadcrumb, for the tests that need one.
+fn row_with_heading(scope: &str, path: &str, text: &str, heading_path: &str) -> Vec<DocumentRow> {
+    let mut rows = row(scope, path, text);
+    rows[0].heading_path = heading_path.to_string();
+    rows
 }
 
 fn config_with_embeddings_off() -> Config {
@@ -116,8 +126,12 @@ fn lexical_only_extraction_yields_text_and_heading_paths() {
 
 /// The end-to-end property: rows written with a null embedding are found by the keyword lane.
 ///
-/// This is the test that would have failed before #56 — the rows simply were not there — and it is
-/// the first proof that the index is built over `text` + `heading_path` rather than over nothing.
+/// This is the test that would have failed before #56 — the rows simply were not there.
+///
+/// **It says nothing about `heading_path`.** Every fixture here has an empty breadcrumb and every
+/// query term appears in the body, so this passes whether the keyword lane indexes one column or
+/// two. It was previously captioned as "the first proof that the index is built over `text` +
+/// `heading_path`", which it has never been. `a_heading_only_term_finds_its_chunk` is that proof.
 #[test]
 fn a_lexical_only_store_answers_a_topical_query() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -166,6 +180,76 @@ fn a_lexical_only_store_answers_a_topical_query() {
     assert!(
         !hits.iter().any(|h| h.path == "safe/deed.md"),
         "an unrelated document must not be returned for this query; got {:?}",
+        hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+    );
+}
+
+/// `heading_path` is genuinely searched, not merely stored.
+///
+/// This is the assertion that was missing for the whole life of the keyword lane. Both prior facts
+/// were true at once and neither showed up in CI: `KEYWORD_COLUMNS` named two columns while Lance
+/// refuses to index two at once, and `heading_path` was computed by the extractor and then dropped
+/// before it reached the table. So the lane indexed nothing and the smoke tests still passed,
+/// because every one of them queried body text.
+///
+/// The query term `arbitration` appears in **no** chunk body below — only in a breadcrumb. So this
+/// fails if the column is unwritten, if the index is missing, or if the second index is built over
+/// the wrong column, and it cannot pass by accident through the `text` index.
+///
+/// What it does not prove: that headings are populated on real documents. xberg only recognises
+/// Markdown ATX and setext headings, so a legal PDF whose sections read `IV. TERMINATION` in plain
+/// text produces an empty breadcrumb for every chunk. That is #78, and it is unresolved.
+#[test]
+fn a_heading_only_term_finds_its_chunk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = config_with_embeddings_off();
+    let store = LanceStore::open(dir.path(), DIM, "balanced").expect("open store");
+
+    // The term that decides this test is `arbitration`. It is in the first row's breadcrumb and in
+    // no body text anywhere in the corpus.
+    store
+        .replace_document(
+            "repo:test",
+            "safe/lease.md",
+            row_with_heading(
+                "repo:test",
+                "safe/lease.md",
+                "The landlord may terminate the lease for non-payment after the cure period.",
+                "# Dispute resolution > ## Arbitration",
+            ),
+        )
+        .expect("write row");
+    store
+        .replace_document(
+            "repo:test",
+            "safe/deed.md",
+            row_with_heading(
+                "repo:test",
+                "safe/deed.md",
+                "The vendor grants the freehold subject to the covenants.",
+                "# Grant > ## Title",
+            ),
+        )
+        .expect("write row");
+
+    basemind::lance::fts::build_index_after_ingest(&store, &cfg.documents.fts).expect("build index");
+
+    let hits = basemind::lance::fts::search_relaxed_on(
+        &store,
+        &["arbitration".to_string()],
+        "scope = 'repo:test'",
+        10,
+        0,
+    )
+    .expect("lexical search");
+
+    assert!(
+        !hits.is_empty(),
+        "a term that appears only in a heading must still be found; the heading index is not reachable"
+    );
+    assert_eq!(
+        hits[0].path, "safe/lease.md",
+        "the chunk whose breadcrumb carries the term must rank in; got {:?}",
         hits.iter().map(|h| &h.path).collect::<Vec<_>>()
     );
 }

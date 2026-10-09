@@ -3,9 +3,26 @@
 //! Split out of `mod.rs` by the 1000-line cap (`tests/max_lines.rs`), and because index build and
 //! query are one concern the vector lane has no part in.
 //!
-//! The index is built over `text` + `heading_path`. `heading_path` is what separates a topical
-//! search from a bag-of-words one: two passages sharing no vocabulary can still both sit under
-//! `IV. TERMINATION`, and without the column that is invisible.
+//! The keyword lane covers `text` + `heading_path`. `heading_path` is what separates a topical
+//! search from a bag-of-words one: two passages sharing no vocabulary can still both sit under the
+//! same heading, and without the column that is invisible.
+//!
+//! **One index per column, not one index over both.** Lance refuses to build an inverted index over
+//! more than one column — `lance-10.0.0/src/index/create.rs:144` and
+//! `lancedb-0.37.1/src/table/create_index.rs:117` both reject `columns.len() != 1` outright, and
+//! neither is behind a feature flag or a version guard. So this is two `create_index` calls.
+//!
+//! The query side needs no matching change. `search_lexical` names no column, and Lance resolves
+//! that by discovering every FTS-indexed column (`fts_indexed_columns` in
+//! `lance-10.0.0/src/dataset/scanner.rs`) and building a `MultiMatchQuery` over all of them; the
+//! planner unions the per-column results, dedupes by row id and keeps the higher score. Adding a
+//! third indexed column later needs no change here at all.
+//!
+//! **What that costs, stated plainly:** the union takes a *maximum*, not a sum. A chunk that
+//! matches weakly on its heading and strongly on its body scores the same as one that matches only
+//! on its heading. A true composite index would have added the two contributions. `MultiMatchQuery`
+//! exposes `try_with_boosts` if real corpora show this needs weighting; nothing is weighted today
+//! because nothing has been measured yet.
 
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
@@ -21,14 +38,24 @@ use crate::config::FtsConfig;
 
 use super::LanceStore;
 
-/// Name of the FTS index over `text` + `heading_path`.
+/// The keyword indexes on `documents`, as `(index name, indexed column)`.
 ///
-/// Named because a table carries one index per column set, and `index_stats` takes a name.
-pub const KEYWORD_INDEX: &str = "documents_keyword_idx";
+/// The names are set explicitly on every `create_index` call. Lance derives a default name from the
+/// column when none is given — `text_idx` — and the previous code compared `list_indices` against a
+/// name it never asked for, so its "drop the stale index" branch could never fire and a changed
+/// tokenizer silently left the old index in place. Naming them here is what makes that branch real.
+///
+/// Order matters only for readability; discovery at query time is schema order, not this order.
+pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
+    ("documents_text_idx", "text"),
+    ("documents_heading_idx", "heading_path"),
+];
 
-/// The columns the keyword index covers. One index, both columns — a table with a single FTS index
-/// resolves the column set from the query, so this stays in one place rather than being repeated at
-/// build and at query.
+/// The columns the keyword lane covers.
+///
+/// Every one of them carries an FTS index, and that is the contract: `search_lexical` names no
+/// column, so Lance searches exactly the columns it finds indexed. A column listed here with no
+/// index behind it would be silently absent from every search rather than erroring.
 pub const KEYWORD_COLUMNS: [&str; 2] = ["text", "heading_path"];
 
 /// Build the tokenizer config for the keyword index.
@@ -50,31 +77,41 @@ pub fn keyword_index_params(cfg: &FtsConfig) -> Result<FtsIndexBuilder> {
         .custom_stop_words(Some(cfg.custom_stop_words.clone())))
 }
 
-/// Attach the keyword index to `table`, replacing any existing one of the same name.
+/// Attach the keyword indexes to `table`, replacing any existing ones of the same name.
 ///
 /// Creating an index whose name already exists is an error rather than a replacement, and the
 /// tokenizer config is not part of the store's `meta.json` — so a changed tokenizer would otherwise
 /// leave a stale index behind with no rebuild and no warning. Dropping first makes this explicit
 /// and idempotent.
+///
+/// The index list is read once, before the loop, and the drops are not read back between creates:
+/// each index is named for the column it covers, so no create can collide with another entry's
+/// drop.
 pub async fn ensure_keyword_index(table: &Table, cfg: &FtsConfig) -> Result<()> {
     let params = keyword_index_params(cfg)?;
-    match table.list_indices().await {
-        Ok(existing) if existing.iter().any(|i| i.name == KEYWORD_INDEX) => {
-            table
-                .drop_index(KEYWORD_INDEX)
-                .await
-                .with_context(|| format!("drop stale {KEYWORD_INDEX}"))?;
+    // Listing is only used to decide whether a drop is needed; failing to list must not stop a
+    // fresh index from being created.
+    let existing = match table.list_indices().await {
+        Ok(indices) => indices,
+        Err(error) => {
+            tracing::debug!(?error, "keyword indexes: could not list indices; creating anyway");
+            Vec::new()
         }
-        Ok(_) => {}
-        // Listing is only used to decide whether a drop is needed; failing to list must not stop a
-        // fresh index from being created.
-        Err(error) => tracing::debug!(?error, "{KEYWORD_INDEX}: could not list indices; creating anyway"),
+    };
+    for (name, column) in KEYWORD_INDEXES {
+        if existing.iter().any(|i| i.name == name) {
+            table
+                .drop_index(name)
+                .await
+                .with_context(|| format!("drop stale {name}"))?;
+        }
+        table
+            .create_index(&[column], Index::FTS(params.clone()))
+            .name(name.to_string())
+            .execute()
+            .await
+            .with_context(|| format!("create {name} on {column}"))?;
     }
-    table
-        .create_index(&KEYWORD_COLUMNS, Index::FTS(params))
-        .execute()
-        .await
-        .with_context(|| format!("create {KEYWORD_INDEX}"))?;
     Ok(())
 }
 
@@ -307,6 +344,28 @@ mod tests {
     #[test]
     fn the_index_covers_text_and_heading_path() {
         assert_eq!(KEYWORD_COLUMNS, ["text", "heading_path"]);
+    }
+
+    /// Every column the lane claims to cover must have an index built for it, and every index must
+    /// name the column it covers.
+    ///
+    /// The two halves fail in opposite directions and both fail silently. An extra `KEYWORD_COLUMNS`
+    /// entry with no index behind it is simply absent from every search; an index named for a
+    /// different column is searched instead of the one intended. `search_lexical` names no column,
+    /// so Lance works from what it finds on disk — this is the only place the two lists are checked
+    /// against each other.
+    #[test]
+    fn every_indexed_column_has_an_index_named_for_it() {
+        let indexed: Vec<&str> = KEYWORD_INDEXES.iter().map(|(_, column)| *column).collect();
+        assert_eq!(
+            indexed, KEYWORD_COLUMNS,
+            "KEYWORD_COLUMNS and KEYWORD_INDEXES must name the same columns in the same order"
+        );
+        let names: Vec<&str> = KEYWORD_INDEXES.iter().map(|(name, _)| *name).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "index names must be distinct: {names:?}");
     }
 
     /// The tokenizer settings a user gets with no config must actually build, and must be the
