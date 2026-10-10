@@ -117,36 +117,18 @@ jobs:
         if: runner.os == 'macOS' && matrix.features == ''
         run: brew install protobuf
 
-      # ~keep mold, Linux only. Measured on this tree: linking is a large share of the leg, and mold
-      # ~keep is ~3-5x faster than GNU ld at lower peak RSS. It is reached through the `cc` driver
-      # ~keep (`-C link-arg=-fuse-ld`) rather than set as the linker directly, because mold does not
-      # ~keep understand gcc's `-m64` and fails on it.
-      # ~keep The flag is exported here rather than at job level on purpose: it is written to
-      # ~keep GITHUB_ENV only in the step that actually installs mold, so a runner where the apt
-      # ~keep package is unavailable falls back to the default linker instead of failing to link.
-      - name: Install mold linker (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          if sudo apt-get install -y mold; then
-            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
-            mold --version
-          else
-            echo "::warning::mold unavailable; falling back to the default linker"
-          fi
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-        with:
-          rustc-wrapper: sccache
-          # ~keep Bounded deliberately. This leg has chronic ENOSPC — it is why `Free disk space`
-          # ~keep exists at all, why `CARGO_PROFILE_DEV_DEBUG` is 0 here and 1 elsewhere, and why the
-          # ~keep purge list is that long. sccache defaults to 10GB, which alongside a ~4GB
-          # ~keep rust-cache is a real ENOSPC risk on a disk that already had to free dotnet, ghc,
-          # ~keep swift, jvm and powershell to fit one build.
-          # ~keep sccache's value here is the cold-cache case — feature-set changes and retries — so
-          # ~keep it is kept deliberately modest rather than greedy. Raise it if the leg ever stops
-          # ~keep hitting ENOSPC.
-          cache-size: 5
+      # ~keep mold and sccache were both tried here and both removed again on 2026-10-10.
+      # ~keep mold (2.30.0, via apt) installed and exported `-C link-arg=-fuse-ld=mold`, and the
+      # ~keep `full` leg then failed with `could not find native static library 'onnxruntime'` from
+      # ~keep `ort-sys`. Whatever the mechanism — `ort` resolves ONNX Runtime through its build
+      # ~keep script, and forcing the linker changed the result — a faster linker is not worth a
+      # ~keep broken `full` leg, and it was not reproducible locally to explain first.
+      # ~keep sccache: `mozilla-actions/sccache-action@v0.0.9` does not accept `rustc-wrapper` or
+      # ~keep `cache-size`; the real inputs are `version`, `token`, `disable_annotations`. The
+      # ~keep action warned and ignored both, so `RUSTC_WRAPPER` was never set and sccache served
+      # ~keep zero compilations — it was inert while appearing configured. Reinstating it means
+      # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
+      # ~keep that the step is present.
 
       - uses: Swatinem/rust-cache@v2
         with:

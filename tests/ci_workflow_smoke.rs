@@ -90,48 +90,34 @@ fn the_release_build_is_not_paid_for_on_pull_requests() {
     );
 }
 
-/// mold is a Linux-only linker, so both halves of using it must be Linux-only.
+/// mold and sccache must stay out until they are shown to work.
 ///
-/// The flag and the binary are set in the same step on purpose. If the apt package were ever
-/// unavailable and the flag were still exported, every link on the runner would fail on a linker
-/// that does not exist — a red CI for a missing optional tool. Falling back to the default linker
-/// costs a few minutes and breaks nothing.
+/// Both were added to this workflow on 2026-10-10 and both were removed again the same day.
+///
+/// mold installed fine (2.30.0 from apt) and exported `-C link-arg=-fuse-ld=mold`, and the `full`
+/// leg then failed in `ort-sys` with `could not find native static library 'onnxruntime'`. sccache
+/// was worse in a quieter way: `mozilla-actions/sccache-action@v0.0.9` does not accept
+/// `rustc-wrapper` or `cache-size`, warned, ignored both, and left `RUSTC_WRAPPER` unset — so
+/// sccache served zero compilations while the workflow read as though it were configured.
+///
+/// A step that installs a tool is not the same as a tool in use, and a step that reads as configured
+/// is not evidence. Whoever reinstates either has to show the compiler env actually reaches rustc.
 #[test]
-fn the_mold_linker_is_installed_and_selected_on_linux_only() {
-    let workflow = workflow();
-    let test = test_job(&workflow);
+fn no_unverified_linker_or_cache_tool_is_reintroduced_silently() {
+    // Comments are stripped first: the note explaining why these were removed necessarily names
+    // them, and a test that matched prose would fail on its own documentation.
+    let live = workflow()
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let mold = test
-        .split("- name: Install mold linker (Linux)")
-        .nth(1)
-        .expect("a mold install step exists");
-    assert!(
-        mold.contains("runner.os == 'Linux'"),
-        "mold is not available on the macOS or Windows legs; installing it unconditionally is a \
-         wasted step at best"
-    );
-    assert!(
-        mold.contains("fuse-ld=mold"),
-        "the mold step must export the linker flag"
-    );
-
-    // The flag is written to GITHUB_ENV from inside the step that installs the binary, and behind
-    // the install succeeding. Assert the guard, not just the presence of the flag.
-    assert!(
-        mold.contains("GITHUB_ENV"),
-        "the linker flag must be exported through GITHUB_ENV so later steps see it"
-    );
-    assert!(
-        mold.contains("apt-get install") && mold.contains("if sudo apt-get install"),
-        "the flag must only be exported when the install actually succeeded, so a runner without \
-         the package falls back to the default linker instead of failing to link"
-    );
-
-    // No global RUSTFLAGS: the Windows leg already routes zlib's import-library path through a
-    // target-scoped variable, and a job-level RUSTFLAGS would collide with it.
-    assert!(
-        !workflow.contains("\n    RUSTFLAGS:"),
-        "do not set a global RUSTFLAGS; the Windows zlib step uses CARGO_TARGET_*_RUSTFLAGS and a \
-         global value would clobber it"
-    );
+    for banned in ["fuse-ld=mold", "sccache-action"] {
+        assert!(
+            !live.contains(banned),
+            "`{banned}` is not in use in CI. mold broke the `full` leg's `ort-sys` link, and \
+             sccache was installed without `RUSTC_WRAPPER` ever being set, so it compiled nothing. \
+             Reinstate only with evidence: a passing `full` leg and the compiler env in the log."
+        );
+    }
 }
