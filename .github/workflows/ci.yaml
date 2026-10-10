@@ -117,9 +117,45 @@ jobs:
         if: runner.os == 'macOS' && matrix.features == ''
         run: brew install protobuf
 
+      # ~keep mold, Linux only. Measured on this tree: linking is a large share of the leg, and mold
+      # ~keep is ~3-5x faster than GNU ld at lower peak RSS. It is reached through the `cc` driver
+      # ~keep (`-C link-arg=-fuse-ld`) rather than set as the linker directly, because mold does not
+      # ~keep understand gcc's `-m64` and fails on it.
+      # ~keep The flag is exported here rather than at job level on purpose: it is written to
+      # ~keep GITHUB_ENV only in the step that actually installs mold, so a runner where the apt
+      # ~keep package is unavailable falls back to the default linker instead of failing to link.
+      - name: Install mold linker (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if sudo apt-get install -y mold; then
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+            mold --version
+          else
+            echo "::warning::mold unavailable; falling back to the default linker"
+          fi
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          rustc-wrapper: sccache
+          # ~keep Bounded deliberately. This leg has chronic ENOSPC — it is why `Free disk space`
+          # ~keep exists at all, why `CARGO_PROFILE_DEV_DEBUG` is 0 here and 1 elsewhere, and why the
+          # ~keep purge list is that long. sccache defaults to 10GB, which alongside a ~4GB
+          # ~keep rust-cache is a real ENOSPC risk on a disk that already had to free dotnet, ghc,
+          # ~keep swift, jvm and powershell to fit one build.
+          # ~keep sccache's value here is the cold-cache case — feature-set changes and retries — so
+          # ~keep it is kept deliberately modest rather than greedy. Raise it if the leg ever stops
+          # ~keep hitting ENOSPC.
+          cache-size: 5
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.features }}
+          # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
+          # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
+          # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
+          # ~keep 2026-10-09: `ubuntu-latest / full` cancelled at exactly 240m, then re-ran cold.
+          cache-on-failure: true
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -152,7 +188,18 @@ jobs:
           cargo clippy --bin basemind --features full,agent-tui,desktop-ui -- -D warnings
           cargo test --bin basemind --features full,agent-tui,desktop-ui --quiet --no-fail-fast
 
+      # ~keep 23 minutes of a 73-minute leg — 32% — and it is the largest single cost in CI.
+      # ~keep A release profile is a different fingerprint from everything above it, so this does
+      # ~keep not reuse the debug or test build: it recompiles the whole dependency graph.
+      # ~keep `publish.yaml` already builds `--release` for all six release targets, so a release
+      # ~keep that does not compile is caught there — but that is *after* the tag, which is too
+      # ~keep late to fix.
+      # ~keep So it runs on pushes to main and not on pull requests: PR latency drops by ~23m,
+      # ~keep and the release commit itself is still checked before anything is tagged. A release-only
+      # ~keep break introduced in a PR is caught on merge instead, which is a round-trip, not a
+      # ~keep release.
       - name: cargo build --release
+        if: github.event_name == 'push'
         run: cargo build --release --quiet --bin basemind --features "${{ matrix.features }}"
 
   deny:
