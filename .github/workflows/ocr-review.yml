@@ -1,0 +1,145 @@
+# OpenCodeReview — automated PR review.
+#
+# Runs OpenCodeReview against the PR diff and posts line-level findings back
+# onto the PR as inline review comments, plus a sticky summary comment.
+#
+# Requires (Settings -> Secrets and variables -> Actions):
+#   secret OCR_LLM_URL         LLM endpoint, e.g. https://models.myia.io/v1
+#   secret OCR_LLM_AUTH_TOKEN  LLM auth token
+#   variable OCR_LLM_MODEL     model name, e.g. swift-1.5-27b
+#   variable OCR_LLM_USE_ANTHROPIC  'false' for OpenAI-compatible endpoints
+#
+# Note on the config seed step below: OpenCodeReview has no OCR_MAX_TOKENS
+# environment variable and the composite action never writes `max_tokens`, so
+# without the seed a CI run falls back to the embedded 200000-token prompt
+# ceiling. That exceeds the serving model's context and a large PR fails with a
+# prompt-overflow error instead of a review. The seed writes the ceiling into
+# the config file before the action runs; `ocr config set` only touches the keys
+# it is given, so the action's own `llm.*` writes preserve it.
+
+name: OpenCodeReview PR Review
+
+concurrency:
+  # Matching events (PR events + the two trigger keywords) share one group per
+  # PR, so a new review cancels any stale one. Everything else lands in a
+  # unique noop group and is skipped without disturbing a running review.
+  # Keep this expression in sync with the job-level `if` below.
+  group: >-
+    ${{
+    (
+      (
+        github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
+        && (
+          github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+        )
+        && (
+          startsWith(github.event.comment.body, '/open-code-review')
+          || startsWith(github.event.comment.body, '@open-code-review')
+        )
+      )
+    )
+    && format('ocr-{0}', github.event.pull_request.number || github.event.issue.number)
+    || format('noop-{0}', github.run_id)
+    }}
+  cancel-in-progress: true
+
+on:
+  # pull_request rather than pull_request_target on purpose. GitHub applies a
+  # default Actions event policy that blocks pull_request_target on public
+  # repositories; enforcement begins 2026-11-02. pull_request has no such
+  # dependency. The trade-off is that secrets are withheld from PRs opened from
+  # a fork, which is why the job is gated to same-repository PRs below rather
+  # than left to fail on a missing secret.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # On-demand re-review: comment `/open-code-review` on a PR.
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Two gates. For `pull_request`, only same-repository PRs are reviewed:
+    # GitHub withholds secrets from fork PRs on this event, so reviewing one
+    # would fail on a missing secret instead of skipping. For `issue_comment`,
+    # the four guards each close a different hole:
+    #   issue.pull_request  - the comment must be on a PR, not a plain issue
+    #   user.type != 'Bot'  - a PAT or App token would not self-suppress
+    #   author_association  - only collaborators may spend LLM quota
+    #   startsWith(...)     - the trigger keywords themselves
+    if: |
+      (
+        github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
+        && (
+          github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+        )
+        && (
+          startsWith(github.event.comment.body, '/open-code-review')
+          || startsWith(github.event.comment.body, '@open-code-review')
+        )
+      )
+    steps:
+      - name: Seed OCR prompt ceiling
+        run: |
+          mkdir -p ~/.opencodereview
+          printf '%s\n' '{"max_tokens": 160000}' > ~/.opencodereview/config.json
+
+      - name: Resolve PR refs
+        id: pr-context
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+
+      - name: Run OpenCodeReview
+        uses: alibaba/open-code-review@v1.12.13
+        with:
+          llm_url: ${{ secrets.OCR_LLM_URL }}
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ vars.OCR_LLM_MODEL }}
+          llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # Pin the CLI to match the pinned action so a review is repeatable.
+          ocr_version: 1.12.13
+          # One machine serves the model; the default of 8 concurrent file
+          # groups saturates it.
+          review_concurrency: '2'
+          # Passed as `--rule`, which outranks both the project and the system
+          # rule layer. The file must be committed for this step to succeed.
+          rule: .opencodereview/rule.json
+          # Only the 27B was measured. A lower ceiling is required for any model
+          # with a smaller context window — frognano-4b tops out at 24576 and
+          # would need roughly 16000.
+          sticky_summary: 'true'
+          incremental: 'false'
+          upload_artifacts: 'true'
+          base_ref: ${{ steps.pr-context.outputs.base_ref }}
+          head_sha: ${{ steps.pr-context.outputs.head_sha }}
