@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [0.33.1] - 2026-10-10
+
+> **Patch release — the Linux ARM64 binary and a GitHub-only publish mode.** No index migration:
+> `RELEASE_MINOR` stays 33, so upgrading from 0.33.0 does **not** re-index. Upgrade from 0.32.x
+> still pays the one full re-index described under 0.33.0.
+
+### Added
+
+- **The `aarch64-unknown-linux-gnu` release binary.** Every publish since 0.32.0 failed that leg:
+  the workflow downloaded the x86_64 `rustup-init` onto an ARM runner, which died with `Exec
+  format error` before compiling anything, so 0.33.0 shipped without its Linux ARM64 asset. The
+  rustup archive URL is now parameterized per target with a per-arch pinned hash.
+- **A `github_only` input on the publish dispatch.** A tag push has always meant "publish
+  everywhere" (npm, PyPI, crates.io, homebrew); a manual dispatch with `github_only=true` builds
+  and promotes the GitHub release only and skips the registries, which stay at their previous
+  version until the next full publish.
+
 ## [0.33.0] - 2026-10-09
 
 > **Minor release — keyword search for documents.** Semantic search over documents is on by
