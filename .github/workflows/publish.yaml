@@ -484,10 +484,12 @@ jobs:
             os: ubuntu-latest
             image: quay.io/pypa/manylinux_2_28_x86_64:latest
             protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
           - triple: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             image: quay.io/pypa/manylinux_2_28_aarch64:latest
             protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -508,10 +510,13 @@ jobs:
           # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
           # Re-pin deliberately on toolchain upgrades (hash from a fresh
           # HTTPS download of the official static archive).
+          # The archive is arch-specific and `matrix.triple` names it exactly:
+          # the aarch64 job runs ARM, so an x86_64 init dies with
+          # "Exec format error" before anything else runs (v0.32.x, v0.33.0).
           rustup_ver="1.28.2"
-          rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+          rustup_sha256="${{ matrix.rustup_sha256 }}"
           curl -fsSL -o /tmp/rustup-init \
-            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/x86_64-unknown-linux-gnu/rustup-init"
+            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/${{ matrix.triple }}/rustup-init"
           echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
           chmod +x /tmp/rustup-init
           /tmp/rustup-init -y --profile minimal --default-toolchain stable
