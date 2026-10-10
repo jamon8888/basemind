@@ -10,6 +10,11 @@ on:
         description: "Release tag to publish (e.g., v0.1.0)"
         required: true
         type: string
+      github_only:
+        description: "Build and publish the GitHub release only — skip npm, PyPI, crates.io and homebrew"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # Key on the resolved release tag, not github.ref: a tag push (refs/tags/vX) and a ~keep
@@ -38,6 +43,7 @@ jobs:
       pypi_exists: ${{ steps.published.outputs.pypi_exists }}
       pypi_hermes_exists: ${{ steps.published.outputs.pypi_hermes_exists }}
       release_assets_exist: ${{ steps.release_assets.outputs.release_assets_exist }}
+      github_only: ${{ steps.skip_registries.outputs.github_only }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -243,6 +249,23 @@ jobs:
           echo "  npm (opencode):     $opencode_exists"
           echo "  PyPI:               $pypi_exists"
           echo "  PyPI (hermes):      $pypi_hermes_exists"
+
+      - name: Resolve whether to skip the package registries
+        id: skip_registries
+        env:
+          GITHUB_ONLY: ${{ inputs.github_only }}
+        run: |
+          set -euo pipefail
+          # Only a manual dispatch can ask for this. A tag push always publishes every registry,
+          # which is what a tag has always meant here — silently changing that would make a tag
+          # stop doing what previous tags did.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$GITHUB_ONLY" = "true" ]; then
+            echo "github_only=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub release only — npm, PyPI, crates.io and homebrew are skipped."
+            echo "Those registries stay at their previous version; the next full publish picks them up."
+          else
+            echo "github_only=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Detect a COMPLETE existing release (all archives + checksums)
         id: release_assets
@@ -936,7 +959,8 @@ jobs:
     # irreversible, so don't publish source unless the platform binaries built and the ~keep
     # release promoted — keeps the surfaces atomic across a partial failure. ~keep
     if: >-
-      always() && needs.meta.outputs.crates_publishable == 'true' &&
+      always() && needs.meta.outputs.github_only != 'true' &&
+      needs.meta.outputs.crates_publishable == 'true' &&
       needs.meta.outputs.crates_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -984,7 +1008,7 @@ jobs:
   publish_npm:
     name: Publish npm
     needs: [meta, finalize_release]
-    if: always() && needs.meta.outputs.npm_exists != 'true' && needs.finalize_release.result == 'success'
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.npm_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -1020,7 +1044,7 @@ jobs:
   publish_opencode:
     name: Publish npm (basemind-opencode)
     needs: [meta, finalize_release]
-    if: always() && needs.meta.outputs.opencode_exists != 'true' && needs.finalize_release.result == 'success'
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.opencode_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -1056,7 +1080,7 @@ jobs:
   publish_pypi:
     name: Publish PyPI
     needs: [meta, finalize_release]
-    if: always() && needs.meta.outputs.pypi_exists != 'true' && needs.finalize_release.result == 'success'
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.pypi_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -1087,7 +1111,7 @@ jobs:
   publish_pypi_hermes:
     name: Publish PyPI (basemind-hermes-plugin)
     needs: [meta, finalize_release]
-    if: always() && needs.meta.outputs.pypi_hermes_exists != 'true' && needs.finalize_release.result == 'success'
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.pypi_hermes_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -1118,7 +1142,7 @@ jobs:
   publish_homebrew:
     name: Update Homebrew formula
     needs: [meta, finalize_release]
-    if: always() && needs.finalize_release.result == 'success' && !contains(needs.meta.outputs.version, '-rc') && !contains(needs.meta.outputs.version, '-beta') && !contains(needs.meta.outputs.version, '-alpha')
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.finalize_release.result == 'success' && !contains(needs.meta.outputs.version, '-rc') && !contains(needs.meta.outputs.version, '-beta') && !contains(needs.meta.outputs.version, '-alpha')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

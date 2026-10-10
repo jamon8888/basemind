@@ -117,9 +117,27 @@ jobs:
         if: runner.os == 'macOS' && matrix.features == ''
         run: brew install protobuf
 
+      # ~keep mold and sccache were both tried here and both removed again on 2026-10-10.
+      # ~keep mold (2.30.0, via apt) installed and exported `-C link-arg=-fuse-ld=mold`, and the
+      # ~keep `full` leg then failed with `could not find native static library 'onnxruntime'` from
+      # ~keep `ort-sys`. Whatever the mechanism — `ort` resolves ONNX Runtime through its build
+      # ~keep script, and forcing the linker changed the result — a faster linker is not worth a
+      # ~keep broken `full` leg, and it was not reproducible locally to explain first.
+      # ~keep sccache: `mozilla-actions/sccache-action@v0.0.9` does not accept `rustc-wrapper` or
+      # ~keep `cache-size`; the real inputs are `version`, `token`, `disable_annotations`. The
+      # ~keep action warned and ignored both, so `RUSTC_WRAPPER` was never set and sccache served
+      # ~keep zero compilations — it was inert while appearing configured. Reinstating it means
+      # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
+      # ~keep that the step is present.
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.features }}
+          # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
+          # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
+          # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
+          # ~keep 2026-10-09: `ubuntu-latest / full` cancelled at exactly 240m, then re-ran cold.
+          cache-on-failure: true
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -152,7 +170,18 @@ jobs:
           cargo clippy --bin basemind --features full,agent-tui,desktop-ui -- -D warnings
           cargo test --bin basemind --features full,agent-tui,desktop-ui --quiet --no-fail-fast
 
+      # ~keep 23 minutes of a 73-minute leg — 32% — and it is the largest single cost in CI.
+      # ~keep A release profile is a different fingerprint from everything above it, so this does
+      # ~keep not reuse the debug or test build: it recompiles the whole dependency graph.
+      # ~keep `publish.yaml` already builds `--release` for all six release targets, so a release
+      # ~keep that does not compile is caught there — but that is *after* the tag, which is too
+      # ~keep late to fix.
+      # ~keep So it runs on pushes to main and not on pull requests: PR latency drops by ~23m,
+      # ~keep and the release commit itself is still checked before anything is tagged. A release-only
+      # ~keep break introduced in a PR is caught on merge instead, which is a round-trip, not a
+      # ~keep release.
       - name: cargo build --release
+        if: github.event_name == 'push'
         run: cargo build --release --quiet --bin basemind --features "${{ matrix.features }}"
 
   deny:

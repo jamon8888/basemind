@@ -68,6 +68,83 @@ fn registry_publishes_wait_for_a_finalized_release() {
     }
 }
 
+/// The `github_only` dispatch input must skip every registry, and only the registries.
+///
+/// A GitHub-only release is still a real release: the binaries are built, the checksums are
+/// computed, and the draft is promoted with the full asset set. What it does not do is move a
+/// version pointer on npm, PyPI, crates.io or the homebrew tap — those are irreversible and are
+/// not implied by "put the binaries on GitHub".
+///
+/// Both directions are asserted. A registry job that lost its gate would publish a version the
+/// operator explicitly declined to publish, which is the worse failure and the harder to notice.
+/// A release-chain job that gained the gate would produce a release with no binaries.
+#[test]
+fn github_only_skips_every_registry_and_nothing_else() {
+    let workflow = workflow();
+
+    for job in [
+        "publish_npm",
+        "publish_opencode",
+        "publish_pypi",
+        "publish_pypi_hermes",
+        "publish_crates",
+        "publish_homebrew",
+    ] {
+        let block = job_block(&workflow, job);
+        assert!(
+            block.contains("needs.meta.outputs.github_only != 'true'"),
+            "job `{job}` publishes irreversibly and must be skipped under github_only; without this \
+             gate a GitHub-only release still moves a version pointer"
+        );
+    }
+
+    // The chain that produces the release itself must run regardless.
+    for job in [
+        "create_release",
+        "build-binaries",
+        "build-linux-binaries",
+        "build-linux-noavx2",
+        "checksums",
+        "finalize_release",
+    ] {
+        let block = job_block(&workflow, job);
+        assert!(
+            !block.contains("github_only"),
+            "job `{job}` builds or finalizes the GitHub release, which github_only still does; \
+             gating it would produce a release with no binaries"
+        );
+    }
+
+    // And the flag must be a dispatch-only input, not a tag-push behaviour change: a tag has
+    // always meant "publish everywhere", and silently redefining that would make this tag do
+    // less than every tag before it. Asserted on the resolution step itself rather than on the
+    // input's mere presence, because a `github_only:` input that the resolution ignores — or
+    // that any trigger can set — is exactly the regression this is here to catch.
+    let meta = job_block(&workflow, "meta");
+    assert!(
+        meta.contains("skip_registries"),
+        "meta must resolve the github_only flag"
+    );
+    let resolution = meta
+        .split("id: skip_registries")
+        .nth(1)
+        .expect("the skip_registries step must exist");
+    assert!(
+        // Shell string equality inside the workflow: `= "workflow_dispatch"`, not `==`, and the
+        // expression is interpolated as `${{ github.event_name }}` so there is a `}}` between
+        // `event_name` and the `=`.
+        resolution.contains("\" = \"workflow_dispatch\"")
+            || resolution.contains("\" = 'workflow_dispatch'")
+            || resolution.contains("github.event_name == 'workflow_dispatch'"),
+        "github_only must be honoured only on a manual dispatch; a tag push must keep publishing \
+         every registry, as every tag before this one did"
+    );
+    assert!(
+        workflow.contains("github_only:"),
+        "the dispatch must expose a `github_only` input"
+    );
+}
+
 /// Binary releases with Git-pinned dependencies cannot be reconstructed by crates.io, so
 /// the source-crate publish must be skipped without blocking the platform artifacts.
 #[test]
