@@ -36,7 +36,7 @@ fn job_block<'a>(workflow: &'a str, job: &str) -> &'a str {
         }
         offset += line.len();
     }
-    &rest[..]
+    rest
 }
 
 /// The `test` matrix job, which every platform leg runs through.
