@@ -131,15 +131,15 @@ jobs:
           ocr_version: 1.12.13
           # One machine serves the model; the default of 8 concurrent file
           # groups saturates it.
-          review_concurrency: '2'
+          review_concurrency: "2"
           # Passed as `--rule`, which outranks both the project and the system
           # rule layer. The file must be committed for this step to succeed.
           rule: .opencodereview/rule.json
           # Only the 27B was measured. A lower ceiling is required for any model
           # with a smaller context window — frognano-4b tops out at 24576 and
           # would need roughly 16000.
-          sticky_summary: 'true'
-          incremental: 'false'
-          upload_artifacts: 'true'
+          sticky_summary: "true"
+          incremental: "false"
+          upload_artifacts: "true"
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
