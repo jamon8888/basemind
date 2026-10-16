@@ -488,6 +488,7 @@ async fn rerank_hits(
     let krz_config = xberg::core::config::RerankerConfig {
         model: krz_model,
         top_k: Some(top_k),
+        acceleration: crate::embeddings::acceleration(state.shared.config.resources.onnx_provider),
         ..Default::default()
     };
     let reranked = xberg::rerank_async(query.to_string(), texts, &krz_config)

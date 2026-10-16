@@ -20,8 +20,9 @@ use crate::chunk::{ChunkOptions, CodeChunkBlob, chunk_file};
 use crate::config::{CodeSearchConfig, Config};
 use crate::embeddings::SharedEmbedder;
 use crate::extract::{FileMapL1, FileMapL2, SCHEMA_VER};
-use crate::lance::CodeRow;
+use crate::lance::{CodeRow, PendingBatch};
 use crate::scanner::EmbedMode;
+use crate::scanner_filter::Filters;
 use crate::search::bm25::ChunkPosting;
 use crate::search::bm25_postings::build_chunk_postings;
 use crate::store::Store;
@@ -113,6 +114,33 @@ fn code_cache_is_reusable(blob: &CodeChunkBlob, dim: u16, preset: &str) -> bool 
         && blob.embeddings.len() == blob.chunks.len()
 }
 
+/// True when a cached chunk sidecar was produced under the current chunking settings and for the
+/// same grammar. A blob that predates `config_digest` (empty) is accepted here and stamped by
+/// [`stamp_legacy_digest`]; a blob whose first chunk names a different language was derived from
+/// another grammar's outline (the file was remapped via `[languages]`) and must be rebuilt.
+fn chunk_blob_is_current(blob: &CodeChunkBlob, digest: &str, lang: &str) -> bool {
+    (blob.config_digest.is_empty() || blob.config_digest == digest)
+        && blob.chunks.first().is_none_or(|c| c.lang == lang)
+}
+
+/// Adopt a legacy (digest-less) sidecar under the current settings by writing it back stamped, so a
+/// later config change is detected against it. Costs one sidecar write per legacy file, no re-embed.
+fn stamp_legacy_digest(
+    store: &Store,
+    rel: &str,
+    hash_hex: &str,
+    mut blob: CodeChunkBlob,
+    digest: &str,
+) -> CodeChunkBlob {
+    if blob.config_digest.is_empty() {
+        blob.config_digest = digest.to_string();
+        if let Err(error) = store.write_chunks_hex(hash_hex, &blob) {
+            tracing::warn!(rel, ?error, "stamp code-chunk sidecar with config digest failed");
+        }
+    }
+    blob
+}
+
 /// Chunk + embed one source file. Reuses the `.chunk` sidecar when an identical-content blob
 /// already exists (the embedding cache); otherwise chunks, embeds in bulk, and writes the blob.
 /// Returns `Ok(None)` when the file yields no chunks. Never opens LanceDB — the write is deferred.
@@ -125,17 +153,22 @@ pub(crate) fn chunk_and_embed(
     l2: Option<&FileMapL2>,
     hash_hex: &str,
     config: &Config,
+    filters: &Filters,
     mode: EmbedMode,
 ) -> Result<Option<PendingCodeBatch>> {
     let cfg = &config.code_search;
-    let embed = matches!(mode, EmbedMode::Inline)
-        && cfg.embed
-        && !crate::scanner_filter::embed_excluded(rel, &cfg.embed_exclude);
+    let embed = matches!(mode, EmbedMode::Inline) && cfg.embed && filters.code_embed_allowed(rel);
     let opts = ChunkOptions {
         max_characters: cfg.max_characters,
         overlap: cfg.overlap,
     };
-    let cached = store.read_chunks_by_hex(hash_hex).ok().flatten();
+    let digest = filters.code_digest.as_str();
+    let cached = store
+        .read_chunks_by_hex(hash_hex)
+        .ok()
+        .flatten()
+        .filter(|blob| chunk_blob_is_current(blob, digest, &l1.language))
+        .map(|blob| stamp_legacy_digest(store, rel, hash_hex, blob, digest));
 
     if !embed {
         let chunks = match cached {
@@ -143,6 +176,7 @@ pub(crate) fn chunk_and_embed(
             None => {
                 let chunks = chunk_file(rel, hash_hex, l1, l2, bytes, opts);
                 let blob = CodeChunkBlob {
+                    config_digest: digest.to_string(),
                     schema_ver: SCHEMA_VER,
                     embedding_dim: 0,
                     embedding_model: String::new(),
@@ -167,12 +201,13 @@ pub(crate) fn chunk_and_embed(
         }));
     }
 
-    let embedder = match SharedEmbedder::load(
+    let embedder = match SharedEmbedder::load_with_provider(
         &config.documents.embedding_preset,
         config
             .resources
             .effective_embed_threads(config.documents.embed_max_threads),
         config.resources.embed_batch_size,
+        config.resources.onnx_provider,
     ) {
         Ok(embedder) => embedder,
         Err(error) => {
@@ -209,6 +244,7 @@ pub(crate) fn chunk_and_embed(
     let chunks = chunk_file(rel, hash_hex, l1, l2, bytes, opts);
     if chunks.is_empty() {
         let blob = CodeChunkBlob {
+            config_digest: digest.to_string(),
             schema_ver: SCHEMA_VER,
             embedding_dim: 0,
             embedding_model: String::new(),
@@ -222,6 +258,7 @@ pub(crate) fn chunk_and_embed(
     }
     if over_chunk_cap(rel, chunks.len(), cfg) {
         let blob = CodeChunkBlob {
+            config_digest: digest.to_string(),
             schema_ver: SCHEMA_VER,
             embedding_dim: 0,
             embedding_model: String::new(),
@@ -258,6 +295,7 @@ pub(crate) fn chunk_and_embed(
     };
     let bm25 = build_chunk_postings(&chunks);
     let blob = CodeChunkBlob {
+        config_digest: digest.to_string(),
         schema_ver: SCHEMA_VER,
         embedding_dim: dim,
         embedding_model: config.documents.embedding_preset.clone(),
@@ -309,36 +347,99 @@ fn build_rows_owned(
 /// same scan wrote chunks. Best-effort: never opens (i.e. never *creates*) the vector store when it
 /// does not already exist, and logs — never propagates — a delete failure.
 pub(crate) fn delete_stale_code_chunks(store: &mut Store, config: &Config, scope: &str, stale: &[String]) {
-    if stale.is_empty() || !should_chunk(config) {
+    if !should_chunk(config) {
         return;
     }
+    delete_code_rows(store, config, scope, stale);
+}
+
+/// Delete the `code_chunks` rows of `paths`, whether they left the scan set or stopped being
+/// embed-eligible. Shared tail of the stale purge and the embed-policy purge; same best-effort,
+/// never-create contract as [`delete_stale_code_chunks`].
+///
+/// Returns `false` only when rows that exist could not be deleted (unknown preset, store open or
+/// delete error); "nothing to delete" and "no vector store" are both `true`.
+pub(crate) fn delete_code_rows(store: &mut Store, config: &Config, scope: &str, paths: &[String]) -> bool {
+    let stale = paths;
+    if stale.is_empty() {
+        return true;
+    }
     if store.lance.is_none() && !store.lance_dir_exists() {
-        return;
+        return true;
     }
     let model = &config.documents.embedding_preset;
     let dim = match SharedEmbedder::load(model, 0, config.resources.embed_batch_size) {
         Ok(embedder) => embedder.dim(),
         Err(error) => {
             tracing::warn!(?error, preset = %model, "code-chunk stale purge: unknown embedding preset; skipping");
-            return;
+            return false;
         }
     };
     let lance = match store.lance_or_open(dim, model) {
         Ok(lance) => lance.clone(),
         Err(error) => {
             tracing::warn!(?error, "code-chunk stale purge: open LanceStore failed; skipping");
-            return;
+            return false;
         }
     };
-    for path in stale {
-        if let Err(error) = lance.delete_code_chunks(scope, path) {
+    if let Err(error) = lance.delete_code_chunks_for_paths(scope, stale) {
+        tracing::warn!(
+            paths = stale.len(),
+            ?error,
+            "code-chunk purge failed; search_code may return a removed or no-longer-embedded path"
+        );
+        return false;
+    }
+    true
+}
+
+/// Drop the derived rows of every indexed source file that is no longer eligible under the current
+/// config: the `code_chunks` vectors of files that are not `embed`-eligible (`embed = false`, or
+/// outside `embed_include` / inside `embed_exclude`), and — when `[code_search] enabled = false` —
+/// the BM25 keyword postings too, so a disabled tier leaves nothing queryable. Run when the embed
+/// policy changed since the last scan; see [`crate::scanner_policy`].
+///
+/// Returns whether the purge fully applied; the caller records the policy only then, so a failed
+/// purge is retried by the next scan instead of being marked done.
+pub(crate) fn purge_unembedded_code(store: &mut Store, config: &Config, filters: &Filters, scope: &str) -> bool {
+    let cfg = &config.code_search;
+    let paths: Vec<String> = store
+        .index
+        .files
+        .keys()
+        .map(|k| k.to_str_lossy().into_owned())
+        .filter(|p| !(cfg.enabled && cfg.embed && filters.code_embed_allowed(p)))
+        .collect();
+    if paths.is_empty() {
+        return true;
+    }
+    let rows = delete_code_rows(store, config, scope, &paths);
+    let postings = cfg.enabled || drop_keyword_postings(store, &paths);
+    rows && postings
+}
+
+fn drop_keyword_postings(store: &Store, paths: &[String]) -> bool {
+    let Some(db) = store.index_db.as_ref() else {
+        return true;
+    };
+    let mut writer = db.writer();
+    for path in paths {
+        if let Err(error) = writer.remove_bm25_file(&crate::path::RelPath::from(path.as_str())) {
             tracing::warn!(
-                rel = %path,
                 ?error,
-                "code-chunk stale purge failed; search_code may return a removed path"
+                "drop keyword postings failed; code search may return stale chunks"
             );
+            return false;
         }
     }
+    if let Err(error) = writer.commit() {
+        tracing::warn!(?error, "commit keyword posting removal failed");
+        return false;
+    }
+    if let Err(error) = db.recompute_bm25_stats() {
+        tracing::warn!(?error, "recompute bm25 stats failed; keyword search may be stale");
+    }
+    true
 }
 
 /// Stream every pending code batch into the `code_chunks` LanceDB table, one file at a time. Opens
@@ -391,6 +492,21 @@ pub(crate) fn flush_code_batches(
     };
 
     let mut inserted = 0usize;
+    let mut pending: PendingBatch<CodeRow> = PendingBatch::default();
+    let write = |pending: &mut PendingBatch<CodeRow>, inserted: &mut usize| {
+        let items = pending.take();
+        let files = items.len();
+        match lance.replace_code_chunks_many(items) {
+            Ok(()) => *inserted += files,
+            Err(error) => {
+                tracing::warn!(
+                    files,
+                    ?error,
+                    "lance replace_code_chunks_many failed; code search may be incomplete"
+                );
+            }
+        }
+    };
     for batch in batches {
         if batch.embedding_dim == 0 {
             continue;
@@ -413,12 +529,13 @@ pub(crate) fn flush_code_batches(
             continue;
         }
         let rows = build_rows_owned(&batch.rel_path, scope, blob.chunks, blob.embeddings);
-        match lance.replace_code_chunks(scope, &batch.rel_path, rows) {
-            Ok(()) => inserted += 1,
-            Err(error) => {
-                tracing::warn!(rel = %batch.rel_path, ?error, "lance replace_code_chunks failed; code search may be incomplete");
-            }
+        pending.push(scope, &batch.rel_path, rows);
+        if pending.is_full() {
+            write(&mut pending, &mut inserted);
         }
+    }
+    if !pending.is_empty() {
+        write(&mut pending, &mut inserted);
     }
     inserted
 }
@@ -483,6 +600,7 @@ mod tests {
 
     fn embedded_blob(model: &str, dim: u16) -> CodeChunkBlob {
         CodeChunkBlob {
+            config_digest: String::new(),
             schema_ver: 0,
             embedding_dim: dim,
             embedding_model: model.to_string(),
@@ -510,6 +628,7 @@ mod tests {
         blob.embeddings.clear();
         assert!(!code_cache_is_reusable(&blob, 768, "balanced"));
         let chunk_only = CodeChunkBlob {
+            config_digest: String::new(),
             schema_ver: 0,
             embedding_dim: 768,
             embedding_model: "balanced".to_string(),
@@ -559,6 +678,157 @@ mod tests {
         assert_eq!(
             CodeSearchConfig::default().max_chunks_per_file,
             crate::config::DocumentsConfig::default().max_chunks_per_document
+        );
+    }
+
+    fn seeded_code_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceStore {
+        let lance = store.lance_or_open(768, "balanced").expect("open lance").clone();
+        for path in paths {
+            let row = CodeRow {
+                scope: "repo:s".to_string(),
+                path: (*path).to_string(),
+                chunk_id: format!("{path}:0"),
+                symbol: "sym".to_string(),
+                kind: "function".to_string(),
+                lang: "rust".to_string(),
+                line_start: 1,
+                line_end: 1,
+                byte_start: 0,
+                byte_end: 4,
+                text: "body".to_string(),
+                embedding: vec![0.25; 768],
+            };
+            lance.replace_code_chunks("repo:s", path, vec![row]).expect("seed row");
+            store.upsert(
+                *path,
+                crate::store::FileEntry {
+                    hash_hex: "h".to_string(),
+                    language: "rust".to_string(),
+                    size_bytes: 1,
+                    mtime: 0,
+                    extract_epoch: crate::extract::EXTRACT_EPOCH,
+                },
+            );
+        }
+        lance
+    }
+
+    fn code_rows(lance: &crate::lance::LanceStore) -> Vec<String> {
+        let mut paths: Vec<String> = lance
+            .search_code_chunks("repo:s", vec![0.25; 768], 50)
+            .expect("search")
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn embed_policy_purge_deletes_vectors_of_newly_ineligible_files_only() {
+        crate::store::init_isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path(), crate::store::VIEW_WORKING).unwrap();
+        let lance = seeded_code_lance(&mut store, &["src/a.rs", "src/generated/b.rs", "lib/c.rs"]);
+        assert_eq!(code_rows(&lance).len(), 3);
+
+        let mut config = crate::config::default_for_root(std::path::Path::new("."));
+        config.code_search.embed = true;
+        config.code_search.embed_exclude = vec!["**/generated/**".to_string()];
+        let filters = Filters::build(&config, Vec::new()).unwrap();
+        purge_unembedded_code(&mut store, &config, &filters, "repo:s");
+        assert_eq!(code_rows(&lance), vec!["lib/c.rs".to_string(), "src/a.rs".to_string()]);
+
+        config.code_search.embed_include = vec!["src/**".to_string()];
+        let filters = Filters::build(&config, Vec::new()).unwrap();
+        purge_unembedded_code(&mut store, &config, &filters, "repo:s");
+        assert_eq!(
+            code_rows(&lance),
+            vec!["src/a.rs".to_string()],
+            "embed_include narrows retroactively"
+        );
+
+        config.code_search.embed = false;
+        let filters = Filters::build(&config, Vec::new()).unwrap();
+        purge_unembedded_code(&mut store, &config, &filters, "repo:s");
+        assert!(code_rows(&lance).is_empty(), "embed = false removes every vector row");
+        assert!(store.lookup("src/a.rs").is_some(), "files stay indexed");
+    }
+
+    #[test]
+    fn a_purge_that_cannot_delete_reports_failure_and_leaves_the_rows() {
+        crate::store::init_isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path(), crate::store::VIEW_WORKING).unwrap();
+        let lance = seeded_code_lance(&mut store, &["src/a.rs"]);
+
+        let mut config = crate::config::default_for_root(std::path::Path::new("."));
+        config.code_search.embed = false;
+        let filters = Filters::build(&config, Vec::new()).unwrap();
+
+        config.documents.embedding_preset = "no-such-preset".to_string();
+        assert!(
+            !purge_unembedded_code(&mut store, &config, &filters, "repo:s"),
+            "an unknown preset means the delete never ran: not applied"
+        );
+        assert_eq!(code_rows(&lance), vec!["src/a.rs".to_string()], "nothing was deleted");
+
+        config.documents.embedding_preset = "balanced".to_string();
+        assert!(purge_unembedded_code(&mut store, &config, &filters, "repo:s"));
+        assert!(code_rows(&lance).is_empty(), "the retry removes the row");
+    }
+
+    #[test]
+    fn disabling_code_search_also_drops_keyword_postings() {
+        crate::store::init_isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path(), crate::store::VIEW_WORKING).unwrap();
+        let rel = crate::path::RelPath::from("src/a.rs");
+        let db = store.index_db.as_ref().expect("index db open");
+        let mut writer = db.writer();
+        writer
+            .upsert_bm25_file(&rel, &build_chunk_postings(&[chunk("h:0", "alpha beta")]))
+            .unwrap();
+        writer.commit().unwrap();
+        db.recompute_bm25_stats().unwrap();
+        assert_eq!(db.bm25_stats().map(|(n, _)| n), Some(1));
+        store.upsert(
+            "src/a.rs",
+            crate::store::FileEntry {
+                hash_hex: "h".to_string(),
+                language: "rust".to_string(),
+                size_bytes: 1,
+                mtime: 0,
+                extract_epoch: crate::extract::EXTRACT_EPOCH,
+            },
+        );
+
+        let mut config = crate::config::default_for_root(std::path::Path::new("."));
+        config.code_search.enabled = false;
+        let filters = Filters::build(&config, Vec::new()).unwrap();
+        purge_unembedded_code(&mut store, &config, &filters, "repo:s");
+        let db = store.index_db.as_ref().unwrap();
+        assert_eq!(
+            db.bm25_stats().map(|(n, _)| n).unwrap_or(0),
+            0,
+            "keyword postings are gone"
+        );
+    }
+
+    #[test]
+    fn chunk_blob_currency_tracks_digest_and_grammar() {
+        let mut blob = embedded_blob("balanced", 768);
+        blob.chunks[0].lang = "rust".to_string();
+        assert!(
+            chunk_blob_is_current(&blob, "d1", "rust"),
+            "legacy blob (no digest) is adoptable"
+        );
+        blob.config_digest = "d1".to_string();
+        assert!(chunk_blob_is_current(&blob, "d1", "rust"));
+        assert!(!chunk_blob_is_current(&blob, "d2", "rust"), "different chunk settings");
+        assert!(
+            !chunk_blob_is_current(&blob, "d1", "python"),
+            "built for another grammar"
         );
     }
 }

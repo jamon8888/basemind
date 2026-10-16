@@ -17,9 +17,11 @@
 //! msgpack blobs. This is fast (no parsing — just decode each L1, push to secondary
 //! indexes) and keeps the on-disk format free to evolve.
 
+pub mod grep_bloom;
 pub mod keys;
 pub mod keys_governance;
 pub mod keys_pii;
+pub(crate) mod name_dict;
 pub mod pii_lineage;
 pub mod writer;
 
@@ -79,6 +81,7 @@ const KEYSPACE_MEMTABLE_BYTES: &[(&str, u64)] = &[
     ("refs_by_path", MEMTABLE_WARM_BYTES),
     ("code_bm25_postings", MEMTABLE_HOT_BYTES),
     ("code_bm25_by_path", MEMTABLE_WARM_BYTES),
+    ("grep_bloom", MEMTABLE_COLD_BYTES),
     ("embeddings", MEMTABLE_COLD_BYTES),
     ("memory_by_key", MEMTABLE_COLD_BYTES),
     ("memory_archive", MEMTABLE_COLD_BYTES),
@@ -261,6 +264,9 @@ pub struct IndexDb {
     pub(crate) symbols_by_name: Keyspace,
     pub(crate) calls_by_path: Keyspace,
     pub(crate) calls_by_callee: Keyspace,
+    /// Distinct callee names of `calls_by_callee`; lets the substring name scan range-scan only the
+    /// matching names instead of walking the partition.
+    pub(crate) callee_names: std::sync::Arc<name_dict::NameDict>,
     /// Reserved fast-path partition: written on every upsert so that future
     /// `dependents`-by-module queries can use a prefix scan instead of iterating the
     /// full import set. Not yet read by any MCP query path; kept to avoid a schema
@@ -269,6 +275,8 @@ pub struct IndexDb {
     pub(crate) imports_by_path: Keyspace,
     /// `implementations_by_trait`: prefix scans on trait name — backs `find_implementations`.
     pub(crate) implementations_by_trait: Keyspace,
+    /// Distinct trait names of `implementations_by_trait`, as [`Self::callee_names`] is for callees.
+    pub(crate) trait_names: std::sync::Arc<name_dict::NameDict>,
     /// `implementations_by_path`: companion to keep the per-file delete on upsert O(prefix).
     pub(crate) implementations_by_path: Keyspace,
     /// `refs_by_def`: scope/import-resolved reference edges keyed by defining site — backs the
@@ -285,6 +293,11 @@ pub struct IndexDb {
     /// `code_bm25_by_path`: forward companion keyed by file → its chunks' `(chunk_id, doclen,
     /// terms)`, so a re-scan deletes the previous postings in O(prefix). Always created.
     pub(crate) code_bm25_by_path: Keyspace,
+    /// `grep_bloom`: file path -> per-file trigram bloom filter + the `(size, mtime_ns)` stamp it was
+    /// built under (see [`grep_bloom`]). A candidate PREFILTER for `code grep` only; a missing or
+    /// stale row means "candidate", which is why this partition was added without a schema bump and
+    /// backfills on rescan.
+    pub(crate) grep_bloom: Keyspace,
     #[allow(dead_code)]
     pub(crate) embeddings: Keyspace,
     /// `memory_by_key`: scope + key → msgpack `MemoryRecord`.
@@ -306,6 +319,57 @@ pub struct IndexDb {
     pub(crate) pii_lineage: Keyspace,
 }
 
+/// Flush/compaction threads per index database. fjall defaults to `min(cores, 4)` per `Database`, and
+/// the daemon holds one per hot workspace, so the default multiplies into dozens of mostly idle threads.
+const FJALL_WORKER_THREADS: usize = 2;
+
+/// Journal ceiling per index database (fjall's minimum; its default is 512 MiB). Recovery replays every
+/// unflushed journal into memtables on open, so an oversized journal is a multi-GB allocation on every
+/// workspace open; a 2.5 GiB single journal was observed on a scanned worktree.
+const FJALL_MAX_JOURNAL_BYTES: u64 = 64 * 1_024 * 1_024;
+
+/// Journal size past which `open` flushes every keyspace, so the next open does not replay it again.
+const JOURNAL_FLUSH_ON_OPEN_BYTES: u64 = 256 * 1_024 * 1_024;
+
+/// Total bytes of fjall journal files under `view_dir`'s index database, WITHOUT opening it (opening
+/// replays every journal into memtables, which is the cost being measured). Zero when absent.
+pub fn journal_bytes_on_disk(view_dir: &Path) -> u64 {
+    // fjall keeps its journals as `<n>.jnl` files directly under the database directory.
+    std::fs::read_dir(view_dir.join(INDEX_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jnl"))
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Whether the index database under `view_dir` carries a journal big enough that opening it is a
+/// memory spike (the threshold at which `open` itself flushes).
+pub fn journal_exceeds_open_budget(view_dir: &Path) -> bool {
+    journal_bytes_on_disk(view_dir) > JOURNAL_FLUSH_ON_OPEN_BYTES
+}
+
+/// Read the fjall `meta.schema_ver` under `view_dir` WITHOUT the wipe-on-mismatch that
+/// [`IndexDb::open`] performs. `Ok(None)` when the database carries no version. Used by the
+/// worktree view seeder to vet a cloned view before it is promoted into place.
+pub fn peek_index_schema_ver(view_dir: &Path) -> Result<Option<u32>, IndexError> {
+    let dir = view_dir.join(INDEX_DIR);
+    let db = Database::builder(&dir)
+        .cache_size(8 * 1_024 * 1_024)
+        .worker_threads(FJALL_WORKER_THREADS)
+        .max_journaling_size(FJALL_MAX_JOURNAL_BYTES)
+        .open()?;
+    let meta = open_keyspace(&db, "meta")?;
+    let ver = meta
+        .get(META_SCHEMA_VER)?
+        .and_then(|bytes| <[u8; 4]>::try_from(&bytes[..]).ok())
+        .map(u32::from_be_bytes);
+    Ok(ver)
+}
+
 impl IndexDb {
     /// Open (or create) the index DB under `view_dir`. On schema-version mismatch the
     /// scanner-derived keyspaces are cleared and rebuilt via `IndexWriter`;
@@ -318,7 +382,11 @@ impl IndexDb {
             source,
         })?;
         let cache_bytes = index_cache_bytes(&dir);
-        let db = Database::builder(&dir).cache_size(cache_bytes).open()?;
+        let db = Database::builder(&dir)
+            .cache_size(cache_bytes)
+            .worker_threads(FJALL_WORKER_THREADS)
+            .max_journaling_size(FJALL_MAX_JOURNAL_BYTES)
+            .open()?;
         let meta = open_keyspace(&db, "meta")?;
         let on_disk_ver = meta
             .get(META_SCHEMA_VER)?
@@ -340,6 +408,7 @@ impl IndexDb {
                 "code_bm25_postings",
                 "code_bm25_by_path",
                 "embeddings",
+                "name_dict",
             ] {
                 open_keyspace(&db, name)?.clear()?;
             }
@@ -356,6 +425,7 @@ impl IndexDb {
         let refs_by_path = open_keyspace(&db, "refs_by_path")?;
         let code_bm25_postings = open_keyspace(&db, "code_bm25_postings")?;
         let code_bm25_by_path = open_keyspace(&db, "code_bm25_by_path")?;
+        let grep_bloom = open_keyspace(&db, "grep_bloom")?;
         let embeddings = open_keyspace(&db, "embeddings")?;
         let memory_by_key = open_keyspace(&db, "memory_by_key")?;
         let memory_archive = open_keyspace(&db, "memory_archive")?;
@@ -364,6 +434,36 @@ impl IndexDb {
 
         meta.insert(META_SCHEMA_VER, INDEX_SCHEMA_VER.to_be_bytes())?;
 
+        if db.journal_disk_space().unwrap_or(0) > JOURNAL_FLUSH_ON_OPEN_BYTES {
+            for keyspace in [
+                &symbols_by_path,
+                &symbols_by_name,
+                &calls_by_path,
+                &calls_by_callee,
+                &imports_by_module,
+                &imports_by_path,
+                &implementations_by_trait,
+                &implementations_by_path,
+                &refs_by_def,
+                &refs_by_path,
+                &code_bm25_postings,
+                &code_bm25_by_path,
+                &grep_bloom,
+                &embeddings,
+                &memory_by_key,
+                &memory_archive,
+                &proposals,
+                &meta,
+            ] {
+                // Best-effort: the flush only spares the NEXT open a replay. On a full or read-only disk
+                // it fails, and that must not make the workspace unopenable.
+                if let Err(error) = keyspace.rotate_memtable_and_wait() {
+                    tracing::warn!(%error, "index journal flush on open failed; continuing with the replayed journal");
+                    break;
+                }
+            }
+        }
+
         Ok(Self {
             db,
             meta,
@@ -371,14 +471,17 @@ impl IndexDb {
             symbols_by_name,
             calls_by_path,
             calls_by_callee,
+            callee_names: std::sync::Arc::default(),
             imports_by_module,
             imports_by_path,
             implementations_by_trait,
+            trait_names: std::sync::Arc::default(),
             implementations_by_path,
             refs_by_def,
             refs_by_path,
             code_bm25_postings,
             code_bm25_by_path,
+            grep_bloom,
             embeddings,
             memory_by_key,
             memory_archive,

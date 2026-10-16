@@ -1,13 +1,13 @@
 //! `ServerHandler` trait implementation for [`BasemindServer`], split out of `mod.rs` to keep both
 //! files under the 1000-line module cap. Behavior is unchanged: this is the same `#[tool_handler]`
 //! impl the macro would generate around the hand-written `list_tools` / `call_tool` / `get_tool` /
-//! prompt / logging / completion overrides.
+//! prompt / completion overrides.
 
 use rmcp::ServerHandler;
 use rmcp::model::{
     CacheScope, CompleteRequestParams, CompleteResult, GetPromptRequestParams, GetPromptResponse, ListPromptsResult,
     ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
-    ServerInfo,
+    ServerConfig,
 };
 use rmcp::tool_handler;
 
@@ -93,9 +93,18 @@ impl ServerHandler for BasemindServer {
             )));
         }
         let should_deliver_comms = request.name != "agents";
+        let cancel_aware = tasks::is_cancel_aware_read(&request.name, request.arguments.as_ref());
         let _admission = admission;
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let response = self.tool_router.call(tcc).await?;
+        // Pure read-only heavy modes race the client's cancellation: the handler future (and the
+        // admission permit it keeps alive alongside) is dropped the moment the request is cancelled.
+        // Mutating modes never take this branch — see `tasks::CANCEL_AWARE_READS`.
+        let response = if cancel_aware {
+            let ct = tcc.request_context.ct.clone();
+            tasks::run_until_cancelled(ct.cancelled(), self.tool_router.call(tcc)).await?
+        } else {
+            self.tool_router.call(tcc).await?
+        };
         #[cfg(all(feature = "comms", any(unix, windows)))]
         let mut response = response;
         #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -174,33 +183,51 @@ impl ServerHandler for BasemindServer {
         self.prompt_router.get_prompt(prompt_context).await
     }
 
-    /// `resources/list`: the redacted `safe/` mirror of a hacienda Safe workspace, and nothing else.
-    /// An agent whose shell is confined to that folder reads it through here.
+    /// `resources/list`: the union of upstream's static outline resources (see [`super::resources`])
+    /// and this fork's `safe/` file resources (see [`safe_resources`]).
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListResourcesResult, rmcp::ErrorData> {
         let root = self.state.shared.root.clone();
-        tokio::task::spawn_blocking(move || safe_resources::list(&root))
+        let safe_items = tokio::task::spawn_blocking(move || safe_resources::list(&root))
             .await
-            .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/list task failed: {error}"), None))
+            .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/list task failed: {error}"), None))?;
+        let mut result = self.list_resources_result();
+        result.resources.extend(safe_items.resources);
+        Ok(result)
     }
 
-    /// `resources/read`: one file under `safe/` as text. Every path that could reach outside it
-    /// (`..`, absolute, encoded separators, a symlink pointing out) is refused; see
-    /// [`safe_resources`].
+    /// `resources/templates/list`: the parameterised resources.
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, rmcp::ErrorData> {
+        Ok(self.list_resource_templates_result())
+    }
+
+    /// `resources/read`: `basemind://safe/<path>` reads one file under `safe/` as text (every path
+    /// that could reach outside it — `..`, absolute, encoded separators, a symlink pointing out —
+    /// is refused; see [`safe_resources`]); every other `basemind://` URI delegates to upstream's
+    /// outline dispatchers (status, repo map, outline, memory).
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ReadResourceResponse, rmcp::ErrorData> {
-        let root = self.state.shared.root.clone();
         let uri = request.uri;
-        let result = tokio::task::spawn_blocking(move || safe_resources::read(&root, &uri))
-            .await
-            .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/read task failed: {error}"), None))??;
-        Ok(result.into())
+        if uri.starts_with(safe_resources::URI_PREFIX) {
+            let root = self.state.shared.root.clone();
+            let result = tokio::task::spawn_blocking(move || safe_resources::read(&root, &uri))
+                .await
+                .map_err(|error| {
+                    rmcp::ErrorData::internal_error(format!("resources/read task failed: {error}"), None)
+                })??;
+            return Ok(result.into());
+        }
+        Ok(self.read_resource_uri(&uri).await?.into())
     }
 
     /// `logging/setLevel`: record the minimum severity the client wants. Subsequent log
@@ -229,15 +256,13 @@ impl ServerHandler for BasemindServer {
         Ok(self.complete_argument(&request))
     }
 
-    #[allow(deprecated)]
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .enable_resources()
                 .enable_completions()
-                .enable_logging()
                 .enable_tasks()
                 .build(),
         )
@@ -252,9 +277,8 @@ impl ServerHandler for BasemindServer {
             "basemind is this repository's indexed context layer: a tree-sitter code map (symbols, \
              references, callers, call graphs), git history and blame at symbol resolution, \
              full-text and semantic search, document RAG, and shared cross-session memory. The \
-             index lives in a machine-global cache keyed by workspace (override \
-             BASEMIND_DATA_HOME); nothing is written into the repo, and a daemon is its sole \
-             writer, so any number of sessions read and write concurrently.\n\
+             index lives in a machine-global cache (override BASEMIND_DATA_HOME); nothing is \
+             written into the repo and any number of sessions share it.\n\
              Every tool takes a required mode; read its description for the modes it offers.\n\
              basemind first, shell/grep/git fallback. These tools return paths, line numbers, and \
              signatures rather than file bodies, so they cost a fraction of the tokens of reading \
@@ -263,7 +287,8 @@ impl ServerHandler for BasemindServer {
              over grepping call sites; code mode grep over ripgrep; code mode find to locate a file \
              by name; git modes recent, blame, blame_symbol, diff and touching over git log or git \
              blame; graph modes calls, neighbors and map to see what reaches what; memory mode \
-             documents over opening PDFs; web modes scrape, crawl and map for the web. Do not \
+             documents over opening PDFs, markdown, config or data files (the code map holds code \
+             only); web modes scrape, crawl and map for the web. Do not \
              re-read a file basemind already mapped. Run admin mode rescan after edits; if a tool \
              reports no indexed files, run basemind scan first.\n\
              You may be one of several agents in this repo, so coordinate rather than assuming you \

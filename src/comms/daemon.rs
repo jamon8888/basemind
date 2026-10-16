@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
+use super::daemon_handlers::PostFields;
 use super::git_history_ops::HistoryEntry;
 use super::ids::{AgentId, ThreadId};
 use super::protocol::{CommsOut, CommsRequest, CommsResponse};
@@ -69,7 +70,7 @@ pub const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
 pub const BOOTSTRAP_TIMEOUT_ENV: &str = "BASEMIND_COMMS_BOOTSTRAP_SECS";
 
 /// Env var overriding [`IDLE_REAP_AFTER`], in whole seconds. Exists so tests can exercise the reap
-/// without sleeping for half an hour; also a field escape hatch for a machine that wants daemons to
+/// without sleeping for ten minutes; also a field escape hatch for a machine that wants daemons to
 /// linger (or vanish) more aggressively.
 pub const IDLE_REAP_AFTER_ENV: &str = "BASEMIND_COMMS_IDLE_REAP_SECS";
 /// Env var overriding [`IDLE_REAP_CHECK_EVERY`], in whole seconds. See [`IDLE_REAP_AFTER_ENV`].
@@ -199,7 +200,12 @@ pub struct Broker {
     pub(super) registry: Mutex<Registry>,
     /// The machine-wide repo/worktree/branch/workspace registry (distinct from the `registry` sink
     /// map above). The daemon is its sole writer; coordination tools read/mutate through it.
-    machine_registry: Mutex<MachineRegistry>,
+    machine_registry: Arc<Mutex<MachineRegistry>>,
+    /// Serializes store mutations (see [`Broker::store_write`]); held only on blocking threads.
+    pub(super) store_write_gate: Arc<std::sync::Mutex<()>>,
+    /// Test hook: milliseconds the NEXT store call sleeps for on its blocking thread, then resets.
+    #[cfg(test)]
+    pub(super) store_delay_ms: Arc<AtomicU64>,
     /// Serializes destructive global blob GC against in-flight rescans. Rescans take the READ side
     /// (many workspaces rescan concurrently); the GC sweep takes the WRITE side. A rescan writes new
     /// content-addressed blobs BEFORE its `index.msgpack` (which `collect_referenced_hashes` reads)
@@ -288,7 +294,10 @@ impl Broker {
                 sinks: AHashMap::new(),
                 state: LifecycleState::Starting,
             }),
-            machine_registry: Mutex::new(machine_registry),
+            machine_registry: Arc::new(Mutex::new(machine_registry)),
+            store_write_gate: Arc::new(std::sync::Mutex::new(())),
+            #[cfg(test)]
+            store_delay_ms: Arc::new(AtomicU64::new(0)),
             blob_gc_lock: RwLock::new(()),
             shutdown: std::sync::OnceLock::new(),
             comms_dir: std::sync::OnceLock::new(),
@@ -445,7 +454,7 @@ impl Broker {
                 return;
             }
         };
-        let _conn = match self.workspaces.begin_conn(&hello.root) {
+        let _conn = match self.workspaces.begin_conn_async(&hello.root).await {
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "relay: connection accounting failed");
@@ -704,6 +713,31 @@ impl Broker {
         result
     }
 
+    /// The signal raised when a pass displaced artifacts (see
+    /// [`WorkspacePool::cleanup_signal`](super::workspace_pool::WorkspacePool)); the daemon's cleanup
+    /// task waits on it to run a prompt blob sweep.
+    pub fn cleanup_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.workspaces.cleanup_signal()
+    }
+
+    /// Handle one request on a link and frame its answer: a [`CommsRequest::Call`] is unwrapped and
+    /// answered with a [`CommsOut::Reply`] echoing its id; a bare request gets the uncorrelated
+    /// [`CommsOut::Response`].
+    pub async fn handle_framed(
+        &self,
+        req: CommsRequest,
+        session: &mut Session,
+        link_tx: &mpsc::Sender<CommsOut>,
+    ) -> CommsOut {
+        match req {
+            CommsRequest::Call { id, request } => CommsOut::Reply {
+                id,
+                response: self.handle(*request, session, link_tx).await,
+            },
+            bare => CommsOut::Response(self.handle(bare, session, link_tx).await),
+        }
+    }
+
     /// Handle one request on a link. Returns the direct response.
     pub async fn handle(
         &self,
@@ -712,13 +746,16 @@ impl Broker {
         link_tx: &mpsc::Sender<CommsOut>,
     ) -> CommsResponse {
         self.touch();
-        if let Some(agent) = session.agent.as_ref()
-            && let Err(error) = self
-                .store
-                .touch_agent_if_stale(agent, super::store::AGENT_TOUCH_INTERVAL)
-        {
-            self.note_store_error("touch_agent", &error).await;
-            tracing::warn!(%error, agent = %agent, "comms: refresh agent activity failed");
+        if let Some(agent) = session.agent.clone() {
+            let touched = {
+                let agent = agent.clone();
+                self.store_write(move |store| store.touch_agent_if_stale(&agent, super::store::AGENT_TOUCH_INTERVAL))
+                    .await
+            };
+            if let Err(error) = touched {
+                self.note_store_error("touch_agent", &error).await;
+                tracing::warn!(%error, agent = %agent, "comms: refresh agent activity failed");
+            }
         }
         let method = req.method();
         match self.dispatch(req, session, link_tx).await {
@@ -746,62 +783,77 @@ impl Broker {
                 remote,
                 cwd,
             } => {
-                let resp = self.on_hello(agent, proto_ver, remote, cwd.clone(), session)?;
+                let resp = self.on_hello(agent, proto_ver, remote, cwd.clone(), session).await?;
                 if let (CommsResponse::Welcome { .. }, Some(root)) = (&resp, cwd) {
-                    let mut registry = self.machine_registry.lock().await;
-                    if let Err(error) = registry.register_workspace(&root) {
+                    let target = root.clone();
+                    if let Err(error) = self.registry_blocking(move |reg| reg.register_workspace(&target)).await {
                         tracing::warn!(%error, root = %root.display(), "comms: registry auto-register failed");
                     }
                 }
                 Ok(resp)
             }
-            CommsRequest::Register { card } => self.on_register(session, card),
-            CommsRequest::ListAgents { thread } => self.on_list_agents(thread),
-            request @ CommsRequest::Cleanup { .. } => Ok(self.on_agents_cleanup_request(request)),
-            CommsRequest::AgentsStatus { agent_ttl_secs } => Ok(self.on_agents_status(agent_ttl_secs)),
+            CommsRequest::Register { card } => self.on_register(session, card).await,
+            CommsRequest::ListAgents { thread } => self.on_list_agents(thread).await,
+            request @ CommsRequest::Cleanup { .. } => Ok(self.on_agents_cleanup_request(request).await),
+            CommsRequest::AgentsStatus { agent_ttl_secs } => Ok(self.on_agents_status(agent_ttl_secs).await),
             CommsRequest::ThreadStart { subject, path, members } => {
                 self.on_thread_start(session, subject, path, members).await
             }
-            CommsRequest::ThreadJoin { thread } => self.on_thread_join(session, thread),
-            CommsRequest::ThreadLeave { thread } => self.on_thread_leave(session, thread),
+            CommsRequest::ThreadJoin { thread } => self.on_thread_join(session, thread).await,
+            CommsRequest::ThreadLeave { thread } => self.on_thread_leave(session, thread).await,
             CommsRequest::ThreadList {
                 remote,
                 cwd,
                 subject_contains,
                 include_archived,
-            } => self.on_thread_list(session, remote, cwd, subject_contains, include_archived),
+            } => {
+                self.on_thread_list(session, remote, cwd, subject_contains, include_archived)
+                    .await
+            }
             CommsRequest::ThreadPost {
                 thread,
                 subject,
                 tags,
                 reply_to,
                 body,
-            } => self.on_post(session, thread, subject, tags, reply_to, body).await,
+                idempotency_key,
+            } => {
+                let fields = PostFields {
+                    subject,
+                    tags,
+                    reply_to,
+                    body,
+                    idempotency_key,
+                };
+                self.on_post(session, thread, fields).await
+            }
             CommsRequest::ThreadHistory {
                 thread,
                 cursor,
                 limit,
                 since_micros,
-            } => self.on_history(thread, cursor, limit, since_micros),
-            CommsRequest::ThreadMembers { thread } => self.on_thread_members(thread),
-            CommsRequest::ThreadAddMember { thread, member } => self.on_thread_add_member(session, thread, member),
-            CommsRequest::ThreadRemoveMember { thread, member } => {
-                self.on_thread_remove_member(session, thread, member)
+            } => self.on_history(thread, cursor, limit, since_micros).await,
+            CommsRequest::ThreadMembers { thread } => self.on_thread_members(thread).await,
+            CommsRequest::ThreadAddMember { thread, member } => {
+                self.on_thread_add_member(session, thread, member).await
             }
-            CommsRequest::ThreadArchive { thread } => self.on_thread_archive(session, thread),
-            CommsRequest::GetBody { message_id } => self.on_get_body(session, message_id),
+            CommsRequest::ThreadRemoveMember { thread, member } => {
+                self.on_thread_remove_member(session, thread, member).await
+            }
+            CommsRequest::ThreadArchive { thread } => self.on_thread_archive(session, thread).await,
+            CommsRequest::GetBody { message_id } => self.on_get_body(session, message_id).await,
             CommsRequest::Inbox {
                 cursor,
                 limit,
                 mark_read,
                 since_micros,
                 ..
-            } => self.on_inbox(session, cursor, limit, mark_read, since_micros),
+            } => self.on_inbox(session, cursor, limit, mark_read, since_micros).await,
             CommsRequest::AckInbox {
                 message_ids,
                 thread,
                 to_seq,
-            } => self.on_ack(session, message_ids, thread, to_seq),
+            } => self.on_ack(session, message_ids, thread, to_seq).await,
             CommsRequest::Subscribe { thread } => self.on_subscribe(session, thread, link_tx).await,
             CommsRequest::SubscribeInbox { thread } => self.on_subscribe_inbox(session, thread, link_tx).await,
             CommsRequest::Unsubscribe { sub } => self.on_unsubscribe(sub).await,
@@ -812,6 +864,7 @@ impl Broker {
                 embed,
             } => Ok(self.on_rescan(root, paths, full, embed).await),
             CommsRequest::ResolvedRefs { root, query } => Ok(self.on_resolved_refs(root, query).await),
+            CommsRequest::IndexRead { root, query } => Ok(self.on_index_read(root, query).await),
             CommsRequest::CodeSearchLanes { root, query } => Ok(self.on_code_search_lanes(root, query).await),
             CommsRequest::GitHistory { root, op } => Ok(self.on_git_history(root, op).await),
             #[cfg(feature = "memory")]
@@ -835,123 +888,11 @@ impl Broker {
             CommsRequest::Ping => Ok(CommsResponse::Pong),
             CommsRequest::Status => self.on_status().await,
             CommsRequest::Stop => Ok(self.on_stop().await),
-        }
-    }
-
-    /// Scan/rescan a workspace on the sole-writer pool. The scan is CPU-bound, so it runs on a
-    /// blocking thread while the reactor keeps serving other links. A scan/store error becomes a
-    /// `CommsResponse::Error` (never a torn link).
-    async fn on_rescan(
-        &self,
-        root: std::path::PathBuf,
-        paths: Option<Vec<std::path::PathBuf>>,
-        full: bool,
-        embed: bool,
-    ) -> CommsResponse {
-        self.mark_active().await;
-        // A tripped scan token means the daemon is draining (every drain route cancels first, ~keep
-        // and the token never un-trips). Launching a scan now would only produce a doomed ~keep
-        // partial pass that defeats coalescing — refuse instead; the client retries against ~keep
-        // the next daemon. ~keep
-        if self.scan_cancel.is_cancelled() {
-            return CommsResponse::Error {
-                code: "rescan_draining".to_string(),
-                message: "daemon draining; rescan refused (retry against the next daemon)".to_string(),
-            };
-        }
-        let _rescan_guard = self.blob_gc_lock.read().await;
-        let pool = Arc::clone(&self.workspaces);
-        let cancel = self.scan_cancel.clone();
-        let started = Instant::now();
-        match tokio::task::spawn_blocking(move || pool.rescan(&root, paths, full, embed, &cancel)).await {
-            // A cancelled pass committed only part of the tree — surface it as an error so no ~keep
-            // client mistakes the partial index for a completed rescan. ~keep
-            Ok(Ok((_, true))) => CommsResponse::Error {
-                code: "rescan_cancelled".to_string(),
-                message: "daemon draining; partial scan committed".to_string(),
-            },
-            Ok(Ok((stats, false))) => CommsResponse::Rescanned {
-                scanned: stats.scanned,
-                updated: stats.updated,
-                docs_indexed: stats.docs_indexed,
-                removed: stats.removed,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            },
-            Ok(Err(error)) => CommsResponse::Error {
-                code: "rescan_failed".to_string(),
-                message: error.to_string(),
-            },
-            Err(join) => CommsResponse::Error {
-                code: "rescan_panicked".to_string(),
-                message: join.to_string(),
-            },
-        }
-    }
-
-    /// Report the daemon's currently-hot workspaces for the statusline.
-    fn on_accessed_paths(&self) -> CommsResponse {
-        CommsResponse::Accessed {
-            workspaces: self.workspaces.accessed(),
-        }
-    }
-
-    /// List every registered workspace in the machine registry.
-    async fn on_workspaces_list(&self) -> CommsResponse {
-        let registry = self.machine_registry.lock().await;
-        CommsResponse::Workspaces {
-            workspaces: registry.workspaces(),
-        }
-    }
-
-    /// List a registered repo's worktrees. An unknown repo id yields an empty list.
-    async fn on_worktrees_list(&self, repo_id: String) -> CommsResponse {
-        let registry = self.machine_registry.lock().await;
-        CommsResponse::Worktrees {
-            worktrees: registry.worktrees(&repo_id),
-        }
-    }
-
-    /// List a registered repo's local branches. An unknown repo id yields an empty list.
-    async fn on_branches_list(&self, repo_id: String) -> CommsResponse {
-        let registry = self.machine_registry.lock().await;
-        CommsResponse::Branches {
-            branches: registry.branches(&repo_id),
-        }
-    }
-
-    /// Advisory-claim a worktree. An unknown `(repo_id, name)` returns `held = false`.
-    async fn on_worktree_claim(&self, repo_id: String, name: String, claimant: String) -> CommsResponse {
-        let mut registry = self.machine_registry.lock().await;
-        match registry.claim_worktree(&repo_id, &name, &claimant) {
-            Ok(held) => CommsResponse::ClaimOutcome { held },
-            Err(error) => registry_error(error),
-        }
-    }
-
-    /// Drop machine-registry rows whose on-disk path is gone, returning how many were removed.
-    ///
-    /// The registry is append-only by construction: a row is written when a workspace registers and
-    /// nothing ever retires it, so every throwaway checkout and test tempdir stays forever and buries
-    /// the live repos `workspace workspaces` exists to surface. Called from the daemon's periodic
-    /// maintenance pass; a failure is logged and reported as zero rather than propagated, because a
-    /// prune is opportunistic housekeeping and must never take the daemon down.
-    pub async fn prune_missing_registry_rows(&self) -> usize {
-        let mut registry = self.machine_registry.lock().await;
-        match registry.prune_missing() {
-            Ok(removed) => removed,
-            Err(error) => {
-                tracing::warn!(%error, "comms: machine registry prune failed");
-                0
-            }
-        }
-    }
-
-    /// Release an advisory worktree claim held by `claimant`.
-    async fn on_worktree_release(&self, repo_id: String, name: String, claimant: String) -> CommsResponse {
-        let mut registry = self.machine_registry.lock().await;
-        match registry.release_worktree(&repo_id, &name, &claimant) {
-            Ok(held) => CommsResponse::ClaimOutcome { held },
-            Err(error) => registry_error(error),
+            // `handle_framed` unwraps the one legal level of `Call`; a nested one is malformed.
+            CommsRequest::Call { .. } => Ok(CommsResponse::Error {
+                code: "nested_call".to_string(),
+                message: "a correlated call cannot wrap another call".to_string(),
+            }),
         }
     }
 }
@@ -965,6 +906,12 @@ pub struct Session {
     /// The scope chain captured at Hello, used for path-glob discovery.
     pub chain: Option<ScopeChain>,
 }
+
+#[path = "daemon_workspace_handlers.rs"]
+mod workspace_handlers;
+
+#[path = "daemon_store_blocking.rs"]
+mod store_blocking;
 
 #[path = "daemon_response.rs"]
 mod response;

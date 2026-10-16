@@ -38,12 +38,18 @@ impl CommsClient {
                 scanned,
                 updated,
                 docs_indexed,
+                docs_degraded,
+                docs_text_fallback,
+                doc_timeouts,
                 removed,
                 elapsed_ms,
             } => Ok(RescanReport {
                 scanned,
                 updated,
                 docs_indexed,
+                docs_degraded,
+                docs_text_fallback,
+                doc_timeouts,
                 removed,
                 elapsed_ms,
             }),
@@ -97,6 +103,20 @@ impl CommsClient {
         match self.request(CommsRequest::ResolvedRefs { root, query }).await? {
             CommsResponse::ResolvedRefs(result) => Ok(result),
             other => Err(self.shape_err(other, "resolved_refs")),
+        }
+    }
+
+    /// Forward a fjall-backed reference scan to the daemon (the sole fjall writer). Backs
+    /// `references` / `callers` / `implementations` on a `daemon_writer` serve, which has no index
+    /// to scan. A pure read, so the transparent reconnect-and-retry is replay-safe.
+    pub async fn index_read(
+        &mut self,
+        root: PathBuf,
+        query: crate::comms::index_read_proto::IndexReadQuery,
+    ) -> Result<crate::comms::index_read_proto::IndexReadResult, CommsClientError> {
+        match self.request(CommsRequest::IndexRead { root, query }).await? {
+            CommsResponse::IndexRead(result) => Ok(result),
+            other => Err(self.shape_err(other, "index_read")),
         }
     }
 

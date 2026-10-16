@@ -31,6 +31,8 @@ mod daemon_forward_handlers;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod daemon_guards;
 #[cfg(all(feature = "comms", any(unix, windows)))]
+mod daemon_handler_helpers;
+#[cfg(all(feature = "comms", any(unix, windows)))]
 mod daemon_handlers;
 /// Second `impl Broker` block: terminal-store-failure detection and the self-shutdown it triggers,
 /// split out of `daemon.rs` for the line cap.
@@ -64,6 +66,8 @@ pub mod http_auth;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod http_frontend;
 #[cfg(all(feature = "comms", any(unix, windows)))]
+pub mod index_read_proto;
+#[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod keys;
 #[cfg(all(feature = "comms", feature = "memory"))]
 pub mod memory_proto;
@@ -75,7 +79,6 @@ pub mod proposals_proto;
 pub mod protocol;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod relay;
-#[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod resolved_proto;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod scope;
@@ -89,6 +92,27 @@ pub mod store_health;
 pub mod transport;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod workspace_pool;
+
+/// A fresh, collision-resistant key for one logical post (pid + clock + counter + a per-process
+/// random seed; no crypto strength needed, only uniqueness per agent and thread).
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub fn new_idempotency_key() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!(
+        "{:x}-{:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        hasher.finish()
+    )
+}
 
 /// Schema version for the comms store, bound to the release minor exactly like
 /// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. A mismatch wipes the comms store and the

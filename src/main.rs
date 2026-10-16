@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use basemind::config::{self, Config, DocumentsCliOverrides};
@@ -10,14 +10,11 @@ use basemind::render::{self, Verbosity};
 use basemind::store::{LockHolder, Store};
 use basemind::watcher::{BatchKind, WatchBatch};
 
-#[cfg(feature = "agent-tui")]
-mod agent_cmd;
 mod comms_cli;
+mod doctor_cli;
 mod lang_cli;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod stdio_relay;
-#[cfg(feature = "desktop-ui")]
-mod ui_cmd;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -43,9 +40,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-    /// Emit machine-readable JSON instead of the human-readable rendering. Applies
-    /// to the tool subcommands (query / git / memory / web / telemetry / cache) and
-    /// is ignored — with a warning — on init / scan / rescan / watch / hook / lang.
+    /// Emit machine-readable JSON instead of the human-readable rendering. Applies to the tool
+    /// subcommands (code / git / graph / memory / web / shell / admin / status / cache), the
+    /// coordination groups (agents / workspace / comms / daemon) and doctor. It is ignored, with a
+    /// warning, on init / scan / rescan / watch / hook / lang / completions / man / statusline /
+    /// serve and the stdin filters (compress-output / delta / checkpoint / detect-waste).
     #[arg(long, global = true)]
     json: bool,
 
@@ -92,7 +91,7 @@ enum Cmd {
     #[cfg(all(feature = "shells", any(unix, windows)))]
     #[command(subcommand)]
     Shell(basemind::cli::shell::ShellCmd),
-    /// Server + cache administration: status, repo, rescan, caches, telemetry, compression.
+    /// Repository identity, telemetry, compression, token counting and retrieval evaluation.
     #[command(subcommand)]
     Admin(basemind::cli::admin::AdminCmd),
     /// Encrypted PII rehydration map operations: encrypt, decrypt, find, forget, inspect.
@@ -102,8 +101,20 @@ enum Cmd {
     /// Install a pre-commit hook that runs `basemind scan --staged`.
     Hook {
         #[command(subcommand)]
-        action: HookCmd,
+        action: basemind::cli::hook::HookCmd,
     },
+    /// Check this installation and workspace: root, config, index, grammars, hook, daemon. Exits 1
+    /// when a check fails.
+    Doctor,
+    /// Index health for this workspace: file counts, languages, scan age.
+    Status,
+    /// Print a shell completion script to stdout (`basemind completions zsh > _basemind`).
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page (roff) to stdout (`basemind man > basemind.1`).
+    Man,
     /// Manage downloaded tree-sitter grammars.
     Lang {
         #[command(subcommand)]
@@ -125,22 +136,14 @@ enum Cmd {
     /// Run an MCP server for a stdio client: ensure the daemon (the real server) is up, then relay
     /// this process's stdin/stdout to it. HTTP-native clients skip this and dial the daemon URL
     /// directly (see `daemon ensure`).
-    Serve(ServeArgs),
-    /// Launch the basemind agent TUI (a coding agent over the code map, needs `--features
-    /// agent-tui`).
-    #[cfg(feature = "agent-tui")]
-    Agent(AgentArgs),
-    /// Launch the basemind desktop UI (an interactive code graph over the code map, needs
-    /// `--features desktop-ui`).
-    #[cfg(feature = "desktop-ui")]
-    Ui(UiArgs),
+    Serve,
     /// Detect CPU feature flags (AVX2, AVX, SSE, NEON) for ONNX model compatibility.
     /// Prints JSON to stdout and exits. No server needed.
     CpuFeatures,
     /// Print a compact one-line summary of the daemon's currently-hot workspaces, for a shell
     /// statusline. Fast and silent: prints nothing and exits 0 when no daemon is running.
     Statusline,
-    /// Manage the `.basemind/` caches (gc / stats / clear). Offline path.
+    /// Manage the machine-global caches (gc / stats / clear). Offline path.
     #[command(subcommand)]
     Cache(basemind::cli::admin::CacheCmd),
     /// Redact arbitrary text using the same pipeline as document extraction.
@@ -226,7 +229,8 @@ struct ScanArgs {
     #[arg(long, conflicts_with = "rev")]
     staged: bool,
     /// Index the tree at the given revision (HEAD, branch name, sha, HEAD~3).
-    /// Writes under .basemind/views/rev-<sha7>/ — separate from the working-tree view.
+    /// Written as the `rev-<sha7>` view in the machine-global workspace cache, separate from the
+    /// working-tree view.
     #[arg(long, value_name = "REV")]
     rev: Option<String>,
     /// Skip building the git-history index after the scan (overrides config). The history tools
@@ -261,62 +265,15 @@ struct RescanArgs {
     rebuild_git_history: bool,
 }
 
-#[derive(clap::Args, Debug)]
-struct ServeArgs {
-    /// LRU capacity per category for the in-process git cache (commit_files, log, blame).
-    #[arg(long, default_value_t = 1024)]
-    git_cache_mem: usize,
-    /// Disable the on-disk git cache. RAM LRU still applies but nothing persists between
-    /// `basemind serve` runs.
-    #[arg(long)]
-    no_git_cache_disk: bool,
-    /// Disable the continuous background re-scan. By default `serve` watches the
-    /// working tree and incrementally refreshes the index as files change, so the
-    /// code map stays current without `rescan`. Pass `--no-watch` to turn that off
-    /// for very large repos (e.g. the ~81k-file TypeScript tree) or CI runs where
-    /// the per-edit incremental scan isn't worth the cost; refresh manually via the
-    /// `rescan` tool instead.
-    #[arg(long)]
-    no_watch: bool,
-    /// Document-tier overrides. Every flag in this group corresponds to a
-    /// `[documents.…]` TOML key and a `BASEMIND_DOCUMENTS_…` env var.
-    #[command(flatten)]
-    documents: DocumentsCliOverrides,
-}
-
-#[cfg(feature = "agent-tui")]
-#[derive(clap::Args, Debug)]
-struct AgentArgs {
-    /// Arguments forwarded verbatim to the sibling `basemind-tui` binary: positional `[prompt]`,
-    /// plus `--resume <id>`, `--continue`, `--daemon`, `--attach`, `--replay <scenario.json>`. The
-    /// environment (including `BASEMIND_AGENT_MODEL` / `ANTHROPIC_API_KEY`) is inherited unchanged.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
-}
-
-#[cfg(feature = "desktop-ui")]
-#[derive(clap::Args, Debug)]
-struct UiArgs {
-    /// Arguments forwarded verbatim to the sibling `basemind-ui` binary (e.g. `--root <path>`). The
-    /// environment is inherited unchanged.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
-}
-
 #[derive(Subcommand, Debug)]
 enum LangCmd {
     /// Show installed grammars and where they live.
     List,
-    /// Force-download all supported grammars (no-op if already cached).
+    /// Force-download all supported grammars, plus any `[languages.<name>] preload = true` from
+    /// basemind.toml (no-op if already cached).
     Install,
     /// Delete the grammar cache. Next run will redownload.
     Clean,
-}
-
-#[derive(Subcommand, Debug)]
-enum HookCmd {
-    /// Write .git/hooks/pre-commit that invokes `basemind scan`.
-    Install,
 }
 
 /// Default tracing directive when `RUST_LOG` is unset, derived from the parsed
@@ -331,7 +288,25 @@ fn default_log_directive(verbosity: Verbosity) -> &'static str {
     }
 }
 
-fn main() -> Result<()> {
+// The daemon's scans and cache warms allocate and free many short-lived multi-MB buffers across
+// dozens of threads; the macOS system allocator keeps that high-water mark resident (a 5 GB
+// peak settling at 1.6 GB of live data). mimalloc returns freed pages to the OS.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Exit-code contract: see [`basemind::cli::exit`].
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::from(basemind::cli::exit::exit_code_for(&error))
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    basemind::alloc_tag::retag_heap_pages();
     let process_started = std::time::Instant::now();
     #[cfg(all(feature = "shells", any(unix, windows)))]
     if let Some(result) = basemind::shells::intercept_internal_reexec() {
@@ -348,6 +323,19 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Every process that may build an ONNX session bounds its memory before the first one exists. The
+    // comms daemon applies its own (tighter) thread cap in `comms_daemon::run`, which must win.
+    #[cfg(feature = "intelligence")]
+    {
+        #[cfg(all(feature = "comms", any(unix, windows)))]
+        let is_comms = matches!(cli.cmd, Cmd::Comms { .. });
+        #[cfg(not(all(feature = "comms", any(unix, windows))))]
+        let is_comms = false;
+        if !is_comms {
+            basemind::embeddings::bound_ort_memory(basemind::embeddings::resolve_embed_threads(0));
+        }
+    }
+
     let no_color = cli.no_color;
     let start = cli
         .root
@@ -358,7 +346,7 @@ fn main() -> Result<()> {
     if root != start {
         tracing::info!(
             resolved_root = %root.display(),
-            from = "ancestor .basemind",
+            from = "ancestor basemind.toml",
             "resolved repo root upward"
         );
     }
@@ -399,12 +387,24 @@ fn main() -> Result<()> {
         Cmd::Vault(v) => dispatch(basemind::cli::ToolCmd::Vault(v)),
         #[cfg(feature = "documents")]
         Cmd::Redact(args) => dispatch(basemind::cli::ToolCmd::Redact(args)),
-        Cmd::Hook { action } => match action {
-            HookCmd::Install => cmd_hook_install(&root),
-        },
+        Cmd::Hook { action } => basemind::cli::hook::run(&root, action),
+        Cmd::Doctor => doctor_cli::cmd_doctor(&root, json),
+        Cmd::Status => {
+            let _ = basemind::lang::ensure_grammars();
+            dispatch(basemind::cli::ToolCmd::Status)
+        }
+        Cmd::Completions { shell } => {
+            // Buffered so a closed pipe (`| head`) is a quiet error, not clap_complete's write panic.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "basemind", &mut script);
+            std::io::Write::write_all(&mut std::io::stdout(), &script).map_err(Into::into)
+        }
+        Cmd::Man => clap_mangen::Man::new(Cli::command())
+            .render(&mut std::io::stdout())
+            .map_err(Into::into),
         Cmd::Lang { action } => match action {
             LangCmd::List => lang_cli::cmd_lang_list(no_color),
-            LangCmd::Install => lang_cli::cmd_lang_install(verbosity, no_color),
+            LangCmd::Install => lang_cli::cmd_lang_install(&root, verbosity, no_color),
             LangCmd::Clean => lang_cli::cmd_lang_clean(),
         },
         Cmd::CompressOutput(args) => basemind::textcompress::cli::run(&args),
@@ -412,11 +412,7 @@ fn main() -> Result<()> {
         Cmd::Checkpoint(args) => basemind::textcompress::cli::run_checkpoint(&root, &args),
         Cmd::DetectWaste(args) => basemind::textcompress::cli::run_detect_waste(&args),
         Cmd::CpuFeatures => basemind::cli::cpu_features::run(&mut std::io::stdout()),
-        Cmd::Serve(args) => cmd_serve(&root, &view, &args, json),
-        #[cfg(feature = "agent-tui")]
-        Cmd::Agent(args) => agent_cmd::run(&root, &args.args),
-        #[cfg(feature = "desktop-ui")]
-        Cmd::Ui(args) => ui_cmd::run(&root, &args.args),
+        Cmd::Serve => cmd_serve(&root, &view),
         Cmd::Cache(action) => basemind::cli::run_cache(&root, action, json),
         // An explicit `--root` selects the per-repo line for that (resolved) workspace; bare
         // `basemind statusline` keeps the daemon hot-workspace summary.
@@ -433,13 +429,21 @@ fn main() -> Result<()> {
 }
 
 /// Emit a `WARN` when a global flag was supplied to a subcommand that does not
-/// consume it. `--json` only affects the tool subcommands (query / git / memory /
-/// web / telemetry / cache); `--view` additionally affects `serve`. Everything else
+/// consume it. `--json` only affects the tool subcommands and the coordination groups;
+/// `--view` additionally affects `serve`. Everything else
 /// ignores them, so warning prevents a no-op flag from looking effective.
 fn warn_ignored_global_flags(cmd: &Cmd, json: bool, view: &str) {
     let consumes_json = matches!(
         cmd,
-        Cmd::Code(_) | Cmd::Git(_) | Cmd::Graph(_) | Cmd::Memory(_) | Cmd::Web(_) | Cmd::Admin(_) | Cmd::Cache(_)
+        Cmd::Code(_)
+            | Cmd::Git(_)
+            | Cmd::Graph(_)
+            | Cmd::Memory(_)
+            | Cmd::Web(_)
+            | Cmd::Admin(_)
+            | Cmd::Cache(_)
+            | Cmd::Status
+            | Cmd::Doctor
     );
     #[cfg(feature = "documents")]
     let consumes_json = consumes_json || matches!(cmd, Cmd::Vault(_));
@@ -451,7 +455,7 @@ fn warn_ignored_global_flags(cmd: &Cmd, json: bool, view: &str) {
         );
     #[cfg(all(feature = "shells", any(unix, windows)))]
     let consumes_json = consumes_json || matches!(cmd, Cmd::Shell(_));
-    let consumes_view = consumes_json || matches!(cmd, Cmd::Serve(_));
+    let consumes_view = consumes_json || matches!(cmd, Cmd::Serve);
 
     if json && !consumes_json {
         tracing::warn!("--json has no effect on this subcommand; ignoring");
@@ -529,8 +533,8 @@ fn writer_collision_notice(root: &std::path::Path) -> Option<String> {
         basemind::store::WriterProbe::Free => None,
         basemind::store::WriterProbe::Held { holder: Some(meta) } => Some(format!(
             "`{}` (pid {}) is already running against this repo and keeping the index fresh — \
-             running this directly is unnecessary and would collide with it. Use that server's \
-             `rescan` tool to refresh the index, or stop it first.",
+             running this directly is unnecessary and would collide with it. Use `basemind rescan` \
+             (forwarded to the daemon when one is running) to refresh the index, or stop it first.",
             meta.command, meta.pid
         )),
         basemind::store::WriterProbe::Held { holder: None } => Some(basemind::store::LOCK_CONTENTION_HELP.to_string()),
@@ -567,6 +571,9 @@ fn sync_git_history_after_scan(
         Ok(outcome) => {
             let summary = match outcome {
                 basemind::git_history::builder::RebuildOutcome::Fresh => "git-history index: up to date".to_string(),
+                basemind::git_history::builder::RebuildOutcome::Skipped { reason } => {
+                    format!("git-history index: not updated ({reason})")
+                }
                 basemind::git_history::builder::RebuildOutcome::Incremental { added } => {
                     format!("git-history index: +{added} commits")
                 }
@@ -596,6 +603,7 @@ fn scan_streaming(
     root: &std::path::Path,
     store: &mut Store,
     config: &basemind::config::Config,
+    cancel: &basemind::scanner::ScanCancel,
 ) -> std::result::Result<basemind::scanner::ScanReport, basemind::scanner::ScanError> {
     let mut observer = render::ScanLineObserver::new(no_color, verbosity);
     basemind::scanner::scan_with_observer(
@@ -604,12 +612,30 @@ fn scan_streaming(
         config,
         source,
         basemind::scanner::EmbedMode::Inline,
-        &basemind::scanner::ScanCancel::new(),
+        cancel,
         &mut observer,
     )
 }
 
+/// Turn an interrupted scan into the exit-`130` error after printing what did land. The scan stops
+/// at a file boundary with its completed batches committed and the stale purge skipped, so the
+/// index is consistent but incomplete — the message says to rerun.
+fn interrupted(
+    out: &mut anstream::AutoStream<std::io::Stdout>,
+    report: &basemind::scanner::ScanReport,
+    verbosity: Verbosity,
+    what: &str,
+) -> Result<()> {
+    render::render_summary(out, &report.stats, verbosity);
+    Err(basemind::cli::exit::CliExit::interrupted(format!(
+        "{what} interrupted: files already indexed are committed and the index is consistent but incomplete; \
+         rerun to finish"
+    )))
+}
+
 fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_color: bool) -> Result<()> {
+    // ~keep Installed first: from here on Ctrl-C asks the scan to stop cleanly instead of killing the process.
+    let cancel = basemind::cli::interrupt::install();
     let root = &guard_workspace_root(root)?;
     bootstrap_grammars(verbosity, no_color)?;
     let config = load_or_default_with(root, Some(args.documents.clone()))?;
@@ -626,8 +652,12 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
             root,
             &mut store,
             &config,
+            &cancel,
         )
         .context("scan staged")?;
+        if report.cancelled {
+            return interrupted(&mut out, &report, verbosity, "scan --staged");
+        }
         render::render_summary(&mut out, &report.stats, verbosity);
         return Ok(());
     }
@@ -648,17 +678,18 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
             root,
             &mut store,
             &config,
+            &cancel,
         )
         .context("scan rev")?;
+        if report.cancelled {
+            return interrupted(&mut out, &report, verbosity, "scan --rev");
+        }
         render::render_summary(&mut out, &report.stats, verbosity);
         return Ok(());
     }
 
     if let Some(notice) = writer_collision_notice(root) {
-        use std::io::Write as _;
-        render::render_scan_header(&mut out, "scan", verbosity);
-        let _ = writeln!(out, "{notice}");
-        return Ok(());
+        return Err(basemind::cli::exit::CliExit::busy(notice));
     }
     let mut store = open_store_for_write(root, basemind::store::VIEW_WORKING, "scan", LockHolder::Scan)?;
     let report = scan_streaming(
@@ -668,26 +699,64 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
         root,
         &mut store,
         &config,
+        &cancel,
     )
     .context("scan")?;
+    if report.cancelled {
+        return interrupted(&mut out, &report, verbosity, "scan");
+    }
     render::render_summary(&mut out, &report.stats, verbosity);
+    reclaim_after_scan(&mut out, &report.stats, std::mem::take(&mut store.reset_stale_schema));
     sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
     Ok(())
 }
 
 fn cmd_rescan(root: &std::path::Path, args: &RescanArgs, verbosity: Verbosity, no_color: bool) -> Result<()> {
     let root = &guard_workspace_root(root)?;
+    let full = args.full || args.paths.is_empty();
+    // ~keep Validate before touching any lock or daemon, so a bad path is a clean exit 2.
+    let abs = if full {
+        Vec::new()
+    } else {
+        basemind::cli::rescan::resolve_paths(root, &args.paths)?
+    };
+    let mut out = render::stdout(no_color);
+    // ~keep A running daemon is the sole index writer: hand it the scan instead of opening a second,
+    // ~keep unlocked-by-it writer. Never fall through to a local scan after a daemon failure.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    if basemind::cli::rescan::daemon_is_up() {
+        use std::io::Write as _;
+        let report = basemind::cli::rescan::rescan_via_daemon(root, (!full).then_some(abs), full)?;
+        let _ = writeln!(
+            out,
+            "rescan via daemon: {} scanned, {} updated, {} docs indexed, {} removed ({} ms)",
+            report.scanned, report.updated, report.docs_indexed, report.removed, report.elapsed_ms
+        );
+        if report.docs_degraded > 0 || report.doc_timeouts > 0 {
+            let _ = writeln!(
+                out,
+                "docs_degraded {}  doc_timeouts {} (see [documents] markdown_chunk_max_bytes)",
+                report.docs_degraded, report.doc_timeouts
+            );
+        }
+        if report.docs_text_fallback > 0 {
+            let _ = writeln!(
+                out,
+                "docs_text_fallback {} (of docs_degraded: read as plain text after a structured-extraction failure)",
+                report.docs_text_fallback
+            );
+        }
+        return Ok(());
+    }
+    let cancel = basemind::cli::interrupt::install();
     bootstrap_grammars(verbosity, no_color)?;
     let config = load_or_default(root)?;
-    let mut out = render::stdout(no_color);
     if let Some(notice) = writer_collision_notice(root) {
-        use std::io::Write as _;
-        let _ = writeln!(out, "{notice}");
-        return Ok(());
+        return Err(basemind::cli::exit::CliExit::busy(notice));
     }
     let mut store = open_store_for_write(root, basemind::store::VIEW_WORKING, "rescan", LockHolder::Rescan)?;
 
-    let report = if args.full || args.paths.is_empty() {
+    let report = if full {
         scan_streaming(
             no_color,
             verbosity,
@@ -695,10 +764,10 @@ fn cmd_rescan(root: &std::path::Path, args: &RescanArgs, verbosity: Verbosity, n
             root,
             &mut store,
             &config,
+            &cancel,
         )
         .context("rescan (full)")?
     } else {
-        let abs: Vec<PathBuf> = args.paths.iter().map(|p| root.join(p)).collect();
         let mut observer = render::ScanLineObserver::new(no_color, verbosity);
         basemind::scanner::scan_paths_with_observer(
             root,
@@ -706,14 +775,34 @@ fn cmd_rescan(root: &std::path::Path, args: &RescanArgs, verbosity: Verbosity, n
             &config,
             &abs,
             basemind::scanner::EmbedMode::Inline,
-            &basemind::scanner::ScanCancel::new(),
+            &cancel,
             &mut observer,
         )
         .context("rescan (paths)")?
     };
+    if report.cancelled {
+        return interrupted(&mut out, &report, verbosity, "rescan");
+    }
     render::render_summary(&mut out, &report.stats, verbosity);
+    reclaim_after_scan(&mut out, &report.stats, std::mem::take(&mut store.reset_stale_schema));
     sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
     Ok(())
+}
+
+/// Reap what a migrating, re-extracting or schema-resetting pass orphaned. Gated on the pass having displaced anything,
+/// so an ordinary no-op or edit-only scan never pays for the cross-workspace reference count.
+fn reclaim_after_scan(
+    out: &mut anstream::AutoStream<std::io::Stdout>,
+    stats: &basemind::scanner::ScanStats,
+    schema_reset: bool,
+) {
+    if !stats.displaced_artifacts() && !schema_reset {
+        return;
+    }
+    match basemind::store_gc::reclaim_displaced_blobs() {
+        Ok(report) => render::render_cleanup(out, &report),
+        Err(error) => tracing::warn!(%error, "post-scan blob cleanup failed; the daemon's next sweep will retry"),
+    }
 }
 
 fn cmd_watch(root: &std::path::Path, verbosity: Verbosity, no_color: bool) -> Result<()> {
@@ -771,11 +860,7 @@ fn cmd_watch(root: &std::path::Path, verbosity: Verbosity, no_color: bool) -> Re
 /// server, whose lifetime was bound to the pipe, was the "drops and never returns" bug). HTTP-native
 /// clients skip `serve` entirely and dial the daemon URL directly (see `basemind daemon ensure`).
 /// Without the `comms` feature there is no daemon to relay to, so it errors with guidance.
-fn cmd_serve(root: &std::path::Path, view: &str, args: &ServeArgs, json: bool) -> Result<()> {
-    // `ServeArgs` (git-cache / `--no-watch` / documents) configure the daemon-hosted workspace, not
-    // this thin relay; the daemon honors them when it first builds the workspace. `--json` is a
-    // rendering flag for the tool subcommands and has no meaning for a raw stdio relay.
-    let _ = (args, json);
+fn cmd_serve(root: &std::path::Path, view: &str) -> Result<()> {
     // Bug #18 guard (transport-independent): a named view that was never scanned must fail fast with
     // actionable guidance instead of implying a server for an index that does not exist. The working
     // view is exempt (it auto-scans on first daemon touch).
@@ -919,27 +1004,4 @@ async fn relay_connect_stream(
             Err(source) => return Err(source),
         }
     }
-}
-
-fn cmd_hook_install(root: &std::path::Path) -> Result<()> {
-    let hooks_dir = root.join(".git").join("hooks");
-    if !hooks_dir.exists() {
-        anyhow::bail!("no .git/hooks directory at {}", hooks_dir.display());
-    }
-    let hook_path = hooks_dir.join("pre-commit");
-    let body = r#"#!/usr/bin/env sh
-# Installed by basemind hook install.
-set -e
-exec basemind scan --staged --quiet
-"#;
-    std::fs::write(&hook_path, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
-    }
-    println!("installed pre-commit hook at {}", hook_path.display());
-    Ok(())
 }

@@ -47,7 +47,7 @@ The crawler:
 
 - Honors `robots.txt` by default (disable with config).
 - SSRF-blocks private and loopback hosts by default to prevent exfil. Allow them with
-  `[crawl].allow_private_network = true` in `.basemind/basemind.toml`.
+  `[crawl].allow_private_network = true` in `basemind.toml`.
 - Tags all pages under a `scope` of `web:<host>` by default, overridable per-request.
 - Stops when it hits `max_depth`, `max_pages`, or no new links.
 
@@ -68,7 +68,7 @@ page.
 
 ## Configuration
 
-In `.basemind/basemind.toml` (config-file-only):
+In `basemind.toml` (config-file-only):
 
 ```toml
 [crawl]
@@ -76,8 +76,11 @@ respect_robots_txt = true         # honor robots.txt (default: true)
 allow_private_network = false     # allow crawling localhost, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (default: false)
 ```
 
-These are **config-file-only** settings — the MCP tools do not expose overrides for
-security.
+`respect_robots_txt` and `allow_private_network` are **config-file-only** settings — the MCP
+tools do not expose overrides for security, and a repository's own `basemind.toml` can enable
+`allow_private_network` only when the operator sets `BASEMIND_ALLOW_PRIVATE_HOSTS=1`. A `crawl` call may
+lower or raise `max_pages` and `max_depth` for that request, bounded by the daemon's caps
+(`BASEMIND_DAEMON_MAX_CRAWL_PAGES`, default 500; `BASEMIND_DAEMON_MAX_CRAWL_DEPTH`, default 8).
 
 ## Security
 

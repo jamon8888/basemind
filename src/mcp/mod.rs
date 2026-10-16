@@ -9,7 +9,6 @@
 //! Transport: stdio (the canonical MCP transport). Spawn via `basemind serve`.
 
 pub(crate) mod admission;
-pub mod agent_api;
 mod background;
 mod budget;
 mod codegraph;
@@ -41,6 +40,7 @@ mod helpers_files;
 mod helpers_fingerprint;
 mod helpers_git;
 mod helpers_git_file;
+mod helpers_git_show;
 #[cfg(feature = "memory")]
 mod helpers_governance;
 mod helpers_graph;
@@ -66,6 +66,11 @@ mod host;
 mod identity;
 #[cfg(feature = "test-support")]
 pub mod in_memory;
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub(crate) mod index_read;
+mod index_route;
+#[cfg(test)]
+mod index_route_tests;
 mod kneedle;
 mod l1_cache;
 mod lean;
@@ -80,15 +85,17 @@ mod notifications;
 mod prompts;
 #[cfg(feature = "memory")]
 pub(crate) mod proposals_ops;
+mod resources;
 mod router_cache;
 mod safe_resources;
-mod savings;
+pub(crate) mod savings;
 mod server_handler;
 mod shared_state;
 mod state;
 mod tasks;
 mod telemetry;
-mod tokens;
+mod term_index;
+pub(crate) mod tokens;
 mod tools;
 mod tools_admin;
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -106,14 +113,14 @@ mod tools_shells;
 mod tools_vault;
 #[cfg(feature = "crawl")]
 mod tools_web;
-mod toon;
+pub(crate) mod toon;
 mod traverse;
 mod types;
 mod types_admin;
 mod types_archmap;
 mod types_code;
 #[cfg(all(feature = "comms", any(unix, windows)))]
-mod types_comms;
+pub(crate) mod types_comms;
 mod types_community;
 mod types_compress;
 mod types_documents;
@@ -124,7 +131,7 @@ mod types_graphview;
 mod types_impls;
 pub(crate) mod types_memory;
 #[cfg(all(feature = "comms", any(unix, windows)))]
-mod types_registry;
+pub(crate) mod types_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 mod types_shells;
 mod types_traverse;
@@ -399,12 +406,21 @@ impl BasemindServer {
             shared,
             agent_id,
             #[cfg(all(feature = "comms", any(unix, windows)))]
-            comms_clients: tokio::sync::Mutex::new(ahash::AHashMap::new()),
+            comms_clients: tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(state::COMMS_CLIENT_CAP).expect("comms client capacity is non-zero"),
+            )),
             #[cfg(all(feature = "comms", any(unix, windows)))]
             delivered_notifications: tokio::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(state::DELIVERED_NOTIFICATION_CAP)
                     .expect("notification cache capacity is non-zero"),
             )),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
+            waited_messages: tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(state::DELIVERED_NOTIFICATION_CAP)
+                    .expect("notification cache capacity is non-zero"),
+            )),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
+            delivery_probe: tokio::sync::Mutex::new(state::DeliveryProbe::default()),
             log_level: std::sync::atomic::AtomicU8::new(notifications::DEFAULT_LOG_ORDINAL),
             lean: std::sync::atomic::AtomicBool::new(lean::lean_mode_enabled()),
         });
@@ -562,11 +578,10 @@ impl BasemindServer {
             "hosted read stack must be index-less so MapCache builds in-RAM call/impl indexes"
         );
         let basemind_dir = crate::store::workspace_cache_dir(root);
-        let config = Arc::new(match crate::config::load_with_overrides(root, None, None) {
-            Ok(loaded) => loaded.config,
-            Err(crate::config::ConfigError::NotFound(_)) => crate::config::default_for_root(root),
-            Err(error) => return Err(anyhow::Error::new(error).context("load hosted workspace config")),
-        });
+        let config = Arc::new(
+            crate::config::daemon::load_daemon(root)
+                .map_err(|error| anyhow::Error::new(error).context("load hosted workspace config"))?,
+        );
         let repo = crate::git::Repo::discover(root).ok().map(Arc::new);
         let git_cache = Arc::new(
             crate::git_cache::GitCache::open(&basemind_dir, HOSTED_GIT_CACHE_MEM, true)
@@ -743,13 +758,28 @@ impl BasemindServer {
     }
 
     /// Names of every tool this server advertises via `tools/list` (the full router, ignoring the
-    /// `BASEMIND_MCP_LEAN` wrapper mode). Exposed for the `tests/cli_parity.rs` guard, which asserts
+    /// `BASEMIND_MCP_LEAN` wrapper mode). Exposed for the `tests/cli_parity/` guard, which asserts
     /// each advertised tool has a CLI counterpart. The set follows the compiled feature flags.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_router
             .list_all()
             .into_iter()
             .map(|tool| tool.name.to_string())
+            .collect()
+    }
+
+    /// Every advertised tool paired with its JSON input schema (the `inputSchema` of `tools/list`).
+    /// Exposed for the `tests/cli_parity/` parameter-parity layer.
+    pub fn tool_input_schemas(&self) -> Vec<(String, serde_json::Value)> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool.name.to_string(),
+                    serde_json::Value::Object((*tool.input_schema).clone()),
+                )
+            })
             .collect()
     }
 }
@@ -837,7 +867,7 @@ mod map_cache_tests {
         let cache = MapCache::build(&store, 0);
         assert_eq!(sym_names(&cache, "a.rs"), vec!["alpha".to_string()]);
         assert_eq!(sym_names(&cache, "b.rs"), vec!["beta".to_string()]);
-        assert!(cache.calls.is_none() && cache.impls.is_none());
+        assert!(!cache.projections_capped());
 
         fs::write(root.join("a.rs"), b"pub fn alpha2() {}\npub fn alpha3() {}\n").unwrap();
         let report = crate::scanner::scan_paths(
@@ -876,3 +906,7 @@ mod map_cache_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "documents"))]
+#[path = "find_files_tests.rs"]
+mod find_files_tests;

@@ -7,6 +7,20 @@ description: >-
   is already touching the code you're about to change.
 ---
 
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:d11ecab18536021127703c562d662e72a04d51eb570025a18b05bc2b4bfa713c
+Source-Hash: blake3:aa3fdcfda21e2102d900287f385f78de45def44813de651b4666209c45fafc67
+Schema-Version: v1
+-->
+
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:7a0a443f940cf2e0cfaa3c25415fa855c9fa0a4ed0296ca46ebe577fcd28f57e
+Source-Hash: blake3:378e61c2bd27ae140e75d818f27005fac54d22d0ad24de4163a71e8572a15c72
+Schema-Version: v1
+-->
+
 # basemind-comms — agent coordination over the broker
 
 You may be one of several agents working this repo. Basemind establishes your session presence
@@ -69,6 +83,10 @@ flooding your context — you pull the messages relevant to your task, not the w
 
 Keep posts concise — subject is a one-liner, body is a few sentences. No fluff, no emojis.
 
+To make a retried post safe, pass `idempotency_key` on `post`: a repeat with the same key returns the
+original `message_id` instead of storing a duplicate (a key is generated when omitted). The MCP relay
+also replays reads and keyed posts after a broker restart, so reuse the same key when you retry.
+
 ## Delivery and explicit waiting
 
 Do not build a polling loop. New-message notices are delivered once at the next supported host turn
@@ -105,6 +123,8 @@ didn't load; check the CLI before assuming silence. Use the `basemind-doctor` sk
 | `agents { mode: "register", … }` | `basemind agents register --name <handle>` | Record your handle. |
 | `agents { mode: "list" }` | `basemind agents list` | List active agents. |
 | `agents { mode: "wait" }` | `basemind agents wait [--thread …]` | Wait for a peer message. |
+| `agents { mode: "status" }` | `basemind agents status` | Active/stale agent counts, last maintenance. |
+| `agents { mode: "cleanup" }` | `basemind agents cleanup [--apply]` | Preview retention; MCP is preview-only, `--apply` is CLI-only. |
 
 ## Notes
 

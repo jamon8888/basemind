@@ -88,7 +88,7 @@ pub(super) fn commit_files(
                     })
                     .or_insert(kind);
             }
-            Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            Ok(gix::object::tree::diff::Action::Continue(()))
         });
     }
     let mut out: Vec<(crate::path::RelPath, ChangeKind)> = union.into_iter().collect();
@@ -320,8 +320,9 @@ impl Repo {
         }
         local
             .merge_base(and, desc)
-            .map(|base| base.detach() == and)
-            .unwrap_or(false)
+            .ok()
+            .flatten()
+            .is_some_and(|base| base.detach() == and)
     }
 
     /// True when the object named by `sha` exists in the repository.

@@ -467,7 +467,7 @@ fn now_unix() -> i64 {
 /// `--clear-fatal`: acknowledge both kinds of corpse the last run left behind.
 ///
 /// They answer one question — "what killed the previous run?" — so one flag retires both, and no
-/// new CLI surface is added (the CLI↔MCP bijection in `tests/cli_parity.rs` is keyed on commands,
+/// new CLI surface is added (the CLI↔MCP bijection in `tests/cli_parity/` is keyed on commands,
 /// not flags, and stays untouched). Only records whose pid is dead are removed, so a scan running
 /// right now keeps its claim.
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -578,6 +578,7 @@ fn cmd_comms_doctor(json: bool, probe: bool, clear_fatal: bool) -> Result<()> {
                     "dir": record.dir,
                     "version": record.version,
                     "uptime_secs": (now - record.started_unix).max(0),
+                    "log": basemind::comms::singleton::daemon_log_path(&record.dir),
                 });
                 if let Some(verdict) = verdict {
                     row["reachable"] = probe_json(verdict);
@@ -618,6 +619,12 @@ fn cmd_comms_doctor(json: bool, probe: bool, clear_fatal: bool) -> Result<()> {
                 verdict.as_ref().map(probe_label).unwrap_or_default(),
                 record.dir.display(),
             );
+            if record.kind == DaemonKind::Comms {
+                println!(
+                    "    log: {}",
+                    basemind::comms::singleton::daemon_log_path(&record.dir).display()
+                );
+            }
         }
         if daemons.len() > ceiling {
             println!(

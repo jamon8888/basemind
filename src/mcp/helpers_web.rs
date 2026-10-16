@@ -23,6 +23,7 @@ use rmcp::model::CallToolResult;
 
 use super::ServerState;
 use super::helpers::json_result;
+use super::helpers_admin::Progress;
 use super::memory::lance_store;
 use super::mode::{WebMode, reject_unsupported};
 use super::types::{
@@ -112,10 +113,10 @@ fn per_call_engine(
 ) -> Result<crawlberg::CrawlEngineHandle, McpError> {
     let mut cfg = state.shared.config.crawl.clone();
     if let Some(mp) = max_pages {
-        cfg.max_pages = mp;
+        cfg.max_pages = mp.min(crate::config::daemon::crawl_page_cap());
     }
     if let Some(md) = max_depth {
-        cfg.max_depth = md;
+        cfg.max_depth = md.min(crate::config::daemon::crawl_depth_cap());
     }
     crate::web::build_engine(&cfg).map_err(|e| mcp_internal("build per-call crawl engine", e))
 }
@@ -128,11 +129,12 @@ async fn embedder(state: &ServerState) -> Result<Arc<SharedEmbedder>, McpError> 
         .resources
         .effective_embed_threads(state.shared.config.documents.embed_max_threads);
     let embed_batch_size = state.shared.config.resources.embed_batch_size;
+    let provider = state.shared.config.resources.onnx_provider;
     let embedder = state
         .shared
         .embedder
         .get_or_try_init(|| async {
-            SharedEmbedder::load(&preset, max_embed_threads, embed_batch_size)
+            SharedEmbedder::load_with_provider(&preset, max_embed_threads, embed_batch_size, provider)
                 .map(Arc::new)
                 .map_err(|e| format!("load embedder: {e}"))
         })
@@ -151,7 +153,11 @@ fn engine(state: &ServerState) -> Result<&crawlberg::CrawlEngineHandle, McpError
 ///
 /// Fields that belong to another mode are rejected rather than dropped: a silently ignored
 /// `max_depth` on a `scrape` call reads to an agent as a successful bounded crawl.
-pub(super) async fn run_web(state: &ServerState, params: WebParams) -> Result<CallToolResult, McpError> {
+pub(super) async fn run_web(
+    state: &ServerState,
+    params: WebParams,
+    progress: Progress<'_>,
+) -> Result<CallToolResult, McpError> {
     let WebParams {
         mode,
         url,
@@ -190,6 +196,7 @@ pub(super) async fn run_web(state: &ServerState, params: WebParams) -> Result<Ca
                     max_depth,
                     scope,
                 },
+                progress,
             )
             .await
         }
@@ -272,7 +279,11 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
     json_result(&response)
 }
 
-async fn run_web_crawl(state: &ServerState, params: WebCrawlParams) -> Result<CallToolResult, McpError> {
+async fn run_web_crawl(
+    state: &ServerState,
+    params: WebCrawlParams,
+    progress: Progress<'_>,
+) -> Result<CallToolResult, McpError> {
     engine(state)?;
     reject_zero_override("max_pages", params.max_pages)?;
     reject_zero_override("max_depth", params.max_depth)?;
@@ -391,7 +402,21 @@ async fn run_web_crawl(state: &ServerState, params: WebCrawlParams) -> Result<Ca
         });
     }
 
+    // The page count is only known once crawlberg has fetched the site, so progress covers the
+    // index phase: one notification per page settled, out of `pages_visited`.
+    let mut pages_done = 0usize;
     while let Some((slot, outcome)) = futs.next().await {
+        pages_done += 1;
+        if let Some((peer, Some(token))) = progress.as_ref() {
+            super::notifications::emit_progress(
+                peer,
+                token.clone(),
+                pages_done as f64,
+                Some(pages_visited as f64),
+                format!("web crawl: indexed {pages_done}/{pages_visited} pages"),
+            )
+            .await;
+        }
         if outcome.indexed {
             pages_indexed += 1;
             total_chunks += outcome.chunks_indexed;

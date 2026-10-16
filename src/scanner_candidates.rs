@@ -97,8 +97,46 @@ pub fn allow_extra_roots(allow: bool) {
     EXTRA_ROOTS_GRANT.store(allow, Ordering::Relaxed);
 }
 
-fn extra_roots_granted() -> bool {
-    EXTRA_ROOTS_GRANT.load(Ordering::Relaxed) || std::env::var(ALLOW_EXTRA_ROOTS_ENV).is_ok_and(|v| is_truthy(&v))
+fn extra_roots_granted(repo_root: &Path) -> bool {
+    EXTRA_ROOTS_GRANT.load(Ordering::Relaxed)
+        || std::env::var(ALLOW_EXTRA_ROOTS_ENV).is_ok_and(|v| extra_roots_grant_covers(&v, repo_root))
+}
+
+/// Whether an [`ALLOW_EXTRA_ROOTS_ENV`] value covers `repo_root`. A truthy word (`1`, `true`, `yes`)
+/// grants every workspace this process scans; anything else is read as a path list (`:`-separated on
+/// Unix, `;` on Windows) of workspace roots, and the grant covers only those and their descendants.
+/// The list form matters for a daemon, which is one process serving many repositories: the bare
+/// word would let any later workspace's `extra_roots` through.
+fn extra_roots_grant_covers(value: &str, repo_root: &Path) -> bool {
+    if is_truthy(value) {
+        return true;
+    }
+    let repo_root = repo_root.canonicalize().unwrap_or_else(|_| repo_root.to_path_buf());
+    std::env::split_paths(value.trim())
+        .filter(|entry| {
+            // A relative entry would be canonicalised against the daemon's cwd (often `/`) and could
+            // cover every workspace, and `on` / `enabled` are not truthy words: say so once instead
+            // of silently granting nothing.
+            let absolute = entry.is_absolute();
+            if !absolute && !entry.as_os_str().is_empty() {
+                crate::config::trust::warn_once(format!(
+                    "{ALLOW_EXTRA_ROOTS_ENV} entry {entry:?} ignored: use 1/true/yes or a list of absolute workspace paths"
+                ));
+            }
+            absolute
+        })
+        .any(|entry| repo_root.starts_with(entry.canonicalize().unwrap_or(entry)))
+}
+
+/// Directories an `extra_roots` entry may never name, grant or not: credential stores and system
+/// configuration. The workspace-level grant says "this operator uses extra roots", not "index my keys".
+fn is_sensitive_root(path: &Path) -> bool {
+    const SENSITIVE_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
+    path.starts_with("/etc")
+        || path.starts_with("/private/etc")
+        || path
+            .components()
+            .any(|c| SENSITIVE_DIRS.iter().any(|d| c.as_os_str() == std::ffi::OsStr::new(d)))
 }
 
 /// `1` / `true` / `yes`, case- and whitespace-insensitive. Matches `root_guard`'s private
@@ -388,13 +426,13 @@ fn walk_extra_roots(root: &Path, config: &Config, filters: &Filters, cancel: &Sc
     if config.scan.extra_roots.is_empty() {
         return;
     }
-    if !extra_roots_granted() {
+    if !extra_roots_granted(root) {
         tracing::warn!(
             roots = config.scan.extra_roots.len(),
             env = ALLOW_EXTRA_ROOTS_ENV,
             "scan.extra_roots ignored: it names directories outside the repository but was read from \
-             the repository's own basemind.toml; set {ALLOW_EXTRA_ROOTS_ENV}=1 in the environment to \
-             opt in",
+             the repository's own basemind.toml; set {ALLOW_EXTRA_ROOTS_ENV}=1 (or a list of workspace \
+             roots) in the environment to opt in",
         );
         return;
     }
@@ -410,7 +448,7 @@ fn walk_extra_roots(root: &Path, config: &Config, filters: &Filters, cancel: &Sc
             tracing::warn!(root = %extra.display(), "extra_root skipped: path is not valid UTF-8");
             continue;
         };
-        let pruner = filters.dir_pruner(None);
+        let pruner = filters.dir_pruner_for_extra_root(&extra);
         // `scan.follow_symlinks` (default `false`) governs here too. Following links used to be
         // hard-coded on, which is strictly worse out of an extra root than inside the repo: the
         // repo walk at least starts from a tree the operator chose and is bounded by that tree's own
@@ -441,7 +479,7 @@ fn walk_extra_roots(root: &Path, config: &Config, filters: &Filters, cancel: &Sc
             let Some(key) = key_str(path, &mut key_buf) else {
                 continue;
             };
-            if !filters.allows(key) {
+            if !filters.allows_in_extra_root(rel) {
                 continue;
             }
             if budget.accept(label, key) == Flow::Stop {
@@ -519,6 +557,10 @@ fn vet_extra_root(raw_root: &Path, repo_root: &Path) -> Option<PathBuf> {
             root = %extra.display(),
             "extra_root refused: that is a filesystem or volume root; indexing it would walk the entire machine"
         );
+        return None;
+    }
+    if is_sensitive_root(&extra) {
+        tracing::warn!(root = %extra.display(), "extra_root refused: credential or system configuration directory");
         return None;
     }
     if !extra.is_dir() {
@@ -681,5 +723,38 @@ mod tests {
         for no in ["0", "false", "no", ""] {
             assert!(!is_truthy(no), "{no:?}");
         }
+    }
+
+    #[test]
+    fn extra_roots_grant_can_be_scoped_to_a_list_of_workspaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowed = dir.path().join("allowed");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(allowed.join("sub")).expect("mkdir");
+        std::fs::create_dir_all(&other).expect("mkdir");
+
+        assert!(
+            extra_roots_grant_covers("1", &other),
+            "the bare word grants every workspace"
+        );
+        let list = std::env::join_paths([&allowed, Path::new("/nonexistent/elsewhere")])
+            .expect("join")
+            .into_string()
+            .expect("utf8");
+        assert!(extra_roots_grant_covers(&list, &allowed));
+        assert!(
+            extra_roots_grant_covers(&list, &allowed.join("sub")),
+            "descendants are covered"
+        );
+        assert!(!extra_roots_grant_covers(&list, &other), "an unlisted workspace is not");
+        assert!(!extra_roots_grant_covers("0", &allowed));
+        assert!(
+            !extra_roots_grant_covers(".", &allowed),
+            "a relative entry never grants"
+        );
+        assert!(!extra_roots_grant_covers("on", &allowed));
+        assert!(is_sensitive_root(Path::new("/home/u/.ssh")));
+        assert!(is_sensitive_root(Path::new("/etc/ssl")));
+        assert!(!is_sensitive_root(Path::new("/home/u/code/external")));
     }
 }

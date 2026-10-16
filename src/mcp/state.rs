@@ -11,6 +11,16 @@ use std::sync::Arc;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub(crate) const DELIVERED_NOTIFICATION_CAP: usize = 4_096;
 
+/// Maximum simultaneously-cached comms-broker clients per connection. Each entry owns a live socket
+/// to the broker plus that client's read buffer and undrained notification queue, and the key is the
+/// caller-supplied `as_agent` — a free-form validated string, so the key space is unbounded and an
+/// insert-only map accumulates one fd + one growing queue per distinct identity a session ever names
+/// (and pins a broker `link` against the daemon's idle reaper). 32 is well above the handful of
+/// sub-identities a real session drives, and eviction only closes a connection that re-opens lazily
+/// on its next use.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub(crate) const COMMS_CLIENT_CAP: usize = 32;
+
 #[cfg(feature = "documents")]
 use super::codegraph;
 use super::{SharedReadStack, helpers_calls, helpers_impls, l1_cache, map_fingerprint, types};
@@ -21,7 +31,7 @@ use crate::store::Store;
 ///
 /// Holds one [`Arc<SharedReadStack>`](super::SharedReadStack) (the heavy read state, shared across
 /// connections) plus this connection's own identity. Field accesses to the shared read stack go
-/// through [`shared`](Self::shared); the identity fields (`agent_id`, `comms_clients`, `log_level`)
+/// through [`shared`](Self::shared); the identity fields (`agent_id`, `comms_clients`)
 /// are read directly.
 pub(crate) struct ServerState {
     /// The workspace-level read stack shared across every connection to this `(root, view)`.
@@ -37,19 +47,24 @@ pub(crate) struct ServerState {
     /// `as_agent` param) gets its own broker connection, so one `serve` process can act as many
     /// named agents. Entries are created on first use; a connect failure surfaces as an MCP error
     /// on the triggering call, never at server boot. Per-connection identity.
+    ///
+    /// Bounded at [`COMMS_CLIENT_CAP`] because the key comes off the wire — see that constant.
     #[cfg(all(feature = "comms", any(unix, windows)))]
-    pub(crate) comms_clients: tokio::sync::Mutex<
-        ahash::AHashMap<
-            crate::comms::ids::AgentId,
-            std::sync::Arc<tokio::sync::Mutex<crate::comms::client::CommsClient>>,
-        >,
-    >,
+    pub(crate) comms_clients: tokio::sync::Mutex<lru::LruCache<crate::comms::ids::AgentId, CommsClientCell>>,
     /// Bounded per-session high-water cache for mailbox notices piggybacked onto tool responses.
     #[cfg(all(feature = "comms", any(unix, windows)))]
     pub(crate) delivered_notifications: tokio::sync::Mutex<lru::LruCache<String, ()>>,
+    /// Messages already returned by a `wait`, so a poll loop that never acks is not answered instantly
+    /// with its own backlog on every call.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    pub(crate) waited_messages: tokio::sync::Mutex<lru::LruCache<String, ()>>,
+    /// Dedicated, rate-limited connection for the per-tool-call delivery-notice probe, so a slow or
+    /// abandoned probe can never desynchronise or head-of-line-block the shared `comms_clients`.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    pub(crate) delivery_probe: tokio::sync::Mutex<DeliveryProbe>,
     /// Minimum logging severity the client asked for via `logging/setLevel`, as an ordinal
-    /// (see [`super::notifications::level_ordinal`]). Defaults to `Info`. Checked before every log emit so
-    /// the server honors the client's verbosity preference. Per-connection.
+    /// (see [`super::notifications::level_ordinal`]). Defaults to `Info`. Checked before every log
+    /// emit so the server honors the client's verbosity preference. Per-connection.
     pub(crate) log_level: std::sync::atomic::AtomicU8,
     /// Whether this server advertises the lean three-tool surface (see [`super::lean`]). Resolved
     /// ONCE at construction from `BASEMIND_MCP_LEAN` (the value does not change mid-session), so the
@@ -57,6 +72,20 @@ pub(crate) struct ServerState {
     /// several servers with different surfaces coexist in one process (integration tests). The
     /// in-memory test serve overrides it directly.
     pub(crate) lean: std::sync::atomic::AtomicBool,
+}
+
+/// A lazily-initialised, shared handle to one identity's broker client. The cell is what a slow connect
+/// waits on, so the registry lock is held only to find or insert it.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub(crate) type CommsClientCell =
+    std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<tokio::sync::Mutex<crate::comms::client::CommsClient>>>>;
+
+/// State of the delivery-notice probe: its own broker connection and the time of the last probe.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[derive(Default)]
+pub(crate) struct DeliveryProbe {
+    pub(crate) client: Option<crate::comms::client::CommsClient>,
+    pub(crate) last_probe: Option<std::time::Instant>,
 }
 
 impl ServerState {
@@ -71,12 +100,21 @@ impl ServerState {
             shared,
             agent_id,
             #[cfg(all(feature = "comms", any(unix, windows)))]
-            comms_clients: tokio::sync::Mutex::new(ahash::AHashMap::new()),
+            comms_clients: tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(COMMS_CLIENT_CAP).expect("comms client capacity is non-zero"),
+            )),
             #[cfg(all(feature = "comms", any(unix, windows)))]
             delivered_notifications: tokio::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(DELIVERED_NOTIFICATION_CAP)
                     .expect("notification cache capacity is non-zero"),
             )),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
+            waited_messages: tokio::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(DELIVERED_NOTIFICATION_CAP)
+                    .expect("notification cache capacity is non-zero"),
+            )),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
+            delivery_probe: tokio::sync::Mutex::new(DeliveryProbe::default()),
             log_level: std::sync::atomic::AtomicU8::new(super::notifications::DEFAULT_LOG_ORDINAL),
             lean: std::sync::atomic::AtomicBool::new(super::lean::lean_mode_enabled()),
         }
@@ -188,7 +226,9 @@ impl ServerState {
                 // the LanceStore read to a blocking thread so its block_on never nests on the reactor.
                 super::doc_links_cache::attach_async(&mut cache, &store, &self.shared.config, &self.shared.scope).await;
                 let files = cache.len();
-                self.shared.cache.store(Arc::new(cache));
+                let cache = Arc::new(cache);
+                self.shared.cache.store(Arc::clone(&cache));
+                cache.warm_terms();
                 self.shared.cache_generation.fetch_add(1, Relaxed);
                 let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 self.shared.cache_warm_ms.store(elapsed_ms, Relaxed);
@@ -208,7 +248,7 @@ impl ServerState {
             self.shared
                 .cache
                 .load()
-                .projections_capped
+                .projections_capped()
                 .then(types::LifecycleNotice::projections_capped)
         })
     }
@@ -221,26 +261,24 @@ pub(crate) struct MapCache {
     /// content hash. Shared with the snapshot this cache was derived from, so an incremental
     /// rescan is a refcount bump rather than a rebuild.
     l1: Arc<l1_cache::L1Cache>,
-    /// In-RAM callee index, populated ONLY when the Fjall index is unavailable —
-    /// i.e. a read-only `serve` session that lost the single-holder lock to another
-    /// process, or a `daemon_writer` front-end whose store is index-less. Lets
-    /// `find_references` / `find_callers` / `call_graph` answer from the shared L2
-    /// blobs so multiple sessions can use one repo at once. `None` on a writer
-    /// session, which uses the live Fjall index (no extra RAM/build cost).
-    pub(crate) calls: Option<helpers_calls::InRamCallIndex>,
-    /// In-RAM trait→impl index, same read-only-only gating as `calls`. Backs
-    /// `find_implementations` from the L1 blobs when Fjall is held elsewhere.
-    pub(crate) impls: Option<helpers_impls::InRamImplIndex>,
-    /// True when a read-only session's projected call/impl indexes hit their byte cap and were
-    /// truncated, so the answers they back are incomplete. Surfaced through
-    /// [`ServerState::lifecycle_notice`] rather than silently degrading a result to "no matches".
-    pub(crate) projections_capped: bool,
+    /// In-RAM callee index: the LAST-RESORT fallback for a session that has neither a Fjall index
+    /// nor a daemon to forward `references` / `callers` to, and the backing for the whole-corpus
+    /// graph walks (`call_graph`, the architecture map), which cannot afford a round trip per file.
+    /// Built on first use ([`calls_projection`](Self::calls_projection)) and never otherwise, so a
+    /// daemon-backed session that only asks point queries holds none of it.
+    calls: std::sync::OnceLock<helpers_calls::InRamCallIndex>,
+    /// In-RAM trait→impl index, same lazy last-resort role as `calls` for `find_implementations`.
+    impls: std::sync::OnceLock<helpers_impls::InRamImplIndex>,
     /// Fingerprint of the indexed file set this map was built from — see
     /// [`map_fingerprint::index_fingerprint`]. The refresh paths compare it against a freshly
     /// reopened store and SKIP the whole-corpus rebuild when it matches, which is what keeps a
     /// no-op daemon scan from transiently doubling serve's resident memory. `0` on the
     /// [`empty`](Self::empty) boot placeholder, which never matches a populated index.
     pub(crate) fingerprint: u64,
+    /// Searchable symbol-name / import text of every file, built on first use (or by the cache
+    /// warm) and patched rather than rebuilt by [`with_delta`](Self::with_delta). Backs the
+    /// substring sweeps of `symbols` and `dependents`.
+    terms: std::sync::OnceLock<Arc<super::term_index::TermIndex>>,
     /// Persisted document→code links (ADR-0008), loaded from the LanceDB document store by the async
     /// cache-warm path ([`super::background::spawn_cache_warm`]) and the view watcher. Empty until
     /// loaded; the codegraph `documents` lane reads it. Preserved across incremental
@@ -248,6 +286,20 @@ pub(crate) struct MapCache {
     /// forward with a refcount bump, not a deep clone of the whole vector.
     #[cfg(feature = "documents")]
     pub(crate) doc_links: std::sync::Arc<[codegraph::DocLink]>,
+    /// Every path of the document tier (markdown, config, data, PDFs ...), sorted. The code map
+    /// holds code only, so decision records (`docs/adr/*.md`) and path citations to prose / config
+    /// files resolve against this set instead of [`Self::files`]. Projected straight from the index
+    /// (no blob or LanceDB read), so it is rebuilt with every cache build and delta.
+    #[cfg(feature = "documents")]
+    pub(crate) doc_paths: std::sync::Arc<[crate::path::RelPath]>,
+}
+
+/// The sorted document-tier paths of `store`'s index.
+#[cfg(feature = "documents")]
+fn doc_paths_of(store: &Store) -> std::sync::Arc<[crate::path::RelPath]> {
+    let mut paths: Vec<crate::path::RelPath> = store.index.doc_files.keys().cloned().collect();
+    paths.sort_unstable();
+    paths.into()
 }
 
 impl MapCache {
@@ -256,30 +308,23 @@ impl MapCache {
     ///
     /// Unlike the whole-corpus map this replaces, `build` decodes NO L1 blobs: it projects the
     /// index into [`l1_cache::FileIndexView`] and leaves the outlines to be faulted in on demand.
-    /// The read-only projections (`calls` / `impls`) are the exception — a session with no Fjall
-    /// index has nothing else to answer reference queries from — and they are charged against the
-    /// same budget.
+    /// The read-only projections (`calls` / `impls`) are not built here either: they are the
+    /// last-resort fallback for a session that can reach no Fjall index, built lazily on first use
+    /// and charged against the same budget.
     pub(crate) fn build(store: &Store, budget_bytes: u64) -> Self {
         let files = l1_cache::FileIndexView::build(store);
         let l1 = Arc::new(l1_cache::L1Cache::new(store.blobs_dir.clone(), budget_bytes));
-        let mut projections_capped = false;
-        let (calls, impls) = if store.index_db.is_none() {
-            let calls = helpers_calls::InRamCallIndex::build(store, budget_bytes);
-            let impls = helpers_impls::InRamImplIndex::build(&files, &l1, budget_bytes);
-            projections_capped = calls.capped() || impls.capped();
-            (Some(calls), Some(impls))
-        } else {
-            (None, None)
-        };
         Self {
             fingerprint: map_fingerprint::index_fingerprint(store),
             files,
             l1,
-            calls,
-            impls,
-            projections_capped,
+            calls: Default::default(),
+            impls: Default::default(),
+            terms: Default::default(),
             #[cfg(feature = "documents")]
             doc_links: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_paths: doc_paths_of(store),
         }
     }
 
@@ -293,11 +338,13 @@ impl MapCache {
             fingerprint: 0,
             files: l1_cache::FileIndexView::default(),
             l1: Arc::new(l1_cache::L1Cache::placeholder()),
-            calls: None,
-            impls: None,
-            projections_capped: false,
+            calls: Default::default(),
+            impls: Default::default(),
+            terms: Default::default(),
             #[cfg(feature = "documents")]
             doc_links: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_paths: Default::default(),
         }
     }
 
@@ -322,12 +369,46 @@ impl MapCache {
             fingerprint: 0,
             files: l1_cache::FileIndexView::from_pairs(metas),
             l1,
-            calls: None,
-            impls: None,
-            projections_capped: false,
+            calls: Default::default(),
+            impls: Default::default(),
+            terms: Default::default(),
             #[cfg(feature = "documents")]
             doc_links: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_paths: Default::default(),
         }
+    }
+
+    /// The in-RAM call projection, built on first use. Only reached by a session with no reachable
+    /// Fjall index (see [`calls`](Self::calls)); a build that hits the byte budget is truncated and
+    /// reports it through [`projections_capped`](Self::projections_capped).
+    pub(crate) fn calls_projection(&self) -> &helpers_calls::InRamCallIndex {
+        self.calls.get_or_init(|| {
+            helpers_calls::InRamCallIndex::build(&self.files, self.l1.blobs_dir(), self.l1.budget_bytes())
+        })
+    }
+
+    /// The in-RAM implementation projection, built on first use. See
+    /// [`calls_projection`](Self::calls_projection).
+    pub(crate) fn impls_projection(&self) -> &helpers_impls::InRamImplIndex {
+        self.impls
+            .get_or_init(|| helpers_impls::InRamImplIndex::build(&self.files, &self.l1, self.l1.budget_bytes()))
+    }
+
+    /// Whether either projection has been built. Test seam for the memory bound: a daemon-backed
+    /// session must answer its reference reads without ever allocating one.
+    #[cfg(all(test, feature = "comms", any(unix, windows)))]
+    pub(crate) fn projections_built(&self) -> bool {
+        self.calls.get().is_some() || self.impls.get().is_some()
+    }
+
+    /// True when a projection this session has ALREADY built hit its byte cap, so the answers it
+    /// backed are incomplete. Surfaced through [`ServerState::lifecycle_notice`] rather than
+    /// silently degrading a result to "no matches". `false` until a projection exists, which is why
+    /// the handlers that fall back to one read the notice AFTER running the scan.
+    pub(crate) fn projections_capped(&self) -> bool {
+        self.calls.get().is_some_and(helpers_calls::InRamCallIndex::capped)
+            || self.impls.get().is_some_and(helpers_impls::InRamImplIndex::capped)
     }
 
     /// Number of indexed files this map covers.
@@ -341,6 +422,12 @@ impl MapCache {
     #[cfg(any(test, feature = "documents", feature = "memory"))]
     pub(crate) fn contains(&self, path: &crate::path::RelPath) -> bool {
         self.files.contains(path)
+    }
+
+    /// Whether `path` is a tracked document (non-code file in the document tier).
+    #[cfg(feature = "documents")]
+    pub(crate) fn contains_doc(&self, path: &crate::path::RelPath) -> bool {
+        self.doc_paths.binary_search(path).is_ok()
     }
 
     /// The language recorded for `path` at scan time, without faulting in its outline.
@@ -364,6 +451,28 @@ impl MapCache {
     pub(crate) fn get(&self, path: &crate::path::RelPath) -> Option<Arc<FileMapL1>> {
         let meta = self.files.get(path)?;
         self.l1.load(&meta.hash_hex)
+    }
+
+    /// The term index, building it from one corpus stream on first use. Later calls (and the
+    /// snapshots derived by [`with_delta`](Self::with_delta)) reuse it.
+    pub(crate) fn terms(&self) -> &super::term_index::TermIndex {
+        self.terms.get_or_init(|| {
+            Arc::new(super::term_index::TermIndex::build(|visit| {
+                self.for_each(|path, l1| visit(path, l1));
+            }))
+        })
+    }
+
+    /// Build the term index on a blocking thread so the first `symbols` / `dependents` call after
+    /// a full cache publish doesn't pay for it. A no-op outside a Tokio runtime (queries then build
+    /// it lazily).
+    pub(crate) fn warm_terms(self: &Arc<Self>) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let cache = Arc::clone(self);
+            runtime.spawn_blocking(move || {
+                cache.terms();
+            });
+        }
     }
 
     /// Stream every `(path, outline)` in path order, stopping early when `f` returns `false`.
@@ -404,38 +513,34 @@ impl MapCache {
     /// an updated path's new view entry names a new hash, so a reader still holding `self` keeps
     /// resolving the old hash and cannot observe the newer content.
     ///
-    /// Only valid on a writer session, where `calls`/`impls` are `None` (a read-only fallback
-    /// session serves those from the blobs and never reaches the rescan path — `scan_and_refresh`
-    /// early-returns on `state.read_only`). If they are somehow present, fall back to a full rebuild
-    /// rather than let the in-RAM call/impl indexes drift out of sync.
+    /// The lazy `calls`/`impls` projections start empty on the derived snapshot, so they are
+    /// rebuilt from the post-rescan file view if ever needed and cannot drift out of sync.
     pub(crate) fn with_delta(
         &self,
         store: &Store,
         updated: &[crate::path::RelPath],
         removed: &[crate::path::RelPath],
     ) -> Self {
-        if self.calls.is_some() || self.impls.is_some() {
-            // Carry doc↔code links (ADR-0008) forward from the previous cache rather than dropping
-            // them: a degraded full rebuild has no off-reactor context to reload the LanceStore.
-            #[cfg(feature = "documents")]
-            {
-                let mut rebuilt = Self::build(store, self.l1.budget_bytes());
-                rebuilt.doc_links = std::sync::Arc::clone(&self.doc_links);
-                return rebuilt;
-            }
-            #[cfg(not(feature = "documents"))]
-            return Self::build(store, self.l1.budget_bytes());
-        }
-        Self {
+        let next = Self {
             fingerprint: map_fingerprint::index_fingerprint(store),
             files: self.files.with_delta(store, updated, removed),
             l1: Arc::clone(&self.l1),
-            calls: None,
-            impls: None,
-            projections_capped: self.projections_capped,
+            // Fresh and empty: a derived snapshot rebuilds its projections lazily, so they can never
+            // describe the pre-rescan corpus.
+            calls: Default::default(),
+            impls: Default::default(),
+            terms: Default::default(),
             #[cfg(feature = "documents")]
             doc_links: std::sync::Arc::clone(&self.doc_links),
+            #[cfg(feature = "documents")]
+            doc_paths: doc_paths_of(store),
+        };
+        if let Some(terms) = self.terms.get() {
+            let _ = next
+                .terms
+                .set(Arc::new(terms.patched(updated, removed, |p| next.get(p))));
         }
+        next
     }
 }
 

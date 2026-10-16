@@ -1,5 +1,11 @@
 ---
-priority: high
+type: Concept
+title: Mcp Surface
+x-ai-rulez:
+  kind: context
+  id: mcp-surface
+  metadata:
+    priority: high
 ---
 
 # MCP Surface
@@ -8,7 +14,7 @@ priority: high
 
 The surface is **nine domain tools**, each one `#[tool]` dispatching on a required,
 non-defaulted `mode` — never a distinct tool per verb. The same nine names are the CLI groups
-(`basemind <domain> <mode>`), enforced as a strict bijection by `tests/cli_parity.rs`. Read
+(`basemind <domain> <mode>`), enforced as a strict bijection by `tests/cli_parity/`. Read
 `src/mcp/mode.rs` for the authoritative wire spellings before writing about any mode; never infer
 one from prose.
 
@@ -18,7 +24,7 @@ one from prose.
 |---|---|---|
 | `code` | outline, symbols, grep, files, find, definition, references, callers, implementations, dependents, expand, semantic, chunk | always |
 | `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open | always |
-| `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search | always |
+| `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search, show | always |
 | `memory` | put, get, list, search, delete, audit, documents, mine, proposals, accept, reject | always¹ |
 | `admin` | status, repo, rescan, cache_stats, gc, cache_clear, telemetry, compress, delta, checkpoint, waste | always |
 | `web` | scrape, crawl, map | `crawl` |

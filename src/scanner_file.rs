@@ -23,7 +23,6 @@ use crate::config::Config;
 use crate::extract::{self, ExtractError, FileMapL1, FileMapL2};
 use crate::git::GitError;
 use crate::hashing;
-use crate::lang;
 use crate::path::RelPath;
 use crate::scanner::{EmbedMode, FileResult, FileStatus, ScanCancel, ScanSource};
 #[cfg(feature = "documents")]
@@ -136,39 +135,64 @@ fn extraction_sidecars_present(store: &Store, config: &Config, hash_hex: &str) -
     true
 }
 
-/// True when the on-disk chunk sidecar already satisfies THIS scan's embedding requirement, so an
-/// otherwise-unchanged file may be short-circuited as `Unchanged`.
+/// True when the on-disk chunk sidecar already satisfies THIS scan's requirements, so an otherwise
+/// unchanged file may be short-circuited as `Unchanged`.
 ///
 /// This is distinct from [`extraction_sidecars_present`] (blob *presence*, which governs l1/l2/chunk
-/// reuse): a chunk-only sidecar is present but carries no vectors. A `Deferred` pass never embeds, so
-/// any present sidecar satisfies it; an `Inline` pass over an embed-eligible file requires embeddings
-/// for the current preset to already exist, else the file must be re-processed to fill them. The
-/// daemon writes chunk-only sidecars in `Deferred`, which a later `Inline` pass upgrades in place —
-/// without this gate the Inline pass would short-circuit past `chunk_and_embed` and never embed.
+/// reuse). The sidecar must have been chunked under the current `[code_search]` settings (its
+/// `config_digest`; a legacy digest-less sidecar is re-checked once so it can be stamped). Then, a
+/// `Deferred` pass never embeds, so any such sidecar satisfies it; an `Inline` pass over an
+/// embed-eligible file requires embeddings for the current preset to already exist, else the file
+/// must be re-processed to fill them, and a changed embed policy re-processes it so its vector rows
+/// are rebuilt. The daemon writes chunk-only sidecars in `Deferred`, which a later `Inline` pass
+/// upgrades in place — without this gate the Inline pass would short-circuit past `chunk_and_embed`
+/// and never embed.
 #[cfg(feature = "code-search")]
-fn embed_state_satisfied(store: &Store, config: &Config, rel: &str, hash_hex: &str, mode: EmbedMode) -> bool {
-    if !matches!(mode, EmbedMode::Inline) {
+fn embed_state_satisfied(
+    store: &Store,
+    config: &Config,
+    filters: &Filters,
+    rel: &str,
+    hash_hex: &str,
+    mode: EmbedMode,
+) -> bool {
+    if !crate::scanner_code::should_chunk(config) {
         return true;
+    }
+    let Ok(Some(peek)) = store.peek_chunk_state(hash_hex) else {
+        return false;
+    };
+    if peek.config_digest != filters.code_digest {
+        return false;
+    }
+    // A changed embed policy may have purged this file's keyword postings along with its vectors
+    // (`[code_search] enabled = false`), and the cached sidecar alone would leave them gone when the
+    // tier is switched back on. Send every file back through the cached-chunk path to re-stage them,
+    // whatever its own embed eligibility.
+    if filters.reflush_embeds {
+        return false;
     }
     let cfg = &config.code_search;
-    if !cfg.embed || crate::scanner_filter::embed_excluded(rel, &cfg.embed_exclude) {
+    if !matches!(mode, EmbedMode::Inline) || !cfg.embed || !filters.code_embed_allowed(rel) {
         return true;
     }
-    match store.peek_chunk_state(hash_hex) {
-        Ok(Some(peek)) => {
-            peek.chunks.is_empty()
-                || (peek.embedding_dim > 0
-                    && peek.embedding_model == config.documents.embedding_preset
-                    && peek.embeddings.len() == peek.chunks.len())
-        }
-        _ => false,
-    }
+    peek.chunks.is_empty()
+        || (peek.embedding_dim > 0
+            && peek.embedding_model == config.documents.embedding_preset
+            && peek.embeddings.len() == peek.chunks.len())
 }
 
 /// Without `code-search` there is no embedding tier, so every scan's embed requirement is trivially
 /// satisfied.
 #[cfg(not(feature = "code-search"))]
-fn embed_state_satisfied(_store: &Store, _config: &Config, _rel: &str, _hash_hex: &str, _mode: EmbedMode) -> bool {
+fn embed_state_satisfied(
+    _store: &Store,
+    _config: &Config,
+    _filters: &Filters,
+    _rel: &str,
+    _hash_hex: &str,
+    _mode: EmbedMode,
+) -> bool {
     true
 }
 
@@ -195,7 +219,15 @@ fn process_file(
     {
         let _ = embed;
     }
-    let lang = match lang::detect(Path::new(rel)) {
+    // Only code is code-mapped. Prose, data and config files belong to the document tier (chunked,
+    // searchable text); a markdown "outline" or a JSON file's keys are noise in the symbol index.
+    // When the documents tier is compiled out there is nowhere else for them to go, so they keep
+    // their grammar.
+    #[cfg(feature = "documents")]
+    let detected = filters.detect_lang(rel).lang().filter(|l| !crate::lang::is_non_code(l));
+    #[cfg(not(feature = "documents"))]
+    let detected = filters.detect_lang(rel).lang();
+    let lang = match detected {
         Some(l) => l,
         None => {
             #[cfg(feature = "documents")]
@@ -211,32 +243,44 @@ fn process_file(
     if matches!(source, ScanSource::WorkingTree)
         && let Some(existing) = store.lookup(rel)
         && existing.mtime != 0
+        && existing.language == lang
+        && existing.extract_epoch >= extract::EXTRACT_EPOCH
         && let Ok(meta) = std::fs::metadata(root.join(rel))
     {
+        // The cap outranks the unchanged shortcut: lowering `max_file_bytes` must evict an already
+        // indexed file that is now too large, not keep reporting it `Unchanged`.
+        if meta.len() > filters.max_file_bytes {
+            return FileResult::bare(rel.to_string(), FileStatus::SkippedTooLarge { size: meta.len() });
+        }
         let mtime = mtime_nanos(&meta);
         if meta.len() == existing.size_bytes
             && mtime == existing.mtime
             && extraction_sidecars_present(store, config, &existing.hash_hex)
-            && embed_state_satisfied(store, config, rel, &existing.hash_hex, embed)
+            && embed_state_satisfied(store, config, filters, rel, &existing.hash_hex, embed)
         {
+            // Bytes were not read, so a missing grep bloom (an index that predates it) is backfilled
+            // here rather than leaving the file a permanent grep candidate.
+            index_batch.backfill_grep_bloom(root, &RelPath::from(rel), meta.len(), mtime);
             return FileResult::bare(rel.to_string(), FileStatus::Unchanged);
         }
     }
 
     let (bytes, size_bytes, mtime) = match source {
-        ScanSource::WorkingTree => match read_working_tree(root, rel, filters) {
+        ScanSource::WorkingTree => {
+            match read_working_tree(root, rel, filters.max_file_bytes, config.scan.follow_symlinks) {
+                Ok(triple) => triple,
+                Err(status) => {
+                    return FileResult::bare(rel.to_string(), status);
+                }
+            }
+        }
+        ScanSource::Staged(repo) => match read_via_git(filters.max_file_bytes, repo.read_blob_staged(rel)) {
             Ok(triple) => triple,
             Err(status) => {
                 return FileResult::bare(rel.to_string(), status);
             }
         },
-        ScanSource::Staged(repo) => match read_via_git(filters, repo.read_blob_staged(rel)) {
-            Ok(triple) => triple,
-            Err(status) => {
-                return FileResult::bare(rel.to_string(), status);
-            }
-        },
-        ScanSource::Rev { repo, sha } => match read_via_git(filters, repo.read_blob_at_rev(sha, rel)) {
+        ScanSource::Rev { repo, sha } => match read_via_git(filters.max_file_bytes, repo.read_blob_at_rev(sha, rel)) {
             Ok(triple) => triple,
             Err(status) => {
                 return FileResult::bare(rel.to_string(), status);
@@ -259,23 +303,44 @@ fn process_file(
     let sidecars_present = extraction_sidecars_present(store, config, hash_hex_str);
     if let Some(existing) = store.lookup(rel)
         && existing.hash_hex == hash_hex_str
+        && existing.language == lang
+        && existing.extract_epoch >= extract::EXTRACT_EPOCH
         && sidecars_present
-        && embed_state_satisfied(store, config, rel, hash_hex_str, embed)
+        && embed_state_satisfied(store, config, filters, rel, hash_hex_str, embed)
     {
+        // Content is unchanged but the stamp moved (touch, checkout): re-stamp the bloom from the
+        // bytes already in hand so grep keeps trusting it.
+        if matches!(source, ScanSource::WorkingTree) {
+            index_batch.restamp_grep_bloom(&RelPath::from(rel), &bytes, size_bytes, mtime);
+        }
         return FileResult::bare(rel.to_string(), FileStatus::Unchanged);
     }
 
     let want_l2 = filters.eager_l2 && store.index_db.is_some();
 
+    let mut foreign_lang = false;
+    // Set when a schema-current blob of the right language predates `EXTRACT_EPOCH`: it is rewritten
+    // in place (its L2 calls, which the epoch does not touch, are carried over).
+    let mut stale_epoch = false;
+    let mut carried_l2: Option<FileMapL2> = None;
     let reused_pair: Option<(FileMapL1, Option<FileMapL2>)> = if sidecars_present {
         match store.read_l1_by_hex(hash_hex_str) {
-            Ok(Some(l1)) => {
+            Ok(Some(l1)) if l1.language == lang && l1.extract_epoch < extract::EXTRACT_EPOCH => {
+                stale_epoch = true;
+                carried_l2 = store.read_l2_by_hex(hash_hex_str).unwrap_or(None);
+                None
+            }
+            Ok(Some(l1)) if l1.language == lang => {
                 let l2 = if want_l2 {
                     store.read_l2_by_hex(hash_hex_str).unwrap_or(None)
                 } else {
                     None
                 };
                 if want_l2 && l2.is_none() { None } else { Some((l1, l2)) }
+            }
+            Ok(Some(_)) => {
+                foreign_lang = true;
+                None
             }
             _ => None,
         }
@@ -313,19 +378,40 @@ fn process_file(
         }
     };
 
-    let l2: Option<FileMapL2> = l2_opt;
-    if !reused && let Err(e) = store.write_filemap_hex(hash_hex_str, &l1, l2.as_ref()) {
-        return FileResult::bare(rel.to_string(), FileStatus::ExtractFailed { msg: e.to_string() });
+    let l2: Option<FileMapL2> = l2_opt.or(carried_l2);
+    if !reused {
+        let written = if foreign_lang || stale_epoch {
+            store.overwrite_filemap_hex(hash_hex_str, &l1, l2.as_ref())
+        } else {
+            store.write_filemap_hex(hash_hex_str, &l1, l2.as_ref())
+        };
+        if let Err(e) = written {
+            return FileResult::bare(rel.to_string(), FileStatus::ExtractFailed { msg: e.to_string() });
+        }
     }
 
     let rel_path = RelPath::from(rel);
     if !index_batch.stage(&rel_path, &l1, l2.as_ref()) {
         tracing::warn!(rel, "index upsert failed; reference search may be incomplete");
     }
+    // Grep reads the working tree, so only a working-tree scan describes what it will sweep.
+    if matches!(source, ScanSource::WorkingTree) {
+        index_batch.stage_grep_bloom(&rel_path, &bytes, size_bytes, mtime);
+    }
 
     #[cfg(feature = "code-search")]
     let code_batch = if crate::scanner_code::should_chunk(config) {
-        match crate::scanner_code::chunk_and_embed(store, rel, &bytes, &l1, l2.as_ref(), hash_hex_str, config, embed) {
+        match crate::scanner_code::chunk_and_embed(
+            store,
+            rel,
+            &bytes,
+            &l1,
+            l2.as_ref(),
+            hash_hex_str,
+            config,
+            filters,
+            embed,
+        ) {
             Ok(batch) => batch,
             Err(error) => {
                 tracing::debug!(
@@ -352,6 +438,7 @@ fn process_file(
         language: lang.to_string(),
         size_bytes,
         mtime,
+        extract_epoch: crate::extract::EXTRACT_EPOCH,
     };
     FileResult {
         path: rel.to_string(),
@@ -365,6 +452,8 @@ fn process_file(
         doc_batch: None,
         #[cfg(feature = "documents")]
         doc_upsert: None,
+        #[cfg(feature = "documents")]
+        doc_tombstone: None,
         #[cfg(feature = "code-search")]
         code_batch,
     }
@@ -386,13 +475,17 @@ fn process_doc(
     let abs = root.join(rel);
     let effective_scope = crate::scanner_docs::doc_scope_for(rel, scope, config);
     let scope = effective_scope.as_ref();
+    if !filters.doc_allowed(rel) {
+        return FileResult::bare(rel.to_string(), FileStatus::SkippedNoLang);
+    }
     let Some(mime_type) = should_extract_document(&abs, &config.documents) else {
         return FileResult::bare(rel.to_string(), FileStatus::SkippedNoLang);
     };
-    let (bytes, size_bytes, mtime) = match read_working_tree(root, rel, filters) {
-        Ok(triple) => triple,
-        Err(status) => return FileResult::bare(rel.to_string(), status),
-    };
+    let (bytes, size_bytes, mtime) =
+        match read_working_tree(root, rel, filters.doc_max_file_bytes, config.scan.follow_symlinks) {
+            Ok(triple) => triple,
+            Err(status) => return FileResult::bare(rel.to_string(), status),
+        };
     let hash = hashing::hash_bytes(&bytes);
     let hex_buf = hashing::hex_buf(&hash);
     let hash_hex = hashing::hex_str(&hex_buf);
@@ -402,18 +495,48 @@ fn process_doc(
             existing,
             hash_hex,
             &config.documents.embedding_preset,
-            crate::scanner_docs::doc_embed_requested(rel, &config.documents, embed),
+            crate::scanner_docs::doc_embed_requested(rel, &config.documents, embed, filters),
+            &filters.doc_digest,
+            filters.reflush_embeds,
         )
         && store.blob_path_doc_hex(hash_hex).exists()
     {
-        return FileResult::bare(rel.to_string(), FileStatus::Unchanged);
+        return FileResult::bare(rel.to_string(), FileStatus::DocUnchanged);
+    }
+
+    // Timed out before on this exact content under these exact limits: a retry would only burn another
+    // timeout (and strand another thread). Editing the file or changing a limit gets past this.
+    if store.doc_tombstoned(rel, hash_hex, &filters.doc_guard_digest) {
+        tracing::debug!(
+            path = rel,
+            "skipping document: it timed out before and nothing relevant changed"
+        );
+        return FileResult::bare(rel.to_string(), FileStatus::DocTombstoned);
+    }
+
+    // A document whose own estimated working set exceeds the whole ceiling can never fit: waiting ~keep
+    // frees nothing and admitting it anyway is how the ceiling stopped meaning anything (a 7 MB ~keep
+    // docx measured 12 GB). Skip it with a logged reason; this is a verdict on the file, not a ~keep
+    // retry, and costs one header read. ~keep
+    let gate = crate::backpressure::FootprintGate::new(config.resources.max_footprint_mb);
+    let estimated = crate::extract::doc_cost::estimate_peak_bytes(&bytes, &mime_type);
+    if gate.exceeds_budget(estimated) {
+        tracing::warn!(
+            path = rel,
+            estimated_mb = estimated / (1024 * 1024),
+            limit_mb = gate.limit_mb(),
+            "skipping document: estimated extraction memory exceeds [resources] max_footprint_mb"
+        );
+        return FileResult::bare(rel.to_string(), FileStatus::SkippedTooLarge { size: size_bytes });
     }
 
     // Both bounds, in the order that makes them complementary: take a concurrency slot first so at ~keep
-    // most `max_concurrent_documents` extractions can ever overlap, then wait out any footprint ~keep
-    // overshoot the ones already running caused. Both are leaf-advisory — neither can refuse. ~keep
+    // most `max_concurrent_documents` extractions can ever overlap, then serialise through the ~keep
+    // footprint gate: over the ceiling only one document is admitted at a time (see ~keep
+    // `FootprintGate::admit_exclusive`), so an overshoot is one document, not one per worker. ~keep
     let _doc_slot = crate::backpressure::acquire_doc_slot(config.resources.max_concurrent_documents);
-    crate::backpressure::FootprintGate::new(config.resources.max_footprint_mb).admit();
+    let admission = gate.admit_exclusive();
+    tracing::debug!(path = rel, estimated_mb = estimated / (1024 * 1024), admitted = ?admission.outcome(), "extracting document");
 
     match extract_and_persist_doc(
         store,
@@ -424,6 +547,7 @@ fn process_doc(
         &config.documents,
         &config.llm,
         &config.resources,
+        filters,
         scope,
         embed,
     ) {
@@ -432,6 +556,8 @@ fn process_doc(
                 chunk_count: batch.chunk_count,
                 embedding_dim: batch.embedding_dim,
                 reused: batch.reused,
+                degraded: batch.degraded,
+                text_fallback: batch.text_fallback,
             };
             let doc_entry = crate::store::DocEntry {
                 hash_hex: hash_hex.to_string(),
@@ -444,6 +570,7 @@ fn process_doc(
                 embedded: batch.embedded && matches!(embed, EmbedMode::Inline),
                 embed_attempted: batch.embed_attempted,
                 rehydration_ref: batch.rehydration_ref.clone(),
+                config_digest: filters.doc_digest.clone(),
             };
             // Deferred persists an entry only to carry a rehydration_ref into the index
             // for the GC live set (else the rehydration blob could be reaped while the
@@ -460,12 +587,31 @@ fn process_doc(
                 upsert: None,
                 doc_batch: Some(batch),
                 doc_upsert,
+                doc_tombstone: None,
                 #[cfg(feature = "code-search")]
                 code_batch: None,
             }
         }
         Ok(None) => FileResult::bare(rel.to_string(), FileStatus::SkippedNoLang),
         Err(error) => {
+            match error.downcast_ref::<crate::extract::ExtractError>() {
+                Some(crate::extract::ExtractError::DocTimeout(budget)) => {
+                    tracing::warn!(path = rel, "skipping document: {error:#}");
+                    return FileResult {
+                        doc_tombstone: Some(crate::store_doc_tombstone::DocTombstone {
+                            hash_hex: hash_hex.to_string(),
+                            guard_digest: filters.doc_guard_digest.clone(),
+                            timeout_secs: budget.as_secs(),
+                        }),
+                        ..FileResult::bare(rel.to_string(), FileStatus::DocTimedOut)
+                    };
+                }
+                Some(crate::extract::ExtractError::DocDeferred(_)) => {
+                    tracing::debug!(path = rel, "deferring document: {error:#}");
+                    return FileResult::bare(rel.to_string(), FileStatus::DocDeferred);
+                }
+                _ => {}
+            }
             let msg = format!("document extract: {error:#}");
             if is_unsupported_format_error(&msg) {
                 tracing::debug!(path = rel, reason = %msg, "skipping file: not an extractable document");
@@ -491,7 +637,7 @@ fn is_unsupported_format_error(msg: &str) -> bool {
 /// would have to reproduce the exact nanosecond mtime to be missed. The value is only ever compared
 /// against a previously-stored one (never displayed), so the unit is a pure internal detail. `i64`
 /// nanos overflow in year 2262; saturate rather than wrap.
-fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
+pub fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()
@@ -500,25 +646,71 @@ fn mtime_nanos(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn read_working_tree(root: &Path, rel: &str, filters: &Filters) -> Result<(Vec<u8>, u64, i64), FileStatus> {
-    let abs = root.join(rel);
-    let metadata = std::fs::metadata(&abs).map_err(|e| FileStatus::ReadFailed {
+fn read_working_tree(
+    root: &Path,
+    rel: &str,
+    max_file_bytes: u64,
+    follow_symlinks: bool,
+) -> Result<(Vec<u8>, u64, i64), FileStatus> {
+    use std::io::Read;
+
+    let read_failed = |e: std::io::Error| FileStatus::ReadFailed {
         kind: e.kind(),
         msg: e.to_string(),
-    })?;
-    if metadata.len() > filters.max_file_bytes {
+    };
+    let not_regular = |msg: &str| FileStatus::ReadFailed {
+        kind: std::io::ErrorKind::InvalidInput,
+        msg: msg.to_string(),
+    };
+    let abs = root.join(rel);
+    // A full scan never yields a symlink unless `follow_symlinks` is on, but the incremental path
+    // (watcher, `rescan paths=[..]`) hands over arbitrary paths: refuse links that could pull a file
+    // from outside the repo (`notes.md -> ~/.ssh/id_rsa`) or an endless device (`x.rs -> /dev/zero`).
+    if !follow_symlinks {
+        let link = std::fs::symlink_metadata(&abs).map_err(read_failed)?;
+        if !link.is_file() {
+            return Err(not_regular("not a regular file (symlinks are not followed)"));
+        }
+        if !rel.starts_with('/') {
+            // A symlinked *directory* on the way (`link -> /etc`, path `link/passwd`) passes the leaf check.
+            let inside = match (abs.canonicalize(), root.canonicalize()) {
+                (Ok(abs), Ok(root)) => abs.starts_with(root),
+                _ => false,
+            };
+            if !inside {
+                return Err(not_regular("resolves outside the workspace root"));
+            }
+        }
+    }
+    let file = std::fs::File::open(&abs).map_err(read_failed)?;
+    // `fstat` on the open handle, so the size checked is the file actually read (no metadata-then-read
+    // race) and a device like `/dev/zero` (reported length 0) is refused rather than slurped.
+    let metadata = file.metadata().map_err(read_failed)?;
+    if !metadata.is_file() {
+        return Err(not_regular("not a regular file"));
+    }
+    if metadata.len() > max_file_bytes {
         return Err(FileStatus::SkippedTooLarge { size: metadata.len() });
     }
-    let bytes = std::fs::read(&abs).map_err(|e| FileStatus::ReadFailed {
-        kind: e.kind(),
-        msg: e.to_string(),
-    })?;
+    // Capped read: a file that grows after the stat still cannot exceed the limit by more than a byte.
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max_file_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(read_failed)?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err(FileStatus::SkippedTooLarge {
+            size: bytes.len() as u64,
+        });
+    }
     let mtime = mtime_nanos(&metadata);
     let size = metadata.len();
     Ok((bytes, size, mtime))
 }
 
-fn read_via_git(filters: &Filters, blob: Result<Option<Vec<u8>>, GitError>) -> Result<(Vec<u8>, u64, i64), FileStatus> {
+fn read_via_git(
+    max_file_bytes: u64,
+    blob: Result<Option<Vec<u8>>, GitError>,
+) -> Result<(Vec<u8>, u64, i64), FileStatus> {
     let blob = blob.map_err(|e| FileStatus::ReadFailed {
         kind: std::io::ErrorKind::Other,
         msg: e.to_string(),
@@ -527,7 +719,7 @@ fn read_via_git(filters: &Filters, blob: Result<Option<Vec<u8>>, GitError>) -> R
         kind: std::io::ErrorKind::NotFound,
         msg: "blob not present in this git source".to_string(),
     })?;
-    if bytes.len() as u64 > filters.max_file_bytes {
+    if bytes.len() as u64 > max_file_bytes {
         return Err(FileStatus::SkippedTooLarge {
             size: bytes.len() as u64,
         });
@@ -553,6 +745,72 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::scanner_lanes::run_optional_lane;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_working_tree_refuses_devices_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // `join` with an absolute `rel` yields `rel`, which lets the test aim at a device node.
+        let zero = read_working_tree(dir.path(), "/dev/zero", 1024, false).unwrap_err();
+        assert!(matches!(zero, FileStatus::ReadFailed { .. }), "got {zero:?}");
+        let sub = read_working_tree(
+            dir.path().parent().unwrap(),
+            dir.path().file_name().unwrap().to_str().unwrap(),
+            1024,
+            false,
+        );
+        assert!(matches!(sub, Err(FileStatus::ReadFailed { .. })));
+    }
+
+    #[test]
+    fn read_working_tree_enforces_the_size_cap_on_the_read_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"0123456789").unwrap();
+        assert!(matches!(
+            read_working_tree(dir.path(), "f.txt", 9, false),
+            Err(FileStatus::SkippedTooLarge { size: 10 })
+        ));
+        let (bytes, size, _) = read_working_tree(dir.path(), "f.txt", 10, false).unwrap();
+        assert_eq!((bytes.len(), size), (10, 10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_reads_refuse_symlinks_and_links_out_of_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        let root = repo.path();
+        std::fs::write(outside.path().join("secret"), "AKIA-secret").expect("write");
+        std::fs::write(root.join("real.rs"), "fn main() {}").expect("write");
+        symlink(outside.path().join("secret"), root.join("notes.md")).expect("file link");
+        symlink("/dev/zero", root.join("zero.rs")).expect("device link");
+        symlink(outside.path(), root.join("linkdir")).expect("dir link");
+
+        let read = |rel: &str, follow| read_working_tree(root, rel, 1024, follow);
+        assert!(read("real.rs", false).is_ok());
+        for rel in ["notes.md", "zero.rs", "linkdir/secret"] {
+            assert!(
+                matches!(read(rel, false), Err(FileStatus::ReadFailed { .. })),
+                "{rel} must be refused"
+            );
+        }
+        // An operator who granted `follow_symlinks` keeps the linked file, and a followed device
+        // still cannot grow past the cap.
+        assert!(read("notes.md", true).is_ok());
+        assert!(read("zero.rs", true).is_err());
+    }
+
+    #[test]
+    fn working_tree_reads_are_capped_by_size() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("big.txt"), vec![b'x'; 4096]).expect("write");
+        assert!(matches!(
+            read_working_tree(repo.path(), "big.txt", 1024, false),
+            Err(FileStatus::SkippedTooLarge { .. })
+        ));
+    }
 
     #[cfg(feature = "documents")]
     #[test]
