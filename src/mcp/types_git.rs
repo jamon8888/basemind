@@ -25,8 +25,7 @@ use crate::path::RelPath;
 pub struct GitParams {
     /// Which operation to run.
     pub mode: GitMode,
-    /// `touching`, `diff`, `diff_outline`, `blame`, `blame_symbol`, `symbol_history`. Repository-
-    /// relative path (forward-slash, no leading `/`). Required by each of those modes.
+    /// Repo-relative path; required by touching/diff/diff_outline/blame/blame_symbol/symbol_history.
     #[serde(default)]
     pub path: Option<RelPath>,
     /// `by_path` — a regular expression matched against each commit's changed **file paths**; and
@@ -40,35 +39,43 @@ pub struct GitParams {
         alias = "q",
         alias = "search"
     )]
+    /// `by_path`: regex over changed file paths. `search`: AND-matched full-text query over author + message. Required by both.
     pub pattern: Option<String>,
-    /// `search` only. Field to scope the query to: `author` (name + email), `message` (summary +
-    /// body), or `all` (default). `summary` / `body` are accepted as aliases for `message`.
+    /// `search`: `author`, `message` or `all` (default).
     #[serde(default)]
+    #[schemars(extend("enum" = ["author", "message", "all"]))]
     pub field: Option<String>,
-    /// `blame_symbol` and `symbol_history`. Name of the symbol to resolve in `path`. Required by
-    /// both modes.
+    /// `blame_symbol`/`symbol_history`: symbol name in `path` (required).
     #[serde(default, alias = "symbol")]
     pub name: Option<String>,
-    /// `blame_symbol` and `symbol_history`. Symbol-kind filter that disambiguates same-named
-    /// symbols (`function`, `struct`, `class`, …).
+    /// `blame_symbol`/`symbol_history`: symbol kind to disambiguate (`function`, `struct`, ...).
     #[serde(default)]
     pub kind: Option<String>,
-    /// `recent`, `touching`, `by_path`, `search`, `blame`, `blame_symbol`, `symbol_history`. Page
-    /// size; the default and cap differ per mode (see the tool description).
+    /// Page size; default and cap vary per mode (see tool description).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// `recent`, `touching`, `by_path`, `search`, `blame`, `blame_symbol`, `symbol_history`. Resume
-    /// token returned by the previous call's `next_cursor`.
+    /// Resume token from the previous `next_cursor`.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// `recent`/`touching`/`by_path`/`search`: token budget for the returned commit list (default
+    /// 20000). Commits past the budget are dropped, `budgeted: true` is set and `next_cursor`
+    /// resumes at the first dropped commit. At least one commit is always returned.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
+    /// `search` only: cap each hit's commit body at this many characters (default 1000, 0 omits
+    /// the body). A cut body ends in a marker and sets `body_truncated`; `show` returns it whole.
+    #[serde(default)]
+    pub body_chars: Option<u32>,
+    /// `show` only: commit to show, a full or abbreviated sha or any revision (required).
+    #[serde(default, alias = "commit", alias = "revision")]
+    pub sha: Option<String>,
     /// `recent` only. Include each commit's per-file change list. Default true.
     #[serde(default)]
     pub include_files: Option<bool>,
     /// `churn` only. How many files to keep in the churn ranking. Default 20, max 200.
     #[serde(default)]
     pub top_k: Option<u32>,
-    /// `by_path` and `churn`. How many commits back from HEAD to inspect before filtering
-    /// (`by_path` default 200 / max 1000; `churn` default 200 / max 2000).
+    /// `by_path`/`churn`: commits back from HEAD to inspect (default 200).
     #[serde(default)]
     pub window: Option<u32>,
     /// `diff_outline`, `blame`, `blame_symbol`. Revision to read at. Defaults to HEAD.
@@ -80,17 +87,16 @@ pub struct GitParams {
     /// `diff` only. Right-hand revision. Required by that mode.
     #[serde(default)]
     pub rev_new: Option<String>,
-    /// `blame` only. 1-based first line of the range to blame. Must be supplied together with
-    /// `line_end`.
+    /// `blame`: 1-based first line; pair with `line_end`.
     #[serde(default)]
     pub line_start: Option<u32>,
-    /// `blame` only. 1-based last line (inclusive) of the range to blame. Must be supplied together
-    /// with `line_start`.
+    /// `blame`: 1-based last line, inclusive; pair with `line_start`.
     #[serde(default)]
     pub line_end: Option<u32>,
     /// `symbol_history` only. Fingerprint strategy for detecting body changes between commits:
     /// `normalized` (default), `structural`, or `structural_loose`.
     #[serde(default)]
+    #[schemars(extend("enum" = ["normalized", "structural", "structural_loose"]))]
     pub hash_mode: Option<String>,
 }
 
@@ -108,6 +114,9 @@ impl GitParams {
             kind: None,
             limit: None,
             cursor: None,
+            max_tokens: None,
+            body_chars: None,
+            sha: None,
             include_files: None,
             top_k: None,
             window: None,
@@ -141,6 +150,13 @@ pub struct SearchGitHistoryParams {
     /// the caller must restart.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Token budget for the returned hits. Default 20000; overflow is dropped, `budgeted: true`
+    /// is set and `next_cursor` resumes at the first dropped hit.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
+    /// Cap on each hit's commit body, in characters. Default 1000; 0 omits the body.
+    #[serde(default)]
+    pub body_chars: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -159,6 +175,10 @@ pub struct RecentChangesParams {
     /// `cursor_invalidated: true` and the caller must restart.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Token budget for the returned commits. Default 20000; overflow is dropped, `budgeted: true`
+    /// is set and `next_cursor` resumes at the first dropped commit.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -173,6 +193,10 @@ pub struct CommitsTouchingParams {
     /// `cursor_invalidated: true` and the caller must restart.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Token budget for the returned commits. Default 20000; overflow is dropped, `budgeted: true`
+    /// is set and `next_cursor` resumes at the first dropped commit.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -219,6 +243,10 @@ pub struct FindCommitsByPathParams {
     /// `cursor_invalidated: true` and the caller must restart.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Token budget for the returned commits. Default 20000; overflow is dropped, `budgeted: true`
+    /// is set and `next_cursor` resumes at the first dropped commit.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -309,6 +337,22 @@ pub(in crate::mcp) struct GitCommitHit {
     /// Full message body, present only for indexed hits with a non-empty body.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
+    /// True when `body` was cut at `body_chars`; it then ends in a marker naming `git` mode `show`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub body_truncated: bool,
+    /// Full body length in bytes, present only when `body_truncated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_bytes: Option<usize>,
+}
+
+/// Response of `git` mode `show`: one commit with its whole message and changed-file list.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub(in crate::mcp) struct GitShowResponse {
+    pub commit: GitCommitHit,
+    pub files: Vec<CommitFileView>,
+    /// Server-side handler latency in microseconds. See [`crate::mcp::helpers::timing`].
+    #[serde(default)]
+    pub elapsed_us: u64,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -319,6 +363,10 @@ pub(in crate::mcp) struct SearchGitHistoryResponse {
     /// full indexed search.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
+    /// True when `max_tokens` (or the default budget) dropped trailing commits; `next_cursor`
+    /// resumes at the first dropped one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub budgeted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -359,6 +407,10 @@ pub(in crate::mcp) struct RecentChangesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_reason: Option<&'static str>,
     /// Opaque cursor to pass back on the next call when more results are available.
+    /// True when `max_tokens` (or the default budget) dropped trailing commits; `next_cursor`
+    /// resumes at the first dropped one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub budgeted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
     /// True when the caller passed a `cursor` minted against a different HEAD sha (HEAD
@@ -383,6 +435,10 @@ pub(in crate::mcp) struct CommitsTouchingResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_reason: Option<&'static str>,
     /// Opaque cursor to pass back on the next call when more results are available.
+    /// True when `max_tokens` (or the default budget) dropped trailing commits; `next_cursor`
+    /// resumes at the first dropped one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub budgeted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
     /// True when the caller passed a `cursor` minted against a different HEAD sha (HEAD
@@ -490,6 +546,10 @@ pub(in crate::mcp) struct FindCommitsByPathResponse {
     pub window_inspected: u32,
     pub commits: Vec<CommitView>,
     /// Opaque cursor to pass back on the next call when more matches are available.
+    /// True when `max_tokens` (or the default budget) dropped trailing commits; `next_cursor`
+    /// resumes at the first dropped one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub budgeted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
     /// True when the caller passed a `cursor` minted against a different HEAD sha (HEAD

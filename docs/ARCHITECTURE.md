@@ -2,9 +2,11 @@
 
 basemind is a single Rust crate that builds one binary (`basemind`) and exposes
 its internals as a library. The binary serves three roles: `basemind scan` indexes
-a workspace, `basemind serve` runs the MCP stdio server, and the daemon
-(`basemind comms daemon`, auto-spawned; singleton per user) is the sole writer managing a
-machine-global cache.
+a workspace, the daemon (`basemind comms daemon`, auto-spawned; singleton per user) is the sole
+writer managing a machine-global cache and hosts the MCP router over one shared read stack per
+workspace, and `basemind serve` is a thin stdio relay that ensures the daemon and pumps bytes to it
+(HTTP-native clients dial the daemon directly). `serve` needs the `comms` feature; the one-shot CLI
+(`basemind code …`, `git …`) opens the store itself and does not.
 
 The Cargo workspace also vendors four crates under `crates/` — `stack-graphs`,
 `tree-sitter-graph`, `tree-sitter-stack-graphs`, `lsp-positions` — a tree-sitter-0.26 fork of
@@ -21,41 +23,34 @@ code-intelligence tier (see [Code intelligence](#code-intelligence-precise-resol
                     │ basemind    │
                     │ scan        │
                     └─────┬───────┘
-                          │
-                          │ IPC (UDS)
+                          │ extraction results over IPC (UDS)
                           ▼
-        ┌──────────────────────────────────┐
-        │  basemind daemon (per-user)      │
-        │                                  │
-        │  ┌─────────┐ ┌─────────────┐    │
-        │  │ Fjall   │ │ LanceDB     │    │
-        │  │ writer  │ │ writer      │    │
-        │  └─────────┘ └─────────────┘    │
-        │        (sole writer per machine) │
-        │  ~/.local/share/basemind/       │
-        └────┬────────────────────────┬───┘
-             │                        │
-   ┌─────────▼──────┐    ┌───────────▼────────┐
-   │ Content-addr   │    │ Fjall + LanceDB    │
-   │ msgpack blobs  │    │ (shared, read-only)│
-   │ (deduped)      │    │                    │
-   └────────────────┘    └───────────┬────────┘
-                                     │
-                   ┌─────────────────┴──────────────┐
-                   │ (all repos/worktrees share)    │
-                   ▼                                ▼
-           ┌────────────────┐              ┌─────────────────┐
-           │ basemind serve │              │ basemind serve  │
-           │ (session 1)    │  (read-only) │ (session 2)     │
-           └────────┬───────┘              └────────┬────────┘
-                    │                               │
-                    └───────────┬───────────────────┘
-                                │ MCP stdio (rmcp)
-                                ▼
-                    ┌──────────────────────┐
-                    │ AI coding agents     │
-                    │ (Claude Code, etc.)  │
-                    └──────────────────────┘
+        ┌──────────────────────────────────────┐
+        │  basemind daemon (singleton)         │
+        │                                      │
+        │  ┌─────────┐ ┌─────────────┐         │
+        │  │ Fjall   │ │ LanceDB     │         │
+        │  │ writer  │ │ writer      │         │
+        │  └─────────┘ └─────────────┘         │
+        │  sole writer per machine; hosts the  │
+        │  MCP router + one shared read stack  │
+        │  per workspace                       │
+        └────┬─────────────────────────┬───────┘
+             │ <cache>/cache/          │ streamable HTTP (opt-in)
+             │ workspaces/<key>/       │ and the stdio relay
+   ┌─────────▼──────┐                  │
+   │ Content-addr   │                  │
+   │ msgpack blobs  │       ┌──────────┴───────────────┐
+   │ (cache/blobs,  │       │ basemind serve           │
+   │ machine-wide,  │       │ (stdio relay, one per    │
+   │ deduped)       │       │ client session)          │
+   └────────────────┘       └──────────┬───────────────┘
+                                       │ MCP stdio
+                                       ▼
+                            ┌──────────────────────┐
+                            │ AI coding agents     │
+                            │ (Claude Code, etc.)  │
+                            └──────────────────────┘
 ```
 
 ## Source layout
@@ -67,13 +62,17 @@ src/
 ├── version.rs              — RELEASE_MINOR — single source of truth for schema versions
 ├── scanner.rs              — orchestrates the scan pipeline: extraction → Fjall index →
 │                             code-map persist barrier → optional enrichment lanes
-├── scanner_file.rs         — per-file pipeline (read/classify/extract) + the rayon pool
+├── scanner_file.rs         — per-file pipeline (read/classify/extract) + the rayon pool; routes
+│                             non-code files (`lang::is_non_code`) to the document tier
 ├── scanner_filter.rs       — include/exclude globs, submodule pruning, incremental
 │                             IndexFilter (nested-.gitignore-aware)
 ├── scanner_lanes.rs        — fault containment (catch_unwind) for the lanes that run after
 │                             the code-map persist barrier
 ├── scanner_code.rs         — code-search branch: L1/L2 → code chunks (feature code-search)
-├── scanner_docs.rs         — document-tier scan (PDF/Office/HTML → LanceDB, feature documents)
+├── scanner_docs.rs         — document-tier scan (PDF/Office/HTML → LanceDB, feature documents); also takes
+│                             prose/data/config (md/json/yaml/toml, `lang::is_non_code`): the code map is code-only
+├── scanner_doc_links.rs    — document→code link production (ADR-0008) for the document tier
+├── scanner_policy.rs       — embed-policy reconciliation: vector rows follow `embed*` config changes
 ├── scanner_candidates.rs   — candidate enumeration + the [scan] max_candidates ceilings and
 │                             the BASEMIND_ALLOW_EXTRA_ROOTS grant for extra_roots
 ├── scanner_index_batch.rs  — per-worker index write batch: commits on files OR staged bytes
@@ -87,20 +86,34 @@ src/
 ├── sysres.rs               — process memory usage + platform limit (cgroup v1/v2, mach,
 │                             Windows); rate-limited, backs the footprint ceiling
 ├── sysres_cgroup.rs        — cgroup / procfs parsers + mount-parameterised readers
+├── alloc_tag.rs            — macOS: retag mimalloc's mappings (Mach VM tag 254) so the heap stops
+│                             reading as IOAccelerator "GPU" memory
+├── daemon_lock.rs          — single-owner daemon lock, pidfile, machine-wide live-daemon registry +
+│                             ceiling (BASEMIND_MAX_DAEMONS)
+├── eval/                   — `basemind admin eval`: scores retrieval quality + token savings
+│                             against gold task files (see benchmarks/eval/README.md)
 ├── chunk.rs                — code-chunk model + chunker (feature code-search)
 ├── embeddings.rs           — shared ONNX embedding engine (feature intelligence)
 ├── url.rs                  — boundary-validated Url newtype (feature crawl)
 ├── store.rs                — content-addressed msgpack blob store; Store facade; holds IndexDb
 ├── store_blob.rs           — blob (de)framing + atomic write
 ├── store_layout.rs         — cache root / workspace-dir mapping; workspace.json marker
-├── store_lock.rs           — .basemind/.lock flock + holder metadata + writer probe
-├── store_gc.rs             — cache garbage collection
+├── store_lock.rs           — workspace-cache `.lock` flock + holder metadata + writer probe
+├── store_gc.rs             — tier-aware, cross-workspace reference-counted blob sweep (`cache gc`)
+├── store_gc_live.rs        — liveness split by tier (code lane vs document lane) + the machine-wide
+│                             `cache/gc.lock` that serialises sweeps
+├── store_gc_budget.rs      — cache size budget + `gc-state.json` (last sweep health)
 ├── store_gc_workspace.rs   — orphaned-workspace reaper for the machine-global cache
+├── store_seed.rs           — seed a new linked worktree's view from a sibling checkout (reflink)
 ├── store_cache_admin.rs    — cache clear / stats admin surface (CLI + MCP)
 ├── index/
 │   ├── mod.rs              — Fjall-backed secondary index; INDEX_SCHEMA_VER; refs_by_def /
 │   │                         refs_by_path (code-intelligence reverse index)
 │   ├── keys.rs             — length-prefixed composite key encodings
+│   ├── grep_bloom.rs       — per-file trigram bloom rows: the `code grep` candidate prefilter
+│   │                         (ADR-0012)
+│   ├── name_dict.rs        — resident dictionary of distinct callee / trait names behind
+│   │                         `references` / `callers` / `implementations`
 │   └── writer.rs           — atomic read-before-write upsert; per-file commit;
 │                             upsert_cross_file_edge
 ├── extract/                — tree-sitter extraction tiers
@@ -109,8 +122,10 @@ src/
 │   ├── l3.rs               — structural hash of symbol bodies
 │   ├── locals.rs           — tree-sitter `locals`-query intra-file scope resolution
 │   │                         (the grammar-native fallback for the code-intel tier)
-│   └── doc.rs              — xberg integration; FileMapDoc (+ keywords,
-│                             entities, summary on the documents path)
+│   ├── doc.rs              — xberg integration; FileMapDoc (+ keywords,
+│   │                         entities, summary on the documents path)
+│   └── doc_cost.rs         — header-derived peak-memory estimate of one document (skip if it
+│                             alone exceeds the footprint ceiling)
 ├── intel/                  — code-intelligence tier: scope/import-resolved navigation
 │   │                         (see "Code intelligence" below)
 │   ├── mod.rs              — engine dispatch + feature gates
@@ -123,7 +138,7 @@ src/
 │   ├── stackgraph.rs       — Python/Java via vendored .tsg stack-graphs
 │   │                         (feature code-intel-stack)
 │   └── tsg/{python,java}.tsg — vendored stack-graph name-binding rulesets
-├── git_history/            — precomputed git-history index (.basemind/git-history.fjall/,
+├── git_history/            — precomputed git-history index (`git-history.fjall/` in the workspace cache,
 │   │                         see "Git-history index" below)
 │   ├── mod.rs              — GitHistoryIndex; Local/Remote backend; CommitMeta; partitions
 │   ├── builder.rs          — sync: walk HEAD, populate partitions incrementally
@@ -143,7 +158,7 @@ src/
 │   ├── code.rs             — [code_search] config table
 │   ├── shells.rs           — [shells] config table
 │   ├── comms.rs            — [comms] config table (broker daemon + identity)
-│   ├── overrides.rs        — DocumentsCliOverrides — backs clap and MCP flatten
+│   ├── overrides.rs        — DocumentsCliOverrides — backs the clap flags
 │   ├── layered.rs          — merge_layers (Mcp > Cli > Env > File > Default)
 │   └── source.rs           — ConfigSource + ProvenanceMap ledger
 ├── mcp/                    — MCP server: nine domain tools (code, graph, git, memory, web,
@@ -151,11 +166,17 @@ src/
 │                             on a required `mode` — see "MCP surface" below
 │   ├── mod.rs, state.rs    — server bootstrap; shared ServerState
 │   ├── mode.rs             — define_mode!: the mode enums, wire spellings, telemetry_key(),
-│   │                         and domain_modes() (what tests/cli_parity.rs walks)
+│   │                         and domain_modes() (what tests/cli_parity/ walks)
 │   ├── tools.rs            — the `code` tool shim (#[tool], thin wrapper; 1000-line cap)
 │   ├── tools_<area>.rs     — one shim per remaining domain: admin, comms (→ `agents`),
 │   │                         git, graph, memory, registry (→ `workspace`), shells
 │   │                         (→ `shell`), web — filenames predate the tool/CLI rename
+│   ├── term_index.rs       — resident term index (symbol names + import strings) behind the
+│   │                         `symbols` / `dependents` substring sweeps
+│   ├── index_route.rs      — where a references/callers/implementations read runs: local index,
+│   │                         daemon-hosted (in-process), forwarded to the daemon, or in-RAM fallback
+│   ├── index_read.rs       — daemon-side executor for the forwarded index reads (`IndexRead`)
+│   ├── l1_cache.rs         — byte-budgeted read-through cache of decoded outlines (max_map_cache_mb)
 │   ├── helpers.rs          — tool bodies; shared scan / decode helpers
 │   ├── helpers_<area>.rs   — the run_<mode> dispatch bodies, area-sliced: admin, archmap,
 │   │                         calls, calls_scan, code, code_search (feature code-search),
@@ -168,16 +189,19 @@ src/
 │   │                         fields per mode) + response structs, mirroring the
 │   │                         tools_/helpers_ area split
 │   ├── cursor.rs           — cursor encoding for paginated tools
-│   ├── savings.rs          — token-savings heuristics, keyed by domain:mode telemetry_key()
-│   │                         plus the bare pre-consolidation spellings basemind-agent still
-│   │                         registers its LLM-facing tools under
+│   ├── savings.rs          — token-savings heuristics, keyed by the domain:mode telemetry_key()
+│   │                         plus the bare pre-consolidation tool-name spellings
 │   ├── telemetry.rs        — per-call telemetry.jsonl writer
 │   └── budget.rs, toon.rs, lean.rs, lenient.rs, kneedle.rs, notifications.rs,
 │       completions.rs, prompts.rs, tokens.rs, background.rs, daemon_forward.rs,
 │       map_fingerprint.rs, identity.rs — response budgeting, TOON/lean output
 │       shaping, request leniency, daemon-forward plumbing for Seam B
+├── stdio_relay.rs          — protocol-aware stdio relay behind `basemind serve`; survives a
+│                             daemon replacement without closing the host's pipes
 ├── comms/                  — agent-comms daemon: broker, thread registry, memory,
-│                             worktree registry (see "Agent comms" below);
+│                             worktree registry (see "Agent comms" below); workspace_pool.rs is
+│                             the daemon's hot-workspace + warm-read-stack pool, index_read_proto.rs
+│                             the wire types of the forwarded index reads;
 │                             http_auth.rs is the BASEMIND_ALLOW_HTTP opt-in + the bearer
 │                             token every HTTP front-end request must present
 ├── git/, git_cache.rs      — gix-backed history, blame, diff, status (git/mod.rs,
@@ -186,7 +210,8 @@ src/
 ├── query.rs                — read-side helpers shared by MCP tools + CLI
 ├── path.rs                 — RelPath: byte-precise repo-relative paths
 ├── lang.rs                 — LangId = &'static str (TSLP pack name), parser pool,
-│                             query cache, override-then-TSLP-fallback try_get_query
+│                             query cache, override-then-TSLP-fallback try_get_query;
+│                             is_non_code(): the grammars routed to the document tier
 ├── lance/                  — LanceDB schema + open/write helpers (feature intelligence)
 ├── search/                 — BM25 / exact / RRF keyword search over code chunks
 │                             (feature code-search)
@@ -201,6 +226,11 @@ src/
 │                             registry (the `workspace` group), shell, web;
 │                             comms_daemon.rs is `basemind comms` — daemon lifecycle only
 │                             (daemon/start/stop/status/doctor)
+│                             choices.rs holds the clap value enums, exit.rs the exit-code
+│                             contract (0/1/2/3/4/130), interrupt.rs the Ctrl-C scan cancel,
+│                             context.rs the one-shot server (daemon-forwarding when one is up)
+├── doctor_cli.rs, lang_cli.rs, comms_cli.rs — `doctor`, `lang`, and `comms`/`daemon`/`statusline`
+│                             entry points in the binary crate
 ├── queries/<pack-name>.scm — hand-written extraction queries (override TSLP tags.scm)
 ├── render.rs, hashing.rs, watcher.rs                   — supporting modules
 
@@ -216,11 +246,14 @@ Walker (gitignore-aware)
   → filter by user glob + size cap
   → rayon par_iter
     → process_file(rel, contents):
-        lang::detect()                — TSLP extension → LangId (or skip)
+        lang::detect()                — TSLP extension → LangId; prose/data/config grammars
+                                        (lang::is_non_code) and unrecognised files go to the
+                                        document tier (scanner_docs), not the code map
         L1 outline   (always)         — extract::l1
         L2 calls     (eager if cfg)   — extract::l2
         Store::write_l1               — content-addressed msgpack blob
         Store::write_l2 (if eager)
+        grep bloom row (working tree) — built from the bytes already in hand
   → collect FileResult { rel, l1_hash, l2_hash?, … }
   → Forward to daemon via IPC (UDS)
         IndexWriter::upsert_file(...) — Fjall secondary index
@@ -255,6 +288,16 @@ Key invariants:
   runs inside `scanner_lanes::run_optional_lane` (`catch_unwind`-wrapped), so a
   panic or hang in one lane degrades only that lane (e.g. "no resolved refs")
   and never costs the code map itself. Source: `src/scanner_lanes.rs`.
+- **Code-only code map** — `symbols`, `outline`, `grep` and the reference tools see code only.
+  Markdown, rst, asciidoc, vimdoc, csv, json, yaml, toml, ini, xml, properties, dotenv, diff,
+  gitignore/gitattributes and fluent files are chunked and searched as documents (gated by
+  `[documents] include` / `exclude` and the MIME allowlist). A path that changes tier is moved on the
+  next full or incremental scan: the stale code-map rows are purged, and the stale blobs are reclaimed
+  by the tier-aware sweep (see [Blob store and GC](#blob-store-and-gc)). A build without the
+  `documents` feature keeps the grammars, since there is no other tier for those files to go to.
+- **Bounded scan** — per-file results are streamed to the index in chunks (`scanner_drive.rs`), never
+  accumulated; the footprint gate pauses the drive between chunks and shrinks it when it cannot
+  hold the ceiling (see [Resource governance](#resource-governance)).
 - **Eager L2 cost** — scanning TypeScript at ~81 k files takes ~22 s with
   eager L2 on (the default). The `scan.eager_l2 = false` escape hatch trades
   reference search for fastest scan.
@@ -332,9 +375,10 @@ Both are misses, never wrong answers — the name-based scan still finds these c
 
 ## Inverted index
 
-A Fjall LSM keyspace at `~/.local/share/basemind/views/<workspace_hash>/<view>/index.fjall/`.
-Daemon-managed; all serving sessions read concurrently from a read-only handle. Source:
-`src/index/{mod,keys,writer}.rs`.
+A Fjall LSM database at `<cache>/cache/workspaces/<workspace_key>/views/<view>/index.fjall/`
+(`<cache>` is `BASEMIND_DATA_HOME`, default `~/.local/share/basemind` on Linux). Fjall admits one
+process per directory, so the daemon holds it and sessions reach it through the daemon (see
+[Index reads](#index-reads-and-resident-lookup-structures)). Source: `src/index/{mod,keys,writer}.rs`.
 
 | Keyspace | Purpose |
 |---|---|
@@ -349,8 +393,12 @@ Daemon-managed; all serving sessions read concurrently from a read-only handle. 
 | `implementations_by_path` | Per-file implementation lookups. |
 | `refs_by_def` | Scope/import-resolved reference edges keyed by defining site — backs the `resolved` annotation on `code` mode `callers` and the cross-file hop in mode `definition`. |
 | `refs_by_path` | `refs_by_def` companion keyed by the USE file — O(prefix) delete on re-resolve. |
+| `code_bm25_postings` | Code-search BM25 keyword postings (feature `code-search`). |
+| `code_bm25_by_path` | Per-file companion of `code_bm25_postings` — O(prefix) delete on re-index. |
+| `grep_bloom` | One trigram bloom filter per indexed file, keyed by path, with the `(size, mtime_ns)` it was built under; the `code grep` prefilter ([ADR-0012](adr/0012-grep-content-prefilter.md)). |
 | `embeddings` | Reserved for in-Fjall vector index; LanceDB owns the live vectors. |
 | `memory_by_key` | Agent memory (`memory` modes `put` / `get`); LanceDB owns the embeddings. |
+| `memory_archive`, `proposals` | Archived memory entries and mined co-change proposals (governance tier). |
 
 Key shapes (length-prefixed, see `src/index/keys.rs`):
 
@@ -362,37 +410,108 @@ calls_by_callee     u16:len(callee) ‖ callee ‖ u16:len(rel) ‖ rel ‖ star
 imports_by_module   u16:len(module) ‖ module ‖ u16:len(rel) ‖ rel ‖ start_byte:u32_be
 refs_by_def         u16:len(def_path) ‖ def_path ‖ def_start:u32_be ‖ u16:len(use_path) ‖ use_path ‖ use_start:u32_be
 refs_by_path        u16:len(use_path) ‖ use_path ‖ use_start:u32_be ‖ u16:len(def_path) ‖ def_path ‖ def_start:u32_be
+grep_bloom          rel (the path bytes)  →  version:u8 ‖ size:u64 ‖ mtime_ns:i64 ‖ bloom bits
 ```
 
 Length-prefixed components guarantee prefix-scan isolation: a `Foo` prefix never
 spills into `Foobar`. Schema version is stamped in the `meta` keyspace; mismatch
 on open drops the whole `index.fjall/` directory and the next scan rebuilds it.
 
+### Index reads and resident lookup structures
+
+`references`, `callers` and `implementations` are *substring* matches over `calls_by_callee` and
+`implementations_by_trait`, whose keys are length-prefixed, so a prefix scan cannot serve them and the
+naive shape walks every key. Two resident structures keep the common queries in the millisecond range
+without changing a single result:
+
+- **Name dictionary** (`src/index/name_dict.rs`). The distinct callee and trait names (orders of
+  magnitude fewer than the keys; a few MB at monorepo scale) live in one contiguous allocation. A
+  query is a `memmem` sweep over it, and only the matching names' key ranges are scanned; keys, order,
+  totals, the `total_is_partial` cap and cursors are those of the full walk. The writer records a name
+  before staging its key, so the dictionary is a superset and a stale name costs one empty range scan.
+  The first query after the index opens still walks the partition while a background pass builds it,
+  and a needle matching over 5 % of the distinct names goes back to the walk.
+- **Term index** (`src/mcp/term_index.rs`). `symbols` and `dependents` search only names and import
+  strings, held per file with no spans or signatures; a hit fetches its span and signature from the
+  outline cache by `(path, symbol index)`, so only the returned page is decoded. It is built in the
+  background when a full cache is published and patched, not rebuilt, by an incremental rescan.
+
+Both are memory only: nothing is persisted or migrated.
+
+Because Fjall admits one process, `src/mcp/index_route.rs` picks where a reference read runs:
+`Local` (this session holds the index: a writer or the CLI), `Host` (a daemon-hosted connection,
+reaching the daemon's workspace pool in-process), `Daemon` (a session that cannot open the index
+forwards an `IndexRead` request over the socket; the daemon runs the same scan functions via
+`src/mcp/index_read.rs`, so results, totals and cursors equal a writer's and the session holds no
+projection), or `InRam` (nothing reachable: a lazily built, byte-budgeted projection of the blobs that
+can be truncated and says so with a `projections_capped` notice). A failed forward degrades to
+`InRam` rather than erroring. The same request type carries the `code grep` bloom lookup
+(`IndexReadQuery::GrepBloom`, at most 16,384 paths per request).
+
+### Grep prefilter
+
+`code grep` is a sweep over every indexed file that passes the language/path filters. A per-file
+trigram bloom (`grep_bloom`: size/8 bytes clamped to 64 B–256 KiB, two hash positions per trigram,
+about 12.8 % of the indexed code bytes) lets it skip files that cannot match: the regex's
+required literals (`regex-syntax`'s literal extractor, prefix and suffix sets, each at least 3 bytes)
+are tested against the bloom, and a file is skipped only if its row rejects them AND a `stat` still
+shows the `(size, mtime_ns)` the row was built under. The real regex still runs on every candidate, so
+a false positive costs a read and never a wrong result; patterns with no required literal sweep
+everything, and `BASEMIND_GREP_BLOOM=0` forces the full sweep. Nothing is resident. See ADR-0012 for
+the sizing and measurements.
+
 ## Schema versioning
 
-Two on-disk schemas, both tracking `RELEASE_MINOR` from `src/version.rs`:
+Two on-disk schemas track `RELEASE_MINOR` from `src/version.rs`, plus a finer-grained extractor epoch:
 
-- `INDEX_SCHEMA_VER` in `src/index/mod.rs` — Fjall partition / key encoding
+- `INDEX_SCHEMA_VER` in `src/index/mod.rs` — Fjall partition / key encoding: `RELEASE_MINOR` plus
+  `INDEX_PARTITION_REVISION`, bumped when the keyspace layout changes between releases. A wholly new
+  keyspace whose absence reads as "nothing known" (such as `grep_bloom`) needs no bump.
 - `SCHEMA_VER` in `src/extract/mod.rs` — msgpack blob format
+- `EXTRACT_EPOCH` in `src/extract/mod.rs` — extraction *output* revision; see below.
 
 Bump cadence:
 
-- Minor release (`0.1.x` → `0.2.0`) bumps `RELEASE_MINOR` → both caches wipe
+- Minor release (`0.1.x` → `0.2.0`) bumps `RELEASE_MINOR` → each view's index and blobs reset
   on next scan.
-- Patch release (`0.1.0` → `0.1.1`) MUST be cache-compatible — never bump from
-  a patch commit.
+- Patch release (`0.1.0` → `0.1.1`) MUST be cache-compatible — never bump `RELEASE_MINOR` from
+  a patch commit. A patch that changes what an unchanged file's blob should contain (not its
+  serialized shape) bumps `EXTRACT_EPOCH` instead: every `FileEntry` and L1 blob records the epoch it
+  was produced under, and the next scan re-extracts only files whose entry or blob predates it, inside
+  the normal memory-bounded pass and keeping their call tier. The scan summary reports `refreshed`
+  (and `tier_migrated` for tier moves).
 
-Wipe-on-mismatch is the migration story; the next `basemind scan` rebuilds from
-source.
+Wipe-on-mismatch is the migration story for the schemas; the next `basemind scan` rebuilds from
+source. What happens to an existing index on each kind of change, and the checklist for adding a new
+on-disk component, is in [UPGRADING.md](UPGRADING.md).
+
+## Blob store and GC
+
+Extraction results live in a content-addressed blob store shared by every workspace on the machine
+(`<cache>/cache/blobs/`); a workspace's `files` (code lane) and `doc_files` (document lane) entries
+reference blobs by hash. The sweep (`src/store_gc.rs`, `src/store_gc_live.rs`) is tier-aware: a `.doc`
+blob is live only if some workspace's `doc_files` references the hash, and `.fm` / `.chunk` / `.rref`
+blobs only if a `files` entry does. That matters when a path changes tier (a markdown file that used
+to be code-mapped keeps its content hash, so its dead code-lane blobs would otherwise be pinned by the
+live `.doc` blob forever). The sweep is reference-counted against every workspace on the machine, keeps
+blobs younger than 6 hours (`BASEMIND_BLOB_GC_GRACE_SECS`), and is serialised by `cache/gc.lock`. It
+runs after any scan that migrated, refreshed or reset something (the daemon does so a minute later),
+hourly in the daemon, and on `basemind cache gc`; the MCP `admin` mode `gc` is a non-destructive report
+because a session cannot sweep without racing its own rescans. The size-budget enforcer and the last
+sweep's health (`gc-state.json`, shown as `last_gc` by `cache stats`) are in `src/store_gc_budget.rs`.
+Budget eviction never touches a locked, most-recently-used or recently built workspace (even over
+budget, which is reported instead); the rules live in `src/store_gc_protect.rs`.
 
 ## MCP surface
 
-`basemind serve` exposes a stdio MCP server (`rmcp`). The live contract is
-`tests/mcp_smoke.rs`.
+The daemon hosts the MCP router (`rmcp`) over a per-workspace shared read stack; `basemind serve`
+relays a client's stdio to it, and HTTP-native clients dial the daemon's streamable-HTTP front-end
+directly (opt-in via `BASEMIND_ALLOW_HTTP`, bearer token in `<comms_dir>/http.addr`). The live
+contract is `tests/mcp_smoke.rs`.
 
 The surface is **nine domain tools**, each dispatching on a required, non-defaulted `mode` — not
-one tool per verb (ADR-0011). The same nine names are the CLI groups, enforced as a strict
-`(domain, mode)` bijection by `tests/cli_parity.rs`. `src/mcp/mode.rs` (`define_mode!`) is the
+one tool per verb (ADR-0011). The same nine names are the CLI groups, checked per
+`(domain, mode)` by `tests/cli_parity/` (see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). `src/mcp/mode.rs` (`define_mode!`) is the
 single source of the wire spellings, the CLI parity table, and the telemetry keys.
 
 | Tool / CLI group | `mode` values | Gate |
@@ -432,23 +551,21 @@ Conventions:
 
 ## Git layer
 
-`gix`-backed log, blame, diff, and status. The git cache at `~/.local/share/basemind/git-cache/<workspace_hash>/`
-has two tiers:
+`gix`-backed log, blame, diff, and status. The git cache at
+`<cache>/cache/workspaces/<workspace_key>/git-cache/` has two tiers:
 
-- An in-process LRU (1024 entries per category by default; tune via
-  `basemind serve --git-cache-mem`).
+- An in-process LRU (1024 entries per category).
 - A sha-keyed disk store: `commit_files/<sha>.msgpack`,
   `log/<head_sha>__<scope>.msgpack`, `blame/<sha>__<path_hash>.msgpack`.
 
 Commits are immutable, so once a sha-keyed entry is on disk it's valid forever.
 HEAD-keyed entries (`log`) roll off naturally when HEAD moves.
 
-Drop the disk cache with `basemind cache clear`. Disable per-run with
-`basemind serve --no-git-cache-disk`.
+Drop the disk cache with `basemind cache clear`.
 
 ### Git-history index
 
-A separate, repo-level Fjall store at `.basemind/git-history.fjall/` — distinct from the
+A separate, per-workspace Fjall store at `git-history.fjall/` in the workspace cache directory — distinct from the
 `git-cache/` blame/log tier above. It turns the `git` tool's history modes (`touching`, `recent`,
 `by_path`, `churn`, the `symbol_history` commit walk, and full-text `search`) from live history
 walks into posting-list lookups. Source:
@@ -470,6 +587,10 @@ walks into posting-list lookups. Source:
   live-walk and report `partial: true`, so it can never serve stale results.
 - A linked worktree shares the MAIN worktree's index (keyed on the main worktree root) rather than
   rebuilding its own, since the commit graph is identical across worktrees of one clone.
+  The index tracks one head: a linked worktree whose HEAD descends from it appends the new commits,
+  while one that diverges leaves the index untouched (`RebuildOutcome::Skipped`) and answers by live
+  walk, so switching worktrees never wipes and rebuilds the history. The first build may come from any
+  worktree. Index sync runs on a dedicated two-thread pool.
 
 ## Resource governance
 
@@ -481,13 +602,35 @@ basemind's footprint on a constrained machine:
 | `scan_threads` | `0` (auto: rayon's per-core default) | Cap on the code-map scanner's rayon pool. |
 | `embed_threads` | `0` (auto: `max(2, logical_cpus / 4)`) | Cap on the ONNX embedding pool. |
 | `embed_batch_size` | `32` | Chunks submitted to ONNX per batch. |
-| `max_concurrent_documents` | `0` (unbounded) | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
+| `max_concurrent_documents` | `0` (unbounded) | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Document extraction then passes `FootprintGate::admit_exclusive`: over `max_footprint_mb` only one document runs at a time, and a document whose header-derived estimate (`src/extract/doc_cost.rs`) exceeds the whole ceiling is skipped as too large. Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
 | `document_models` | `full` | Model families document extraction runs: `full` \| `code_only` (embeddings only, no keywords/NER/summarization/OCR) \| `none` (metadata + keyword search only). |
+| `onnx_provider` | `cpu` | ONNX execution provider for embeddings, reranker, layout and NER: `cpu` \| `auto` \| `coreml` \| `cuda` \| `tensorrt`. `auto` on macOS means CoreML, which compiles per input shape and measured 7.6 GB for one tiny document vs 0.8 GB on CPU. |
 | `max_footprint_mb` | `0` (auto) | Ceiling on process memory footprint. A positive integer is an explicit mebibyte ceiling; `0` or `"auto"` derives one from the environment; `"off"` disables the gate. |
 | `max_map_cache_mb` | `256` | Byte budget for the MCP read stack's decoded-outline cache (`src/mcp/l1_cache.rs`), per workspace. `0` = unbounded. A miss costs one blob read and never changes an answer. The code-graph memo is charged at half this value, and a read-only session's projected call / implementation indexes are charged against it too. |
 
+In the shared daemon these values are ceilings, not settings: `src/config/daemon.rs` applies
+`min(file, cap)` to each (and to `[scan]` / `[documents]` / `[crawl]` limits), with `0` / `"auto"` /
+`"off"` resolving to the cap, and the operator raises a cap through `BASEMIND_DAEMON_MAX_*` in the
+daemon's environment. ONNX Runtime memory is bounded in every process (`embeddings::bound_ort_memory`:
+no memory-pattern planning, no retained CPU arena; intra-op threads are the auto embed-thread count, or
+2 in the daemon), and the daemon drops resident embedding engines when the last concurrent embedding
+pass ends.
+
+Other bounds that are not `[resources]` keys:
+
+- **Stack-graph resolution** (`src/intel/stackgraph.rs`) abandons a file past 600,000 steps, 50,000
+  partial paths or a 3 s budget (degrading to the `locals` fallback) and runs at most 2 builds at a
+  time; a wall-clock budget alone let parallel workers stitching 100-200 KB files take a large-monorepo
+  scan from ~2 GB to 9-13 GB.
+- **Panicking embed jobs** are contained (`catch_unwind`) so a panic surfaces as an error instead of
+  aborting the process through rayon.
+- **Allocator.** `mimalloc` is the global allocator (it returns freed pages to the OS). On macOS
+  `src/alloc_tag.rs` retags its mappings from Mach VM tag 100 (`VM_MEMORY_IOACCELERATOR`) to 254
+  (application-specific), so `footprint`, `vmmap` and Activity Monitor report the heap as application
+  memory, not "GPU" memory.
+
 `[resources]` bounds **one** read stack. The daemon holds several, and that multiplier is its own
-bound (`src/comms/workspace_pool.rs`). A hot pool entry is an open `Store` handle, capped at 16
+bound (`src/comms/workspace_pool.rs`). A hot pool entry is an open `Store` handle, capped at 4
 (`DEFAULT_HOT_CAP`); a *warm read stack* is the O(corpus) structure `max_map_cache_mb` governs, and
 it is capped separately and far lower:
 
@@ -505,11 +648,23 @@ rebuild, so edits made in the gap are picked up on the next watcher event or res
 immediately — the same window a daemon restart or the 15-minute entry sweep already opens.
 
 The best-effort `FootprintGate` backpressure (`src/backpressure.rs`) samples the process
-footprint via `src/sysres.rs` at the document-extraction and chunk-embedding admit points and
-parks the calling worker in a bounded backoff loop while the process is over the ceiling. It is
-deliberately never a hard invariant: an unreadable sample admits immediately, and a sustained
-overshoot admits anyway after `max_wait` (5s) to guarantee forward progress — the gate shaves the
-scan's peak memory, it never fails a scan.
+footprint via `src/sysres.rs` and parks the calling worker in a bounded backoff loop while the
+process is over the ceiling. It is deliberately never a hard invariant: an unreadable sample admits
+immediately, and a sustained overshoot admits anyway after `max_wait` (5s) to guarantee forward
+progress — the gate shaves the scan's peak memory, it never fails a scan. It acts at three levels:
+
+- **Drive loop** (`src/scanner_drive.rs`): candidates are processed in chunks and the gate is
+  consulted between chunks, holding no index batch. Each admit that had to be waited out halves the
+  chunk size and worker count, and consecutive clear admits widen them back, so a scan that cannot
+  hold its ceiling converges on a narrower, slower pass instead of a dead one.
+- **Leaves, advisory** (`admit`): a large-file parse waits, then proceeds after `max_wait`; there is no
+  smaller unit of work to fall back to.
+- **Document extraction, exclusive** (`admit_exclusive`): over the ceiling at most ONE document is
+  admitted at a time (the admission holds a process-wide token), and an otherwise idle process is
+  admitted at once, since waiting on an idle process can never free memory. Before extraction a
+  document's peak memory is estimated from its header (`src/extract/doc_cost.rs`: raster pixels,
+  OOXML/ODF uncompressed size, per-type factors, 32 MiB floor); one whose estimate exceeds the whole
+  ceiling is skipped and counted as too large, with a warning naming the estimate and the limit.
 
 `src/sysres.rs` (plus `src/sysres_cgroup.rs`) reports both usage and the *limit* the platform
 imposes, which is what makes `auto` possible:
@@ -581,7 +736,7 @@ flowchart TB
     A2["Agent B — repo Y (same workspace)"]
     HK["SessionStart hook\n(boot-subscribe + inject)"]
   end
-  subgraph serve["basemind serve (per session)"]
+  subgraph serve["basemind serve (per session: stdio relay to the daemon-hosted MCP router)"]
     MT["MCP tools: memory + agents"]
     CC["CommsClient (proxy)"]
     PEER["rmcp Peer (push, best-effort)"]
@@ -636,6 +791,79 @@ not *do not use one*. `basemind daemon ensure` honours it, like every other impl
 A working unit — with the install steps, the environment.d wiring, and the commands that verify the
 ceiling is real rather than merely configured — ships at `docs/systemd/basemind-comms.service`.
 
+### Request correlation, timeouts and the daemon log
+
+Every client request after `Hello` travels as a `Call { id, request }` and is answered by a
+`Reply { id, response }` (protocol version 4; `ensure_daemon` replaces an older daemon on its
+version check, and a skewed peer fails `Hello` with `proto_skew`). A client that abandons a request
+mid-flight (a timeout, a cancelled tool call) therefore cannot mistake the late reply for the next
+request's answer: stale ids are discarded, and only a drop in the middle of writing a frame forces
+a reconnect. Bare requests (status probes, `Hello`) still get an uncorrelated `Response`.
+
+Nothing waits forever. A coordination request must be answered within
+`BASEMIND_COMMS_REQUEST_TIMEOUT_SECS` (default 10) and the connect + `Hello` within
+`BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS` (default 30: a cold daemon answers `Hello` only once its store is open), else the call fails with the retryable
+`comms: broker unresponsive`. Forwarded work (scan, embed, memory, git-history, index reads) is
+exempt. The stdio relay answers a request the daemon has not replied to within
+`BASEMIND_RELAY_REQUEST_TIMEOUT_SECS` (default 180, `0` disables) with a retryable `-32002
+backend_timeout` and drops the late reply. The MCP `wait` mode is capped at 40 s, returns early
+when the host cancels the call or the connection closes (the ephemeral link, and so its
+subscription, is dropped at once), and does not return messages a previous `wait` already returned.
+
+The detached daemon's stdout and stderr are appended to `<comms_dir>/daemon.log` (mode 0600,
+rotated to `daemon.log.1` past 8 MiB at spawn and trimmed in place while running). `basemind comms
+doctor` prints the path for every comms daemon (`log` in `--json`).
+
+### Daemon runtime, store access and early accept
+
+The daemon is mostly an idle I/O relay, so it runs a small multi-thread tokio runtime of 8 async
+workers (`DAEMON_ASYNC_WORKERS` in `src/cli/comms_daemon.rs`) and a capped blocking pool. The comms
+store is Fjall, so every call is blocking disk I/O. Handlers never run it on a worker: reads go
+through `Broker::store_blocking` and mutations through `Broker::store_write`
+(`src/comms/daemon_store_blocking.rs`), both of which hand a closure to `spawn_blocking`. Writers
+additionally take a plain-mutex write gate so read-modify-write sequences (a post's `seq`
+allocation, thread-record updates) stay serialized exactly as when every handler ran inline. A slow
+disk therefore cannot stall `Ping` or `Status` on another link, and a plain inbox read skips the
+gate.
+
+On Unix the singleton socket is accepted before the store has finished opening (`EarlyAccept` in
+`src/comms/frontend_uds.rs`). Until the broker is published, only `Ping` is answered, so
+`ensure_daemon` sees a healthy daemon. Every other request, and relay connections, park until the
+broker exists and are then served as if they had arrived afterwards; nothing is dropped.
+
+### Idempotent posts and relay replay
+
+`agents` `post` accepts an `idempotency_key` (1-128 printable ASCII characters; the MCP layer
+generates one when the caller omits it). The store records `(from, thread, key) -> message id` in the
+`meta` keyspace in the same batch as the message, so rows survive a daemon restart. A repeat within
+the one-hour window (`IDEMPOTENCY_TTL`) returns the original id and appends nothing; older rows are
+pruned.
+
+The stdio relay (`src/stdio_relay.rs`) uses this to survive a backend restart without closing the
+host's pipes. It reconnects with a 250 ms to 5 s backoff and re-sends each in-flight request at most
+once (5 s replay timeout), but only when re-sending is safe:
+
+- the read methods `ping`, `tools/list`, `resources/list`, `resources/read`,
+  `resources/templates/list`, `prompts/list`, `prompts/get` and `completion/complete`;
+- every `code`, `git` and `graph` call;
+- `agents` modes `list`, `thread_list`, `members`, `history`, `message`, `inbox`, `ack`, `wait` and
+  `status`;
+- `agents` `post`, which the relay stamps with a `relay-` key when the caller gave none.
+
+Every other in-flight request is answered with a retryable `-32001 backend_restarted` rather than
+guessed at, and a request the backend never answered within the relay deadline gets `-32002
+backend_timeout`.
+
+### Delivery probe
+
+An ordinary MCP tool response can carry a short notice of unread agent messages. Each tool call may
+run a probe (`take_delivery_notice` in `src/mcp/helpers_comms.rs`) over a dedicated broker
+connection so it never contends with the session's interactive client. It is rate-limited to one per
+2 s per session, has a 200 ms read budget and a 2 s connect budget, scans at most 200 inbox rows
+(the broker bounds its own scan, so the cost does not grow with the backlog), and lists up to five
+messages, each at most once per session. Failure and contention are silent, so mailbox delivery
+cannot make another tool slow or unavailable.
+
 ### Evidence a killed process leaves behind
 
 A daemon that *diagnoses* its own failure records it (`comms/store_health.rs` writes
@@ -648,7 +876,10 @@ file proves the process never ran its destructors; the record's `phase` says how
 `root` names what it was scanning. `basemind comms doctor` lists every such record whose pid is dead
 (filesystem-only, no RPC, so it stays usable on a wedged machine) and `--clear-fatal` acknowledges
 them alongside the fatal-store record. Alongside it, a periodic `rss_mb` / `ceiling_mb` line makes
-the growth curve that led to the kill reconstructable from the log.
+the growth curve that led to the kill reconstructable from the log. The sampler reads the footprint
+every 200 ms and each line also carries `window_peak_mb` (the maximum since the previous line) and
+`process_peak_rss_mb`; a gibibyte jump above anything already logged writes a `spike=true` line at once,
+so a transient shorter than the 5 s line interval is still visible.
 
 ### Thread model
 

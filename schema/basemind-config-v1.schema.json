@@ -24,6 +24,7 @@
           "**/bazel-testlogs/**",
           "**/bazel-*/**"
         ],
+        "floor_allow": [],
         "respect_gitignore": true,
         "follow_symlinks": false,
         "max_file_bytes": 2097152,
@@ -59,6 +60,7 @@
       }
     },
     "languages": {
+      "description": "Per-grammar overrides keyed by tree-sitter-language-pack grammar name (`[languages.jinja2]`):\ndisable a grammar, map extra extensions / file names onto it, or pre-fetch it.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/LanguageConfig"
@@ -70,16 +72,26 @@
       "default": {
         "enabled": true,
         "mime_allowlist": [],
+        "include": [],
+        "exclude": [],
+        "max_file_bytes": 52428800,
         "extension_denylist": [],
         "max_chunks_per_document": 2000,
         "max_pages": 500,
-        "extraction_timeout_secs": 600,
+        "extraction_timeout_secs": 120,
+        "phase_budget_secs": 1800,
+        "max_abandoned_extractions": 4,
+        "markdown_chunk_max_bytes": 1048576,
+        "plain_text_chunk_max_bytes": 4194304,
         "max_characters": 1000,
         "overlap": 200,
         "embedding_preset": "balanced",
         "embed": true,
+        "embed_include": [],
         "embed_exclude": [],
         "extract_archives": false,
+        "max_archive_bytes": 67108864,
+        "max_archive_entries": 1000,
         "language": {
           "auto_detect": true,
           "min_confidence": 0.8,
@@ -142,7 +154,8 @@
         "embed_batch_size": 32,
         "max_footprint_mb": 0,
         "max_map_cache_mb": 256,
-        "document_models": "full"
+        "document_models": "full",
+        "onnx_provider": "cpu"
       }
     },
     "code_search": {
@@ -154,6 +167,7 @@
         "overlap": 200,
         "max_chunks_per_file": 2000,
         "embed": false,
+        "embed_include": [],
         "embed_exclude": [],
         "reranker": {
           "enabled": false,
@@ -189,7 +203,7 @@
         "max_pages": 32,
         "max_depth": 2,
         "max_body_size": 4194304,
-        "user_agent": "basemind/0.26.0 (+https://github.com/Goldziher/basemind)",
+        "user_agent": "basemind/0.29.3 (+https://github.com/Goldziher/basemind)",
         "allow_private_network": false
       }
     },
@@ -217,9 +231,6 @@
         "max_retries": null,
         "max_tokens": null
       }
-    },
-    "agent": {
-      "description": "The `[agent]` table, accepted here but interpreted elsewhere.\n\nThe agent front-end owns this section and parses it itself, leniently, straight out of the\nTOML document (`crates/basemind-tui/src/config.rs`). The core server never reads it — but it\nmust still ACCEPT it, because `deny_unknown_fields` above applies to the whole file: without\nthis passthrough, a repo whose `basemind.toml` legitimately carries `[agent]` fails to parse,\nthe daemon cannot host that workspace (`host_build_failed`), `serve` dies before `initialize`,\nand every MCP tool silently disappears. Keeping it untyped avoids duplicating the agent\ncrate's role schema here while preserving strict typo-checking for every other section."
     }
   },
   "additionalProperties": false,
@@ -231,16 +242,19 @@
       "type": "object",
       "properties": {
         "include": {
+          "description": "Allow-list of globs (repo-relative, forward-slash, case-sensitive; `*` crosses `/`). A file\nis scanned only when it matches at least one entry, so an empty list is rejected at load\n(it would silently index nothing). A bare name with no glob metacharacters (`src`,\n`docs/api`) matches that path and everything beneath it, like a `.gitignore` entry.",
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1
           },
+          "minItems": 1,
           "default": [
             "**/*"
           ]
         },
         "exclude": {
+          "description": "Deny-list of globs, same syntax as `include`; exclusion beats inclusion. Applied on top of\nthe always-on exclude floor (`build`, `out`, `vendor`, `coverage`, `venv`, `dist`, `target`,\n... see `floor_allow`). A bare name (`generated`) excludes every path segment called that,\nand everything beneath it. For `extra_roots` files the globs match the path relative to the\nextra root, not the absolute path.",
           "type": "array",
           "items": {
             "type": "string",
@@ -259,12 +273,21 @@
             "**/bazel-*/**"
           ]
         },
+        "floor_allow": {
+          "description": "Entries to remove from the always-on exclude floor, named by directory (`build`, `vendor`)\nor by the floor pattern itself (`**/build/**`). Use it to index a tree the floor otherwise\ndrops. The default `exclude` list is separate: a directory also listed there (`dist`,\n`target`) must be removed from `exclude` too. The floor also drops credential files (`.env`,\n`.env.*`, `.aws`, `.ssh`, `.gnupg`, `.npmrc`, `id_rsa`, `*.pem`, `*.key`, ...); list the\nentry (`.env.*`, `*.pem`) to index one deliberately. A credential entry here is honoured only\nwhen the operator sets `BASEMIND_ALLOW_REPO_CREDENTIALS`, so a repository's own file cannot\nun-exclude the operator's secrets. `.git` and `.basemind` can never be allowed,\nand an entry naming nothing in the floor is ignored with a warning.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
         "respect_gitignore": {
           "type": "boolean",
           "default": true
         },
         "follow_symlinks": {
-          "description": "Follow symlinks during the walk. Default `false` — symlinks are a common way to escape the\nrepo (Bazel's `bazel-*` convenience symlinks point into an external output tree), and\nfollowing them can balloon the scan or pull in unrelated files. Set `true` for repos that\ndeliberately symlink real source into place; the exclude floor still prunes `bazel-*` so a\nsymlinked Bazel tree does not leak in. This governs `extra_roots` too: those walks used to\nfollow links unconditionally, which let a link inside a directory named by the *repository's\nown* config reach anywhere on the filesystem.",
+          "description": "Follow symlinks during the walk. Ignored (forced `false`) when set by the repository's own\n`basemind.toml` unless the operator sets `BASEMIND_ALLOW_FOLLOW_SYMLINKS=1`. Default `false` — symlinks are a common way to escape the\nrepo (Bazel's `bazel-*` convenience symlinks point into an external output tree), and\nfollowing them can balloon the scan or pull in unrelated files. Set `true` for repos that\ndeliberately symlink real source into place; the exclude floor still prunes `bazel-*` so a\nsymlinked Bazel tree does not leak in. This governs `extra_roots` too: those walks used to\nfollow links unconditionally, which let a link inside a directory named by the *repository's\nown* config reach anywhere on the filesystem.",
           "type": "boolean",
           "default": false
         },
@@ -286,7 +309,7 @@
           "default": true
         },
         "extra_roots": {
-          "description": "Extra directories to index in addition to the repository root. Each entry is an\nabsolute path to a directory *outside* the repo — e.g. a Bazel external repo cache\n(`/private/var/tmp/_bazel_<user>/<hash>/external`) — whose files should resolve in\nsymbol search, references, outlines, and document search.\n\n**Requires the `BASEMIND_ALLOW_EXTRA_ROOTS=1` environment grant.** This key is read from\nthe scanned repository's own `basemind.toml`, so without an operator-side opt-in a cloned\nrepository could point basemind at `~/.ssh` and read the results back out through the\nsearch tools. Unset, every entry here is ignored with a warning.\n\nFiles under an extra root are keyed by their **absolute** path (repo files stay\nrepo-relative), so returned paths for external files are absolute. Missing or\nunreadable roots are skipped with a warning; so is a root inside the repo (the primary\nwalk already covers it) and a filesystem or volume root (never indexable, grant or no\ngrant). Extra roots are (re-)indexed on a full `basemind scan` only — the live watcher\ndoes not track them — they count toward `max_candidates` like any other candidate, and\nthey follow symlinks only when `follow_symlinks` is on. Because these trees can be large,\nscope them narrowly and lean on `exclude` + `max_file_bytes`.",
+          "description": "Extra directories to index in addition to the repository root. Each entry is an\nabsolute path to a directory *outside* the repo — e.g. a Bazel external repo cache\n(`/private/var/tmp/_bazel_<user>/<hash>/external`) — whose files should resolve in\nsymbol search, references, outlines, and document search.\n\n**Requires the `BASEMIND_ALLOW_EXTRA_ROOTS` environment grant.** This key is read from\nthe scanned repository's own `basemind.toml`, so without an operator-side opt-in a cloned\nrepository could point basemind at `~/.ssh` and read the results back out through the\nsearch tools. Unset, every entry here is ignored with a warning. `1` grants every\nworkspace the process scans (including every later workspace of a long-lived daemon); a\npath list (`:`-separated) of workspace roots grants only those workspaces.\n\nFiles under an extra root are keyed by their **absolute** path (repo files stay\nrepo-relative), so returned paths for external files are absolute. Missing or\nunreadable roots are skipped with a warning; so is a root inside the repo (the primary\nwalk already covers it) and a filesystem or volume root (never indexable, grant or no\ngrant). Extra roots are (re-)indexed on a full `basemind scan` only — the live watcher\ndoes not track them — they count toward `max_candidates` like any other candidate, and\nthey follow symlinks only when `follow_symlinks` is on. Because these trees can be large,\nscope them narrowly and lean on `exclude` + `max_file_bytes`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -326,6 +349,7 @@
           "default": 250
         },
         "live_l2": {
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set).",
           "type": "boolean",
           "default": false
         }
@@ -336,7 +360,7 @@
       "type": "object",
       "properties": {
         "file_map_lru": {
-          "description": "Maximum number of extracted FileMaps to keep hot in memory.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set). The\noutline cache is bounded by `resources.max_map_cache_mb`.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
@@ -349,6 +373,7 @@
       "type": "object",
       "properties": {
         "transport": {
+          "description": "Reserved: `stdio` is the only variant and nothing reads it.",
           "$ref": "#/$defs/McpTransport",
           "default": "stdio"
         }
@@ -365,8 +390,32 @@
       "type": "object",
       "properties": {
         "enabled": {
+          "description": "`false` disables the language: its files are no longer parsed as code and are handled as if\nno grammar recognised them (so they fall through to the document tier, subject to\n`[documents]`). Use it for tree-sitter-language-pack misdetections such as `.txt` (vimdoc)\nor `.conf` (nginx). Already-indexed files of a disabled language are dropped on the next scan.",
           "type": "boolean",
           "default": true
+        },
+        "extensions": {
+          "description": "Extra file suffixes mapped to this grammar, e.g. `[\".mako\", \".tpl\"]` (leading dot optional,\ncase-insensitive, compound suffixes like `.html.erb` allowed). Overrides take precedence over\nbuilt-in detection. The table key must be a tree-sitter-language-pack grammar name.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "filenames": {
+          "description": "Exact file names mapped to this grammar, e.g. `[\"BUILD.in\"]`. Takes precedence over\n`extensions` and built-in detection.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "preload": {
+          "description": "Also fetch this grammar in `basemind lang install` (by default only the languages basemind\nships queries for are pre-fetched; others download on first use).",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -389,8 +438,33 @@
           },
           "default": []
         },
+        "include": {
+          "description": "Allow-list of globs (repo-relative, forward-slash) selecting which non-code files are indexed\nas documents. Empty (default) = every non-code file that passes `[scan]`. A bare name with no\nglob metacharacters (`docs`) matches that path and everything beneath it. `exclude` wins over\n`include`.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "exclude": {
+          "description": "Deny-list of globs applied to document indexing itself (not just embedding): matching files\nare not extracted, chunked or searchable as documents. Same syntax as `include`.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "max_file_bytes": {
+          "description": "Per-document size cap in bytes, independent of `[scan] max_file_bytes` (which only bounds\nsource files). Default 50 MiB, so PDFs and Office files above the 2 MiB scan cap are still\nextracted. Larger files are skipped and counted in the scan summary as too large.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1024,
+          "default": 52428800
+        },
         "extension_denylist": {
-          "description": "Extra file extensions (lowercase, no dot) to skip on top of the built-in archive/binary\ndenylist. The built-in floor (`.zip/.tar/.jar/.so/.wasm/...`) is always applied — this only\nadds to it — so archives and binaries are never routed to xberg extraction + embedding.",
+          "description": "File extensions to skip on top of the built-in archive/binary denylist (`pdf` and `.PDF` are\nequivalent: case-insensitive, leading dot optional). The built-in floor\n(`.zip/.tar/.jar/.so/.wasm/...`) is always applied — this only adds to it — so archives and\nbinaries are never routed to xberg extraction + embedding.",
           "type": "array",
           "items": {
             "type": "string",
@@ -413,11 +487,40 @@
           "default": 500
         },
         "extraction_timeout_secs": {
-          "description": "Maximum wall-clock time xberg may spend extracting one document.",
+          "description": "Maximum wall-clock time one document's extraction (including chunking) may take. Enforced by a\nwatchdog: a document that overruns is abandoned, skipped and counted as `doc_timeouts` in the scan\nsummary, so one pathological file cannot stall a scan. A timed-out document is remembered by\ncontent hash and not retried while it is unchanged and the extraction limits are unchanged;\nediting the file or changing this value (or the chunk cutovers or `max_pages`) retries it.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
-          "default": 600
+          "default": 120
+        },
+        "phase_budget_secs": {
+          "description": "Wall-clock budget for the whole document phase of one scan, started at the first document that\nneeds a real extraction. Once spent, the remaining documents are deferred (counted as\n`docs_deferred`, not failed) and picked up by the next scan, so several documents timing out\ntogether cost this budget rather than `extraction_timeout_secs` each. Documents already running\nfinish or hit their own timeout, so a scan can overshoot by up to one `extraction_timeout_secs`. Never\nless than `extraction_timeout_secs` in effect.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1,
+          "default": 1800
+        },
+        "max_abandoned_extractions": {
+          "description": "Cap on timed-out extraction threads still running. A timed-out extraction cannot be cancelled\nand keeps a core busy until it finishes on its own; at the cap, further documents are deferred\n(counted as `docs_deferred`) instead of spawning another thread, and picked up by a later scan.\nA soft bound: extractions already in flight when it is reached may still time out.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 4
+        },
+        "markdown_chunk_max_bytes": {
+          "description": "Largest text-like document (markdown, csv, json, yaml, xml, toml, ini, ...) in bytes still chunked\nwith xberg's structure-aware markdown splitter. The splitter re-scans every remaining element\nper chunk, so its cost grows with the square of the document: a multi-megabyte file can stall a\nscan worker for minutes. Larger files are chunked by a linear fixed-size chunker instead (counted\nas `docs_degraded` in the scan summary). Never applies to binary formats (PDF, Office, ...).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1024,
+          "default": 1048576
+        },
+        "plain_text_chunk_max_bytes": {
+          "description": "Like `markdown_chunk_max_bytes` but for plain text (`text/plain`: `.txt`, `.log`, ...), which has no\nmarkdown structure for the splitter to exploit, so the cutover is lower.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1024,
+          "default": 4194304
         },
         "max_characters": {
           "description": "Maximum chunk size in characters.",
@@ -443,8 +546,17 @@
           "type": "boolean",
           "default": true
         },
+        "embed_include": {
+          "description": "Allow-list of globs for embedding: when non-empty only matching documents are embedded; the\nrest stay extracted + keyword-searchable. It only narrows what `include`/`exclude` already\nindex. Empty (default) = every indexed document is embedded. Only consulted when `embed = true`.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
         "embed_exclude": {
-          "description": "Glob patterns (repo-relative, forward-slash) for documents that are still extracted +\nindexed but **never** embedded. Keeps ONNX vectors off selected large or low-value documents\nwhile leaving their text searchable by keyword. Empty by default; only consulted when\n`embed = true`.",
+          "description": "Glob patterns (repo-relative, forward-slash) for documents that are still extracted +\nindexed but **never** embedded. Keeps ONNX vectors off selected large or low-value documents\nwhile leaving their text searchable by keyword. Beats `embed_include`. Empty by default; only\nconsulted when `embed = true`. Changing it removes the vector rows of newly excluded\ndocuments on the next scan.",
           "type": "array",
           "items": {
             "type": "string",
@@ -456,6 +568,20 @@
           "description": "Route archives (`.zip/.tar/.jar/...`) into xberg's recursive archive extractor. Default\n`false`: archives and compressed containers are rejected by the built-in floor before any\nextraction, so a single archive can't explode into thousands of embeds. Flip to `true` to opt\ninto extracting the files *inside* archives — at the cost of the extra recursion + embedding\nwork. True binaries (`.so/.wasm/.exe/...`) are always rejected regardless of this flag.",
           "type": "boolean",
           "default": false
+        },
+        "max_archive_bytes": {
+          "description": "Cap on the total *uncompressed* bytes xberg may unpack from one archive when\n`extract_archives = true`. An archive past the cap fails extraction (counted as an extract\nfailure) instead of being unpacked into memory. Default 64 MiB; xberg's own default is 500 MB.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1024,
+          "default": 67108864
+        },
+        "max_archive_entries": {
+          "description": "Cap on the number of entries in one archive when `extract_archives = true`. Default 1000;\nxberg's own default is 10,000.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 1,
+          "default": 1000
         },
         "language": {
           "description": "Language detection + preferred languages for chunking / extraction.",
@@ -573,7 +699,7 @@
           "default": false
         },
         "preferred_languages": {
-          "description": "Reserved — accepts ISO 639-3 codes (e.g. `\"fra\"`, `\"deu\"`) for future use.\nXberg rc.10 does not honor a preferred-language hint, but the field\nis kept on the schema so users can populate it without a config break.",
+          "description": "Reserved: currently has no effect (a load-time warning is logged when set) — accepts ISO 639-3 codes (e.g. `\"fra\"`, `\"deu\"`) for future use.\nXberg rc.10 does not honor a preferred-language hint, but the field\nis kept on the schema so users can populate it without a config break.",
           "type": "array",
           "items": {
             "type": "string"
@@ -602,7 +728,7 @@
           "format": "uint",
           "minimum": 0,
           "default": 20
-        }
+}
       },
       "additionalProperties": false
     },
@@ -623,7 +749,7 @@
           "description": "Maximum keywords to extract per document. Matches xberg's\n`KeywordConfig.max_keywords` default of 10.",
           "type": "integer",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "default": 10
         },
         "min_score": {
@@ -862,7 +988,7 @@
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Backend selection. `tesseract` is the default; `paddle` for CJK-heavy\ncorpora; `vlm` routes through `[llm]` for vision-language OCR.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value); OCR runs with xberg's defaults.",
           "$ref": "#/$defs/OcrBackend",
           "default": "tesseract"
         },
@@ -912,7 +1038,7 @@
       ]
     },
     "ResourcesConfig": {
-      "description": "Top-level `[resources]` table. Every field has `#[serde(default)]` (directly\nor via a default fn) so adding a knob never breaks an older TOML file, and an\nomitted `[resources]` section deserialises to [`ResourcesConfig::default`].\n\n`0` is the \"auto\" sentinel for the thread / concurrency caps: it means \"let\nbasemind pick a bounded fraction of the machine\" rather than \"use zero\nthreads\". This keeps the default config safe on a laptop while letting an\noperator pin an explicit budget on a shared box.",
+      "description": "Top-level `[resources]` table. Every field has `#[serde(default)]` (directly\nor via a default fn) so adding a knob never breaks an older TOML file, and an\nomitted `[resources]` section deserialises to [`ResourcesConfig::default`].\n\n`0` is the \"auto\" sentinel for the thread / concurrency caps: it means \"let\nbasemind pick a bounded fraction of the machine\" rather than \"use zero\nthreads\". This keeps the default config safe on a laptop while letting an\noperator pin an explicit budget on a shared box.\n\n**In the shared daemon these are ceilings, not requests.** The effective value is the smaller of\nthe file's and the daemon's cap (`BASEMIND_DAEMON_MAX_SCAN_THREADS`, `..._MAX_EMBED_THREADS`,\n`..._MAX_EMBED_BATCH`, `..._MAX_CONCURRENT_DOCUMENTS`, `..._MAX_FOOTPRINT_MB`,\n`..._MAX_MAP_CACHE_MB`, and `..._MAX_CANDIDATES` for `[scan] max_candidates`), and a file value\nthat means \"no limit\" (`0`, `\"auto\"`, `\"off\"`) resolves to the cap. The operator raises a cap in\nthe daemon's environment; a repository cannot.",
       "type": "object",
       "properties": {
         "scan_threads": {
@@ -940,7 +1066,7 @@
           "description": "Number of chunks the embedder submits to ONNX per batch. Larger batches\namortise per-call overhead at the cost of a higher transient memory\nspike; 32 is a safe default across the preset models. Threaded into both\n`SharedEmbedder` (code-search + query paths) and the document extractor's\n`EmbeddingConfig`.",
           "type": "integer",
           "format": "uint",
-          "minimum": 0,
+          "minimum": 1,
           "default": 32
         },
         "max_footprint_mb": {
@@ -949,7 +1075,7 @@
           "default": 0
         },
         "max_map_cache_mb": {
-          "description": "Byte budget, in mebibytes, for the MCP read stack's decoded-outline cache\n([`crate::mcp::l1_cache::L1Cache`]). `0` means unbounded — the\npre-0.26 behaviour, where every indexed file's decoded L1 stayed\nresident for the process lifetime, once per hot workspace.\n\nCharged in BYTES rather than in entries because a decoded outline\nspans three orders of magnitude (a ~1.4 KB median against a measured\n697 KB maximum), so an entry cap would bound the count and not the\nfootprint. A miss costs one content-addressed blob read and never\nchanges an answer. Read-only sessions charge their projected call /\nimplementation indexes — the substitute for a Fjall index they cannot\nopen — against the same budget, since it is the one knob bounding the\nread stack.",
+          "description": "Byte budget, in mebibytes, for the MCP read stack's decoded-outline cache\n([`crate::mcp::l1_cache::L1Cache`]). `0` means unbounded — the\npre-0.26 behaviour, where every indexed file's decoded L1 stayed\nresident for the process lifetime, once per hot workspace.\n\nCharged in BYTES rather than in entries because a decoded outline\nspans three orders of magnitude (a ~1.4 KB median against a measured\n697 KB maximum), so an entry cap would bound the count and not the\nfootprint. A miss costs one content-addressed blob read and never\nchanges an answer. A read-only session that can reach neither a Fjall\nindex nor the daemon that holds it (a daemon-backed session forwards\nreference reads and builds nothing) charges its last-resort projected\ncall / implementation indexes against the same budget, since it is the\none knob bounding the read stack.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
@@ -959,6 +1085,11 @@
           "description": "Which model families run during document extraction. `Full` (default)\nruns every configured post-processor; the narrower profiles strip\nenrichment / embeddings to shrink the scan-time footprint on code-centric\nworkspaces. See [`DocumentModelProfile`].",
           "$ref": "#/$defs/DocumentModelProfile",
           "default": "full"
+        },
+        "onnx_provider": {
+          "description": "ONNX Runtime execution provider for every model basemind loads (embeddings, reranking, layout\ndetection, NER). Defaults to `cpu`: on macOS the `auto` provider routes models through CoreML,\nwhich compiles a fresh graph per input shape and measured 7.6 GB resident for one tiny document\nagainst 0.8 GB on the CPU provider (and 3x slower), so a scan over a document-heavy repository\ngrew without bound. `auto` restores the platform default (CoreML on macOS, CUDA on a Linux\nbuild with GPU support); `coreml`, `cuda` and `tensorrt` pin one.",
+          "$ref": "#/$defs/OnnxProvider",
+          "default": "cpu"
         }
       },
       "additionalProperties": false
@@ -1013,6 +1144,36 @@
         }
       ]
     },
+    "OnnxProvider": {
+      "description": "ONNX Runtime execution provider used for every model session; see\n[`ResourcesConfig::onnx_provider`].",
+      "oneOf": [
+        {
+          "description": "CPU execution provider. The default: bounded memory on every platform.",
+          "type": "string",
+          "const": "cpu"
+        },
+        {
+          "description": "Platform default: CoreML on macOS, CUDA on a Linux build with GPU support, CPU elsewhere.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Apple CoreML (Neural Engine + GPU). Memory grows with the number of distinct input shapes.",
+          "type": "string",
+          "const": "coreml"
+        },
+        {
+          "description": "NVIDIA CUDA.",
+          "type": "string",
+          "const": "cuda"
+        },
+        {
+          "description": "NVIDIA TensorRT.",
+          "type": "string",
+          "const": "tensorrt"
+        }
+      ]
+    },
     "CodeSearchConfig": {
       "description": "`[code_search]` table. Chunk + embed source code for the `code` tool's `semantic` mode.",
       "type": "object",
@@ -1048,8 +1209,17 @@
           "type": "boolean",
           "default": false
         },
+        "embed_include": {
+          "description": "Allow-list of globs for embedding: when non-empty only matching files are embedded; the rest\nare still chunked + keyword-searchable. Empty (default) = every chunked file is embedded.\nOnly consulted when `embed = true`.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
         "embed_exclude": {
-          "description": "Glob patterns (repo-relative, forward-slash) for files that are still chunked + indexed\n(BM25 / code-map) but **never** embedded. Use it to keep vectors off large generated or\nvendored files while leaving them searchable by keyword. Empty by default. Only consulted\nwhen `embed = true` — with embedding already off it is a no-op.",
+          "description": "Glob patterns (repo-relative, forward-slash) for files that are still chunked + indexed\n(BM25 / code-map) but **never** embedded. Use it to keep vectors off large generated or\nvendored files while leaving them searchable by keyword. Beats `embed_include`. Empty by\ndefault. Only consulted when `embed = true`; changing it removes the vector rows of newly\nexcluded files on the next scan.",
           "type": "array",
           "items": {
             "type": "string",
@@ -1073,17 +1243,17 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch. Only meaningful when the `memory` cargo feature is compiled in.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value); the `memory` cargo feature alone decides whether memory is available.",
           "type": "boolean",
           "default": true
         },
         "scope_strategy": {
-          "description": "How to derive the scope key for an opened repository.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value). Would choose how the scope key of an opened repository is derived.",
           "$ref": "#/$defs/MemoryScopeStrategy",
           "default": "git_remote_with_fallback"
         },
         "default_visibility": {
-          "description": "Default memory tier when a `memory_*` call omits `visibility`. `group` (shared) keeps\ntoday's behavior; set to `individual` so a user's writes default to their private tier.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value). Would set the default memory tier when a `memory_*` call omits\n`visibility`.",
           "type": "string",
           "enum": [
             "group",
@@ -1113,7 +1283,7 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch. Only meaningful when the `comms` cargo feature is compiled in; when\n`false` the MCP / CLI comms tools are wired but the server never connects to a daemon.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value).",
           "type": "boolean",
           "default": true
         },
@@ -1126,35 +1296,35 @@
           "default": null
         },
         "idle_timeout_secs": {
-          "description": "Seconds of zero-subscriber idle before the broker sheds caches. Keeps the socket bound.",
+          "description": "Reserved: parsed but currently has no effect (the daemon's idle timers are not read from\nthis file).",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
           "default": 1800
         },
         "max_messages_per_room": {
-          "description": "Per-room front-matter retention cap before old messages become prune-eligible.",
+          "description": "Reserved: parsed but currently has no effect.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 1000
         },
         "retention_secs": {
-          "description": "Message retention window in seconds. Older messages are eligible for pruning.",
+          "description": "Reserved: parsed but currently has no effect.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
           "default": 604800
         },
         "max_rooms": {
-          "description": "Hard cap on the number of concurrently registered rooms.",
+          "description": "Reserved: parsed but currently has no effect.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 256
         },
         "workspace_root": {
-          "description": "Optional explicit workspace root the daemon associates this client with. When unset the\nclient uses its discovered repo / cwd for scope context.",
+          "description": "Reserved: parsed but currently has no effect; the client always uses its discovered repo.",
           "type": [
             "string",
             "null"
@@ -1197,10 +1367,10 @@
           "description": "User-Agent header sent with every request. Override to identify your\ncrawler to operators; the default includes the basemind release\nversion + the upstream repo URL so site operators can trace traffic.",
           "type": "string",
           "minLength": 1,
-          "default": "basemind/0.26.0 (+https://github.com/Goldziher/basemind)"
+          "default": "basemind/0.29.3 (+https://github.com/Goldziher/basemind)"
         },
         "allow_private_network": {
-          "description": "Allow crawling URLs that resolve to private, loopback, or link-local\naddresses (`127.0.0.0/8`, `10.0.0.0/8`, `169.254.0.0/16`, …). Default\n`false`: the engine rejects them with an SSRF-policy violation. Flip this\non only to scrape an internal docs server you control. (The\n`CRAWLBERG_ALLOW_PRIVATE_NETWORK` env var is honoured as a process-wide\noverride regardless of this setting.)",
+          "description": "Allow crawling URLs that resolve to private, loopback, or link-local\naddresses (`127.0.0.0/8`, `10.0.0.0/8`, `169.254.0.0/16`, …). Default\n`false`: the engine rejects them with an SSRF-policy violation. Flip this\non only to scrape an internal docs server you control. **`true` in the repository's own\n`basemind.toml` is ignored (with a warning) unless the operator sets\n`BASEMIND_ALLOW_PRIVATE_HOSTS=1` in the environment**, because a cloned repository could\notherwise aim the crawler at internal services. (The `CRAWLBERG_ALLOW_PRIVATE_NETWORK` env\nvar is honoured as a process-wide override regardless of this setting.)",
           "type": "boolean",
           "default": false
         }
@@ -1243,7 +1413,7 @@
           "default": 50
         },
         "keep_on_exit": {
-          "description": "Keep the session alive after the visual surface is closed. When `false` the session is\ntorn down once its presentation exits.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value).",
           "type": "boolean",
           "default": true
         }
@@ -1264,7 +1434,7 @@
           "const": "window"
         },
         {
-          "description": "Surface the session over a web frontend (wired by the lead; command-building is a no-op).",
+          "description": "Surface the session over a web frontend. No terminal is launched (no command is built); the caller gets the attach command.",
           "type": "string",
           "const": "web"
         },
@@ -1340,12 +1510,12 @@
           "default": ""
         },
         "api_key": {
-          "description": "API key — either a literal (discouraged; keeps secrets in version control)\nor an `{ env = \"OPENAI_API_KEY\" }` reference. `Unset` lets the underlying\nprovider SDK fall back to its standard environment variable lookup.",
+          "description": "API key — either a literal (discouraged; keeps secrets in version control)\nor an `{ env = \"OPENAI_API_KEY\" }` reference. `Unset` lets the underlying\nprovider SDK fall back to its standard environment variable lookup. In the repository's\nown `basemind.toml`, an env reference is honoured only for the chosen provider's standard\nvariable (`OPENAI_API_KEY` for `openai/...`, `ANTHROPIC_API_KEY` for `anthropic/...`, ...)\nor `BASEMIND_LLM_API_KEY`; any other name is ignored with a warning unless\n`BASEMIND_ALLOW_REPO_LLM=1` is set.",
           "$ref": "#/$defs/ApiKey",
           "default": null
         },
         "base_url": {
-          "description": "Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …).",
+          "description": "Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). **Ignored (with a\nwarning) when it comes from the repository's own `basemind.toml`** unless the operator sets\n`BASEMIND_ALLOW_REPO_LLM=1` in the environment: a cloned repository could otherwise point\nthe summarizer and NER at a host that collects your API key and document text. A value\npassed by CLI flag or environment override is operator-supplied and always honoured.",
           "type": [
             "string",
             "null"
@@ -1368,7 +1538,7 @@
             "null"
           ],
           "format": "uint64",
-          "minimum": 0,
+          "minimum": 1,
           "default": null
         },
         "max_retries": {

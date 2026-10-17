@@ -62,9 +62,10 @@ impl LifecycleNotice {
     pub(crate) fn projections_capped() -> Self {
         Self {
             state: "projections_capped",
-            message: "This session has no writable index and its in-memory reference projections hit \
-                      the `[resources] max_map_cache_mb` budget, so reference / implementation \
-                      results are truncated. Raise the budget for complete results.",
+            message: "No daemon was reachable, so this session answered from in-memory reference \
+                      projections that hit the `[resources] max_map_cache_mb` budget; reference / \
+                      implementation results are truncated. Start the daemon or raise the budget \
+                      for complete results.",
             retry: false,
         }
     }
@@ -519,6 +520,10 @@ pub(super) struct StatusResponse {
     /// submodules and for non-repo serves.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub submodules: Vec<RelPath>,
+    /// Size and modification time (`<bytes>B@<unix secs>`, or `absent`) of the workspace's
+    /// `basemind.toml` on disk right now. A changed value between two calls means the file was
+    /// edited; a long-lived daemon reloads it on the next request for that workspace.
+    pub config_stamp: String,
     /// Server-side handler latency in microseconds — the tool body's own execution (index / store
     /// lookup + response construction), excluding MCP transport, argument deserialization, and
     /// response serialization. Distinct from `index_build_ms` / `warm_ms`, which report the
@@ -528,7 +533,7 @@ pub(super) struct StatusResponse {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct ReferenceHit {
+pub(crate) struct ReferenceHit {
     pub path: RelPath,
     /// 1-based.
     pub line: u32,
@@ -799,6 +804,15 @@ pub(super) struct RescanResponse {
     /// refreshed, but landed in no reported bucket, so `scanned` exceeded the sum of the counts and
     /// `updated: 0` read as "rescan ignored my document" when the content had in fact been updated.
     pub docs_indexed: usize,
+    /// Documents chunked by the linear fallback instead of xberg's markdown splitter because they
+    /// exceeded `[documents] markdown_chunk_max_bytes` / `plain_text_chunk_max_bytes`.
+    pub docs_degraded: usize,
+    /// Subset of `docs_degraded`: structured extraction failed (parse error or security limit, e.g. a
+    /// Helm template as YAML or a CSV past the cell limit) and the file was re-read as `text/plain`.
+    pub docs_text_fallback: usize,
+    /// Documents abandoned because extraction overran `[documents] extraction_timeout_secs`; retried
+    /// on the next scan.
+    pub doc_timeouts: usize,
     pub removed: usize,
     pub skipped_unchanged: usize,
     pub skipped_no_lang: usize,
@@ -879,8 +893,8 @@ pub use super::types_git::{
 };
 pub(super) use super::types_git::{
     BlameHunkView, BlameResponse, BlameSymbolResponse, CommitFileView, CommitView, CommitsTouchingResponse,
-    DiffFileResponse, DiffOutlineResponse, DiffSymbolView, FindCommitsByPathResponse, GitCommitHit, HotFileEntry,
-    HotFilesResponse, HunkView, RecentChangesResponse, SearchGitHistoryResponse, SymbolHistoryEntry,
+    DiffFileResponse, DiffOutlineResponse, DiffSymbolView, FindCommitsByPathResponse, GitCommitHit, GitShowResponse,
+    HotFileEntry, HotFilesResponse, HunkView, RecentChangesResponse, SearchGitHistoryResponse, SymbolHistoryEntry,
     SymbolHistoryResponse, WorkingTreeStatusView,
 };
 

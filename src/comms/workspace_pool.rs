@@ -25,7 +25,47 @@ use crate::store::{self, LockHolder, Store, VIEW_WORKING};
 
 /// Default number of workspaces the daemon keeps hot in RAM at once. A cold workspace opened past
 /// this evicts the least-recently-used entry; it re-opens lazily on its next request.
-pub(crate) const DEFAULT_HOT_CAP: usize = 16;
+pub(crate) const DEFAULT_HOT_CAP: usize = 4;
+
+/// Serializes hosted read-stack builds across every workspace in the daemon. An `Arc` so the permit
+/// can be owned by the blocking build itself ([`run_gated_build`]).
+#[cfg(all(feature = "comms", any(unix, windows)))]
+static READ_STACK_BUILD_GATE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
+/// How long a read-stack build may queue for the gate before giving up, so one wedged build (network
+/// FS, a giant repo) cannot park every other workspace's first use forever.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+const READ_STACK_BUILD_GATE_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a store read/write may wait for a workspace's store lock, which a scan holds for its whole
+/// duration. Past it the call fails as busy instead of parking a blocking-pool thread for minutes.
+#[cfg(not(test))]
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STORE_LOCK_WAIT: Duration = Duration::from_millis(300);
+
+/// Run `build` on a blocking thread while holding one permit of `gate`. The permit is owned by the
+/// blocking closure, so it is released when the BUILD ends, not when the awaiting future is dropped:
+/// a cancelled caller (client disconnect, timeout, drain) cannot free the gate while its build is
+/// still running and let a second O(corpus) build start beside it.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+async fn run_gated_build<T: Send + 'static>(
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+    build: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let permit = tokio::time::timeout(wait, gate.acquire_owned())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out after {wait:?} waiting for the read stack build gate"))?
+        .map_err(|closed| anyhow::anyhow!("read stack build gate closed: {closed}"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_err(|join| anyhow::anyhow!("hosted read stack build panicked: {join}"))
+}
 
 /// Default number of daemon-hosted READ STACKS kept warm at once — deliberately far below
 /// [`DEFAULT_HOT_CAP`], which governs something much cheaper.
@@ -96,6 +136,10 @@ pub(crate) enum WorkspacePoolError {
     /// back to defaults and never reaches here).
     #[error("load workspace config: {0}")]
     Config(#[from] config::ConfigError),
+    /// The workspace's store is held by a long operation (a scan) and did not free up within
+    /// [`STORE_LOCK_WAIT`]. Transient: retry once the scan settles.
+    #[error("workspace {root} is busy (scanning); retry shortly")]
+    Busy { root: PathBuf },
     /// The root is not a project basemind will index (issue #62). `message` is the full
     /// operator-facing guidance from [`config::root_guard::refusal_message`], carried verbatim so
     /// the daemon's generic `Err` arm relays the real explanation instead of a status word;
@@ -109,8 +153,12 @@ struct WorkspaceEntry {
     /// The open read-write store. Behind its own lock so concurrent scans of the SAME workspace
     /// serialize here (one writer) while different workspaces proceed in parallel.
     store: Mutex<Store>,
-    /// Resolved config for this workspace, captured at open time.
-    config: Config,
+    /// Resolved config for this workspace, replaced in place when `basemind.toml` changes on disk
+    /// (see [`WorkspacePool::refresh_config`]). A scan takes a snapshot, so one scan never sees a
+    /// config change halfway through.
+    config: std::sync::RwLock<std::sync::Arc<Config>>,
+    /// Stamp of the config file the current `config` was loaded from.
+    config_stamp: Mutex<config::daemon::ConfigStamp>,
     /// Canonical workspace root.
     root: PathBuf,
     /// Stable workspace key (blake3 of the canonical root).
@@ -144,9 +192,60 @@ struct WorkspaceEntry {
     /// stack. Eviction (LRU + idle sweep) skips any entry with a live connection so a hosted
     /// workspace is never dropped from under an in-flight rmcp session.
     active_conns: std::sync::atomic::AtomicUsize,
+    /// Count of in-flight operations (scans, store reads / writes) holding this entry's store.
+    /// Eviction skips a busy entry: dropping it from the map while its `Arc` lives on in a scan would
+    /// leave the store's index lock held, so the next open of the same root would fail on the lock.
+    busy: std::sync::atomic::AtomicUsize,
+}
+
+/// RAII marker for one in-flight operation on a [`WorkspaceEntry`]; see [`WorkspaceEntry::busy`].
+struct BusyGuard(std::sync::Arc<WorkspaceEntry>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl WorkspaceEntry {
+    /// Mark the entry busy until the returned guard drops.
+    fn begin_busy(self: &std::sync::Arc<Self>) -> BusyGuard {
+        self.busy.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        BusyGuard(std::sync::Arc::clone(self))
+    }
+
+    /// Whether eviction may drop this entry: no live relay connection and no in-flight operation.
+    fn evictable(&self) -> bool {
+        use std::sync::atomic::Ordering::Acquire;
+        self.active_conns.load(Acquire) == 0 && self.busy.load(Acquire) == 0
+    }
+
+    /// Lock the store, waiting at most [`STORE_LOCK_WAIT`]. A scan holds the lock for its whole run,
+    /// so an unbounded wait would park a blocking-pool thread per forwarded read until the pool is
+    /// exhausted.
+    fn lock_store_bounded(&self) -> Result<std::sync::MutexGuard<'_, Store>, WorkspacePoolError> {
+        let deadline = Instant::now() + STORE_LOCK_WAIT;
+        loop {
+            match self.store.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(WorkspacePoolError::Busy {
+                            root: self.root.clone(),
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    /// Snapshot of the current config.
+    fn config(&self) -> std::sync::Arc<Config> {
+        self.config.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
     /// Read the last-used instant, recovering from a poisoned lock (a panic mid-scan must not
     /// wedge the whole pool).
     fn last_used(&self) -> Instant {
@@ -209,6 +308,10 @@ pub(crate) struct WorkspacePool {
     /// than holding a separate one, so `begin_drain` trips a single flag that every scan path — socket
     /// or hosted — observes at per-file granularity.
     scan_cancel: ScanCancel,
+    /// Raised whenever a completed pass displaced artifacts (tier migration or epoch re-extraction),
+    /// so the daemon reclaims the orphaned blobs promptly instead of waiting out the maintenance
+    /// interval. A stored permit coalesces any number of passes into one wake-up.
+    cleanup_signal: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl WorkspacePool {
@@ -219,7 +322,13 @@ impl WorkspacePool {
             open_lock: Mutex::new(()),
             cap: cap.max(1),
             scan_cancel: ScanCancel::new(),
+            cleanup_signal: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// The signal raised after a pass that displaced artifacts; the daemon's cleanup task waits on it.
+    pub(crate) fn cleanup_signal(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.cleanup_signal)
     }
 
     /// The pool's drain token, for the broker to adopt as its own so a single `cancel()` stops
@@ -261,8 +370,10 @@ impl WorkspacePool {
     ) -> Result<(ScanStats, bool), WorkspacePoolError> {
         let entry = self.get_or_open(root)?;
         entry.touch();
+        let _busy = entry.begin_busy();
 
         let mode = if embed { EmbedMode::Inline } else { EmbedMode::Deferred };
+        let config = entry.config();
         let incremental = matches!(paths, Some(ref p) if !full && !p.is_empty());
         let gen_before = entry.full_scan_gen.load(std::sync::atomic::Ordering::Acquire);
         let mut store = entry.store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -278,19 +389,19 @@ impl WorkspacePool {
         if cancel.is_cancelled() {
             return Ok((ScanStats::default(), true));
         }
+        // The daemon owns the embedding engine for forwarded and hosted passes alike: release it when
+        // the last concurrent full Inline pass ends. Incremental passes keep it warm for searches.
+        #[cfg(feature = "intelligence")]
+        let _embed_pass = (matches!(mode, EmbedMode::Inline) && !incremental).then(crate::embeddings::begin_embed_pass);
         let report = if incremental {
             let paths = paths.as_deref().unwrap_or_default();
-            scanner::scan_paths_with_cancel(&entry.root, &mut store, &entry.config, paths, mode, cancel)?
+            scanner::scan_paths_with_cancel(&entry.root, &mut store, &config, paths, mode, cancel)?
         } else {
-            scanner::scan_with_cancel(
-                &entry.root,
-                &mut store,
-                &entry.config,
-                ScanSource::WorkingTree,
-                mode,
-                cancel,
-            )?
+            scanner::scan_with_cancel(&entry.root, &mut store, &config, ScanSource::WorkingTree, mode, cancel)?
         };
+        if report.stats.displaced_artifacts() || std::mem::take(&mut store.reset_stale_schema) {
+            self.cleanup_signal.notify_one();
+        }
         if !incremental && !report.cancelled {
             let generation = entry.full_scan_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
             *entry.last_full.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, mode, report.stats));
@@ -306,7 +417,8 @@ impl WorkspacePool {
     pub(crate) fn with_workspace<R>(&self, root: &Path, f: impl FnOnce(&Store) -> R) -> Result<R, WorkspacePoolError> {
         let entry = self.get_or_open(root)?;
         entry.touch();
-        let store = entry.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let _busy = entry.begin_busy();
+        let store = entry.lock_store_bounded()?;
         Ok(f(&store))
     }
 
@@ -323,7 +435,8 @@ impl WorkspacePool {
     ) -> Result<R, WorkspacePoolError> {
         let entry = self.get_or_open(root)?;
         entry.touch();
-        let mut store = entry.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let _busy = entry.begin_busy();
+        let mut store = entry.lock_store_bounded()?;
         Ok(f(&mut store))
     }
 
@@ -344,12 +457,12 @@ impl WorkspacePool {
     /// shed.
     #[cfg(all(feature = "comms", any(unix, windows)))]
     pub(crate) async fn get_or_build_serve_state(
-        &self,
+        self: &std::sync::Arc<Self>,
         root: &Path,
         host: std::sync::Arc<dyn crate::mcp::HostBackend>,
         git_history_host: std::sync::Arc<dyn crate::git_history::remote::HistoryHost>,
     ) -> anyhow::Result<std::sync::Arc<crate::mcp::SharedReadStack>> {
-        let entry = self.get_or_open(root).map_err(anyhow::Error::new)?;
+        let entry = self.get_or_open_async(root).await.map_err(anyhow::Error::new)?;
         entry.touch();
         let (shared, built) = {
             let mut slot = entry.serve_state.lock().await;
@@ -357,11 +470,15 @@ impl WorkspacePool {
                 Some(hosted) => (hosted.shared(), false),
                 None => {
                     let root_buf = root.to_path_buf();
-                    let hosted = tokio::task::spawn_blocking(move || {
-                        crate::mcp::BasemindServer::build_hosted_read_stack(&root_buf, host, git_history_host)
-                    })
-                    .await
-                    .map_err(|join| anyhow::anyhow!("hosted read stack build panicked: {join}"))??;
+                    // One build at a time machine-wide: a reconnect storm after a daemon restart would
+                    // otherwise run one O(corpus) build per workspace concurrently, and the warm cap
+                    // only trims AFTER each finishes.
+                    let hosted = run_gated_build(
+                        std::sync::Arc::clone(&READ_STACK_BUILD_GATE),
+                        READ_STACK_BUILD_GATE_WAIT,
+                        move || crate::mcp::BasemindServer::build_hosted_read_stack(&root_buf, host, git_history_host),
+                    )
+                    .await??;
                     let shared = hosted.shared();
                     *slot = Some(hosted);
                     (shared, true)
@@ -469,10 +586,90 @@ impl WorkspacePool {
     /// shared read stack is never dropped from under an in-flight rmcp session.
     #[cfg(all(feature = "comms", any(unix, windows)))]
     pub(crate) fn begin_conn(&self, root: &Path) -> Result<ServeConnGuard, WorkspacePoolError> {
-        let entry = self.get_or_open(root)?;
+        Ok(Self::register_conn(self.get_or_open(root)?))
+    }
+
+    /// [`Self::begin_conn`] for async callers: a cold open (journal replay, seed clone) runs on a
+    /// blocking thread instead of parking a runtime worker.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    pub(crate) async fn begin_conn_async(
+        self: &std::sync::Arc<Self>,
+        root: &Path,
+    ) -> Result<ServeConnGuard, WorkspacePoolError> {
+        Ok(Self::register_conn(self.get_or_open_async(root).await?))
+    }
+
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    fn register_conn(entry: std::sync::Arc<WorkspaceEntry>) -> ServeConnGuard {
         entry.touch();
         entry.active_conns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Ok(ServeConnGuard { entry })
+        ServeConnGuard { entry }
+    }
+
+    /// Reload `entry`'s config when its `basemind.toml` changed on disk since it was loaded.
+    ///
+    /// The stamp is advanced before the reload, so a file that fails to parse is reported once per
+    /// edit rather than once per request, and the previous config stays in force until a good one
+    /// lands. A hosted read stack with no live connection is dropped so its next build picks the new
+    /// config up; live sessions keep theirs until they reconnect. The scanner's thread pool is sized
+    /// once per process, so a changed `scan_threads` only warns.
+    fn refresh_config(&self, entry: &WorkspaceEntry) {
+        let now = config::daemon::ConfigStamp::of(&entry.root);
+        {
+            let mut stamp = entry.config_stamp.lock().unwrap_or_else(PoisonError::into_inner);
+            if *stamp == now {
+                return;
+            }
+            *stamp = now;
+        }
+        let new = match config::daemon::load_daemon(&entry.root) {
+            Ok(new) => new,
+            Err(error) => {
+                tracing::warn!(root = %entry.root.display(), %error, "config changed but does not load; keeping the previous config");
+                return;
+            }
+        };
+        let old = entry.config();
+        if old.resources.scan_threads != new.resources.scan_threads {
+            tracing::warn!(
+                root = %entry.root.display(),
+                "config changed: resources.scan_threads is fixed for the process lifetime; restart the daemon for it to take effect"
+            );
+        }
+        tracing::info!(root = %entry.root.display(), stamp = %now, "config changed; reloaded");
+        *entry.config.write().unwrap_or_else(PoisonError::into_inner) = std::sync::Arc::new(new);
+        #[cfg(all(feature = "comms", any(unix, windows)))]
+        if entry.active_conns.load(std::sync::atomic::Ordering::Acquire) == 0
+            && let Ok(mut slot) = entry.serve_state.try_lock()
+        {
+            *slot = None;
+        }
+    }
+
+    /// Async front for [`Self::get_or_open`]: a hot entry is served inline, a cold one is opened on a
+    /// blocking thread so the journal replay / seed clone never stalls an async worker (and the
+    /// `open_lock` wait never parks one).
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    async fn get_or_open_async(
+        self: &std::sync::Arc<Self>,
+        root: &Path,
+    ) -> Result<std::sync::Arc<WorkspaceEntry>, WorkspacePoolError> {
+        let key = store::workspace_key(root);
+        let hit = self.lock_map().get(&key).cloned();
+        if let Some(entry) = hit {
+            self.refresh_config(&entry);
+            return Ok(entry);
+        }
+        let pool = std::sync::Arc::clone(self);
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || pool.get_or_open(&root))
+            .await
+            .map_err(|join| {
+                WorkspacePoolError::Store(store::StoreError::Io {
+                    path: PathBuf::new(),
+                    source: std::io::Error::other(format!("workspace open task failed: {join}")),
+                })
+            })?
     }
 
     /// Fetch the entry for `root`, opening it read-write and inserting it (evicting LRU past the
@@ -485,9 +682,10 @@ impl WorkspacePool {
     fn get_or_open(&self, root: &Path) -> Result<std::sync::Arc<WorkspaceEntry>, WorkspacePoolError> {
         let key = store::workspace_key(root);
         {
-            let map = self.lock_map();
-            if let Some(entry) = map.get(&key) {
-                return Ok(entry.clone());
+            let hit = self.lock_map().get(&key).cloned();
+            if let Some(entry) = hit {
+                self.refresh_config(&entry);
+                return Ok(entry);
             }
         }
         let _opening = self.open_lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -514,10 +712,12 @@ impl WorkspacePool {
             }
         };
         let store = Store::open_with_holder(&resolved, VIEW_WORKING, LockHolder::Rescan)?;
-        let config = load_config(&resolved)?;
+        let config_stamp = config::daemon::ConfigStamp::of(&resolved);
+        let config = config::daemon::load_daemon(&resolved)?;
         let entry = std::sync::Arc::new(WorkspaceEntry {
             store: Mutex::new(store),
-            config,
+            config: std::sync::RwLock::new(std::sync::Arc::new(config)),
+            config_stamp: Mutex::new(config_stamp),
             root: resolved,
             key: key.clone(),
             last_used: Mutex::new(Instant::now()),
@@ -526,26 +726,31 @@ impl WorkspacePool {
             #[cfg(all(feature = "comms", any(unix, windows)))]
             serve_state: tokio::sync::Mutex::new(None),
             active_conns: std::sync::atomic::AtomicUsize::new(0),
+            busy: std::sync::atomic::AtomicUsize::new(0),
         });
 
+        // Victims are dropped AFTER the map lock is released: the last `Arc` to an entry closes its
+        // fjall database, which must not happen while every other request waits on the map.
+        let mut evicted = Vec::new();
         let mut map = self.lock_map();
         while map.len() >= self.cap {
-            // ~keep Only evict entries with no live relay connection — a hosted workspace must not be
-            // ~keep dropped from under an in-flight rmcp session. If every entry is busy, exceed the cap
-            // ~keep rather than evict an active one (the sweep reclaims it once its connections drain).
+            // ~keep Only evict entries with no live relay connection and no in-flight scan or store op
+            // ~keep — a hosted workspace must not be dropped from under an rmcp session, and a scanning
+            // ~keep one still holds its index lock. If every entry is busy, exceed the cap rather than
+            // ~keep evict an active one (the sweep reclaims it once it drains).
             let victim = map
                 .values()
-                .filter(|e| e.active_conns.load(std::sync::atomic::Ordering::Acquire) == 0)
+                .filter(|e| e.evictable())
                 .min_by_key(|e| e.last_used())
                 .map(|e| e.key.clone());
-            match victim {
-                Some(victim) => {
-                    map.remove(&victim);
-                }
+            match victim.and_then(|key| map.remove(&key)) {
+                Some(entry) => evicted.push(entry),
                 None => break,
             }
         }
         map.insert(key, entry.clone());
+        drop(map);
+        drop(evicted);
         Ok(entry)
     }
 
@@ -567,17 +772,17 @@ impl WorkspacePool {
     /// Evict every entry idle for at least `idle`, returning the count dropped. The staleness
     /// collector calls this to shed cold workspaces from RAM (their on-disk cache survives).
     pub(crate) fn evict_idle(&self, idle: Duration) -> usize {
-        use std::sync::atomic::Ordering::Acquire;
         let mut map = self.lock_map();
         let stale: Vec<String> = map
             .values()
-            .filter(|e| e.last_used().elapsed() >= idle && e.active_conns.load(Acquire) == 0)
+            .filter(|e| e.last_used().elapsed() >= idle && e.evictable())
             .map(|e| e.key.clone())
             .collect();
-        for key in &stale {
-            map.remove(key);
-        }
-        stale.len()
+        let removed: Vec<_> = stale.iter().filter_map(|key| map.remove(key)).collect();
+        drop(map);
+        let count = removed.len();
+        drop(removed);
+        count
     }
 
     /// Number of hot workspaces currently held. Exposed for tests and diagnostics.
@@ -622,6 +827,14 @@ impl crate::mcp::HostBackend for WorkspacePool {
             super::daemon_forward_handlers::code_search_lanes_against(store, &query)
         })
         .map_err(|error| error.to_string())?
+    }
+
+    fn host_index_read(
+        &self,
+        root: &Path,
+        query: crate::comms::index_read_proto::IndexReadQuery,
+    ) -> Result<crate::comms::index_read_proto::IndexReadResult, String> {
+        super::daemon_forward_handlers::index_read_via_pool(self, root, &query)
     }
 
     fn host_resolved_refs(
@@ -669,16 +882,6 @@ impl crate::mcp::HostBackend for WorkspacePool {
         })
         .map_err(|error| error.to_string())
         .and_then(|result| result.map_err(|error| error.to_string()))
-    }
-}
-
-/// Resolve a workspace's config, mirroring the CLI's `load_or_default`: a missing `basemind.toml`
-/// falls back to per-root defaults; only a genuine parse/IO error propagates.
-fn load_config(root: &Path) -> Result<Config, WorkspacePoolError> {
-    match config::load_with_overrides(root, None, None) {
-        Ok(loaded) => Ok(loaded.config),
-        Err(config::ConfigError::NotFound(_)) => Ok(config::default_for_root(root)),
-        Err(error) => Err(error.into()),
     }
 }
 

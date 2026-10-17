@@ -18,7 +18,7 @@ use rmcp::model::{ListResourcesResult, ReadResourceResult, Resource, ResourceCon
 use serde_json::json;
 
 /// Every resource URI starts with this; the rest is the path under `safe/`.
-const URI_PREFIX: &str = "basemind://safe/";
+pub(crate) const URI_PREFIX: &str = "basemind://safe/";
 /// Same ceiling as the inline text of `redact_text`.
 const MAX_RESOURCE_BYTES: u64 = 1 << 20;
 /// A mirror this large is not a folder an agent browses; stop listing rather than stall.

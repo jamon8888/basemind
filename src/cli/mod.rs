@@ -14,21 +14,28 @@
 pub mod admin;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod agents;
+pub mod choices;
 pub mod code;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod comms_daemon;
 pub mod context;
 pub mod cpu_features;
+pub mod exit;
 pub mod git;
 pub mod graph;
+pub mod hook;
 pub mod init;
+pub mod init_gitignore;
 pub mod init_rules;
+pub mod init_settings;
+pub mod interrupt;
 pub mod memory;
 #[cfg(feature = "documents")]
 pub mod redact;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod registry;
 pub mod render;
+pub mod rescan;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shell;
 #[cfg(feature = "documents")]
@@ -68,9 +75,11 @@ pub enum ToolCmd {
     /// On-demand web ingestion (needs `--features crawl`).
     #[command(subcommand)]
     Web(web::WebCmd),
-    /// Server + cache administration: status, repo, rescan, caches, telemetry, compression.
+    /// Server administration: repo identity, telemetry, compression, tokens, eval.
     #[command(subcommand)]
     Admin(admin::AdminCmd),
+    /// Index health for this workspace: file counts, languages, scan age.
+    Status,
     /// Headless agent shell sessions: spawn / send / capture / kill / list / broadcast
     /// (needs `--features shells`).
     #[cfg(all(feature = "shells", any(unix, windows)))]
@@ -85,12 +94,43 @@ pub enum ToolCmd {
     Redact(redact::RedactArgs),
 }
 
+/// Resolve a user-supplied CLI path into the repo-relative `RelPath` key the index is keyed by
+/// (scanner-produced: no leading `./`, never absolute). Every path argument of every tool subcommand
+/// goes through this, so `/abs/repo/src/foo.rs`, `./src/foo.rs` and `src/foo.rs` are the same file.
+///
+/// Relative inputs are taken relative to the repository root (not the shell's cwd). Paths that
+/// escape or fall outside the repository can't match an indexed file, so the raw input is kept and
+/// the downstream tool reports "file not indexed" rather than silently mangling it.
+pub(crate) fn resolve_path(server: &crate::mcp::BasemindServer, path: &str) -> crate::path::RelPath {
+    match crate::path::normalize_query_path(path, &server.state.shared.root) {
+        Some(rel) => crate::path::RelPath::from(rel),
+        None => crate::path::RelPath::from(path),
+    }
+}
+
 /// Map a tool `Result<CallToolResult, McpError>` into an `anyhow::Result`,
 /// surfacing the tool's own error message verbatim. Tools that return an
 /// `is_error` result still produce `Ok(...)` — the JSON payload describes the
 /// condition, so we render it rather than fail the process.
+///
+/// Two failures are classified for the exit-code contract ([`exit`]): invalid params are usage
+/// errors (`2`), and an unavailable fjall index gets an actionable hint instead of the bare
+/// internal message.
 pub fn run_tool(tool: &str, result: Result<CallToolResult, McpError>) -> Result<CallToolResult> {
-    result.map_err(|e| anyhow::anyhow!("{tool}: {e}"))
+    result.map_err(|e| {
+        let message = e.message.to_string();
+        if e.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+            return exit::CliExit::usage(format!("{tool}: {message}"));
+        }
+        if message.contains("index not available") {
+            return exit::CliExit::busy(format!(
+                "{tool}: {message}. Another basemind process holds the index lock and no daemon is \
+                 reachable to forward to. Start the daemon with `basemind comms start` (it becomes the \
+                 sole writer and serves this call), or stop the process holding the lock and retry."
+            ));
+        }
+        anyhow::anyhow!("{tool}: {e}")
+    })
 }
 
 /// Dispatch a tool subcommand group. Builds one one-shot server per invocation
@@ -118,8 +158,9 @@ pub fn run(
         .build()
         .context("build tokio runtime")?;
 
+    let intent = context::Intent::Read;
     runtime.block_on(async move {
-        let server = context::build_server(root, view, documents)?;
+        let server = context::build_server_for(root, view, documents, intent)?;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let opts = Emit {
@@ -133,6 +174,7 @@ pub fn run(
             ToolCmd::Memory(m) => memory::run(&server, m, &opts, &mut out).await?,
             ToolCmd::Web(w) => web::run(&server, w, &opts, &mut out).await?,
             ToolCmd::Admin(a) => admin::run(&server, a, &opts, &mut out).await?,
+            ToolCmd::Status => admin::run_status(&server, &opts, &mut out).await?,
             #[cfg(all(feature = "shells", any(unix, windows)))]
             ToolCmd::Shell(s) => shell::run(&server, s, &opts, &mut out).await?,
             #[cfg(feature = "documents")]

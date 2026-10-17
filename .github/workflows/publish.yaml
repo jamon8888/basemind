@@ -51,6 +51,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -315,6 +319,8 @@ jobs:
     needs: meta
     if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release_info.outputs.release_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -323,12 +329,31 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
       - name: Ensure the GitHub release exists
+        id: ensure
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           tag="${{ needs.meta.outputs.tag }}"
+
+          # `gh release view --json databaseId` is the query GitHub eventually settles on; retry it
+          # a bounded few times because the record is not always visible the instant create returns.
+          release_id_for() {
+            local t="$1" id=""
+            for _ in 1 2 3 4 5 6 7 8; do
+              id="$(gh release view "$t" --json databaseId -q .databaseId 2>/dev/null || true)"
+              if [ -n "$id" ] && [ "$id" != "null" ]; then
+                printf '%s' "$id"
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists."
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
             prerelease=""
             case "$tag" in
@@ -341,8 +366,38 @@ jobs:
             # platform build therefore leaves a hidden draft, not a live release
             # with missing binaries and no checksums (the v0.10.0 failure mode that
             # broke the plugin launcher's checksum-verified download).
-            gh release create "$tag" --title "$tag" --notes "Release $tag" --verify-tag --draft $prerelease
+            # `gh release create` has no --json; create, then resolve the numeric id with retries
+            # (a fresh record is briefly invisible to the release API).
+            gh release create "$tag" --title "$tag" --notes "Release $tag" \
+              --verify-tag --draft $prerelease >/dev/null
+            if ! release_id="$(release_id_for "$tag")"; then
+              echo "::error::created release for $tag but its id never became visible"
+              exit 1
+            fi
+            echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+            echo "Created draft release id: $release_id"
           fi
+
+      - name: Capture the release id
+        id: release_info
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Every later job addresses assets by this id, never by the tag: a tag can resolve to
+          # more than one release record, and that is what split the v0.27.0 assets.
+          if [ "${{ steps.ensure.outputs.created }}" = "true" ]; then
+            # Reuse the id create just returned. Re-resolving the id from the releases list is
+            # racy: the list endpoint omits the draft for a short window right after creation, so
+            # a freshly created release looked absent and the run died with "no release record".
+            release_id="${{ steps.ensure.outputs.release_id }}"
+            echo "Reusing created release id: $release_id"
+          else
+            release_id="$(bash .github/scripts/release-asset.sh resolve "${{ needs.meta.outputs.tag }}")"
+            echo "Resolved release id: $release_id"
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     name: Build binaries / ${{ matrix.triple }}
@@ -419,11 +474,6 @@ jobs:
           cargo build --release --features "${{ matrix.features || 'full' }}" --bin basemind \
             --target "${{ matrix.triple }}"
 
-      # The agent TUI and desktop UI are not released yet: they build in CI (`cargo build ~keep
-      # --workspace`, plus the basemind-tui replay leg) but ship in no archive, and the launcher ~keep
-      # subcommands that would re-exec them are behind the root crate's `agent-tui` / `desktop-ui` ~keep
-      # features, which `full` deliberately omits. ~keep
-
       - name: Package release
         shell: bash
         run: ./scripts/package-release.sh ${{ matrix.triple }}
@@ -449,26 +499,35 @@ jobs:
           test -f "$dir/libonnxruntime.dylib"
           ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./libonnxruntime.dylib'); print('libonnxruntime.dylib load OK')" )
 
+      - name: Verify release state before upload
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Refuse to upload while the tag is ambiguous or the draft has been promoted — the
+          # v0.27.0 state, in which uploads followed the tag onto a second release record.
+          bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}" >/dev/null
+
       - name: Upload to GitHub release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ needs.meta.outputs.tag }}"
+          set -euo pipefail
           triple="${{ matrix.triple }}"
 
           if [ "$triple" = "x86_64-pc-windows-msvc" ]; then
             archive="basemind-${triple}.zip"
+            content_type="application/zip"
           else
             archive="basemind-${triple}.tar.gz"
+            content_type="application/gzip"
           fi
 
-          if [ ! -f "$archive" ]; then
-            echo "::error::Archive not found: $archive"
-            exit 1
-          fi
-
-          gh release upload "$tag" "$archive" --clobber
+          bash .github/scripts/release-asset.sh upload \
+            "${{ needs.create_release.outputs.release_id }}" "$archive" "$content_type"
 
   build-linux-binaries:
     name: Build Linux binaries / ${{ matrix.triple }}
@@ -631,23 +690,26 @@ jobs:
         shell: bash
         run: ./scripts/package-release.sh ${{ matrix.triple }}
 
+      - name: Verify release state before upload
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Refuse to upload while the tag is ambiguous or the draft has been promoted — the
+          # v0.27.0 state, in which uploads followed the tag onto a second release record.
+          bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}" >/dev/null
+
       - name: Upload to GitHub release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
-          archive="basemind-${{ matrix.triple }}.tar.gz"
-          if [ ! -f "$archive" ]; then
-            echo "::error::Archive not found: $archive"
-            exit 1
-          fi
-          # The container runs as root but the workspace is owned by the runner
-          # uid; gh shells out to git, which refuses with "dubious ownership".
-          # Mark it safe and pass --repo so gh never needs the local git remote.
-          git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
-          gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
+          bash .github/scripts/release-asset.sh upload \
+            "${{ needs.create_release.outputs.release_id }}" \
+            "basemind-${{ matrix.triple }}.tar.gz" application/gzip
 
   build-linux-noavx2:
     name: Build Linux no-AVX2 binary (x86_64, SSE2 baseline)
@@ -844,7 +906,7 @@ jobs:
 
   checksums:
     name: Generate and upload checksums
-    needs: [meta, build-binaries, build-linux-binaries, build-linux-noavx2]
+    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -852,74 +914,75 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Verify all 6 expected archives are present
+      - name: Resolve the release id
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
+          id="$(bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}")"
+          echo "release_id=$id" >>"$GITHUB_ENV"
 
-          # Expected archives for the 6 build targets
-          expected=(
-            "basemind-x86_64-unknown-linux-gnu.tar.gz"
-            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
-            "basemind-aarch64-unknown-linux-gnu.tar.gz"
-            "basemind-aarch64-apple-darwin.tar.gz"
-            "basemind-x86_64-apple-darwin.tar.gz"
-            "basemind-x86_64-pc-windows-msvc.zip"
-          )
-
-          # Fetch the list of release assets
-          gh release view "$tag" --json assets -q '.assets[].name' > /tmp/release_assets.txt || true
-
-          missing_count=0
-          for expected_asset in "${expected[@]}"; do
-            if ! grep -q "^${expected_asset}$" /tmp/release_assets.txt 2>/dev/null; then
-              echo "::error::Missing expected archive: $expected_asset"
-              missing_count=$((missing_count + 1))
+      - name: Verify all 5 platform archives are present
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Checksums must cover every platform. Generating the file from a partial asset set is
+          # what let v0.27.0 ship archives no downloader could verify.
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+            -q '.[].name' >/tmp/release_assets.txt
+          missing=0
+          for asset in \
+            basemind-x86_64-unknown-linux-gnu.tar.gz \
+            basemind-aarch64-unknown-linux-gnu.tar.gz \
+            basemind-aarch64-apple-darwin.tar.gz \
+            basemind-x86_64-apple-darwin.tar.gz \
+            basemind-x86_64-pc-windows-msvc.zip; do
+            if ! grep -qx "$asset" /tmp/release_assets.txt; then
+              echo "::error::release $release_id is missing $asset"
+              missing=$((missing + 1))
             fi
           done
-
-          if [ $missing_count -gt 0 ]; then
-            echo "::error::Release is incomplete: $missing_count of 6 platform archives missing. The release must have all 6 binaries before checksums can be generated."
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing of 5 platform archives missing; refusing to checksum a partial release"
             exit 1
           fi
-
-          echo "✓ All 5 expected archives present"
+          echo "all 5 archives present on release $release_id"
 
       - name: Download archives and generate checksums
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
+          while read -r name; do
+            bash .github/scripts/release-asset.sh download "$release_id" "$name" "$name"
+          done < <(grep -E '^basemind-.+\.(tar\.gz|zip)$' /tmp/release_assets.txt)
 
-          # Download all archives from the release
-          gh release view "$tag" --json assets -q '.assets[] | select(.name | test("basemind-.+\\.(tar\\.gz|zip)$")).name' | while read -r asset; do
-            echo "Downloading $asset..."
-            gh release download "$tag" -p "$asset" -O "$asset"
-          done
-
-          # Generate checksums file with explicit platform list for clarity
-          sha256sum basemind-*.tar.gz basemind-*.zip | sort > "basemind_${{ needs.meta.outputs.version }}_checksums.txt"
-
-          echo "✓ Generated checksums file"
+          sha256sum basemind-*.tar.gz basemind-*.zip | sort >"basemind_${{ needs.meta.outputs.version }}_checksums.txt"
           cat "basemind_${{ needs.meta.outputs.version }}_checksums.txt"
 
       - name: Upload checksums to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ needs.meta.outputs.tag }}"
-          gh release upload "$tag" basemind_${{ needs.meta.outputs.version }}_checksums.txt --clobber
-          echo "✓ Uploaded checksums to release"
+          set -euo pipefail
+          bash .github/scripts/release-asset.sh upload \
+            "$release_id" \
+            "basemind_${{ needs.meta.outputs.version }}_checksums.txt" text/plain
 
   finalize_release:
     name: Publish GitHub release
-    needs: [meta, checksums]
+    needs: [meta, create_release, checksums]
     if: always() && needs.meta.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      # The promotion step runs `.github/scripts/release-asset.sh`; without a checkout the
+      # workspace is empty and `bash` exits 127. Every other job that uses the script checks
+      # out first — only this one was missed.
+      - name: Checkout
+        uses: actions/checkout@v6
+
       - name: Promote draft to a published release once complete
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -928,8 +991,16 @@ jobs:
           tag="${{ needs.meta.outputs.tag }}"
           version="${{ needs.meta.outputs.version }}"
 
+          # require_draft=false here, unlike every upload site: this job is the one that promotes,
+          # and on a re-run over an already-complete release `create_release` is skipped and the
+          # record is already published. Refusing that would strand the wrapper publishes.
+          # expected_id is empty on that same path, which `resolve` treats as "no expectation".
+          release_id="$(bash .github/scripts/release-asset.sh resolve \
+            "$tag" false "${{ needs.create_release.outputs.release_id }}")"
+
           # The full asset set a launcher / npm install.js / pip downloader needs:
-          # every platform archive plus the checksums file they verify against.
+          # every platform archive plus the checksums file they verify against. v0.27.0 was
+          # promoted with 3 of 5 archives and no checksums file, so every downloader broke.
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
             "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
@@ -940,22 +1011,24 @@ jobs:
             "basemind_${version}_checksums.txt"
           )
 
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
-            > /tmp/assets.txt || true
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+            -q '.[].name' >/tmp/assets.txt
           missing=0
           for asset in "${required[@]}"; do
             if ! grep -qx "$asset" /tmp/assets.txt; then
-              echo "::error::release $tag is missing $asset"
+              echo "::error::release $release_id (tag $tag) is missing $asset"
               missing=$((missing + 1))
             fi
           done
           if [ "$missing" -gt 0 ]; then
-            echo "::error::release $tag is incomplete ($missing required assets missing); leaving it as a draft"
+            echo "::error::release $release_id (tag $tag) is incomplete ($missing required assets missing); leaving it as a draft"
             exit 1
           fi
 
-          gh release edit "$tag" --draft=false --repo "$GITHUB_REPOSITORY"
-          echo "✓ Promoted $tag to a published release"
+          # By id, not tag: the tag would follow whichever record GitHub decides it points at.
+          # Idempotent — a PATCH to draft=false on a published release is a no-op.
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false >/dev/null
+          echo "promoted release $release_id (tag $tag) to published"
 
   publish_crates:
     name: Publish crates.io
@@ -1022,14 +1095,15 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-
-      - name: Update npm
-        run: npm install -g npm@11
 
       - name: Publish to npm
         env:
@@ -1044,10 +1118,10 @@ jobs:
             npm_tag="latest"
           fi
 
-          npm publish --provenance --access public --tag "$npm_tag"
+          pnpm publish --no-git-checks --provenance --access public --tag "$npm_tag"
 
   publish_opencode:
-    name: Publish npm (basemind-opencode)
+    name: Publish npm (basemind-opencode, OpenCode and Pi)
     needs: [meta, finalize_release]
     if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.opencode_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
@@ -1058,21 +1132,37 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.11.2
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Update npm
-        run: npm install -g npm@11
+      - name: Stage and verify the combined agent package
+        run: |
+          set -euo pipefail
+          package_dir="$(mktemp -d)"
+          bash scripts/stage-agent-package.sh "$package_dir"
+          pnpm --dir "$package_dir" pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/pi-pack.json"
+          node - "$RUNNER_TEMP/pi-pack.json" <<'JS'
+          const fs = require('node:fs');
+          const files = JSON.parse(fs.readFileSync(process.argv[2])).files.map((file) => file.path);
+          const skills = files.filter((file) => /^skills\/[^/]+\/SKILL\.md$/.test(file));
+          if (skills.length !== 10 || !files.includes('.pi/extensions/basemind.ts') || !files.includes('basemind.js') || !files.includes('tui.js')) {
+            throw new Error(`Incomplete agent package: ${skills.length} skills`);
+          }
+          console.log(`Packed ${skills.length} skills, the Pi extension, and OpenCode adapters`);
+          JS
 
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ""
         run: |
           unset NODE_AUTH_TOKEN
-          cd opencode-plugin
           version="${{ needs.meta.outputs.version }}"
           if [[ "$version" == *"-rc."* ]]; then
             npm_tag="beta"
@@ -1080,7 +1170,10 @@ jobs:
             npm_tag="latest"
           fi
 
-          npm publish --provenance --access public --tag "$npm_tag"
+          archive="$(jq -r '.filename' "$RUNNER_TEMP/pi-pack.json")"
+          # pnpm 12 reports an absolute path; older versions a bare file name.
+          [[ "$archive" == /* ]] || archive="$RUNNER_TEMP/$archive"
+          pnpm publish --no-git-checks "$archive" --provenance --access public --tag "$npm_tag"
 
   publish_pypi:
     name: Publish PyPI
@@ -1146,7 +1239,7 @@ jobs:
 
   publish_homebrew:
     name: Update Homebrew formula
-    needs: [meta, finalize_release]
+    needs: [meta, create_release, finalize_release]
     if: always() && needs.meta.outputs.github_only != 'true' && needs.finalize_release.result == 'success' && !contains(needs.meta.outputs.version, '-rc') && !contains(needs.meta.outputs.version, '-beta') && !contains(needs.meta.outputs.version, '-alpha')
     runs-on: ubuntu-latest
     steps:
@@ -1166,9 +1259,15 @@ jobs:
             echo "HOMEBREW_TOKEN not set — skipping the Homebrew formula update."
             exit 0
           fi
-          tag="${{ needs.meta.outputs.tag }}"
+          # Resolve rather than read create_release's output: this job also runs on the
+          # already-complete path, where create_release is skipped and that output is empty.
+          # By now finalize_release has promoted the record, so the draft requirement is off.
+          release_id="$(bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" false "${{ needs.create_release.outputs.release_id }}")"
           version="${{ needs.meta.outputs.version }}"
-          gh release download "$tag" -p "basemind_${version}_checksums.txt" -O checksums.txt
+          checksums_file="basemind_${version}_checksums.txt"
+
+          bash .github/scripts/release-asset.sh download "$release_id" "$checksums_file" checksums.txt
           ./scripts/update-homebrew-formula.sh "$version" checksums.txt > basemind.rb
 
           git clone --depth 1 "https://x-access-token:${HOMEBREW_TOKEN}@github.com/Goldziher/homebrew-tap.git" tap

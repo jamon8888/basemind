@@ -36,12 +36,12 @@ pub struct SearchDocumentsParams {
     /// When set, only hits whose parent document carries at least one entity
     /// in that category are returned. Combined with `keywords_contains` via
     /// AND semantics (both must match when both are set).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub entity_category: Option<String>,
     /// Optional case-insensitive substring match against `DocKeyword.text`.
     /// When set, only hits whose parent document carries at least one keyword
     /// containing the substring are returned.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub keywords_contains: Option<String>,
     /// Per-query overrides for any `documents.*` config knob. Takes precedence over
     /// serve-time config and CLI flags. Known override fields (mirroring `[documents]`)

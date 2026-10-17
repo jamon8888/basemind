@@ -610,13 +610,17 @@ fn grep_query() -> crate::mcp::params::CodeParams {
 async fn warm_read_stacks_are_capped_independently_of_hot_stores() {
     store::init_isolated_cache();
     let cap = warm_read_stack_cap();
+    // ~keep Derived from the real caps rather than hard-coded: open more workspaces than the stack
+    // ~keep cap, and size the store pool so every one of them stays hot. (`DEFAULT_HOT_CAP` may be
+    // ~keep lower than `cap + 2`, so it cannot be the pool size here.)
     let workspaces = cap + 2;
+    let hot_cap = workspaces.max(DEFAULT_HOT_CAP);
     assert!(
-        workspaces <= DEFAULT_HOT_CAP,
-        "the fixture must stay inside the STORE cap, or it cannot show the two caps diverging"
+        workspaces > cap && workspaces <= hot_cap,
+        "the fixture must exceed the STACK cap yet stay inside the STORE cap, or it cannot show the two caps diverging"
     );
 
-    let pool = std::sync::Arc::new(WorkspacePool::new(DEFAULT_HOT_CAP));
+    let pool = std::sync::Arc::new(WorkspacePool::new(hot_cap));
     let roots: Vec<tempfile::TempDir> = (0..workspaces).map(|_| workspace_with_sources()).collect();
     let mut first_answer = String::new();
     for (i, root) in roots.iter().enumerate() {
@@ -639,7 +643,7 @@ async fn warm_read_stacks_are_capped_independently_of_hot_stores() {
     assert_eq!(
         pool.warm_read_stacks(),
         cap,
-        "read stacks are capped at {cap}, well below the {DEFAULT_HOT_CAP} store cap"
+        "read stacks are capped at {cap}, below the {hot_cap} store cap"
     );
 
     // ~keep The cap has to have BITTEN for any of this to mean anything: the least-recently-used
@@ -729,4 +733,158 @@ async fn an_active_connection_pins_its_warm_read_stack() {
         1,
         "the stack is shed once the last connection drains"
     );
+}
+
+#[test]
+fn a_changed_basemind_toml_replaces_the_cached_config_and_a_broken_one_keeps_it() {
+    store::init_isolated_cache();
+    let pool = WorkspacePool::new(DEFAULT_HOT_CAP);
+    let ws = workspace_with_sources();
+    let toml = ws.path().join("basemind.toml");
+
+    std::fs::write(&toml, "\"$schema\" = \"v1\"\n[watch]\ndebounce_ms = 111\n").expect("write toml");
+    let entry = pool.get_or_open(ws.path()).expect("open");
+    assert_eq!(entry.config().watch.debounce_ms, 111);
+
+    std::fs::write(&toml, "\"$schema\" = \"v1\"\n[watch]\ndebounce_ms = 2222\n").expect("rewrite toml");
+    let entry = pool.get_or_open(ws.path()).expect("reopen");
+    assert_eq!(entry.config().watch.debounce_ms, 2222, "the rewritten file is live");
+
+    std::fs::write(&toml, "this is = not valid [toml").expect("break toml");
+    let entry = pool.get_or_open(ws.path()).expect("reopen with a broken file");
+    assert_eq!(
+        entry.config().watch.debounce_ms,
+        2222,
+        "a file that does not load keeps the last good config"
+    );
+    assert_eq!(pool.len(), 1, "the entry (and its store) was reused, not rebuilt");
+}
+
+#[test]
+fn pool_config_is_clamped_whatever_the_repo_asks_for() {
+    let _env = crate::config::daemon::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    store::init_isolated_cache();
+    let pool = WorkspacePool::new(DEFAULT_HOT_CAP);
+    let ws = workspace_with_sources();
+    std::fs::write(
+        ws.path().join("basemind.toml"),
+        "\"$schema\" = \"v1\"\n[scan]\nmax_candidates = 0\n[resources]\nmax_footprint_mb = \"off\"\nmax_map_cache_mb = 0\n",
+    )
+    .expect("write toml");
+    let config = pool.get_or_open(ws.path()).expect("open").config();
+    use crate::config::daemon::{DEFAULT_MAX_CANDIDATES, DEFAULT_MAX_FOOTPRINT_MB, DEFAULT_MAX_MAP_CACHE_MB};
+    assert_eq!(
+        config.resources.max_footprint_mb,
+        crate::config::MaxFootprint::Mebibytes(DEFAULT_MAX_FOOTPRINT_MB)
+    );
+    assert!((1..=DEFAULT_MAX_MAP_CACHE_MB).contains(&config.resources.max_map_cache_mb));
+    assert!((1..=DEFAULT_MAX_CANDIDATES).contains(&config.scan.max_candidates));
+}
+
+#[test]
+fn in_flight_operation_blocks_lru_eviction_and_idle_sweep() {
+    store::init_isolated_cache();
+    let pool = WorkspacePool::new(1);
+    let ws1 = workspace_with_sources();
+    let ws2 = workspace_with_sources();
+
+    let entry = pool.get_or_open(ws1.path()).expect("open ws1");
+    let busy = entry.begin_busy();
+    assert_eq!(
+        pool.evict_idle(Duration::ZERO),
+        0,
+        "a scanning entry is never idle-swept"
+    );
+
+    // ~keep Opening ws2 past the cap must not evict the scanning ws1: its `Arc` (and index lock) would
+    // ~keep outlive the map entry and the next open of ws1 would fail on the lock.
+    pool.get_or_open(ws2.path()).expect("open ws2");
+    assert_eq!(pool.len(), 2, "the busy entry is kept past the cap");
+
+    drop(busy);
+    drop(entry);
+    assert_eq!(
+        pool.evict_idle(Duration::ZERO),
+        2,
+        "both entries are sweepable once idle"
+    );
+}
+
+#[test]
+fn store_access_waits_a_bounded_time_then_reports_busy() {
+    store::init_isolated_cache();
+    let pool = WorkspacePool::new(2);
+    let ws = workspace_with_sources();
+    let entry = pool.get_or_open(ws.path()).expect("open");
+
+    // A scan holds the store lock; a forwarded read must fail as busy instead of parking forever.
+    let held = entry.store.lock().expect("hold store lock as a scan would");
+    let started = Instant::now();
+    let result = entry.lock_store_bounded();
+    assert!(matches!(result, Err(WorkspacePoolError::Busy { .. })));
+    assert!(
+        started.elapsed() >= STORE_LOCK_WAIT,
+        "waited the full bound before giving up"
+    );
+    drop(result);
+    drop(held);
+    assert!(entry.lock_store_bounded().is_ok(), "free lock is acquired at once");
+}
+
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[tokio::test]
+async fn gated_build_keeps_its_permit_until_the_build_ends_even_if_the_caller_is_dropped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let running = std::sync::Arc::new(AtomicUsize::new(0));
+    let peak = std::sync::Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+
+    let first = {
+        let (running, peak) = (running.clone(), peak.clone());
+        tokio::spawn(run_gated_build(gate.clone(), Duration::from_secs(5), move || {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            running.fetch_sub(1, Ordering::SeqCst);
+        }))
+    };
+    tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+        .await
+        .unwrap();
+    // The caller goes away mid-build (client disconnect / timeout / drain).
+    first.abort();
+    let _ = first.await;
+
+    let second = {
+        let (running, peak) = (running.clone(), peak.clone());
+        tokio::spawn(run_gated_build(gate.clone(), Duration::from_secs(5), move || {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            running.fetch_sub(1, Ordering::SeqCst);
+        }))
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !second.is_finished(),
+        "second build must wait for the orphaned first build"
+    );
+    release_tx.send(()).unwrap();
+    second.await.unwrap().expect("second build runs after the first ends");
+    assert_eq!(peak.load(Ordering::SeqCst), 1, "builds never overlapped");
+}
+
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[tokio::test]
+async fn gated_build_times_out_instead_of_waiting_forever() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let _held = gate.clone().acquire_owned().await.unwrap();
+    let error = run_gated_build(gate, Duration::from_millis(50), || ())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
 }

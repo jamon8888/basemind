@@ -19,8 +19,10 @@ use super::model::{AgentCard, MessageMeta, Thread};
 /// response / notification shapes. Negotiated in [`CommsRequest::Hello`]. Bumped 1→2 for the
 /// room→thread redesign; bumped 2→3 for [`CommsRequest::SubscribeInbox`] (an old client talking
 /// to a new daemon, or vice versa, now fails the Hello skew check instead of risking a decode
-/// error on the new variant).
-pub const PROTO_VER: u32 = 3;
+/// error on the new variant); bumped 3→4 for request correlation ([`CommsRequest::Call`] /
+/// [`CommsOut::Reply`]), so a skewed peer fails the Hello check with a clear error and the daemon
+/// takeover in `ensure_daemon` replaces an older daemon.
+pub const PROTO_VER: u32 = 4;
 
 /// A request from a client to the broker. `method` selects the variant; `params` are the
 /// flattened fields.
@@ -128,6 +130,11 @@ pub enum CommsRequest {
         reply_to: Option<String>,
         /// The message body bytes.
         body: Vec<u8>,
+        /// Client-generated key making a retried post return the original id instead of storing a
+        /// second copy (deduplicated per agent and thread for an hour). Additive: an older daemon
+        /// ignores it.
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     /// Read a thread's history, oldest-first, paginated. Returns front-matter only.
     ThreadHistory {
@@ -305,6 +312,16 @@ pub enum CommsRequest {
         /// The lookup to run against that workspace's read-write index.
         query: crate::comms::resolved_proto::ResolvedRefQuery,
     },
+    /// Forward a fjall-backed reference read (`references` / `callers` / `implementations` scans) to
+    /// the daemon. A `daemon_writer` serve holds no fjall index, so these range scans only exist
+    /// daemon-side; answering them there is what keeps the results complete without projecting the
+    /// whole call graph into every session's RAM. A pure read.
+    IndexRead {
+        /// Canonical workspace root, selecting the daemon's hot workspace.
+        root: std::path::PathBuf,
+        /// The scan to run against that workspace's read-write index.
+        query: crate::comms::index_read_proto::IndexReadQuery,
+    },
     /// Forward the code-search keyword (BM25) and exact (symbol-name) lanes to the daemon. Both are
     /// answered from fjall, which a reader `serve` cannot open, so without this they return nothing
     /// at all — and did so silently. Ranking only; the caller hydrates bodies from blobs. A pure
@@ -353,6 +370,17 @@ pub enum CommsRequest {
     Stop,
     /// Report daemon status (pid / version / uptime / thread + subscriber counts).
     Status,
+    /// A correlated request: the broker handles `request` and answers with a [`CommsOut::Reply`]
+    /// echoing `id`, so a client that abandoned an earlier request (a cancelled future) can tell
+    /// the stale reply from the one it is waiting for. A bare request is still answered with an
+    /// uncorrelated [`CommsOut::Response`]. `Hello` is always sent bare (it negotiates the
+    /// protocol version, so it must stay decodable by a peer that speaks a different one).
+    Call {
+        /// Client-chosen id, unique per link and echoed in the reply.
+        id: u64,
+        /// The wrapped request.
+        request: Box<CommsRequest>,
+    },
 }
 
 impl CommsRequest {
@@ -390,6 +418,7 @@ impl CommsRequest {
             Self::Governance { .. } => "governance",
             Self::GitHistory { .. } => "git_history",
             Self::ResolvedRefs { .. } => "resolved_refs",
+            Self::IndexRead { .. } => "index_read",
             Self::CodeSearchLanes { .. } => "code_search_lanes",
             Self::AccessedPaths { .. } => "accessed_paths",
             Self::WorkspacesList { .. } => "workspaces_list",
@@ -400,6 +429,7 @@ impl CommsRequest {
             Self::Ping => "ping",
             Self::Stop => "stop",
             Self::Status => "status",
+            Self::Call { request, .. } => request.method(),
         }
     }
 }
@@ -491,6 +521,18 @@ pub enum CommsResponse {
         /// would have reported anyway.
         #[serde(default)]
         docs_indexed: usize,
+        /// Documents chunked by the linear fallback (over the `[documents]` chunk cutovers). Additive
+        /// with `#[serde(default)]`, like `docs_indexed`: an older peer omits it and it decodes as 0.
+        #[serde(default)]
+        docs_degraded: usize,
+        /// Subset of `docs_degraded` re-read as `text/plain` after a structured-extraction failure.
+        /// Additive with `#[serde(default)]` like its siblings.
+        #[serde(default)]
+        docs_text_fallback: usize,
+        /// Documents abandoned because extraction overran `[documents] extraction_timeout_secs`.
+        /// Additive with `#[serde(default)]`; an older peer omits it and it decodes as 0.
+        #[serde(default)]
+        doc_timeouts: usize,
         /// Files pruned because they no longer exist.
         removed: usize,
         /// Wall-clock scan time in milliseconds.
@@ -498,6 +540,8 @@ pub enum CommsResponse {
     },
     /// Reply to [`CommsRequest::ResolvedRefs`]: the resolved edges.
     ResolvedRefs(crate::comms::resolved_proto::ResolvedRefResult),
+    /// Reply to [`CommsRequest::IndexRead`]: the scanned page.
+    IndexRead(crate::comms::index_read_proto::IndexReadResult),
     /// Reply to [`CommsRequest::CodeSearchLanes`]: ranked chunk ids for the keyword + exact lanes.
     CodeSearchLanes(crate::comms::code_search_proto::CodeSearchLaneResult),
     /// Reply to [`CommsRequest::GitHistory`]: the sync outcome, the indexed HEAD, or a page of
@@ -637,8 +681,15 @@ pub enum CommsNotification {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommsOut {
-    /// A reply to a specific request.
+    /// An uncorrelated reply to a bare request.
     Response(CommsResponse),
+    /// The reply to a [`CommsRequest::Call`], carrying the request's id.
+    Reply {
+        /// The id of the `Call` this answers.
+        id: u64,
+        /// The response.
+        response: CommsResponse,
+    },
     /// An out-of-band push.
     Notification(CommsNotification),
 }
@@ -650,6 +701,7 @@ mod tests {
     #[test]
     fn request_round_trips_through_msgpack() {
         let req = CommsRequest::ThreadPost {
+            idempotency_key: None,
             thread: ThreadId::parse("th-1").expect("thread"),
             subject: "hi".to_string(),
             tags: vec!["t".to_string()],
@@ -659,6 +711,39 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&req).expect("encode");
         let back: CommsRequest = rmp_serde::from_slice(&bytes).expect("decode");
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn rescanned_without_doc_guard_counters_decodes_as_zero() {
+        // An older daemon omits `docs_degraded` / `doc_timeouts`; a newer client must read them as 0.
+        let old = serde_json::json!({
+            "result": "rescanned",
+            "data": {"scanned": 3, "updated": 2, "docs_indexed": 1, "removed": 0, "elapsed_ms": 7}
+        });
+        let bytes = rmp_serde::to_vec_named(&old).expect("encode");
+        let back: CommsResponse = rmp_serde::from_slice(&bytes).expect("decode");
+        assert!(matches!(
+            back,
+            CommsResponse::Rescanned {
+                docs_indexed: 1,
+                docs_degraded: 0,
+                docs_text_fallback: 0,
+                doc_timeouts: 0,
+                ..
+            }
+        ));
+        let new = CommsResponse::Rescanned {
+            scanned: 3,
+            updated: 2,
+            docs_indexed: 1,
+            docs_degraded: 4,
+            docs_text_fallback: 2,
+            doc_timeouts: 5,
+            removed: 0,
+            elapsed_ms: 7,
+        };
+        let bytes = rmp_serde::to_vec_named(&new).expect("encode");
+        assert_eq!(rmp_serde::from_slice::<CommsResponse>(&bytes).expect("decode"), new);
     }
 
     #[test]

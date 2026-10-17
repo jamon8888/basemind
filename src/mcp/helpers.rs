@@ -578,8 +578,18 @@ pub(super) async fn scan_and_refresh(
     let state_for_scan = Arc::clone(&state);
     let (report, paths) = tokio::task::spawn_blocking(move || {
         let mut store = state_for_scan.shared.store.blocking_write();
+        // The store may have been opened via `Store::open_read_only` (the CLI / MCP query path),
+        // which never creates `view_dir` on disk. On a workspace's first-ever scan that directory
+        // is still missing here, and `flush()` would fail with ENOENT writing `index.msgpack.tmp`.
+        // ~keep
+        store.ensure_dirs()?;
         let mut observer = RescanPaths::default();
         let cancel = crate::scanner::ScanCancel::new();
+        // A full Inline pass loads the embedding engine; release it once the pass is over (incremental
+        // watcher batches keep it warm for the searches that follow an edit).
+        #[cfg(feature = "intelligence")]
+        let _embed_pass = (matches!(embed, crate::scanner::EmbedMode::Inline) && scoped_paths.is_none())
+            .then(crate::embeddings::begin_embed_pass);
         let report = if let Some(paths) = scoped_paths {
             crate::scanner::scan_paths_with_observer(&root, &mut store, &config, &paths, embed, &cancel, &mut observer)
         } else {

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+pub mod alloc_tag;
 pub mod backpressure;
 #[cfg(feature = "code-search")]
 pub mod chunk;
@@ -10,10 +11,11 @@ pub mod cli;
 pub mod comms;
 pub mod config;
 /// Single-owner daemon lock + pidfile + the machine-wide, kind-tagged live-daemon registry and
-/// ceiling, shared by every daemon family (comms broker, agent-ipc, shells).
+/// ceiling, shared by every daemon family (the comms broker, shells).
 pub mod daemon_lock;
 #[cfg(feature = "intelligence")]
 pub mod embeddings;
+pub mod eval;
 pub mod extract;
 pub mod git;
 pub mod git_cache;
@@ -27,6 +29,7 @@ pub mod intel;
 #[cfg(feature = "intelligence")]
 pub mod lance;
 pub mod lang;
+pub mod lang_rules;
 pub mod mcp;
 pub mod path;
 pub mod pii;
@@ -47,6 +50,7 @@ pub mod scanner_file;
 pub(crate) mod scanner_filter;
 pub(crate) mod scanner_index_batch;
 pub mod scanner_lanes;
+pub(crate) mod scanner_policy;
 pub mod search;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shells;
@@ -54,11 +58,15 @@ pub mod store;
 pub mod store_blob;
 mod store_blob_codec;
 pub mod store_cache_admin;
+pub mod store_doc_tombstone;
 pub mod store_gc;
 pub mod store_gc_budget;
+pub(crate) mod store_gc_live;
+pub mod store_gc_protect;
 pub mod store_gc_workspace;
 pub mod store_layout;
 mod store_lock;
+mod store_seed;
 pub mod sysres;
 pub mod textcompress;
 #[cfg(feature = "crawl")]

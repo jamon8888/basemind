@@ -1,5 +1,11 @@
 #[cfg(feature = "documents")]
 pub mod doc;
+#[cfg(feature = "documents")]
+pub mod doc_cost;
+#[cfg(feature = "documents")]
+pub mod doc_fallback;
+#[cfg(feature = "documents")]
+pub mod doc_guard;
 pub mod l1;
 pub mod l2;
 pub mod l3;
@@ -63,6 +69,22 @@ pub fn extract_l1_l2(
 ///   discriminated `{"bytes": [u8...]}` object.
 pub const SCHEMA_VER: u16 = crate::version::RELEASE_MINOR;
 
+/// Extractor epoch: a finer-grained sibling of [`SCHEMA_VER`] for extraction-OUTPUT changes that keep
+/// the serialized shape readable.
+///
+/// [`SCHEMA_VER`] tracks the release minor and a mismatch wipes every cache, which a patch release
+/// must never trigger. When an extractor fix changes what a blob SHOULD hold without changing its
+/// layout (the signature of a symbol now ends at the grammar's body field instead of embedding the
+/// body), bump this instead. Content-addressed blobs are never rewritten on their own — the file is
+/// "unchanged" — so the scanner compares this against the epoch stamped on the `FileEntry` (the
+/// cheap mtime+size shortcut) and on the blob's [`FileMapL1::extract_epoch`] (blob reuse), and
+/// re-extracts only files whose entry or blob predates it, under the same bounded scan pipeline.
+/// Anything written before the field existed deserializes as epoch `0`.
+///
+/// History:
+/// - 1: symbol `signature` stops at the grammar's body field (`extract::l1::header_text`).
+pub const EXTRACT_EPOCH: u16 = 1;
+
 #[derive(Debug, Error)]
 pub enum ExtractError {
     #[error("non-utf8 source")]
@@ -78,6 +100,16 @@ pub enum ExtractError {
     #[cfg(feature = "documents")]
     #[error("xberg extraction failed: {0}")]
     Document(String),
+    /// Document extraction overran its wall-clock budget (`[documents] extraction_timeout_secs`) and
+    /// was abandoned.
+    #[cfg(feature = "documents")]
+    #[error("document extraction exceeded its {0:?} budget and was abandoned")]
+    DocTimeout(std::time::Duration),
+    /// Document extraction was not started: the document-phase budget is spent or too many timed-out
+    /// extraction threads are still running. Not a verdict on the file; it is retried on the next scan.
+    #[cfg(feature = "documents")]
+    #[error("document extraction deferred: {0}")]
+    DocDeferred(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +137,10 @@ pub struct FileMapL1 {
     /// next rescan (fully on the next minor-release cache wipe).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rationale: Vec<RationaleRecord>,
+    /// The [`EXTRACT_EPOCH`] this map was extracted under; `0` for blobs written before the field
+    /// existed. A reader that finds `extract_epoch < EXTRACT_EPOCH` re-extracts instead of reusing.
+    #[serde(default)]
+    pub extract_epoch: u16,
 }
 
 /// The class of an inline rationale marker (ADR-0009), classified by deterministic patterns over

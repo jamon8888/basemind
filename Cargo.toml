@@ -1,7 +1,39 @@
 
 [package]
+include = [
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/src/**",
+  "/README.md",
+  "/LICENSE",
+  "/ATTRIBUTIONS.md",
+  "/build.rs",
+  "/schema/basemind-config-v1.schema.json",
+  "!/src/scanner_filter_tests.rs",
+  "!/src/watcher_tests.rs",
+  "!/src/scanner_docs_security_tests.rs",
+  "!/src/scanner_docs_tests.rs",
+  "!/src/store_blob_tests.rs",
+  "!/src/store_gc_tier_tests.rs",
+  "!/src/comms/client_tests.rs",
+  "!/src/comms/store_tests.rs",
+  "!/src/comms/workspace_pool_tests.rs",
+  "!/src/comms/daemon_tests.rs",
+  "!/src/comms/daemon_forward_tests.rs",
+  "!/src/lance/tests.rs",
+  "!/src/mcp/helpers_calls_scan_tests.rs",
+  "!/src/mcp/helpers_governance/tests.rs",
+  "!/src/mcp/codegraph_tests.rs",
+  "!/src/mcp/index_route_tests.rs",
+  "!/src/mcp/lazy_cache_tests.rs",
+  "!/src/mcp/find_files_tests.rs",
+  "!/src/mcp/map_cache_budget_tests.rs",
+  "!/src/mcp/term_index_tests.rs",
+  "!/src/registry/tests.rs",
+  "!/src/index/writer_tests.rs",
+]
 name = "basemind"
-version = "0.33.1"
+version = "0.34.0"
 authors = ["Na'aman Hirschfeld <nhirschfeld@gmail.com>"]
 edition = "2024"
 description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, on-demand web crawl, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
@@ -14,18 +46,11 @@ keywords = ["mcp", "agent-context", "rag", "code-map", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.cargo-machete]
-ignored = ["serde_toon_format"]
+# `rustix` is not imported directly: it is pinned to hold rmux-client's Linux build (see the
+# dependency's comment), so machete's unused-dependency scan must skip it.
+ignored = ["serde_toon_format", "rustix"]
 [workspace]
-members = [
-  "crates/basemind-agent",
-  "crates/basemind-agent-ipc",
-  "crates/basemind-tui",
-  "crates/basemind-ui",
-  "crates/lsp-positions",
-  "crates/stack-graphs",
-  "crates/tree-sitter-graph",
-  "crates/tree-sitter-stack-graphs",
-]
+members = ["crates/lsp-positions", "crates/stack-graphs", "crates/tree-sitter-graph", "crates/tree-sitter-stack-graphs"]
 
 [workspace.lints.clippy]
 all = "warn"
@@ -43,11 +68,17 @@ default = []
 
 intelligence = ["dep:xberg", "dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
 
+# Just the real o200k tokenizer (`xberg::chunking::count_tokens`), used by `basemind admin tokens`
+# and `src/mcp/savings.rs`. `xberg/chunking-tokenizers` is a pure-Rust `tokenizers` crate underneath
+# (no LanceDB/Arrow/OCR/ONNX), so this is deliberately its own feature rather than riding on
+# `intelligence` — it stays cheap enough to build without also pulling in the vector-store deps.
+tokenizer = ["dep:xberg", "xberg/chunking-tokenizers"]
+
 documents = [
   "intelligence",
+  "tokenizer",
   "xberg/formats",
   "xberg/analysis",
-  "xberg/chunking-tokenizers",
   "xberg/embeddings",
   "xberg/reranker",
   "xberg/reranker-presets",
@@ -73,7 +104,6 @@ memory = ["intelligence", "xberg/embeddings", "xberg/keywords", "xberg/ner-onnx"
 crawl = ["documents", "dep:crawlberg", "dep:url"]
 
 comms = [
-  "dep:tokio-util",
   "dep:hyper",
   "dep:hyper-util",
   "dep:http",
@@ -99,14 +129,6 @@ code-intel-stack = ["dep:stack-graphs", "dep:tree-sitter-graph", "dep:tree-sitte
 
 code-intel = ["code-intel-js", "code-intel-stack"]
 
-# The two interactive front-ends are not released yet. Each gates only the launcher subcommand in
-# this crate — the front-ends themselves are separate, unpublished workspace crates
-# (`crates/basemind-tui`, ratatui; `crates/basemind-ui`, tauri). Deliberately absent from `full`, so
-# neither the release archive nor the crates.io build advertises a command whose sibling binary it
-# does not ship. `cargo build --workspace` still compiles both crates, so they cannot bit-rot.
-agent-tui = []
-desktop-ui = []
-
 # GLiNER2 candle NER backend for redact_text person/organization/location (#37).
 # Degrades to pattern-only redaction when the model dir is missing or the tool
 # is called without `ner_model_dir`.
@@ -123,7 +145,6 @@ full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-s
 #   only exists in a build with this feature.
 # Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
 hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
-
 test-support = ["dep:tempfile"]
 
 ort-dynamic = ["xberg?/ort-dynamic"]
@@ -134,7 +155,7 @@ anstream = "1.0"
 anstyle = "1"
 anyhow = "1"
 arc-swap = "1.9.2"
-# Pinned to match LanceDB's transitive arrow: lancedb 0.33 -> lance 9 -> datafusion 54 -> arrow 58.
+# ~keep Arrow major 58 matches LanceDB 0.40 so public schema and array types share one identity.
 # Bumping past 58 forks arrow into two versions and breaks Scannable/Schema type identity. ~keep
 arrow-array = { version = "=58", optional = true }
 arrow-schema = { version = "=58", optional = true }
@@ -144,16 +165,18 @@ bstr = { version = "1", features = ["serde"] }
 # Streamable-HTTP MCP front-end (comms daemon only): response bodies + query parsing + hyper server. ~keep
 bytes = { version = "1", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
-crawlberg = { version = "1.5.0", default-features = false, features = ["native-runtime"], optional = true }
+clap_complete = "4"
+clap_mangen = "0.3"
+crawlberg = { version = "1.10.3", default-features = false, features = ["native-runtime"], optional = true }
 directories = "6"
-fjall = "3.1.10"
+fjall = "3.1.12"
 form_urlencoded = { version = "1", optional = true }
 fs2 = "0.4"
 futures = { version = "0.3", optional = true }
 # OS CSPRNG for the comms daemon's HTTP bearer token. Already in the graph via ahash, so this adds ~keep
 # no build cost; a hand-rolled seed mix would be rolling our own crypto for a credential. ~keep
 getrandom = { version = "0.4", features = ["std"], optional = true }
-gix = { version = "0.87.1", features = ["status", "blob-diff", "revision", "max-performance-safe"] }
+gix = { version = "0.89.0", features = ["status", "blob-diff", "revision", "max-performance-safe"] }
 globset = "0.4"
 hex = "0.4"
 # Loopback-TCP hyper server hosting the streamable-HTTP MCP transport (comms daemon only). ~keep
@@ -162,35 +185,43 @@ http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["server", "http1", "http2"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
 ignore = "0.4"
-jsonschema = "0.52"
-# ~keep Held at 0.37: lancedb 0.38.0 does not compile without its `remote` feature --
-# ~keep `error.rs` gates the `Error::Http` variant behind `#[cfg(feature = "remote")]`
-# ~keep while `job.rs` references it unconditionally. Enabling `remote` would pull an HTTP
-# ~keep client stack in for no benefit here. Revisit when upstream fixes the gate.
-lancedb = { version = "0.37", optional = true }
+jsonschema = "0.58"
+# ~keep `remote` is enabled only because lancedb 0.38-0.40 do not compile without it: `error.rs`
+# ~keep gates `Error::Http` behind `#[cfg(feature = "remote")]` while `job.rs` uses it unconditionally.
+# ~keep It pulls tonic/arrow-flight/reqwest in but nothing is invoked; drop it once upstream fixes the gate.
+lancedb = { version = "0.40.0", features = ["remote"], optional = true }
 libc = "0.2"
-lru = "0.18.3"
+# ~keep `extended` exposes `mi_option_set`, used by `alloc_tag` to retag the heap off `VM_MEMORY_IOACCELERATOR`.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+lru = "0.18.5"
 memchr = "2"
+mimalloc = "0.1"
 notify = "8"
 notify-debouncer-full = "0.7"
 nucleo-matcher = "0.3.1"
-oxc_allocator = { version = "=0.138.0", optional = true }
-oxc_parser = { version = "=0.138.0", optional = true }
-oxc_resolver = { version = "=11.23.0", optional = true }
-oxc_semantic = { version = "=0.138.0", optional = true }
-oxc_span = { version = "=0.138.0", optional = true }
-oxc_syntax = { version = "=0.138.0", optional = true }
+oxc_allocator = { version = "0.154.0", optional = true }
+oxc_parser = { version = "0.154.0", optional = true }
+oxc_resolver = { version = "11.24.3", optional = true }
+oxc_semantic = { version = "0.154.0", optional = true }
+oxc_span = { version = "0.154.0", optional = true }
+oxc_syntax = { version = "0.154.0", optional = true }
 rayon = "1"
 regex = "1.13.1"
-rmcp = { version = "3.2", features = ["server", "macros", "schemars", "transport-async-rw"] }
+regex-syntax = "0.8"
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "schemars", "transport-async-rw"] }
 rmp-serde = "1"
 rmux-client = { version = "0.10", default-features = false, optional = true }
 rmux-sdk = { version = "0.10", default-features = false, optional = true }
 rmux-server = { version = "0.10", default-features = false, optional = true }
+# rustix 1.1.5 renamed the `runtime` module rmux-client 0.10 imports to a ~keep
+# mangled private name (`runtime_448b8ad740e2a26f`) and made the old path ~keep
+# `pub(crate)`, so the Linux-only signal setup in its attach resize path stops ~keep
+# compiling. Hold rustix at 1.1.4, the last release whose `runtime` is public. ~keep
+rustix = "=1.1.4"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_toon_format = { version = "0.1", optional = true }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_toon_format = { version = "0.2", optional = true }
 stack-graphs = { package = "basemind-stack-graphs", version = "0.14.1", path = "crates/stack-graphs", optional = true }
 streaming-iterator = "0.1"
 tempfile = { version = "3", optional = true }
@@ -207,20 +238,17 @@ tokio = { version = "1", features = [
   "fs",
   "process",
 ] }
-tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tokio-util = { version = "0.7", features = ["codec"] }
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tree-sitter = "0.26"
-tree-sitter-graph = { package = "basemind-tree-sitter-graph", version = "0.12.0", path = "crates/tree-sitter-graph", optional = true }
-tree-sitter-language-pack = "1.16.1"
-tree-sitter-stack-graphs = { package = "basemind-tree-sitter-stack-graphs", version = "0.10.0", path = "crates/tree-sitter-stack-graphs", optional = true }
+tree-sitter = "0.27"
+tree-sitter-graph = { package = "basemind-tree-sitter-graph", version = "0.12.1", path = "crates/tree-sitter-graph", optional = true }
+tree-sitter-language-pack = "1.22.1"
+tree-sitter-stack-graphs = { package = "basemind-tree-sitter-stack-graphs", version = "0.10.1", path = "crates/tree-sitter-stack-graphs", optional = true }
 url = { version = "2", features = ["serde"], optional = true }
-xberg = { version = "1.1.0", git = "https://github.com/xberg-io/xberg.git", rev = "71297af8da8913d38a3f43b81eed35e29aafa6b7", default-features = false, features = [
-  "tokio-runtime",
-  "simd-utf8",
-], optional = true }
-zstd = "0.13.3"
+xberg = { version = "1.3.9", default-features = false, features = ["tokio-runtime", "simd-utf8"], optional = true }
+zstd = "0.14.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.7"
@@ -231,10 +259,15 @@ criterion = { version = "0.8", features = ["html_reports"] }
 form_urlencoded = "1"
 insta = "1"
 proptest = "1"
-rmcp = { version = "3.2", features = ["client", "transport-async-rw", "transport-child-process"] }
+rmcp = { version = "3.5", features = ["client", "transport-async-rw", "transport-child-process"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 wiremock = "0.6"
+
+# ~keep `version::build_id` streams the whole executable (~1.3 GB in a debug build) through blake3;
+# ~keep unoptimized that takes 10+ s and tripped the comms request timeouts in debug test runs.
+[profile.dev.package.blake3]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
@@ -303,6 +336,14 @@ opt-level = 1
 
 [profile.release.package.zip]
 opt-level = 2
+
+[[example]]
+name = "doc_measure"
+required-features = ["documents"]
+
+[[example]]
+name = "lance_bench"
+required-features = ["documents"]
 
 [[bench]]
 name = "extract"

@@ -32,22 +32,11 @@ echo "→ Cargo.toml         → $VERSION"
 sed -i.bak -E "s/^version = \"[^\"]+\"$/version = \"$VERSION\"/" Cargo.toml
 rm Cargo.toml.bak
 
-# The internal (publish = false) workspace crates track the release version in lock-step, so a
-# locally built front-end reports the same version as the `basemind` it was built beside — none of
-# them ships in the archive yet. Path deps between them carry no version, so only the [package]
-# version line (anchored) is rewritten.
-WORKSPACE_CRATES=(
-  crates/basemind-agent/Cargo.toml
-  crates/basemind-agent-ipc/Cargo.toml
-  crates/basemind-tui/Cargo.toml
-  crates/basemind-ui/Cargo.toml
-)
-for crate_manifest in "${WORKSPACE_CRATES[@]}"; do
-  [[ -f "$crate_manifest" ]] || continue
-  echo "→ ${crate_manifest} → $VERSION"
-  sed -i.bak -E "s/^version = \"[^\"]+\"$/version = \"$VERSION\"/" "$crate_manifest"
-  rm "${crate_manifest}.bak"
-done
+# The config schema snapshot embeds the crate version in the default user agent;
+# tests/config_schema.rs asserts it byte-equal, so it must move with the version.
+echo "→ config schema      → $VERSION"
+sed -i.bak -E "s#basemind/[0-9][^ ]* \(\+https#basemind/$VERSION (+https#" schema/basemind-config-v1.schema.json
+rm schema/basemind-config-v1.schema.json.bak
 
 if [[ -f npm-package/package.json ]]; then
   echo "→ npm-package        → $VERSION"

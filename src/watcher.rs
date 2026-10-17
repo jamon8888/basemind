@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,7 +7,7 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use notify::event::CreateKind;
 use notify::{Config as NotifyConfig, EventKind, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
+use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -47,6 +48,74 @@ pub enum BatchKind {
     },
 }
 
+/// Bound on the debouncer→consumer queue, in whole debounced batches.
+///
+/// The consumer rescans synchronously, so on a large monorepo one iteration can take minutes while
+/// the debouncer keeps emitting a batch every `watch.debounce_ms` (250 ms by default). Unbounded,
+/// that queue grows for as long as the churn lasts — a branch switch across 55 worktrees / 82k files
+/// buries the consumer under thousands of `Vec<PathBuf>` batches, each of which costs another rescan.
+/// 64 slots is ~16 s of backlog at the default debounce, comfortably more than an incremental scan
+/// needs, so the overflow path stays cold in normal operation; past it the producer coalesces into
+/// [`PendingPaths`] instead of blocking or dropping.
+const DEBOUNCE_QUEUE_CAPACITY: usize = 64;
+
+/// Overflow sink shared by the debouncer callback and the consumer loop.
+///
+/// A full queue must neither block the callback — it runs on the debouncer's emit thread, so
+/// blocking there stalls debouncing and backs up notify's own channel — nor drop the batch, because
+/// a lost path means a file silently missing from the index. So the callback folds the overflowing
+/// batch into this set: N queued batches collapse into one union of paths, bounded by how many
+/// distinct paths the tree has rather than by how many batches the debouncer emitted.
+#[derive(Default)]
+struct PendingPaths(Mutex<BTreeSet<PathBuf>>);
+
+impl PendingPaths {
+    /// Fold one overflowing batch's relevant paths into the set.
+    fn coalesce(&self, events: &[DebouncedEvent]) {
+        let mut set = self.0.lock().expect("pending paths poisoned");
+        for ev in events {
+            if !is_relevant(&ev.event.kind) {
+                continue;
+            }
+            set.extend(ev.event.paths.iter().cloned());
+        }
+    }
+
+    /// Take everything coalesced so far, leaving the set empty. The consumer calls this on every
+    /// loop iteration — including the idle timeout — so a set that filled up during a long rescan is
+    /// processed as soon as that rescan returns.
+    fn take(&self) -> Vec<PathBuf> {
+        let mut set = self.0.lock().expect("pending paths poisoned");
+        std::mem::take(&mut *set).into_iter().collect()
+    }
+}
+
+/// Debouncer callback body: hand the batch to the consumer, or coalesce it when the queue is full.
+/// Never blocks, never discards a path.
+fn dispatch_debounced(
+    tx: &std::sync::mpsc::SyncSender<DebounceEventResult>,
+    pending: &PendingPaths,
+    res: DebounceEventResult,
+) {
+    match tx.try_send(res) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(Ok(events))) => {
+            debug!(
+                n = events.len(),
+                "debounce queue full; coalescing batch into the pending set"
+            );
+            pending.coalesce(&events);
+        }
+        // Errors carry no path, so there is nothing to coalesce; log them here instead of queueing.
+        Err(std::sync::mpsc::TrySendError::Full(Err(errors))) => {
+            for e in errors {
+                warn!(error = %e, "watch error (debounce queue full)");
+            }
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+    }
+}
+
 /// Path-emitting primitive at the core of every watcher. Runs the
 /// `notify-debouncer-full` event loop and, for each debounced batch, hands the
 /// caller the set of repo-relative changed paths (sorted + deduped, with
@@ -64,10 +133,27 @@ pub enum BatchKind {
 pub fn watch_paths(
     root: &Path,
     config: &Config,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    on_change: impl FnMut(Vec<PathBuf>, BatchKind),
+) -> Result<(), WatchError> {
+    watch_paths_reloading(root, config, || None, shutdown, on_change)
+}
+
+/// [`watch_paths`] whose indexability filter follows config changes: before each batch is filtered,
+/// `reload` is asked for a new config, and a `Some` rebuilds the filter (globs, `[languages]`,
+/// floor, submodule roots) from it. The caller owns applying the same config to its own scans, so
+/// the filter and the scan can never disagree. Without this the globs and languages the watcher
+/// started with stay in force until it is restarted.
+pub fn watch_paths_reloading(
+    root: &Path,
+    config: &Config,
+    mut reload: impl FnMut() -> Option<Arc<Config>>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     mut on_change: impl FnMut(Vec<PathBuf>, BatchKind),
 ) -> Result<(), WatchError> {
-    let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<DebounceEventResult>(DEBOUNCE_QUEUE_CAPACITY);
+    let pending = Arc::new(PendingPaths::default());
+    let pending_producer = Arc::clone(&pending);
     let debounce = Duration::from_millis(config.watch.debounce_ms);
     // ~keep NoCache, not the default RecommendedCache. On macOS/Windows the default is FileIdMap,
     // ~keep whose add_path recursively WalkDirs the whole subtree with follow_links(true) — at
@@ -80,14 +166,12 @@ pub fn watch_paths(
     let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
         debounce,
         None,
-        move |res| {
-            let _ = tx.send(res);
-        },
+        move |res| dispatch_debounced(&tx, &pending_producer, res),
         NoCache::new(),
         NotifyConfig::default(),
     )?;
 
-    let filter = crate::scanner_filter::IndexFilter::new(root, config)?;
+    let mut filter = crate::scanner_filter::IndexFilter::new(root, config)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -149,41 +233,13 @@ pub fn watch_paths(
             info!("shutdown requested; exiting watcher");
             return Ok(());
         }
+        // One generation of work: the batch we just received, every other batch already queued, and
+        // whatever the callback coalesced aside while the last rescan was running. Rescanning those
+        // one at a time is what lets a backlog outlive the burst that produced it, so they are merged
+        // into a single union of paths instead.
+        let mut queued: Vec<Vec<DebouncedEvent>> = Vec::new();
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(events)) => {
-                filter.clear_cache();
-                let mut touched: Vec<PathBuf> = Vec::new();
-                for ev in events {
-                    if !is_relevant(&ev.event.kind) {
-                        continue;
-                    }
-                    // Linux inotify: a directory created after startup is not covered by the
-                    // frozen NonRecursive watch set. Re-arm by registering a watch on it.
-                    #[cfg(target_os = "linux")]
-                    if matches!(&ev.event.kind, EventKind::Create(CreateKind::Folder)) {
-                        for p in &ev.event.paths {
-                            if p.is_dir()
-                                && let Err(e) = debouncer.watch(p, RecursiveMode::NonRecursive)
-                            {
-                                warn!(path = %p.display(), error = %e, "inotify re-arm failed");
-                            }
-                        }
-                    }
-                    for p in &ev.event.paths {
-                        if keep_event_path(&filter, root, p) {
-                            touched.push(p.clone());
-                        }
-                    }
-                }
-                touched.sort();
-                touched.dedup();
-                if touched.is_empty() {
-                    continue;
-                }
-                debug!(n = touched.len(), "debounced batch");
-                let n = touched.len();
-                on_change(touched, BatchKind::Incremental { paths: n });
-            }
+            Ok(Ok(events)) => queued.push(events),
             Ok(Err(errors)) => {
                 for e in errors {
                     warn!(error = %e, "watch error");
@@ -195,6 +251,79 @@ pub fn watch_paths(
                 return Ok(());
             }
         }
+        // Bounded by the queue's own capacity so a sustained event stream can never keep the drain
+        // spinning past the next shutdown check.
+        for _ in 1..DEBOUNCE_QUEUE_CAPACITY {
+            match rx.try_recv() {
+                Ok(Ok(events)) => queued.push(events),
+                Ok(Err(errors)) => {
+                    for e in errors {
+                        warn!(error = %e, "watch error");
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for ev in queued.into_iter().flatten() {
+            if !is_relevant(&ev.event.kind) {
+                continue;
+            }
+            // Linux inotify: a directory created after startup is not covered by the
+            // frozen NonRecursive watch set. Re-arm by registering a watch on it.
+            #[cfg(target_os = "linux")]
+            if matches!(&ev.event.kind, EventKind::Create(CreateKind::Folder)) {
+                for p in &ev.event.paths {
+                    if p.is_dir()
+                        && let Err(e) = debouncer.watch(p, RecursiveMode::NonRecursive)
+                    {
+                        warn!(path = %p.display(), error = %e, "inotify re-arm failed");
+                    }
+                }
+            }
+            candidates.extend(ev.event.paths.iter().cloned());
+        }
+        // Taken after the drain, so a batch that overflowed while we were draining is not left
+        // sitting until the next iteration.
+        let coalesced = pending.take();
+        // A coalesced path has lost its event kind, so the Create(Folder) test above cannot fire for
+        // it; re-arm any that is a directory, or a subtree created during the burst stays unwatched.
+        #[cfg(target_os = "linux")]
+        for p in &coalesced {
+            if p.is_dir()
+                && let Err(e) = debouncer.watch(p, RecursiveMode::NonRecursive)
+            {
+                warn!(path = %p.display(), error = %e, "inotify re-arm failed");
+            }
+        }
+        candidates.extend(coalesced);
+        if candidates.is_empty() {
+            continue;
+        }
+
+        if let Some(fresh) = reload() {
+            match crate::scanner_filter::IndexFilter::new(root, &fresh) {
+                Ok(rebuilt) => {
+                    info!("config changed; watcher filter rebuilt");
+                    filter = rebuilt;
+                }
+                Err(error) => warn!(%error, "config changed but its filter does not build; keeping the previous one"),
+            }
+        }
+        filter.clear_cache();
+        candidates.sort();
+        candidates.dedup();
+        let touched: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|p| keep_event_path(&filter, root, p))
+            .collect();
+        if touched.is_empty() {
+            continue;
+        }
+        debug!(n = touched.len(), "debounced batch");
+        let n = touched.len();
+        on_change(touched, BatchKind::Incremental { paths: n });
     }
 }
 
@@ -235,28 +364,65 @@ pub fn watch(
     }
     info!("initial scan complete; entering watch mode");
 
-    watch_paths(root, &config, shutdown, |touched, kind| {
-        let mut guard = store.lock().expect("store poisoned");
-        let mut observer = CollectObserver::new();
-        match crate::scanner::scan_paths_with_observer(
-            root,
-            &mut guard,
-            &config,
-            &touched,
-            crate::scanner::EmbedMode::Inline,
-            &crate::scanner::ScanCancel::new(),
-            &mut observer,
-        ) {
-            Ok(report) => {
-                on_batch(WatchBatch {
-                    kind,
-                    report: &report,
-                    results: observer.results(),
-                });
+    // The config the filter and the scans both use; replaced together when `basemind.toml` changes.
+    let current = Arc::new(Mutex::new(Arc::clone(&config)));
+    let reload_current = Arc::clone(&current);
+    let mut reloader = config_reloader(root);
+    watch_paths_reloading(
+        root,
+        &config,
+        move || {
+            let fresh = reloader()?;
+            *reload_current.lock().expect("config poisoned") = Arc::clone(&fresh);
+            Some(fresh)
+        },
+        shutdown,
+        |touched, kind| {
+            let config = Arc::clone(&current.lock().expect("config poisoned"));
+            let mut guard = store.lock().expect("store poisoned");
+            let mut observer = CollectObserver::new();
+            match crate::scanner::scan_paths_with_observer(
+                root,
+                &mut guard,
+                &config,
+                &touched,
+                crate::scanner::EmbedMode::Inline,
+                &crate::scanner::ScanCancel::new(),
+                &mut observer,
+            ) {
+                Ok(report) => {
+                    on_batch(WatchBatch {
+                        kind,
+                        report: &report,
+                        results: observer.results(),
+                    });
+                }
+                Err(e) => warn!(error = %e, "scan_paths failed"),
             }
-            Err(e) => warn!(error = %e, "scan_paths failed"),
+        },
+    )
+}
+
+/// A `reload` source for [`watch_paths_reloading`] that yields a freshly loaded config whenever the
+/// workspace's `basemind.toml` changed since the previous call. A file that stops loading is
+/// reported once and the previous config stays in force.
+pub fn config_reloader(root: &Path) -> impl FnMut() -> Option<Arc<Config>> + use<> {
+    let root = root.to_path_buf();
+    let mut stamp = crate::config::daemon::ConfigStamp::of(&root);
+    move || {
+        let now = crate::config::daemon::ConfigStamp::of(&root);
+        if now == stamp {
+            return None;
         }
-    })
+        stamp = now;
+        match crate::config::load_with_overrides(&root, None, None) {
+            Ok(loaded) => Some(Arc::new(loaded.config)),
+            Err(error) => {
+                warn!(%error, "config changed but does not load; keeping the previous config");
+                None
+            }
+        }
+    }
 }
 
 fn is_relevant(kind: &EventKind) -> bool {
@@ -294,299 +460,5 @@ fn keep_event_path(filter: &crate::scanner_filter::IndexFilter, root: &Path, p: 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    /// Block until the watcher is demonstrably live, then drain what arming produced.
-    ///
-    /// Registering a filesystem watch is asynchronous, so a test that just sleeps before its
-    /// trigger races the registration whenever the machine is busy. That race is invisible in the
-    /// negative tests below — an unarmed watcher reports nothing, which is exactly what they
-    /// assert, so they pass without having tested anything. This writes `probe.rs` under `root`
-    /// until the callback answers (proving the watch is live) and then drains pending batches, so
-    /// a following assertion measures the filter rather than the startup window.
-    fn arm_watcher(root: &Path, path_rx: &mpsc::Receiver<Vec<PathBuf>>) {
-        let probe = root.join("probe.rs");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            assert!(std::time::Instant::now() < deadline, "watcher never armed within 30s");
-            std::fs::write(&probe, b"fn probe() {}\n").expect("write probe file");
-            match path_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(_) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("watcher thread died"),
-            }
-        }
-        std::fs::remove_file(&probe).expect("remove probe file");
-        // Drain the arming batches (and the probe's own removal) so they cannot be mistaken for
-        // an emission the assertion under test is meant to rule out.
-        while path_rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
-    }
-
-    /// `watch_paths` should hand the callback the repo-relative path of a file
-    /// that changes under the watched root, within a bounded window. This is the
-    /// primitive the MCP serve watcher funnels into `scan_and_refresh`.
-    #[test]
-    fn should_emit_changed_path_when_file_is_modified() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 50;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (path_tx, path_rx) = mpsc::channel::<Vec<PathBuf>>();
-
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_paths(&root_for_thread, &config, shutdown_rx, |paths, kind| {
-                assert!(matches!(kind, BatchKind::Incremental { .. }));
-                let _ = path_tx.send(paths);
-            })
-        });
-
-        let target = root.join("hello.rs");
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let received = loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher never reported hello.rs within 30s"
-            );
-            std::fs::write(&target, b"fn main() {}\n").expect("write file");
-            match path_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(paths) => break paths,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("watcher thread died"),
-            }
-        };
-        assert!(
-            received.iter().any(|p| p.ends_with("hello.rs")),
-            "expected hello.rs in {received:?}"
-        );
-
-        let _ = shutdown_tx.send(());
-        let _ = handle.join();
-    }
-
-    #[test]
-    fn shutdown_interrupts_sustained_event_batches() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 1;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (batch_tx, batch_rx) = mpsc::channel::<usize>();
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let pulse = root.join("pulse.rs");
-        let pulse_for_thread = pulse.clone();
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            let mut generation = 0usize;
-            let result = watch_paths(&root_for_thread, &config, shutdown_rx, |_paths, _kind| {
-                generation += 1;
-                let _ = batch_tx.send(generation);
-                let _ = std::fs::write(&pulse_for_thread, format!("fn pulse_{generation}() {{}}\n"));
-            });
-            let _ = done_tx.send(());
-            result
-        });
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while batch_rx.recv_timeout(Duration::from_millis(100)).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher never entered the event loop"
-            );
-            std::fs::write(&pulse, b"fn pulse_0() {}\n").expect("write initial pulse");
-        }
-        for _ in 0..3 {
-            batch_rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("sustained batch arrives");
-        }
-
-        shutdown_tx.send(()).expect("signal shutdown under load");
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("watcher must observe shutdown without waiting for a quiet receive timeout");
-        handle.join().expect("join watcher").expect("watcher succeeds");
-    }
-
-    /// A rename must still surface the new path. Under `NoCache` the debouncer no longer stitches
-    /// FileId-based rename events, so a rename degrades to remove-old + create-new — we assert the
-    /// create half reaches the callback so the renamed file gets (re)indexed. Guards the cache swap
-    /// in `watch_paths` (issue #43).
-    #[test]
-    fn should_emit_new_path_when_file_is_renamed() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 50;
-
-        let original = root.join("before.rs");
-        std::fs::write(&original, b"fn main() {}\n").expect("seed file");
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (path_tx, path_rx) = mpsc::channel::<Vec<PathBuf>>();
-
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_paths(&root_for_thread, &config, shutdown_rx, |paths, kind| {
-                assert!(matches!(kind, BatchKind::Incremental { .. }));
-                let _ = path_tx.send(paths);
-            })
-        });
-
-        // A rename is one-shot — once `before.rs` is gone the trigger cannot be retried — so
-        // unlike the sibling modify test this cannot re-fire inside the polling loop. It must
-        // know the watch is live BEFORE renaming. ~keep
-        arm_watcher(&root, &path_rx);
-
-        let renamed = root.join("after.rs");
-        std::fs::rename(&original, &renamed).expect("rename file");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let saw_new_path = loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher never reported after.rs within 30s"
-            );
-            match path_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(paths) if paths.iter().any(|p| p.ends_with("after.rs")) => break true,
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("watcher thread died"),
-            }
-        };
-        assert!(saw_new_path, "expected after.rs to surface post-rename");
-
-        let _ = shutdown_tx.send(());
-        let _ = handle.join();
-    }
-
-    /// Changes inside `.basemind/` must never surface — the watcher would
-    /// otherwise feed its own index writes back into a rescan loop.
-    #[test]
-    fn should_ignore_changes_under_basemind_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::fs::create_dir_all(root.join(crate::config::BASEMIND_DIR)).expect("mkdir .basemind");
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 50;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (path_tx, path_rx) = mpsc::channel::<Vec<PathBuf>>();
-
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_paths(&root_for_thread, &config, shutdown_rx, |paths, _kind| {
-                let _ = path_tx.send(paths);
-            })
-        });
-
-        arm_watcher(&root, &path_rx);
-        std::fs::write(root.join(crate::config::BASEMIND_DIR).join("noise.txt"), b"ignored\n")
-            .expect("write basemind file");
-
-        let result = path_rx.recv_timeout(Duration::from_millis(800));
-        assert!(result.is_err(), "expected no emission, got {result:?}");
-
-        let _ = shutdown_tx.send(());
-        let _ = handle.join();
-    }
-
-    /// Writes under a *nested* child-repo `.basemind/` and under a gitignored path must not wake a
-    /// rescan — this is the core of issue #33 (an umbrella repo's watcher must ignore a nested
-    /// serve's index flushes, and gitignored churn generally).
-    #[test]
-    fn should_ignore_nested_basemind_and_gitignored_paths() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize tempdir");
-        std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
-        std::fs::create_dir_all(root.join("child").join(crate::config::BASEMIND_DIR)).expect("mkdir child/.basemind");
-        std::fs::write(root.join(".gitignore"), b"build/\n").expect("write .gitignore");
-        std::fs::create_dir_all(root.join("build")).expect("mkdir build");
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 50;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (path_tx, path_rx) = mpsc::channel::<Vec<PathBuf>>();
-
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_paths(&root_for_thread, &config, shutdown_rx, |paths, _kind| {
-                let _ = path_tx.send(paths);
-            })
-        });
-
-        arm_watcher(&root, &path_rx);
-        std::fs::write(
-            root.join("child")
-                .join(crate::config::BASEMIND_DIR)
-                .join("index.msgpack"),
-            b"\x00",
-        )
-        .expect("write nested basemind file");
-        std::fs::write(root.join("build").join("out.o"), b"\x00").expect("write gitignored file");
-
-        let result = path_rx.recv_timeout(Duration::from_millis(800));
-        assert!(
-            result.is_err(),
-            "expected no emission for nested-.basemind / gitignored churn, got {result:?}"
-        );
-
-        let _ = shutdown_tx.send(());
-        let _ = handle.join();
-    }
-
-    /// A permission-denied directory must not break the watcher's startup. This is the entire
-    /// point of the PR: with non-fatal watch registration, an unreadable tree is skipped (with a
-    /// warning) instead of aborting `watch_paths` with a `notify error: Permission denied`.
-    ///
-    /// The reproduction only bites when the test runs as a non-root user (as in CI); as root the
-    /// `chmod 000` directory is still readable, so the test passes trivially locally but exercises
-    /// the EACCES path in CI.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn should_not_fail_startup_on_unreadable_directory() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize");
-        let locked = root.join("locked");
-        std::fs::create_dir_all(&locked).expect("mkdir locked");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
-        }
-        let mut config = crate::config::default_for_root(&root);
-        config.watch.debounce_ms = 50;
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), WatchError>>();
-        let root_for_thread = root.clone();
-        let handle = std::thread::spawn(move || {
-            let result = watch_paths(&root_for_thread, &config, shutdown_rx, |_paths, _kind| {});
-            let _ = done_tx.send(result);
-        });
-
-        // Give the watcher a moment to arm (registering watches), then shut it down.
-        std::thread::sleep(Duration::from_millis(500));
-        let _ = shutdown_tx.send(());
-        let result = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("watcher thread died");
-        let _ = handle.join();
-        // Restore read/exec so the TempDir drop can remove the tree.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
-        }
-        assert!(
-            result.is_ok(),
-            "watch_paths must not fail on an unreadable directory: {result:?}"
-        );
-    }
-}
+#[path = "watcher_tests.rs"]
+mod tests;

@@ -34,8 +34,15 @@ use crate::comms::model::now_micros;
 
 /// Default page size when a mode omits `limit`. Mirrors the broker's `DEFAULT_LIMIT`.
 const DEFAULT_LIMIT: u32 = 100;
-const DELIVERY_SCAN_LIMIT: u32 = 1_000;
+/// Rows the delivery probe asks for. The broker bounds its own scan to a constant past this, so the
+/// probe costs the same regardless of how large the unread backlog is.
+const DELIVERY_SCAN_LIMIT: u32 = 200;
+/// Minimum spacing between delivery probes for one session.
+const DELIVERY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const DELIVERY_NOTICE_LIMIT: usize = 5;
+/// Upper bound on dialing (and, if need be, spawning) the broker for a cached identity.
+const CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+const DELIVERY_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Default recency window for modes `history` / `inbox` when the caller omits `since_hours`.
@@ -44,9 +51,10 @@ const DEFAULT_SINCE_HOURS: u32 = 24;
 /// Default long-poll timeout for mode `wait` when the caller omits `timeout_secs`.
 const DEFAULT_WAIT_SECS: u32 = 30;
 
-/// Hard cap on mode `wait`'s `timeout_secs`. Comfortably under the daemon's 30-minute idle-reap
-/// window and short enough that one outstanding wait cannot meaningfully delay a drain.
-const MAX_WAIT_SECS: u32 = 300;
+/// Hard cap on mode `wait`'s `timeout_secs`. Kept under typical MCP host request timeouts (~60 s) so
+/// a wait ends with a clean `timed_out` answer rather than being abandoned by the host, and short
+/// enough that one outstanding wait cannot meaningfully delay a drain.
+const MAX_WAIT_SECS: u32 = 40;
 
 /// Microseconds in one hour — the scale factor for the `since_hours` → `since_micros` cutoff.
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
@@ -118,33 +126,70 @@ pub(super) async fn resolve_comms_client(
         None => AgentId::parse(state.agent_id.clone())
             .map_err(|e| comms_err(format!("invalid agent id {:?}: {e}", state.agent_id)))?,
     };
-    let mut map = state.comms_clients.lock().await;
-    if let Some(handle) = map.get(&target) {
-        return Ok(handle.clone());
-    }
-    let client = connect_comms_client(state, target.clone()).await?;
-    let handle = Arc::new(Mutex::new(client));
-    map.insert(target, handle.clone());
-    Ok(handle)
+    // Hold the map lock only to find or create this identity's cell. Connecting happens under the
+    // cell's own once-init, so a slow or wedged connect for one identity cannot block lookups (or
+    // connects) for any other, and a failed connect leaves the cell empty for the next caller.
+    let cell = {
+        let mut map = state.comms_clients.lock().await;
+        match map.get(&target) {
+            Some(cell) => cell.clone(),
+            None => {
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                // ~keep `put` past the cap drops the least-recently-used cell; callers hold the
+                // ~keep returned `Arc`, so an evicted client stays alive until its last in-flight
+                // ~keep handle drops, and the identity reconnects on next use.
+                map.put(target.clone(), cell.clone());
+                cell
+            }
+        }
+    };
+    let handle = cell
+        .get_or_try_init(|| async {
+            let client = tokio::time::timeout(CONNECT_BUDGET, connect_comms_client(state, target.clone()))
+                .await
+                .map_err(|_| {
+                    comms_err(format!(
+                        "broker unresponsive: connect did not finish within {}s (retryable)",
+                        CONNECT_BUDGET.as_secs()
+                    ))
+                })??;
+            Ok::<_, McpError>(Arc::new(Mutex::new(client)))
+        })
+        .await?;
+    Ok(handle.clone())
 }
 
 /// Return a bounded, exactly-once-per-session front-matter notice for an ordinary tool response.
 /// Failure and contention are deliberately silent so mailbox delivery can never make another MCP
 /// capability slow or unavailable.
 pub(super) async fn take_delivery_notice(state: &ServerState) -> Option<String> {
-    let handle = tokio::time::timeout(DELIVERY_BUDGET, resolve_comms_client(state, None))
-        .await
-        .ok()?
-        .ok()?;
-    let page = tokio::time::timeout(DELIVERY_BUDGET, async {
-        let mut client = handle.lock().await;
-        client
-            .read_inbox(None, None, None, DELIVERY_SCAN_LIMIT, false, None)
-            .await
-    })
-    .await
-    .ok()?
-    .ok()?;
+    // Contention means another tool call is already probing; skip rather than queue behind it.
+    let mut probe = state.delivery_probe.try_lock().ok()?;
+    if probe
+        .last_probe
+        .is_some_and(|at| at.elapsed() < DELIVERY_PROBE_INTERVAL)
+    {
+        return None;
+    }
+    probe.last_probe = Some(std::time::Instant::now());
+    if probe.client.is_none() {
+        // Dialing gets its own, longer budget: a daemon that has to be reached or spawned would
+        // otherwise never finish inside the read budget and the probe would never connect.
+        match tokio::time::timeout(DELIVERY_CONNECT_BUDGET, connect_ephemeral_client(state)).await {
+            Ok(Ok(client)) => probe.client = Some(client),
+            _ => return None,
+        }
+    }
+    let page = match tokio::time::timeout(DELIVERY_BUDGET, probe_inbox(&mut probe.client)).await {
+        Ok(Ok(page)) => page,
+        // A failed or timed-out probe leaves the connection in an unknown state: drop it so the next
+        // probe dials a fresh one. It is private to the probe, so nothing else is disturbed.
+        _ => {
+            probe.client = None;
+            return None;
+        }
+    };
+    drop(probe);
     let (messages, unread, _) = page;
     let mut delivered = state.delivered_notifications.lock().await;
     let unseen: Vec<_> = messages
@@ -174,6 +219,26 @@ pub(super) async fn take_delivery_notice(state: &ServerState) -> Option<String> 
     }
     notice.push_str("Use agents mode message with the message id to read a body; ack only after handling it.");
     Some(notice)
+}
+
+/// One bounded inbox read over the probe's private connection.
+async fn probe_inbox(
+    slot: &mut Option<CommsClient>,
+) -> Result<
+    (
+        Vec<crate::comms::protocol::SeqMeta>,
+        u32,
+        Option<crate::comms::cursor::Cursor>,
+    ),
+    McpError,
+> {
+    let client = slot
+        .as_mut()
+        .ok_or_else(|| comms_err("delivery probe has no connection"))?;
+    client
+        .read_inbox(None, None, None, DELIVERY_SCAN_LIMIT, false, None)
+        .await
+        .map_err(comms_err)
 }
 
 /// Open a fresh, un-cached broker connection for the server's own identity. Long forwarded
@@ -276,7 +341,11 @@ fn require_field<T>(mode: AgentsMode, field: &str, value: Option<T>) -> Result<T
 /// Validation runs before the broker connection so a malformed call costs no daemon round-trip, and
 /// fields belonging to another mode are rejected rather than dropped: a silently ignored `thread` on
 /// an `inbox` call reads to an agent as a successful single-thread read.
-pub(super) async fn run_agents(state: &ServerState, params: AgentsParams) -> Result<CallToolResult, McpError> {
+pub(super) async fn run_agents(
+    state: &ServerState,
+    params: AgentsParams,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<CallToolResult, McpError> {
     let AgentsParams {
         mode,
         thread,
@@ -291,6 +360,7 @@ pub(super) async fn run_agents(state: &ServerState, params: AgentsParams) -> Res
         body,
         tags,
         reply_to,
+        idempotency_key,
         include_archived,
         mark_read,
         cursor,
@@ -324,6 +394,7 @@ pub(super) async fn run_agents(state: &ServerState, params: AgentsParams) -> Res
         ("body", body.is_some()),
         ("tags", tags.is_some()),
         ("reply_to", reply_to.is_some()),
+        ("idempotency_key", idempotency_key.is_some()),
         ("include_archived", include_archived.is_some()),
         ("mark_read", mark_read.is_some()),
         ("cursor", cursor.is_some()),
@@ -453,6 +524,7 @@ pub(super) async fn run_agents(state: &ServerState, params: AgentsParams) -> Res
                     body,
                     tags,
                     reply_to,
+                    idempotency_key,
                     as_agent,
                 },
             )
@@ -509,6 +581,7 @@ pub(super) async fn run_agents(state: &ServerState, params: AgentsParams) -> Res
         AgentsMode::Wait => {
             run_inbox_wait(
                 state,
+                cancel,
                 InboxWaitParams {
                     timeout_secs,
                     thread,
@@ -560,7 +633,7 @@ fn allowed_fields(mode: AgentsMode) -> &'static [&'static str] {
         AgentsMode::ThreadList => &["subject_contains", "include_archived"],
         AgentsMode::Join | AgentsMode::Leave | AgentsMode::Members | AgentsMode::Archive => &["thread"],
         AgentsMode::AddMember | AgentsMode::RemoveMember => &["thread", "member"],
-        AgentsMode::Post => &["thread", "subject", "body", "tags", "reply_to"],
+        AgentsMode::Post => &["thread", "subject", "body", "tags", "reply_to", "idempotency_key"],
         AgentsMode::History => &["thread", "cursor", "limit", "since_hours"],
         AgentsMode::Message => &["message_id"],
         AgentsMode::Inbox => &["cursor", "limit", "mark_read", "since_hours"],
@@ -591,328 +664,9 @@ fn validate_cleanup_apply(mode: AgentsMode, apply: Option<bool>) -> Result<(), M
     Ok(())
 }
 
-async fn run_agent_register(state: &ServerState, params: AgentRegisterParams) -> Result<CallToolResult, McpError> {
-    let card = crate::comms::model::AgentCard {
-        name: params.name,
-        description: params.description,
-        version: params.version,
-        skills: params.skills,
-    };
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let agent_id = client.agent().as_str().to_string();
-    client.register_agent(card).await.map_err(comms_err)?;
-    json_result(&AgentRegisterResponse {
-        agent_id,
-        registered: true,
-    })
-}
-
-async fn run_agent_list(state: &ServerState, params: AgentListParams) -> Result<CallToolResult, McpError> {
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let records = client.list_agents(params.thread).await.map_err(comms_err)?;
-    let agents: Vec<AgentSummary> = records
-        .iter()
-        .map(|r| AgentSummary {
-            agent_id: r.agent_id.as_str().to_string(),
-            name: r.card.name.clone(),
-            description: r.card.description.clone(),
-            version: r.card.version.clone(),
-            skills: r.card.skills.clone(),
-            first_seen: r.first_seen,
-            last_seen: r.last_seen,
-        })
-        .collect();
-    json_result(&AgentListResponse {
-        total: agents.len(),
-        agents,
-    })
-}
-
-async fn run_thread_start(state: &ServerState, params: ThreadStartParams) -> Result<CallToolResult, McpError> {
-    let creator = match &params.as_agent {
-        Some(raw) => AgentId::parse(raw.clone()).map_err(|e| comms_err(format!("invalid as_agent {raw:?}: {e}")))?,
-        None => AgentId::parse(state.agent_id.clone())
-            .map_err(|e| comms_err(format!("invalid agent id {:?}: {e}", state.agent_id)))?,
-    };
-    validate_thread_dimensions(
-        params.subject.as_deref(),
-        params.path.as_deref(),
-        &params.members,
-        &creator,
-    )?;
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let thread = client
-        .start_thread(params.subject, params.path, params.members)
-        .await
-        .map_err(comms_err)?;
-    json_result(&ThreadStartResponse {
-        thread: ThreadSummary::from_thread(&thread, now_micros()),
-    })
-}
-
-async fn run_thread_list(state: &ServerState, params: ThreadListParams) -> Result<CallToolResult, McpError> {
-    let (remote, cwd) = scope_context_for(&state.shared.root);
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let threads = client
-        .list_threads(remote, cwd, params.subject_contains, params.include_archived)
-        .await
-        .map_err(comms_err)?;
-    let now = now_micros();
-    let summaries: Vec<ThreadSummary> = threads.iter().map(|t| ThreadSummary::from_thread(t, now)).collect();
-    json_result(&ThreadListResponse {
-        total: summaries.len(),
-        threads: summaries,
-    })
-}
-
-async fn run_thread_join(state: &ServerState, params: ThreadJoinParams) -> Result<CallToolResult, McpError> {
-    let label = params.thread.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    client.join_thread(params.thread).await.map_err(comms_err)?;
-    json_result(&ThreadMembershipResponse {
-        thread: label,
-        joined: true,
-        left: false,
-    })
-}
-
-async fn run_thread_leave(state: &ServerState, params: ThreadLeaveParams) -> Result<CallToolResult, McpError> {
-    let label = params.thread.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    client.leave_thread(params.thread).await.map_err(comms_err)?;
-    json_result(&ThreadMembershipResponse {
-        thread: label,
-        joined: false,
-        left: true,
-    })
-}
-
-async fn run_thread_members(state: &ServerState, params: ThreadMembersParams) -> Result<CallToolResult, McpError> {
-    let label = params.thread.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let members = client.thread_members(params.thread).await.map_err(comms_err)?;
-    json_result(&ThreadMembersResponse {
-        thread: label,
-        members: members.iter().map(|m| m.as_str().to_string()).collect(),
-    })
-}
-
-async fn run_thread_add_member(state: &ServerState, params: ThreadMemberParams) -> Result<CallToolResult, McpError> {
-    let thread = params.thread.as_str().to_string();
-    let member = params.member.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    client
-        .add_member(params.thread, params.member)
-        .await
-        .map_err(comms_err)?;
-    json_result(&ThreadMemberChangeResponse {
-        thread,
-        member,
-        added: true,
-        removed: false,
-    })
-}
-
-async fn run_thread_remove_member(state: &ServerState, params: ThreadMemberParams) -> Result<CallToolResult, McpError> {
-    let thread = params.thread.as_str().to_string();
-    let member = params.member.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    client
-        .remove_member(params.thread, params.member)
-        .await
-        .map_err(comms_err)?;
-    json_result(&ThreadMemberChangeResponse {
-        thread,
-        member,
-        added: false,
-        removed: true,
-    })
-}
-
-async fn run_thread_archive(state: &ServerState, params: ThreadArchiveParams) -> Result<CallToolResult, McpError> {
-    let label = params.thread.as_str().to_string();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    client.archive_thread(params.thread).await.map_err(comms_err)?;
-    json_result(&ThreadArchiveResponse {
-        thread: label,
-        archived: true,
-    })
-}
-
-/// Reject a `body` that was supplied but holds nothing.
-///
-/// Omitting `body` is legal — that is a deliberate subject-only post. Supplying one that is empty or
-/// whitespace-only is a caller mistake (an unresolved template, a variable that expanded to nothing),
-/// and storing it is worse than refusing it: the front-matter records `body_len: 0`, and `message`
-/// later returns `found: true, body: ""`, which reads as a failed retrieval rather than as a message
-/// that never had content. Failing at the post surfaces the mistake where it can still be corrected.
-fn reject_empty_body(body: Option<&str>) -> Result<(), McpError> {
-    if body.is_some_and(|body| body.trim().is_empty()) {
-        return Err(McpError::invalid_params(
-            format!(
-                "`{}` mode=\"{}\" was given an empty `body`; omit `body` entirely for a subject-only post",
-                AgentsMode::DOMAIN,
-                AgentsMode::Post.as_str()
-            ),
-            None,
-        ));
-    }
-    Ok(())
-}
-
-async fn run_thread_post(state: &ServerState, params: ThreadPostParams) -> Result<CallToolResult, McpError> {
-    reject_empty_body(params.body.as_deref())?;
-    let body = params.body.unwrap_or_default().into_bytes();
-    let tags = params.tags.unwrap_or_default();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let message_id = client
-        .post_message(params.thread, params.subject, body, tags, params.reply_to)
-        .await
-        .map_err(comms_err)?;
-    json_result(&ThreadPostResponse { message_id })
-}
-
-async fn run_thread_history(state: &ServerState, params: ThreadHistoryParams) -> Result<CallToolResult, McpError> {
-    let limit = clamp_limit(params.limit);
-    let cursor = params.cursor.map(crate::comms::cursor::Cursor);
-    let since = since_cutoff(params.since_hours);
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let (metas, next_cursor) = client
-        .read_history(params.thread, cursor, limit, since)
-        .await
-        .map_err(comms_err)?;
-    let now = now_micros();
-    let messages: Vec<MessageFrontMatter> = metas
-        .iter()
-        .map(|sm| MessageFrontMatter::from_seq_meta(sm, now))
-        .collect();
-    json_result(&ThreadHistoryResponse {
-        total: messages.len(),
-        messages,
-        next_cursor,
-    })
-}
-
-async fn run_message_get(state: &ServerState, params: MessageGetParams) -> Result<CallToolResult, McpError> {
-    let message_id = params.message_id.clone();
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let body = client.get_body(params.message_id).await.map_err(comms_err)?;
-    let found = body.is_some();
-    let body = body.map(|b| String::from_utf8_lossy(&b).into_owned());
-    json_result(&MessageGetResponse {
-        message_id,
-        found,
-        body,
-    })
-}
-
-async fn run_inbox_read(state: &ServerState, params: InboxReadParams) -> Result<CallToolResult, McpError> {
-    let limit = clamp_limit(params.limit);
-    let cursor = params.cursor.map(crate::comms::cursor::Cursor);
-    let since = since_cutoff(params.since_hours);
-    let (remote, cwd) = scope_context_for(&state.shared.root);
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let (metas, unread, next_cursor) = client
-        .read_inbox(remote, cwd, cursor, limit, params.mark_read, since)
-        .await
-        .map_err(comms_err)?;
-    let now = now_micros();
-    let messages: Vec<MessageFrontMatter> = metas
-        .iter()
-        .map(|sm| MessageFrontMatter::from_seq_meta(sm, now))
-        .collect();
-    json_result(&InboxReadResponse {
-        total: messages.len(),
-        unread,
-        messages,
-        next_cursor,
-    })
-}
-
-async fn run_inbox_ack(state: &ServerState, params: InboxAckParams) -> Result<CallToolResult, McpError> {
-    let has_bulk = params.thread.is_some() && params.to_seq.is_some();
-    if params.message_ids.is_empty() && !has_bulk {
-        return Err(comms_err(
-            "`agents` mode=\"ack\" requires `message_ids`, or a (`thread`, `to_seq`) pair",
-        ));
-    }
-    let handle = resolve_comms_client(state, params.as_agent).await?;
-    let mut client = handle.lock().await;
-    let (acked, cursors) = client
-        .ack_inbox(params.message_ids, params.thread, params.to_seq)
-        .await
-        .map_err(comms_err)?;
-    let cursors_advanced: Vec<CursorAdvance> = cursors
-        .into_iter()
-        .map(|(thread, seq)| CursorAdvance { thread, seq })
-        .collect();
-    json_result(&InboxAckResponse {
-        acked: acked as usize,
-        cursors_advanced,
-    })
-}
-
-/// Long-poll the inbox and return as soon as a peer posts (or on timeout).
-///
-/// LOAD-BEARING: this opens its OWN ephemeral [`CommsClient`], never the shared cached
-/// `Arc<Mutex<CommsClient>>` behind [`resolve_comms_client`]. Locking that shared client for the
-/// wait would hold its mutex for up to `timeout_secs`, head-of-line-blocking every OTHER comms
-/// tool call for this identity (agent_list, thread_post, inbox_read, …) for the whole wait. A
-/// fresh connection per wait avoids that at the cost of one extra link + broker sink per
-/// outstanding call — an accepted trade-off (see the design brief's risk notes).
-async fn run_inbox_wait(state: &ServerState, params: InboxWaitParams) -> Result<CallToolResult, McpError> {
-    let timeout_secs = params.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS).clamp(1, MAX_WAIT_SECS);
-    let cursor = params.cursor.map(crate::comms::cursor::Cursor);
-    let since = since_cutoff(params.since_hours);
-    let (remote, cwd) = scope_context_for(&state.shared.root);
-
-    let agent = match &params.as_agent {
-        Some(raw) => AgentId::parse(raw.clone()).map_err(|e| comms_err(format!("invalid as_agent {raw:?}: {e}")))?,
-        None => AgentId::parse(state.agent_id.clone())
-            .map_err(|e| comms_err(format!("invalid agent id {:?}: {e}", state.agent_id)))?,
-    };
-    let mut client = connect_comms_client(state, agent).await?;
-
-    let (timed_out, metas, unread, next_cursor) = client
-        .wait_inbox(
-            remote,
-            cwd,
-            params.thread,
-            since,
-            cursor,
-            DEFAULT_LIMIT,
-            std::time::Duration::from_secs(u64::from(timeout_secs)),
-        )
-        .await
-        .map_err(comms_err)?;
-
-    let now = now_micros();
-    let messages: Vec<MessageFrontMatter> = metas
-        .iter()
-        .map(|sm| MessageFrontMatter::from_seq_meta(sm, now))
-        .collect();
-    json_result(&InboxWaitResponse {
-        timed_out,
-        total: messages.len(),
-        unread,
-        messages,
-        next_cursor,
-    })
-}
+#[path = "helpers_comms_ops.rs"]
+mod ops;
+use ops::*;
 
 #[cfg(test)]
 mod tests {

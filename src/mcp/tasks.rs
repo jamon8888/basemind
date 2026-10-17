@@ -14,6 +14,64 @@ use rmcp::task_manager::{TaskExit, TaskOptions};
 
 use super::BasemindServer;
 
+tokio::task_local! {
+    /// The task a slow tool is running inside, set around the router call by [`spawn_slow_tool`].
+    /// Lets [`super::notifications::emit_progress`] mirror each progress message onto the task's
+    /// `statusMessage`, so a client polling `tasks/get` sees the same counter a progress-token
+    /// subscriber does.
+    pub(super) static CURRENT_TASK: rmcp::task_manager::TaskContext;
+}
+
+/// Pure read-only modes that are safe to abandon mid-flight: they only read the in-RAM map / index
+/// (or the vector store) and write nothing durable, so dropping the handler future on client
+/// cancellation loses only recomputable work. NEVER add a mode that writes (rescan, put, accept,
+/// cache or registry mutation): dropping those at an await point could strand a half-applied write.
+/// Keyed like [`SLOW_CALLS`] on `domain:mode`.
+pub(super) const CANCEL_AWARE_READS: &[&str] = &[
+    "code:grep",
+    "code:semantic",
+    "graph:map",
+    "graph:calls",
+    "memory:documents",
+    // Read-only long poll; it opens its own comms link whose drop is the cleanup, so abandoning it
+    // (or cancelling its token) is exactly what frees the broker subscriber.
+    "agents:wait",
+];
+
+/// Whether this call is one of the [`CANCEL_AWARE_READS`].
+pub(super) fn is_cancel_aware_read(name: &str, arguments: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
+    let Some(mode) = arguments
+        .and_then(|args| args.get("mode"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    CANCEL_AWARE_READS.iter().any(|read| {
+        read.split_once(':')
+            .is_some_and(|(tool, read_mode)| tool == name && read_mode == mode)
+    })
+}
+
+/// JSON-RPC code for a request the client cancelled (the LSP `RequestCancelled` code).
+const REQUEST_CANCELLED_CODE: i32 = -32800;
+
+/// Race `work` against the request's cancellation signal. On cancellation the work future is dropped
+/// (releasing every guard it holds) and a `request_cancelled` error is returned immediately.
+pub(super) async fn run_until_cancelled<T>(
+    cancelled: impl std::future::Future<Output = ()>,
+    work: impl std::future::Future<Output = Result<T, McpError>>,
+) -> Result<T, McpError> {
+    tokio::select! {
+        biased;
+        () = cancelled => Err(McpError::new(
+            rmcp::model::ErrorCode(REQUEST_CANCELLED_CODE),
+            "request_cancelled",
+            None,
+        )),
+        result = work => result,
+    }
+}
+
 /// Calls whose work can dominate the transport for long enough that a task-capable client is better
 /// served an async handle it can poll than a blocked `tools/call`. Kept deliberately small and
 /// centralized: only operations that routinely run for seconds belong here. Feature-gated entries
@@ -59,6 +117,17 @@ pub(super) fn is_slow_tool(name: &str, arguments: Option<&serde_json::Map<String
     })
 }
 
+/// Dispose of the tool's child task after `tasks/cancel`. The tool's token is always cancelled so a
+/// cancel-aware handler unwinds on its own; a pure read ([`CANCEL_AWARE_READS`]) is also aborted so its
+/// guards (comms link, admission permit) drop immediately instead of at its next poll. Anything else
+/// (rescan) is left detached to finish its write.
+fn settle_cancelled<T>(work: tokio::task::JoinHandle<T>, tool_ct: &tokio_util::sync::CancellationToken, abort: bool) {
+    tool_ct.cancel();
+    if abort {
+        work.abort();
+    }
+}
+
 /// Spawn a slow tool's invocation as a SEP-2663 task and return the seed [`CreateTaskResult`].
 ///
 /// The spawned future runs the SAME work the synchronous path would: it rebuilds a
@@ -80,10 +149,16 @@ pub(super) fn is_slow_tool(name: &str, arguments: Option<&serde_json::Map<String
 pub(super) fn spawn_slow_tool(
     server: &BasemindServer,
     request: CallToolRequestParams,
-    context: RequestContext<RoleServer>,
+    mut context: RequestContext<RoleServer>,
     admission: super::admission::Admission,
 ) -> CreateTaskResult {
     let server = server.clone();
+    // The tool observes `context.ct` (e.g. `agents wait` selects on it), but `tasks/cancel` only
+    // fires the task's own signal. Give the tool a child of the request token that the task runner
+    // cancels, so task cancellation reaches cancel-aware handlers just like a direct cancel does.
+    let tool_ct = context.ct.child_token();
+    context.ct = tool_ct.clone();
+    let cancel_aware = super::tasks::is_cancel_aware_read(&request.name, request.arguments.as_ref());
     // Clone the manager handle out so the spawned closure can move `server` wholesale (it needs the
     // router by value for `'static`); `TaskManager` is a cheap Arc clone that shares the same store.
     let manager = server.tasks.clone();
@@ -91,14 +166,18 @@ pub(super) fn spawn_slow_tool(
         Box::pin(async move {
             // The real work runs on a detached-on-cancel child task (see the fn-level note); the
             // outer future only races the tool's completion against cancellation.
+            let task_ctx = ctx.clone();
             let mut work = tokio::spawn(async move {
                 let _admission = admission;
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(&server, request, context);
-                server.tool_router.call(tcc).await
+                CURRENT_TASK.scope(task_ctx, server.tool_router.call(tcc)).await
             });
             let outcome = tokio::select! {
                 biased;
-                () = ctx.cancelled() => return Err(TaskExit::Cancelled),
+                () = ctx.cancelled() => {
+                    settle_cancelled(work, &tool_ct, cancel_aware);
+                    return Err(TaskExit::Cancelled);
+                }
                 joined = &mut work => joined,
             };
             match outcome {
@@ -177,5 +256,123 @@ mod tests {
             Some(&args(serde_json::json!({ "mode": "sniff" })))
         ));
         assert!(!is_slow_tool("web", Some(&args(serde_json::json!({ "mode": 7 })))));
+    }
+
+    #[test]
+    fn should_race_cancellation_only_for_the_pure_read_modes() {
+        for (tool, mode) in [
+            ("code", "grep"),
+            ("code", "semantic"),
+            ("graph", "map"),
+            ("graph", "calls"),
+            ("memory", "documents"),
+        ] {
+            assert!(is_cancel_aware_read(
+                tool,
+                Some(&args(serde_json::json!({ "mode": mode })))
+            ));
+        }
+        for (tool, mode) in [
+            ("admin", "rescan"),
+            ("memory", "put"),
+            ("memory", "accept"),
+            ("code", "outline"),
+            ("web", "crawl"),
+        ] {
+            assert!(!is_cancel_aware_read(
+                tool,
+                Some(&args(serde_json::json!({ "mode": mode })))
+            ));
+        }
+        assert!(!is_cancel_aware_read("code", None));
+    }
+
+    /// Holds a heavy admission permit; dropping it (as a cancelled handler future does) frees it.
+    #[tokio::test]
+    async fn cancelling_a_read_returns_promptly_and_releases_the_permit() {
+        use super::super::admission::{HeavyAdmission, WorkClass};
+        let admission = HeavyAdmission::new(1, std::time::Duration::from_millis(50));
+        let permit = admission.admit(WorkClass::Heavy).await.expect("permit");
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let work = async move {
+            let _held = permit;
+            std::future::pending::<Result<(), McpError>>().await
+        };
+        let call = tokio::spawn(run_until_cancelled(
+            async {
+                let _ = cancelled.await;
+            },
+            work,
+        ));
+        assert!(
+            admission.admit(WorkClass::Heavy).await.is_err(),
+            "permit is held while the read runs"
+        );
+        cancel.send(()).expect("send cancel");
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("cancelled call returns promptly")
+            .expect("join")
+            .expect_err("cancelled call is an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(error.code, rmcp::model::ErrorCode(REQUEST_CANCELLED_CODE));
+        admission
+            .admit(WorkClass::Heavy)
+            .await
+            .expect("permit released after cancel");
+    }
+
+    /// Drops its flag on drop, standing in for the comms link a `wait` holds.
+    struct LinkGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for LinkGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Task cancellation must reach a long-running cancel-aware read: its token fires and (for the
+    /// pure reads) the work is aborted, so the guard it holds (the subscriber link) is released at once.
+    #[tokio::test]
+    async fn cancelling_a_task_releases_a_cancel_aware_reads_link() {
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool_ct = tokio_util::sync::CancellationToken::new();
+        let guard = LinkGuard(released.clone());
+        let work = tokio::spawn(async move {
+            let _link = guard;
+            std::future::pending::<()>().await;
+        });
+        settle_cancelled(work, &tool_ct, true);
+        assert!(tool_ct.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !released.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("link released promptly after task cancel");
+    }
+
+    /// A write tool (rescan) is detached, not aborted: it keeps its guard and runs to completion.
+    #[tokio::test]
+    async fn cancelling_a_task_detaches_a_mutating_tool() {
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tool_ct = tokio_util::sync::CancellationToken::new();
+        let guard = LinkGuard(released.clone());
+        let work = tokio::spawn(async move {
+            let _link = guard;
+            std::future::pending::<()>().await;
+        });
+        settle_cancelled(work, &tool_ct, false);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_read_returns_its_result() {
+        let value = run_until_cancelled(std::future::pending::<()>(), async { Ok::<_, McpError>(7) })
+            .await
+            .expect("result");
+        assert_eq!(value, 7);
     }
 }

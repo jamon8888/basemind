@@ -18,8 +18,6 @@ use serde_json::Value;
 use super::BasemindServer;
 use super::helpers::{LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX, record_call};
 use super::lenient::Lenient;
-use super::mode::CodeMode;
-use super::types::{FindCallersParams, FindReferencesParams, OutlineParams, SearchSymbolsParams, WorkspaceGrepParams};
 use super::types_code::CodeParams;
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_core")]
@@ -29,30 +27,37 @@ impl BasemindServer {
     // schemars emits as `$ref` into `$defs` — the construct that silently dropped the whole
     // registry in GH #50. The per-mode shapes are documented in the description instead. ~keep
     #[tool(
+        title = "Code map",
         description = "Read this repository's code map instead of opening files: grep it, find \
         where something is defined, see who calls this, locate a file by name, and pull one \
         symbol's body. Everything is served from the index — paths, lines, columns and \
-        signatures — at a fraction of the tokens a Read or a shell `rg` costs. `mode` is \
-        required. `outline` returns one file's structure (symbols with kind + row/col + \
+        signatures — at a fraction of the tokens a Read or a shell `rg` costs. The map holds \
+        CODE only: markdown, JSON, YAML, TOML, XML, CSV and other prose/config/data files are \
+        documents, invisible to every mode here (`outline` errors \"not indexed\"); search them \
+        with `memory` mode `documents`. `mode` is required. `outline` returns one file's structure (symbols with kind + row/col + \
         signature, plus imports) — read this INSTEAD of opening the file, then fetch only the \
         span you need; `l2: true` adds call sites and doc comments when an L2 blob exists for \
         the file's current content. `symbols` searches every indexed symbol NAME for `name` as \
         a case-sensitive SUBSTRING (optional `kind` filter) — the definition finder, and the \
         right answer to \"where is X defined\"; `total` counts matches up to a per-call cap \
         (`limit*64`, min 2000) and sets `total_is_partial` when it stops there. `grep` is regex \
-        content search (Rust `regex` syntax) over EVERY indexed file — use it for a pattern, \
-        a string literal or a comment, and prefer `symbols` for a plain identifier; `limit` \
-        caps hits, never files, so `total_matches` is exact, and `language` / `path_contains` \
-        narrow the sweep. `files` enumerates indexed paths (`path_contains` / `language` \
-        filters). `find` is fuzzy filename search (fzf/fd-style subsequence, case-insensitive, \
-        ranked by score) — reach for it instead of `find` / `fd` / `ls -R`. `definition` \
+        content search (Rust `regex` syntax) over EVERY indexed code file — use it for a \
+        pattern, a string literal or a comment, and prefer `symbols` for a plain identifier; \
+        `limit` caps hits, never files, so `total_matches` is exact, and `language` / \
+        `path_contains` narrow the sweep. A per-file trigram filter skips files that cannot \
+        match, so patterns with a literal of 3+ bytes are fast; `.*` or `(?i)k` sweep all. \
+        `files` enumerates indexed paths, documents included (`path_contains` / `language` \
+        filters). `find` is fuzzy filename search over code AND document files (fzf/fd-style \
+        subsequence, case-insensitive, ranked by score, weak matches cut) — reach for it instead \
+        of `find` / `fd` / `ls -R`. `definition` \
         resolves the reference at `path`:`line`:`column` to the definition it BINDS to — \
         scope-resolved, not name-matched, so it never conflates same-named symbols, and it \
         follows cross-file imports for JS/TS; `line` is 1-based, `column` 0-based bytes; a \
         position with no resolved binding returns no `definition` rather than an error. \
         `references` finds every call site whose callee identifier contains `name` — NAME-ONLY, \
         no scope resolution, so `Foo::bar()` and `bar()` both match `name=\"bar\"`; that is the \
-        fast, complete floor for \"what calls this\". `callers` answers the same question for \
+        fast, complete floor for \"what calls this\" (only with no daemon reachable can a \
+        last-resort in-RAM fallback truncate, flagged by a `projections_capped` notice). `callers` answers the same question for \
         ONE specific definition: it resolves `path` + `name` (+ optional `kind`) first, echoes \
         it as `definition`, then runs that same name scan — so `total` agrees with `references` \
         on an unambiguous name — and additionally marks each hit `resolved` when scope/import \
@@ -62,7 +67,8 @@ impl BasemindServer {
         implement / extend / inherit `trait_name` (case-sensitive substring; Rust, Python, \
         TS/TSX, JS class + interface extends/implements — Go structural satisfaction is not \
         detected). `dependents` is the reverse import lookup: indexed files whose imports \
-        mention `module` (heuristic substring against each recorded module path). `expand` \
+        mention `module` (heuristic substring against each recorded module path; all matches, \
+        no `limit` or `cursor`). `expand` \
         returns one symbol's RAW SOURCE BODY resolved by `path` + `name` (+ `kind` to \
         disambiguate an overload) — the inverse of an outline entry, and the second half of the \
         outline-then-expand pattern. `semantic` searches code by MEANING rather than spelling: \
@@ -73,9 +79,10 @@ impl BasemindServer {
         disambiguated with `chunk_id` or `byte_start`. Caps: `symbols` / `grep` / `references` \
         / `callers` / `implementations` default `limit` 100, max 1000; `files` / `find` default \
         200, max 5000; `semantic` default 10, max 100. The index scanners bound their work at \
-        `scan_cap = limit * 8` and flag a cut result with `total_is_partial`. `cursor` pages \
-        (`references` / `callers` / `implementations` cursors are stable across rescans; the \
-        in-memory ones set `cursor_invalidated`), `max_tokens` budgets the returned list and \
+        `scan_cap = limit * 8` (min 2000) and flag a cut result with `total_is_partial`. `cursor` pages \
+        (`references` / `callers` / `implementations` cursors are stable across rescans; \
+        `symbols` / `grep` / `files` / `find` cursors are not and set `cursor_invalidated` \
+        after one), `max_tokens` budgets the returned list and \
         sets `budgeted`, and `format: \"toon\"` returns compact tabular rows. Parameters that \
         belong to another mode are rejected, not ignored.",
         // Every mode is a read over the local index or working tree — nothing is written and
@@ -98,93 +105,6 @@ impl BasemindServer {
         let __result: Result<CallToolResult, McpError> = super::helpers_code::run_code(&self.state, p).await;
         record_call(&self.state, __key, &__params_json, __started, &__result);
         __result
-    }
-}
-
-/// Named in-process entry points for the five code-map operations the `basemind-agent` engine
-/// exposes as its own tools, bridged through [`super::agent_api`].
-///
-/// They are deliberately NOT `#[tool]`s: the MCP registry advertises exactly one `code` tool. Each
-/// builds the same [`CodeParams`] an MCP caller would send, so telemetry, validation, and the
-/// response shape are identical to `code { mode: … }`.
-impl BasemindServer {
-    pub(crate) async fn outline(
-        &self,
-        Parameters(Lenient(p)): Parameters<Lenient<OutlineParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.code(Parameters(Lenient(CodeParams {
-            path: Some(p.path),
-            l2: Some(p.l2),
-            max_tokens: p.max_tokens,
-            format: p.format,
-            ..CodeParams::new(CodeMode::Outline)
-        })))
-        .await
-    }
-
-    pub(crate) async fn search_symbols(
-        &self,
-        Parameters(Lenient(p)): Parameters<Lenient<SearchSymbolsParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.code(Parameters(Lenient(CodeParams {
-            name: Some(p.needle),
-            kind: p.kind,
-            limit: p.limit,
-            max_tokens: p.max_tokens,
-            format: p.format,
-            cursor: p.cursor,
-            ..CodeParams::new(CodeMode::Symbols)
-        })))
-        .await
-    }
-
-    pub(crate) async fn find_references(
-        &self,
-        Parameters(Lenient(p)): Parameters<Lenient<FindReferencesParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.code(Parameters(Lenient(CodeParams {
-            name: Some(p.name),
-            limit: p.limit,
-            max_tokens: p.max_tokens,
-            format: p.format,
-            cursor: p.cursor,
-            ..CodeParams::new(CodeMode::References)
-        })))
-        .await
-    }
-
-    pub(crate) async fn find_callers(
-        &self,
-        Parameters(Lenient(p)): Parameters<Lenient<FindCallersParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.code(Parameters(Lenient(CodeParams {
-            path: Some(p.path),
-            name: Some(p.name),
-            kind: p.kind,
-            limit: p.limit,
-            max_tokens: p.max_tokens,
-            cursor: p.cursor,
-            ..CodeParams::new(CodeMode::Callers)
-        })))
-        .await
-    }
-
-    pub(crate) async fn workspace_grep(
-        &self,
-        Parameters(Lenient(p)): Parameters<Lenient<WorkspaceGrepParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.code(Parameters(Lenient(CodeParams {
-            pattern: Some(p.pattern),
-            language: p.language,
-            path_contains: p.path_contains,
-            limit: p.limit,
-            max_tokens: p.max_tokens,
-            format: p.format,
-            include_context: Some(p.include_context),
-            cursor: p.cursor,
-            ..CodeParams::new(CodeMode::Grep)
-        })))
-        .await
     }
 }
 

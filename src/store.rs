@@ -178,6 +178,18 @@ pub struct Index {
     /// `.doc.msgpack` blobs as GC-referenced so the blob GC stops reaping the doc cache.
     #[serde(default)]
     pub doc_files: AHashMap<RelPath, DocEntry>,
+    /// [`crate::config::rules::embed_policy_digest`] of the config the last complete full scan ran
+    /// under. A different value means the embed on/off switches or embed globs changed, so the next
+    /// full scan re-flushes eligible files and purges vector / keyword rows of ineligible ones.
+    /// `#[serde(default)]` keeps older `index.msgpack` files readable (additive, no schema bump).
+    #[serde(default)]
+    pub embed_policy: String,
+    /// Relative path → [`crate::store_doc_tombstone::DocTombstone`] for documents whose extraction
+    /// timed out, so an unchanged file is not re-extracted (and does not strand another abandoned
+    /// thread) on every scan. `#[serde(default)]` keeps older `index.msgpack` files readable
+    /// (additive, no schema bump).
+    #[serde(default)]
+    pub doc_tombstones: AHashMap<RelPath, crate::store_doc_tombstone::DocTombstone>,
 }
 
 impl Index {
@@ -186,6 +198,8 @@ impl Index {
             schema_ver: SCHEMA_VER,
             files: AHashMap::new(),
             doc_files: AHashMap::new(),
+            embed_policy: String::new(),
+            doc_tombstones: AHashMap::new(),
         }
     }
 }
@@ -200,6 +214,11 @@ pub struct FileEntry {
     /// read + blake3 hash. Nanosecond resolution keeps that fast-path effectively race-free. Only
     /// ever compared against a stored value, never displayed, so the unit is internal.
     pub mtime: i64,
+    /// The [`crate::extract::EXTRACT_EPOCH`] the entry's blob was extracted under; `0` for entries
+    /// written before the field existed. An entry below the current epoch is never short-circuited
+    /// as unchanged, so the scan re-extracts it (see `process_file`).
+    #[serde(default)]
+    pub extract_epoch: u16,
 }
 
 /// Per-document index entry — the doc-tier analogue of [`FileEntry`]. Records the content hash of
@@ -242,6 +261,12 @@ pub struct DocEntry {
     /// pre-existing entries deserialize as `None`.
     #[serde(default)]
     pub rehydration_ref: Option<String>,
+    /// [`crate::config::rules::doc_digest`] of the settings the doc was processed under. The
+    /// unchanged fast path compares it with the current config, so changing a chunk-size / keyword /
+    /// OCR knob re-processes the doc. Empty on entries that predate the field, which costs one
+    /// cheap re-check (the cached blob is adopted and stamped, not re-extracted).
+    #[serde(default)]
+    pub config_digest: String,
 }
 
 pub struct Store {
@@ -271,6 +296,10 @@ pub struct Store {
     /// vanilla code-only scan doesn't pay the LanceDB startup cost.
     #[cfg(feature = "intelligence")]
     pub lance: Option<LanceStore>,
+    /// True when this open discarded a view index written under another schema (a release-minor
+    /// bump): every blob that index referenced is now unreferenced, so the first scan of the
+    /// rebuilt view should be followed by a blob sweep (see `Store::displaced_blobs_pending`).
+    pub reset_stale_schema: bool,
     _lock: Option<File>,
 }
 
@@ -287,6 +316,13 @@ impl Store {
     pub fn open_with_holder(root: &Path, view: &str, holder: LockHolder) -> Result<Self, StoreError> {
         let basemind_dir = workspace_cache_dir(root);
         ensure_dir(&basemind_dir)?;
+        // Lock before creating any of the rebuildable subdirectories below: the cache-budget
+        // eviction sweep (`store_gc_budget::evict_workspace`) takes this same lock before it
+        // `remove_dir_all`s `views/` et al., and skips (`locked_skipped`) when it can't get it.
+        // Locking first closes the window where it could see `views/`/`view_dir` freshly created
+        // but still unlocked, delete them, and leave `flush()` writing into a directory that no
+        // longer exists. ~keep
+        let lock = acquire_lock_as(&basemind_dir, holder)?;
         let blobs_dir = global_blobs_dir();
         ensure_dir(&blobs_dir)?;
         let blobs_shared = true;
@@ -294,13 +330,19 @@ impl Store {
         migrate_legacy_index_into_views(&basemind_dir)?;
 
         let view_dir = basemind_dir.join(VIEWS_DIR).join(view);
+        // A fresh linked worktree clones its working view from a sibling checkout (COW, atomic
+        // rename) BEFORE fjall opens, so the first scan skips content-identical files. ~keep
+        if view == VIEW_WORKING {
+            crate::store_seed::seed_working_view(root, &basemind_dir, &view_dir);
+        }
         ensure_dir(&view_dir)?;
-        let lock = acquire_lock_as(&basemind_dir, holder)?;
         ensure_workspace_marker(&basemind_dir, root);
+        let mut reset_stale_schema = false;
         let index = match read_index(&view_dir) {
             Ok(Some(idx)) => idx,
             Ok(None) => Index::empty(),
             Err(StoreError::SchemaMismatch { found, expected }) => {
+                reset_stale_schema = true;
                 tracing::info!(
                     found,
                     expected,
@@ -324,8 +366,29 @@ impl Store {
             index_db,
             #[cfg(feature = "intelligence")]
             lance: None,
+            reset_stale_schema,
             _lock: Some(lock),
         })
+    }
+
+    /// Materialize this store's on-disk directories (`basemind_dir`, `blobs_dir`, `views/`,
+    /// `view_dir`) if they don't already exist.
+    ///
+    /// A store opened via [`Store::open_read_only`] never creates these — that constructor
+    /// deliberately does no filesystem writes so a read-only consumer never contends for the
+    /// exclusive lock. But `admin rescan` / `basemind scan` upgrade a read-only-opened store to a
+    /// writer in place (`scan_and_refresh` takes the in-process write lock and scans directly into
+    /// it, never re-opening through [`Store::open_with_holder`]), so on a workspace's first-ever
+    /// scan `view_dir` does not exist on disk yet and `flush()`'s `OpenOptions::open` on
+    /// `index.msgpack.tmp` fails with ENOENT. Call this before scanning a store that may have been
+    /// opened read-only. Cheap and idempotent when the directories already exist; does not touch
+    /// the lock file. ~keep
+    pub fn ensure_dirs(&self) -> Result<(), StoreError> {
+        ensure_dir(&self.basemind_dir)?;
+        ensure_dir(&self.blobs_dir)?;
+        ensure_dir(&self.basemind_dir.join(VIEWS_DIR))?;
+        ensure_dir(&self.view_dir)?;
+        Ok(())
     }
 
     /// Open without taking the exclusive lock. Use for read-only consumers (CLI query, MCP).
@@ -396,6 +459,7 @@ impl Store {
             index_db,
             #[cfg(feature = "intelligence")]
             lance: None,
+            reset_stale_schema: false,
             _lock: None,
         })
     }
@@ -714,6 +778,25 @@ mod tests {
     }
 
     #[test]
+    fn ensure_dirs_lets_a_read_only_opened_store_flush_on_first_scan() {
+        init_isolated_cache();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store =
+            Store::open_read_only(tmp.path(), VIEW_WORKING).expect("working view opens even when never scanned");
+        assert!(
+            !store.view_dir.exists(),
+            "open_read_only must not create view_dir on a never-scanned workspace"
+        );
+        store
+            .ensure_dirs()
+            .expect("ensure_dirs creates the missing directories");
+        assert!(store.view_dir.exists(), "ensure_dirs must create view_dir");
+        store
+            .flush()
+            .expect("flush must not ENOENT once ensure_dirs has materialized view_dir");
+    }
+
+    #[test]
     fn open_writer_creates_named_view_for_first_scan() {
         init_isolated_cache();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -740,5 +823,89 @@ mod tests {
     fn schema_mismatch_is_not_lock_contention() {
         let err = StoreError::SchemaMismatch { found: 1, expected: 2 };
         assert!(!err.is_lock_contention());
+    }
+
+    /// An `index.msgpack` written before `doc_files`, `embed_policy` and the per-document digest
+    /// fields existed must still decode, with the new fields at their neutral values.
+    #[test]
+    fn index_written_before_the_additive_fields_still_decodes() {
+        let legacy = serde_json::json!({
+            "schema_ver": SCHEMA_VER,
+            "files": {},
+        });
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let index: Index = rmp_serde::from_slice(&bytes).expect("legacy index decodes");
+        assert!(index.doc_files.is_empty());
+        assert_eq!(index.embed_policy, "");
+        assert!(index.doc_tombstones.is_empty());
+
+        let legacy = serde_json::json!({
+            "schema_ver": SCHEMA_VER,
+            "files": {},
+            "doc_files": {
+                "docs/a.pdf": {"hash_hex": "ab", "embedding_preset": "fast", "size_bytes": 3, "mtime": 7},
+            },
+        });
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        let index: Index = rmp_serde::from_slice(&bytes).expect("legacy doc entry decodes");
+        let entry = index.doc_files.values().next().expect("one doc entry");
+        assert!(!entry.embedded && !entry.embed_attempted);
+        assert_eq!(entry.config_digest, "");
+    }
+
+    /// An `index.msgpack` written before `embed_policy`, `DocEntry::{embedded, embed_attempted,
+    /// config_digest}` existed must still decode, with those fields at their neutral defaults -- the
+    /// defaults the scanner's upgrade path (purge-without-reflush, cheap re-check) relies on.
+    #[test]
+    fn a_pre_digest_index_decodes_with_neutral_defaults() {
+        #[derive(Serialize)]
+        struct LegacyDoc {
+            hash_hex: String,
+            embedding_preset: String,
+            size_bytes: u64,
+            mtime: i64,
+        }
+        #[derive(Serialize)]
+        struct LegacyIndex {
+            schema_ver: u16,
+            files: AHashMap<RelPath, FileEntry>,
+            doc_files: AHashMap<RelPath, LegacyDoc>,
+        }
+        let mut files = AHashMap::new();
+        files.insert(
+            RelPath::from("a.rs"),
+            FileEntry {
+                hash_hex: "h1".to_string(),
+                language: "rust".to_string(),
+                size_bytes: 3,
+                mtime: 7,
+                extract_epoch: crate::extract::EXTRACT_EPOCH,
+            },
+        );
+        let mut doc_files = AHashMap::new();
+        doc_files.insert(
+            RelPath::from("d.pdf"),
+            LegacyDoc {
+                hash_hex: "h2".to_string(),
+                embedding_preset: "balanced".to_string(),
+                size_bytes: 9,
+                mtime: 0,
+            },
+        );
+        let bytes = rmp_serde::to_vec_named(&LegacyIndex {
+            schema_ver: SCHEMA_VER,
+            files,
+            doc_files,
+        })
+        .expect("encode legacy index");
+
+        let index: Index = rmp_serde::from_slice(&bytes).expect("legacy index decodes");
+
+        assert!(index.embed_policy.is_empty(), "no recorded policy");
+        let doc = index.doc_files.get(&RelPath::from("d.pdf")).expect("doc entry kept");
+        assert_eq!(doc.hash_hex, "h2");
+        assert!(!doc.embedded && !doc.embed_attempted);
+        assert!(doc.config_digest.is_empty());
+        assert_eq!(index.files.len(), 1);
     }
 }

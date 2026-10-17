@@ -1,10 +1,16 @@
 ---
-priority: high
+type: Concept
+title: Crate Layout
+x-ai-rulez:
+  kind: context
+  id: crate-layout
+  metadata:
+    priority: high
 ---
 
 # Crate Layout
 
-Basemind is a single Rust crate that builds a CLI binary (`basemind`) and exposes its internals as a library. Two binaries-in-one: `basemind scan` indexes a workspace into `.basemind/`; `basemind serve` runs the MCP stdio server.
+Basemind is a single Rust crate that builds a CLI binary (`basemind`) and exposes its internals as a library. Two binaries-in-one: `basemind scan` indexes a workspace into the machine-global cache (`~/.local/share/basemind/`, override `BASEMIND_DATA_HOME`); `basemind serve` runs the MCP stdio server.
 
 ## `src/`
 
@@ -12,7 +18,7 @@ Basemind is a single Rust crate that builds a CLI binary (`basemind`) and expose
 - `main.rs` — CLI entry (`scan`, `serve`).
 - `scanner.rs` — rayon-parallel file walker; orchestrates per-file extraction and writes blobs + index.
 - `scanner_docs.rs` — document-tier scan (PDF / Office / HTML → LanceDB) when `--features documents`.
-- `store.rs` — content-addressed msgpack blob store at `.basemind/blobs/<hash>.{l1,l2,l3}.msgpack`. Holds the `IndexDb` handle.
+- `store.rs` — content-addressed msgpack blob store at `~/.local/share/basemind/blobs/<hash>.{l1,l2,l3}.msgpack`. Holds the `IndexDb` handle.
 - `index/` — Fjall-backed secondary index (`mod.rs`, `keys.rs`, `writer.rs`).
 - `extract/` — tree-sitter extraction tiers:
   - `l1.rs` — outlines (symbols, signatures, imports, docs).
@@ -27,12 +33,12 @@ Basemind is a single Rust crate that builds a CLI binary (`basemind`) and expose
   - `source.rs` — `ConfigSource` + `ProvenanceMap` ledger.
 - `mcp/` — MCP server: nine domain tools (`code`, `graph`, `git`, `memory`, `web`, `agents`, `workspace`, `shell`, `admin`), each one `#[tool]` dispatching on a required `mode`.
   - `mod.rs` — server bootstrap.
-  - `mode.rs` — `define_mode!`: the mode enums, wire spellings, `telemetry_key()`, and `domain_modes()` (what `tests/cli_parity.rs` walks).
+  - `mode.rs` — `define_mode!`: the mode enums, wire spellings, `telemetry_key()`, and `domain_modes()` (what `tests/cli_parity/` walks).
   - `tools.rs` (`code`) + `tools_admin.rs` / `tools_comms.rs` (`agents`) / `tools_git.rs` / `tools_graph.rs` / `tools_memory.rs` / `tools_registry.rs` (`workspace`) / `tools_shells.rs` (`shell`) / `tools_web.rs` — one `#[tool]` shim per domain (thin wrapper; 1000-line cap each). Filenames predate the CLI/tool rename for `agents`/`workspace`/`shell`.
   - `helpers.rs` + `helpers_<area>.rs` (`helpers_calls.rs` / `helpers_code.rs` / `helpers_code_search.rs` / `helpers_documents.rs` / `helpers_graph.rs` / `helpers_grep.rs` / `helpers_impls.rs` / `helpers_web.rs`, and more) — the `run_<mode>` bodies each shim dispatches to.
   - `memory.rs` — `search_documents` + `memory_*` bodies behind the `memory` tool's modes, over LanceDB.
   - `types.rs` + `types_<domain>.rs` — one flat `<Domain>Params` per domain (optional sibling fields per mode) + response structs, `JsonSchema`-derived.
-  - `cursor.rs`, `savings.rs`, `telemetry.rs` — pagination cursors, token-savings heuristics (keyed by `domain:mode`, plus the bare pre-consolidation spellings `basemind-agent` still uses), telemetry sink.
+  - `cursor.rs`, `savings.rs`, `telemetry.rs` — pagination cursors, token-savings heuristics (keyed by `domain:mode`, plus the bare pre-consolidation tool-name spellings), telemetry sink.
 - `query.rs` — read-side helpers shared between MCP tools and the CLI.
 - `git.rs` + `git_cache.rs` — `gix`-backed history / blame / churn.
 - `path.rs` — `RelPath` byte-precise repo-relative paths.
@@ -47,10 +53,10 @@ Basemind is a single Rust crate that builds a CLI binary (`basemind`) and expose
 - `git_smoke.rs` / `git_cache_smoke.rs` / `scan_smoke.rs` / `schema_bump.rs` / `config_schema.rs` — focused smoke tests.
 - `fixtures/` — small synthetic repos for unit tests.
 
-#### `.basemind/` (created at scan time)
+#### Global cache (`~/.local/share/basemind/`, created at scan time)
 
 - `blobs/<hash>.{l1,l2,l3}.msgpack` — content-addressed extraction blobs (dedup across files / views).
-- `views/<view>/index.fjall/` — Fjall LSM tree (the secondary index over those blobs).
+- `views/<workspace_hash>/<view>/index.fjall/` — Fjall LSM tree (the secondary index over those blobs).
 
 #### Other
 
