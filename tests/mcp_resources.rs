@@ -46,12 +46,13 @@ async fn resources_list_read_and_complete() {
     let caps = service.peer_info().expect("info").capabilities.clone();
     assert!(caps.resources.is_some(), "resources capability must be advertised");
 
+    // Fork contract (see `tests/mcp_safe_resources.rs`): the list advertises only `safe/` mirror
+    // files — and nothing at all without safe lists configured, so this fixture lists nothing.
+    // Upstream's outline resources keep their direct-read dispatch (asserted below) but are
+    // never advertised.
     let resources = service.list_all_resources().await.expect("list");
     let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
-    assert!(
-        uris.contains(&"basemind://status") && uris.contains(&"basemind://repo/map"),
-        "{uris:?}"
-    );
+    assert!(uris.iter().all(|uri| uri.starts_with("basemind://safe/")), "{uris:?}");
     let templates = service.list_all_resource_templates().await.expect("templates");
     assert!(templates.iter().any(|t| t.uri_template == "basemind://outline/{path}"));
 

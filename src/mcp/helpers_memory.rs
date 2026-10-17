@@ -55,7 +55,7 @@ fn require<T>(mode: MemoryMode, field: &str, value: Option<T>) -> Result<T, McpE
 /// One list walked against [`accepted`], rather than a hand-written reject list per mode: a field
 /// added to [`MemoryParams`] but forgotten in some mode's accept list is then rejected by default,
 /// which is the safe direction — the unsafe one is a parameter silently ignored.
-fn supplied(p: &MemoryParams) -> [(&'static str, bool); 25] {
+fn supplied(p: &MemoryParams) -> [(&'static str, bool); 26] {
     [
         ("key", p.key.is_some()),
         ("value", p.value.is_some()),
@@ -82,6 +82,7 @@ fn supplied(p: &MemoryParams) -> [(&'static str, bool); 25] {
         ("kind", p.kind.is_some()),
         ("id", p.id.is_some()),
         ("reason", p.reason.is_some()),
+        ("documents config overrides", p.overrides.any()),
     ]
 }
 
@@ -257,6 +258,7 @@ async fn run_documents(state: &ServerState, mut params: MemoryParams) -> Result<
         scope: params.scope.take(),
         entity_category: params.entity_category.take(),
         keywords_contains: params.keywords_contains.take(),
+        overrides: params.overrides,
     };
     super::memory::run_search_documents(state, p).await
 }
@@ -298,6 +300,7 @@ mod tests {
             kind: None,
             id: None,
             reason: None,
+            overrides: Default::default(),
         }
     }
 

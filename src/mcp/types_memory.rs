@@ -173,6 +173,11 @@ pub struct MemoryParams {
     /// `reject` only: human-readable reason. Logged, never persisted.
     #[serde(default)]
     pub reason: Option<String>,
+
+    /// `documents` only: per-query overrides for any `documents.*` config knob, taking precedence
+    /// over serve-time config and CLI flags. Unrecognized fields are ignored — flatten semantics.
+    #[serde(flatten, default)]
+    pub overrides: crate::config::DocumentsCliOverrides,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]

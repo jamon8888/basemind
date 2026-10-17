@@ -334,7 +334,7 @@ fallback_or_die() {
       LOCK_HELD=""
       exec env BASEMIND_FORCE_VERSION="$cand" "$0" "${ARGS[@]}"
     done
-fi
+  fi
   fb="$(newest_compatible_cached)"
   if [ -n "$fb" ]; then
     log "warning: $reason"

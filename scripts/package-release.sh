@@ -196,7 +196,7 @@ macos)
     codesign --force --sign - "$STAGING_DIR/libonnxruntime.dylib"
     rm -rf "$ort_tmp"
     echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
-fi
+  fi
 
   tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
   echo "✓ Created basemind-${TRIPLE}.tar.gz"

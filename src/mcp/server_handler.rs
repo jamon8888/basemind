@@ -183,8 +183,10 @@ impl ServerHandler for BasemindServer {
         self.prompt_router.get_prompt(prompt_context).await
     }
 
-    /// `resources/list`: the union of upstream's static outline resources (see [`super::resources`])
-    /// and this fork's `safe/` file resources (see [`safe_resources`]).
+    /// `resources/list`: this fork's `safe/` file resources (see [`safe_resources`]) carried in
+    /// upstream's response envelope (ttl/scope, see [`super::resources`]). The fork contract —
+    /// asserted in `tests/mcp_safe_resources.rs` — advertises nothing outside `safe/`, so
+    /// upstream's static outline resources are never listed; they keep their direct-read dispatch.
     async fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -195,7 +197,9 @@ impl ServerHandler for BasemindServer {
             .await
             .map_err(|error| rmcp::ErrorData::internal_error(format!("resources/list task failed: {error}"), None))?;
         let mut result = self.list_resources_result();
-        result.resources.extend(safe_items.resources);
+        // Replace, never extend: only `safe/` files may appear in the list (the static items in
+        // `result` are discarded here; the envelope metadata around them is kept).
+        result.resources = safe_items.resources;
         Ok(result)
     }
 

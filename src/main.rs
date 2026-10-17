@@ -13,8 +13,10 @@ use basemind::watcher::{BatchKind, WatchBatch};
 mod comms_cli;
 mod doctor_cli;
 mod lang_cli;
+mod scan_args;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod stdio_relay;
+use scan_args::{RescanArgs, ScanArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,6 +61,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// The top-level dispatch enum lives for the process lifetime and is matched once;
+// boxing its largest variant would trade ergonomics for nothing.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Initialize (or refresh) basemind onboarding: write basemind.toml, gitignore the cache, and
     /// inject a "prefer basemind over grep/read/git" rules block. Re-runnable and idempotent.
@@ -219,50 +224,6 @@ enum CommsLifecycleCmd {
         #[arg(long)]
         clear_fatal: bool,
     },
-}
-
-#[derive(clap::Args, Debug)]
-struct ScanArgs {
-    /// Index the git staging area instead of the working tree. Used by the
-    /// pre-commit hook so the cache reflects what's about to be committed.
-    /// Mutually exclusive with --rev.
-    #[arg(long, conflicts_with = "rev")]
-    staged: bool,
-    /// Index the tree at the given revision (HEAD, branch name, sha, HEAD~3).
-    /// Written as the `rev-<sha7>` view in the machine-global workspace cache, separate from the
-    /// working-tree view.
-    #[arg(long, value_name = "REV")]
-    rev: Option<String>,
-    /// Skip building the git-history index after the scan (overrides config). The history tools
-    /// then fall back to the live walk. Equivalent to `BASEMIND_GH_INDEX=0`.
-    #[arg(long)]
-    no_git_history: bool,
-    /// Wipe and fully rebuild the git-history index instead of incrementally syncing it. Use after
-    /// a history rewrite if revalidation didn't already trigger a rebuild.
-    #[arg(long)]
-    rebuild_git_history: bool,
-    /// Document-tier overrides. Every flag in this group corresponds to a
-    /// `[documents.…]` TOML key and a `BASEMIND_DOCUMENTS_…` env var.
-    #[command(flatten)]
-    documents: DocumentsCliOverrides,
-}
-
-#[derive(clap::Args, Debug)]
-struct RescanArgs {
-    /// Repo-relative paths to re-index incrementally. When omitted (or with `--full`),
-    /// the entire working tree is re-indexed. Paths are forward-slash with no leading `/`.
-    #[arg(value_name = "PATH")]
-    paths: Vec<String>,
-    /// Force a full working-tree re-index even when paths are supplied. Use to rebuild a
-    /// stale or empty index from scratch.
-    #[arg(long)]
-    full: bool,
-    /// Skip building the git-history index after the rescan (overrides config).
-    #[arg(long)]
-    no_git_history: bool,
-    /// Wipe and fully rebuild the git-history index instead of incrementally syncing it.
-    #[arg(long)]
-    rebuild_git_history: bool,
 }
 
 #[derive(Subcommand, Debug)]

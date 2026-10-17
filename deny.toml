@@ -19,6 +19,12 @@ ignore = [
   # Fork-line advisory carried by our pinned dependency set; regenerate via `cargo deny` when the
   # merge settles.
   "RUSTSEC-2026-0285",
+  # zip 8.6.0 is transitive only (calamine via xberg, candle-core via xberg-gliner); both require
+  # zip ^8 and the fixes shipped in >=9.0.0 exclusively. basemind reads archives through those
+  # crates and never calls the vulnerable ZipArchive::extract / stream-extraction APIs.
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
 ]
 [licenses]
 allow = [

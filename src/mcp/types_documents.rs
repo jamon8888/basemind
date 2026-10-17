@@ -43,6 +43,12 @@ pub struct SearchDocumentsParams {
     /// containing the substring are returned.
     #[serde(default)]
     pub keywords_contains: Option<String>,
+    /// Per-query overrides for any `documents.*` config knob. Takes precedence over
+    /// serve-time config and CLI flags. Known override fields (mirroring `[documents]`)
+    /// are applied; unrecognized fields are silently ignored — flatten semantics
+    /// (`#[serde(flatten)]` and `deny_unknown_fields` are mutually exclusive in serde).
+    #[serde(flatten, default)]
+    pub overrides: crate::config::DocumentsCliOverrides,
 }
 
 #[cfg(feature = "documents")]

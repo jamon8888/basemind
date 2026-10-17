@@ -176,6 +176,16 @@ impl SharedEmbedder {
     /// (sourced from `[resources].embed_batch_size`). Larger batches amortise
     /// per-call overhead at a higher transient memory spike.
     pub fn load(preset: &str, max_embed_threads: usize, batch_size: usize) -> Result<Self> {
+        Self::load_with_provider(preset, max_embed_threads, batch_size, OnnxProvider::default())
+    }
+
+    /// [`load`](Self::load) with an explicit ONNX execution provider (`[resources] onnx_provider`).
+    pub fn load_with_provider(
+        preset: &str,
+        max_embed_threads: usize,
+        batch_size: usize,
+        provider: OnnxProvider,
+    ) -> Result<Self> {
         let (model, dim, model_name) = match EMBEDDING_PRESETS.iter().find(|p| p.name == preset) {
             Some(meta) => {
                 let dim = u16::try_from(meta.dimensions)

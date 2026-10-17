@@ -170,6 +170,10 @@ pub fn table() -> Vec<Row> {
             "installation and workspace health check printing human diagnostics and exiting 1 on failure; an MCP client is already connected",
         ),
         cli_only(
+            "cpu-features",
+            "detects local CPU feature flags for ONNX runtime model compatibility; a machine diagnostic run before serving, not a query",
+        ),
+        cli_only(
             "completions",
             "emits a shell completion script for the CLI's own grammar",
         ),
