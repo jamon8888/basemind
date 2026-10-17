@@ -8,8 +8,10 @@ fn doc_rows(scope: &str, path: &str, n: usize, tag: &str) -> Vec<DocumentRow> {
             chunk_idx: c as u32,
             mime_type: "text/plain".into(),
             text: format!("{tag} {path} {c}"),
+            heading_path: String::new(),
             byte_start: 0,
             byte_end: 1,
+            rehydration_ref: None,
             embedding: vec![0.0; 4],
         })
         .collect()

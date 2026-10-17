@@ -23,8 +23,10 @@ fn rows(doc: usize, chunks: usize, gen_: u32) -> Vec<DocumentRow> {
             chunk_idx: c as u32,
             mime_type: "text/markdown".into(),
             text: format!("document {doc} chunk {c} generation {gen_} lorem ipsum dolor sit amet"),
+            heading_path: String::new(),
             byte_start: (c * 64) as u32,
             byte_end: (c * 64 + 63) as u32,
+            rehydration_ref: None,
             embedding: vec![0.0; DIM as usize],
         })
         .collect()

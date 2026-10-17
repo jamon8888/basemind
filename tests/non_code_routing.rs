@@ -128,6 +128,7 @@ fn a_document_that_becomes_code_leaves_the_document_tier() {
             mtime: 0,
             embedded: false,
             embed_attempted: false,
+            rehydration_ref: None,
             config_digest: String::new(),
         },
     );
