@@ -385,6 +385,8 @@ pub fn domain_modes() -> Vec<(&'static str, &'static [&'static str])> {
         (AgentsMode::DOMAIN, AgentsMode::ALL_MODES),
         #[cfg(all(feature = "comms", any(unix, windows)))]
         (WorkspaceMode::DOMAIN, WorkspaceMode::ALL_MODES),
+        #[cfg(feature = "documents")]
+        (VaultMode::DOMAIN, VaultMode::ALL_MODES),
     ]
 }
 

@@ -4,13 +4,16 @@
 //! chatty client connection can never fail a tool call. Upstream deprecated MCP logging
 //! (SEP-2577) and stopped advertising it; this fork keeps the `logging/setLevel` handler, which
 //! records the client's minimum severity on `super::ServerState::log_level` as an ordinal (see
-//! [`level_ordinal`]).
+//! [`level_ordinal`]), and the rescan path emits a threshold-gated `rescan_complete` notification
+//! through [`emit_log`].
 
 use rmcp::Peer;
 use rmcp::RoleServer;
-#[allow(deprecated)]
-use rmcp::model::LoggingLevel;
 use rmcp::model::ProgressNotificationParam;
+#[allow(deprecated)]
+use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
+use serde_json::Value;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Severity ordinal (RFC 5424 order: lower = more verbose). `logging/setLevel L` means "send me
 /// messages at severity `L` and above", so a message is emitted when its ordinal `>=` the stored
@@ -31,6 +34,32 @@ pub(super) fn level_ordinal(level: LoggingLevel) -> u8 {
 
 /// Default logging threshold before the client calls `logging/setLevel`: `Info` and above.
 pub(super) const DEFAULT_LOG_ORDINAL: u8 = 1;
+
+/// True when a message at `level` should be sent given the client's current threshold.
+#[allow(deprecated)]
+pub(super) fn should_log(threshold: &AtomicU8, level: LoggingLevel) -> bool {
+    level_ordinal(level) >= threshold.load(Ordering::Relaxed)
+}
+
+/// Emit a logging notification if `level` clears the client's threshold. Best-effort.
+#[allow(deprecated)]
+pub(super) async fn emit_log(
+    peer: &Peer<RoleServer>,
+    threshold: &AtomicU8,
+    level: LoggingLevel,
+    logger: &'static str,
+    data: Value,
+) {
+    if !should_log(threshold, level) {
+        return;
+    }
+    if let Err(error) = peer
+        .notify_logging_message(LoggingMessageNotificationParam::new(level, data).with_logger(logger))
+        .await
+    {
+        tracing::debug!(?error, "logging notification dropped");
+    }
+}
 
 /// Emit a progress notification for `token`. Best-effort; only called when the client supplied a
 /// progress token on the request.

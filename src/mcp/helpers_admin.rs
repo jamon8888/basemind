@@ -461,6 +461,24 @@ async fn run_rescan(
 
     let stats = fetch_rescan_stats(&state, scoped_paths).await?;
 
+    if let Some(peer) = peer {
+        #[allow(deprecated)]
+        super::notifications::emit_log(
+            peer,
+            &state.log_level,
+            rmcp::model::LoggingLevel::Info,
+            "basemind.rescan",
+            serde_json::json!({
+                "event": "rescan_complete",
+                "scanned": stats.scanned,
+                "updated": stats.updated,
+                "removed": stats.removed,
+                "extract_failed": stats.extract_failed,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+        )
+        .await;
+    }
     if let (Some(peer), Some(token)) = (peer, progress_token) {
         let scanned = stats.scanned as f64;
         super::notifications::emit_progress(

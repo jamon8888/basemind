@@ -61,6 +61,7 @@ pub struct RedactTextParams {
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
+        title = "Redact text",
         description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), and ner_ran (false when NER did not run and only pattern redaction applied; set require_ner to fail instead).",
         annotations(
             read_only_hint = false,

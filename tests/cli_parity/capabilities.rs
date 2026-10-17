@@ -244,5 +244,18 @@ pub fn table() -> Vec<Row> {
         pair("shell", "list", "shell list"),
         pair("shell", "broadcast", "shell broadcast"),
     ]);
+    // `redact` and the `vault` group compile only with `documents`, on both the CLI and the MCP side.
+    #[cfg(feature = "documents")]
+    rows.extend([
+        pair("vault", "encrypt", "vault encrypt"),
+        pair("vault", "decrypt", "vault decrypt"),
+        pair("vault", "find", "vault find"),
+        pair("vault", "forget", "vault forget"),
+        pair("vault", "inspect", "vault inspect"),
+        cli_only(
+            "redact",
+            "file/stdin redaction driver over the same engine as the `redact_text` MCP tool; the tool takes inline text and carries no mode enum, so there is no (tool, mode) pair to point at",
+        ),
+    ]);
     rows
 }

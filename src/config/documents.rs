@@ -647,7 +647,8 @@ pub struct OcrConfig {
     pub backend: OcrBackend,
     /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`).
     /// Defaults to English plus the six EU national-ID languages (DE, FR, ES,
-    /// IT, NL, PL) so ID documents OCR correctly before PII detection.    #[serde(default = "OcrConfig::default_languages")]
+    /// IT, NL, PL) so ID documents OCR correctly before PII detection.
+    #[serde(default = "OcrConfig::default_languages")]
     pub languages: Vec<String>,
 }
 

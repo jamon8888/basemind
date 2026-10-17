@@ -26,12 +26,23 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn encode_query(pairs: &[(&str, &str)]) -> String {
-    let mut ser = form_urlencoded::Serializer::new(String::new());
-    for (k, v) in pairs {
-        ser.append_pair(k, v);
-    }
-    ser.finish()
+/// The filesystem/volume root as this platform expresses it: `/` on unix, the system volume
+/// (`D:/` on a GitHub Windows runner) on Windows. Unix-style `/` is *relative* on Windows, so a
+/// hard-coded `/` would be refused as a non-absolute path (400) instead of exercising the
+/// filesystem-root guard (403).
+fn filesystem_root() -> std::path::PathBuf {
+    std::env::current_dir()
+        .expect("current dir")
+        .ancestors()
+        .last()
+        .expect("filesystem root")
+        .to_path_buf()
+}
+
+/// Percent-encode a path for a `?root=` query value, normalising separators so Windows
+/// backslashes are emitted as `/` rather than needing their own escape.
+fn encode_root(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/").replace('/', "%2F")
 }
 
 /// One HTTP/1.1 POST over loopback, returning `(status_code, body)`. `Connection: close` lets us
@@ -198,7 +209,6 @@ async fn serve() -> ServedHttp {
     }
 }
 
-#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streamable_http_serves_initialize_and_tools_list() {
     basemind::store::init_isolated_cache();
@@ -214,8 +224,7 @@ async fn streamable_http_serves_initialize_and_tools_list() {
     let headers = json_headers(&bearer);
 
     let root_str = root.to_str().expect("utf-8 repo path");
-    let query = encode_query(&[("root", root_str), ("agent", "smoke")]);
-    let target = format!("/mcp?{query}");
+    let target = format!("/mcp?root={root_str}&agent=smoke");
 
     // --- initialize ---
     let init = json!({
@@ -360,7 +369,6 @@ async fn both_routes_require_the_daemon_bearer_token() {
 
 /// ADR-0006: `GET /ui?root=<repo>` serves the self-contained interactive graph page (the browser/
 /// agent-drivable twin the `ui` tool points at), and the route's error paths return the right status.
-#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ui_route_serves_interactive_html() {
     basemind::store::init_isolated_cache();
@@ -379,9 +387,11 @@ async fn ui_route_serves_interactive_html() {
     let token = served.token.clone();
 
     let root_str = root.to_str().expect("utf-8 repo path");
+    // The route reads a percent-encoded root; `/` encodes to %2F.
+    let encoded_root = root_str.replace('/', "%2F");
     let ui = |query: &str| format!("/ui?token={token}&{query}");
 
-    let (status, head, body) = http_get(&addr, &ui(&encode_query(&[("root", root_str)]))).await;
+    let (status, head, body) = http_get(&addr, &ui(&format!("root={encoded_root}"))).await;
     assert_eq!(status, 200, "GET /ui must return 200: {body}");
     assert!(head.contains("content-type: text/html"), "html content-type: {head}");
     assert!(
@@ -405,39 +415,35 @@ async fn ui_route_serves_interactive_html() {
         "the 400 is plain text: {head}"
     );
     assert!(body.contains("root"), "the 400 body names the missing root: {body}");
-    let (status, _, _) = http_get(&addr, &ui("root=%2Fno%2Fsuch%2Fpath%2Fbm-xyz")).await;
+    let missing = filesystem_root().join("no").join("such").join("path").join("bm-xyz");
+    let (status, _, _) = http_get(&addr, &ui(&format!("root={}", encode_root(&missing)))).await;
     assert_eq!(status, 404, "a root that does not resolve must 404");
 
     // DNS-rebinding guard: a foreign `Host` (a rebound-to-127.0.0.1 attacker page) is rejected before
     // the workspace is read, even for an otherwise-valid, credentialed request — 403, not 200.
-    let root_q = encode_query(&[("root", root_str)]);
-    let (status, _, _) = http_get_with_host(&addr, &ui(&root_q), "evil.example").await;
+    let (status, _, _) = http_get_with_host(&addr, &ui(&format!("root={encoded_root}")), "evil.example").await;
     assert_eq!(
         status, 403,
         "a non-loopback Host must be rejected on the loopback listener"
     );
     // A `localhost` Host is loopback and still served (regression guard for the allowlist).
-    let (status, _, _) = http_get_with_host(&addr, &ui(&root_q), "localhost:1234").await;
+    let (status, _, _) = http_get_with_host(&addr, &ui(&format!("root={encoded_root}")), "localhost:1234").await;
     assert_eq!(status, 200, "a loopback Host (localhost) is still served");
 
     // The route serves visual formats only (like the `ui` tool): a graph *data* format is a 400 whose
     // body names the rejected knob — the route and tool reject it through the same `render_ui_parts`.
-    let (status, _, body) = http_get(
-        &addr,
-        &ui(&encode_query(&[("root", root_str), ("format", "node_link")])),
-    )
-    .await;
+    let (status, _, body) = http_get(&addr, &ui(&format!("root={encoded_root}&format=node_link"))).await;
     assert_eq!(status, 400, "a graph data format is rejected by the route: {body}");
     assert!(body.contains("format"), "the 400 body names the bad format: {body}");
     // `format=svg` renders and is served with the SVG content-type (proves the format knob is plumbed
     // through to the response, not just the default HTML path).
-    let (status, head, _) = http_get(&addr, &ui(&encode_query(&[("root", root_str), ("format", "svg")]))).await;
+    let (status, head, _) = http_get(&addr, &ui(&format!("root={encoded_root}&format=svg"))).await;
     assert_eq!(status, 200, "svg renders");
     assert!(head.contains("image/svg+xml"), "svg content-type: {head}");
 
     // `/ui` is a pure read render, so it is method-agnostic: a POST carrying the same query serves the
     // same page (the body is ignored). Pins current behavior — the route has no write/side-effect path.
-    let (status, _) = http_post(&addr, &ui(&root_q), b"", &[]).await;
+    let (status, _) = http_post(&addr, &ui(&format!("root={encoded_root}")), b"", &[]).await;
     assert_eq!(status, 200, "POST /ui serves the same read-only page");
 
     served.stop().await;
@@ -447,7 +453,6 @@ async fn ui_route_serves_interactive_html() {
 /// project. A relative value is rejected BEFORE `std::fs::canonicalize` (which would otherwise
 /// resolve it against the daemon's own cwd — wherever the daemon happened to be spawned), and the
 /// filesystem root is refused outright. Neither may mint a workspace cache directory on the way.
-#[cfg_attr(windows, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_root_param_must_be_absolute_and_must_be_a_project() {
     basemind::store::init_isolated_cache();
@@ -467,7 +472,14 @@ async fn mcp_root_param_must_be_absolute_and_must_be_a_project() {
     );
     assert!(body.contains("absolute"), "the 400 body says why: {body}");
 
-    let (status, body) = http_post(&addr, "/mcp?root=%2F", payload.as_bytes(), &headers).await;
+    let fs_root = filesystem_root();
+    let (status, body) = http_post(
+        &addr,
+        &format!("/mcp?root={}", encode_root(&fs_root)),
+        payload.as_bytes(),
+        &headers,
+    )
+    .await;
     assert_eq!(status, 403, "the filesystem root must be refused: {body}");
     assert!(
         body.contains("filesystem/volume root") && body.contains("no override"),
@@ -475,7 +487,7 @@ async fn mcp_root_param_must_be_absolute_and_must_be_a_project() {
     );
 
     assert!(
-        !basemind::store::workspace_cache_dir(std::path::Path::new("/")).exists(),
+        !basemind::store::workspace_cache_dir(&fs_root).exists(),
         "a refused root must not mint a workspace cache dir"
     );
 
@@ -489,9 +501,14 @@ async fn mcp_root_param_must_be_absolute_and_must_be_a_project() {
     let nested = repo_root.join("src");
     std::fs::create_dir_all(&nested).expect("mkdir src");
     std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n").expect("write source");
-    let nested_str = nested.to_str().expect("utf-8 path");
-    let query = encode_query(&[("root", nested_str)]);
-    let (status, body) = http_post(&addr, &format!("/mcp?{query}"), payload.as_bytes(), &headers).await;
+    let encoded_nested = nested.to_str().expect("utf-8 path").replace('/', "%2F");
+    let (status, body) = http_post(
+        &addr,
+        &format!("/mcp?root={encoded_nested}"),
+        payload.as_bytes(),
+        &headers,
+    )
+    .await;
     assert_eq!(status, 200, "a repo subdirectory resolves to its repository: {body}");
 
     served.stop().await;
