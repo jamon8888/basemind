@@ -1,8 +1,7 @@
-# Temporary diagnostic for the `ocr: command not found` failure at the
-# composite action's Run step. Mirrors alibaba/open-code-review@v1.12.13 step
-# order (checkout -> npm install -g -> config sets -> review invocation) with
-# probes between steps. Delete once the failure mechanism is identified.
-name: OCR runner debug
+# Temporary: prints SHA-256 fingerprints (never values) of the OCR wiring so
+# the configured secret can be compared against a known-good key offline.
+# Delete after verification.
+name: OCR secret fingerprint
 
 on:
   workflow_dispatch:
@@ -11,50 +10,17 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  fingerprint:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
-      - name: Seed OCR prompt ceiling (like ocr-review.yml)
+      - name: Print fingerprints
+        env:
+          KEY: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          URL: ${{ secrets.OCR_LLM_URL }}
         run: |
-          mkdir -p ~/.opencodereview
-          printf '%s\n' '{"max_tokens": 160000}' > ~/.opencodereview/config.json
-
-      - name: Checkout base (like the action's Checkout step)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install OpenCodeReview (mirror of the action's Install step)
-        run: |
-          npm install -g "@alibaba-group/open-code-review@1.12.13"
-          echo "--- after install ---"
-          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
-          echo "PATH=$PATH"
-          echo "npm=$(command -v npm) node=$(command -v node) $(node --version)"
-          echo "npm prefix -g: $(npm prefix -g)"
-          echo "command -v ocr: $(command -v ocr)"
-          ls -l "$(command -v ocr)"
-          echo "readlink: $(readlink -f "$(command -v ocr)")"
-          npm ls -g --depth=0 2>/dev/null | head -6
-          ocr version
-
-      - name: Configure-like step (ocr config sets, like the action)
-        run: |
-          ocr config unset provider || true
-          ocr config set llm.url "https://example.invalid/v1"
-          ocr config set llm.model "probe"
-          ocr config set language "English"
-          echo "--- after config ---"
-          command -v ocr
-          ocr version
-
-      - name: Run-like step (the invocation that fails in the action)
-        run: |
-          echo "--- run step state ---"
-          command -v ocr || echo "OCR GONE from PATH"
-          ls -l /usr/local/bin/ocr 2>&1 || true
-          ls -l "$(readlink -f /usr/local/bin/ocr 2>/dev/null)" 2>&1 || true
-          ls /usr/local/lib/node_modules/@alibaba-group/open-code-review 2>&1 | head -5 || true
-          df -h /usr/local /tmp /home | tail -4
-          ocr version && echo "PROBE RESULT: ocr survives all steps"
+          echo "key_sha256=$(printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1)"
+          echo "url_sha256=$(printf %s "$URL" | shasum -a 256 | cut -d' ' -f1)"
+          echo "url_host=$(printf %s "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')"
+          echo "model=${{ vars.OCR_LLM_MODEL }}"
+          echo "use_anthropic=${{ vars.OCR_LLM_USE_ANTHROPIC }}"
