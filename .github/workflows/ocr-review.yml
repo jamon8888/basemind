@@ -71,6 +71,10 @@ permissions:
 jobs:
   code-review:
     runs-on: ubuntu-latest
+    env:
+      # Pinned twice on purpose: the isolated-prefix install below and the
+      # action's ocr_version input must agree, and one variable keeps them so.
+      OCR_VERSION: 1.12.13
     # A giant sync PR (500+ files) reviews for longer than 30 minutes at
     # concurrency 2; the timeout cancelled a real review mid-flight.
     timeout-minutes: 55
@@ -102,6 +106,18 @@ jobs:
         )
       )
     steps:
+      # The runner's shared npm prefix is not stable: /usr/local/bin/ocr resolved
+      # for a dozen `ocr config set` calls and then lost its target mid-step
+      # (MODULE_NOT_FOUND) while the image's npm lifecycle kept rewriting the
+      # shared prefix after its install printed completion. Install to a private
+      # prefix and put it first on PATH so every `ocr` the composite action
+      # invokes is this pinned copy, untouched by the image or other npm churn.
+      - name: Install OpenCodeReview to an isolated prefix
+        run: |
+          npm install -g --prefix "$HOME/.ocr" "@alibaba-group/open-code-review@${{ env.OCR_VERSION }}"
+          echo "$HOME/.ocr/bin" >> "$GITHUB_PATH"
+          "$HOME/.ocr/bin/ocr" version
+
       - name: Seed OCR prompt ceiling
         run: |
           mkdir -p ~/.opencodereview
@@ -143,7 +159,7 @@ jobs:
           # llm.extra_body and folds it into the checkpoint fingerprint.
           llm_extra_body: '{"thinking": {"type": "disabled"}, "chat_template_kwargs": {"enable_thinking": false}}'
           # Pin the CLI to match the pinned action so a review is repeatable.
-          ocr_version: 1.12.13
+          ocr_version: ${{ env.OCR_VERSION }}
           # One machine serves the model; the default of 8 concurrent file
           # groups saturates it.
           review_concurrency: "2"
