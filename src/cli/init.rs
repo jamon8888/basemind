@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 
+use super::init_gitignore;
 use super::init_rules::{self, BlockSections, Capability};
+use super::init_settings;
 use crate::config;
 
 /// BEGIN delimiter of the managed rules block. Load-bearing: the splice matches this verbatim.
@@ -33,7 +35,8 @@ pub(crate) const END_MARKER: &str = "<!-- END basemind -->";
 /// the built-in default, so an unedited file is a no-op. Written to the repo ROOT (committed); the
 /// index it drives lives in the machine-global cache, so nothing is written into the repo.
 pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — https://github.com/Goldziher/basemind
-# Lives at the repo root and is meant to be committed. The index (blobs + Fjall) is derived state
+# Lives at the repo root, or under `.config/` (`.config/basemind.toml` / `.config/basemind/
+# config.toml`), and is meant to be committed. The index (blobs + Fjall) is derived state
 # kept in the machine-global cache under ~/.local/share/basemind/ (override BASEMIND_DATA_HOME),
 # keyed by workspace and wiped on schema bumps — nothing is written into the repo, so there is
 # nothing to gitignore. Never put durable config in the cache.
@@ -42,47 +45,78 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 
 [scan]
 # Files to index. Default is "everything"; the tree-sitter language registry + a binary/size check
-# filter the long tail. Narrow it if you only care about specific languages.
+# filter the long tail. Narrow it if you only care about specific languages. Must not be empty.
+# Globs are repo-relative, forward-slash, case-sensitive; `*` also crosses `/`. A bare name with no
+# glob characters (`src`, `docs/api`) matches that path and everything beneath it, like .gitignore.
 # include = ["**/*"]
-# Extra exclude globs, ADDED ON TOP of the always-on floor (node_modules, target, dist, .venv,
-# __pycache__, .git, .basemind, bazel-*, .idea, .DS_Store, …). You cannot remove a floor entry.
+# Extra exclude globs, ADDED ON TOP of the always-on floor (node_modules, target, dist, build, out,
+# vendor, coverage, venv, .venv, __pycache__, .git, .basemind, bazel-*, .idea, .DS_Store, …). Same
+# syntax as include: `generated` excludes every directory of that name; exclude beats include.
+# The floor also drops credentials and key material so no secret becomes searchable: .env and
+# .env.* (which includes .env.example), .aws, .ssh, .gnupg, .npmrc, .pypirc, .netrc,
+# .git-credentials, id_rsa / id_dsa / id_ecdsa / id_ed25519, *.pem, *.key, *.p12, *.pfx, *.jks,
+# *.keystore.
 # exclude = []
+# Floor entries to drop so that tree gets indexed, by directory name, file name or glob (`build`,
+# `.env.*`, `*.pem`), or the floor pattern itself. `.git` and `.basemind` can never be allowed, and
+# a credential entry is honoured only with the operator's BASEMIND_ALLOW_REPO_CREDENTIALS grant. The
+# default exclude also lists dist/target/node_modules/.venv, so remove those from exclude as well
+# when allowing them.
+# floor_allow = []
 # Honor .gitignore / .git/info/exclude while walking. Leave on unless you deliberately want
 # ignored files indexed.
 # respect_gitignore = true
 # Follow symlinks during the walk. Off by default — symlinks often escape the repo (e.g. Bazel's
-# bazel-* convenience symlinks). Turn on for repos that symlink real source into place.
+# bazel-* convenience symlinks). Turn on for repos that symlink real source into place. Ignored in
+# this file unless the operator sets BASEMIND_ALLOW_FOLLOW_SYMLINKS=1 in the environment.
 # follow_symlinks = false
 # Skip files larger than this many bytes (prevents minified-bundle stalls).
 # max_file_bytes = 2097152
 # Skip paths under any submodule root listed in .gitmodules.
 # skip_submodules = true
-# Run L2 extraction (calls + docs) inline with L1. Powers find_references / find_callers. Turning
-# off roughly halves scan time on large repos but leaves reference search empty until an L2 pass.
+# Run L2 extraction (calls + docs) inline with L1. Powers the `code` tool's references / callers
+# modes. Turning off roughly halves scan time on large repos but leaves reference search empty
+# until an L2 pass.
 # eager_l2 = true
-# Absolute paths OUTSIDE the repo to also index (e.g. a Bazel external cache). Symlinks are always
-# followed for these regardless of scan.follow_symlinks.
+# Absolute paths OUTSIDE the repo to also index (e.g. a Bazel external cache). Ignored unless the
+# operator sets BASEMIND_ALLOW_EXTRA_ROOTS in the environment (1 = any workspace, or a `:`-separated
+# list of absolute workspace roots), because this file is authored by the repository. Credential
+# directories (.ssh, .aws, .gnupg, /etc) are refused even then. Symlinks inside them are followed
+# only when scan.follow_symlinks is on.
 # extra_roots = []
+
+# Per-grammar overrides, keyed by tree-sitter-language-pack name (`basemind lang list`).
+# enabled = false: stop parsing that grammar's files as code; they fall through to the document
+#   tier like any unrecognised file (use [documents] exclude to drop them entirely). Fixes
+#   misdetections such as `.txt` (vimdoc) and `.conf` (nginx).
+# extensions / filenames: map extra paths onto the grammar (override built-in detection).
+# preload = true: `basemind lang install` also fetches this grammar.
+# [languages.vimdoc]
+# enabled = false
+# [languages.jinja2]
+# extensions = [".mako", ".tpl"]
+# filenames = ["BUILD.in"]
+# preload = true
 
 [code_intel]
 # Precise, scope- and import-aware name resolution. On by default: JS/TS resolve via oxc, Python and
-# Java via the stack-graphs engine, so find_references / find_callers / goto_definition distinguish a
-# shadowed local from an import instead of matching by name. Set false to fall back to fast
+# Java via the stack-graphs engine, so the `code` tool's references / callers / definition modes
+# distinguish a shadowed local from an import instead of matching by name. Set false to fall back to fast
 # tree-sitter locals binding for every language. Applies to files (re)scanned after the change.
 # precise_resolution = true
 
 [watch]
 # Coalesce filesystem events within this window (milliseconds).
 # debounce_ms = 250
-# Run L2 extraction on live watch edits (extra CPU per edit).
+# Reserved: parsed but has no effect yet.
 # live_l2 = false
 
 [cache]
-# Max extracted file-maps kept hot in memory.
+# Reserved: parsed but has no effect yet (see [resources] max_map_cache_mb for the outline cache).
 # file_map_lru = 256
 
 [mcp]
-# MCP transport. Only "stdio" is supported today.
+# Reserved: "stdio" is the only transport and nothing reads this key.
 # transport = "stdio"
 
 [documents]
@@ -98,9 +132,22 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 #   multilingual— default; multilingual model for 100+ languages
 # embedding_preset = "multilingual"
 # Globs for documents that are still extracted + indexed but NOT embedded (keyword-only).
+# Globs scoping which non-code files are indexed as documents. Empty include = everything that
+# passes [scan]; exclude applies to document indexing itself and beats include.
+# include = []
+# exclude = []
+# Per-document size cap in bytes (separate from scan.max_file_bytes, so big PDFs/Office files work).
+# max_file_bytes = 52428800
+# Extensions to skip on top of the built-in archive/binary floor (case-insensitive, dot optional).
+# extension_denylist = []
+# Embedding scope: when embed_include is non-empty only matching documents are embedded; embed_exclude
+# always wins. Non-embedded documents stay extracted + keyword-searchable. Changing either (or embed)
+# removes the vectors of newly ineligible documents on the next scan.
+# embed_include = []
 # embed_exclude = []
 # Route archives (.zip/.tar/.jar/…) into the recursive archive extractor. Off by default so one
-# archive can't explode into thousands of embeds. True binaries are always skipped.
+# archive can't explode into thousands of embeds. True binaries are always skipped. In the shared
+# daemon this also needs BASEMIND_DAEMON_ALLOW_EXTRACT_ARCHIVES=1 in the daemon's environment.
 # extract_archives = false
 
 [code_search]
@@ -111,9 +158,38 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # keyword lane over the same text). Chunking + BM25 keyword search work regardless. Turn on only if
 # you specifically want vector search over code (downloads an ONNX model, re-embeds on preset change).
 # embed = false
-# Globs for source files that are still chunked + BM25-indexed but NOT embedded (only used when
-# embed = true).
+# Embedding scope for source files (only used when embed = true): embed_include is an allow-list
+# (empty = all chunked files), embed_exclude wins over it; files left out are still chunked +
+# BM25-indexed. Changing either removes the vectors of newly ineligible files on the next scan.
+# embed_include = []
 # embed_exclude = []
+
+[resources]
+# Footprint bounds. 0 = auto for the thread / concurrency caps. The shared daemon treats these as
+# ceilings: min(value here, daemon cap), with 0 / "auto" / "off" resolving to the cap. Raise a
+# daemon cap with BASEMIND_DAEMON_MAX_SCAN_THREADS / _EMBED_THREADS / _EMBED_BATCH /
+# _CONCURRENT_DOCUMENTS / _FOOTPRINT_MB / _MAP_CACHE_MB / _CANDIDATES in the daemon's environment
+# (the daemon also caps file, document, crawl and debounce settings; see the configuration docs).
+# scan_threads = 0
+# embed_threads = 0
+# max_concurrent_documents = 0
+# embed_batch_size = 32
+# max_footprint_mb = 0
+# max_map_cache_mb = 256
+
+[crawl]
+# Web crawl / scrape limits. allow_private_network = true is ignored when it comes from this file
+# unless the operator sets BASEMIND_ALLOW_PRIVATE_HOSTS=1 in the environment.
+# respect_robots_txt = true
+# allow_private_network = false
+
+[llm]
+# Optional LLM for abstractive summaries and LLM NER. Inert while `model` is empty. In this file
+# `base_url` is ignored and api_key env references are limited to the provider's standard variable
+# (OPENAI_API_KEY for openai/..., ANTHROPIC_API_KEY for anthropic/..., or BASEMIND_LLM_API_KEY)
+# unless the operator sets BASEMIND_ALLOW_REPO_LLM=1 in the environment.
+# model = "openai/gpt-4o"
+# api_key = { env = "OPENAI_API_KEY" }
 "##;
 
 /// Where to inject the usage rules. `Auto` never writes a COMMITTED agent-instructions file
@@ -134,10 +210,20 @@ pub enum RulesTarget {
     Agents,
     /// Force the personal, gitignored `AGENTS.local.md` delimited block.
     AgentsLocal,
-    /// Force an ai-rulez rule file (`.ai-rulez/rules/basemind-usage.md`).
+    /// Force the COMMITTED ai-rulez rule file (`.ai-rulez/rules/basemind-usage.md`). An explicit
+    /// opt-in only — `Auto` never resolves here, it prefers [`RulesTarget::AiRulezLocal`].
     AiRulez,
+    /// Force the personal, gitignored ai-rulez rule file (`.ai-rulez/local/rules/basemind-usage.md`).
+    /// This is what `Auto` resolves to when `.ai-rulez/config.toml` owns governance.
+    AiRulezLocal,
     /// Write no rules at all (same as `--no-rules`).
     None,
+}
+
+/// Clap value parser accepting exactly the [`Capability`] slugs; keeps `--help` and validation in
+/// sync with the enum.
+fn capability_slugs() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(Capability::ALL.map(Capability::slug))
 }
 
 /// Flags for `basemind init`. Flattened into the `Cmd::Init` clap variant in `main.rs`.
@@ -148,18 +234,25 @@ pub struct InitArgs {
     #[arg(long)]
     pub yes: bool,
 
-    /// Enable only these capabilities (repeatable). Slugs: code-search-navigation,
-    /// code-mapping-architecture, git-history, agent-comms, documents-rag, semantic-search.
-    #[arg(long = "with", value_name = "CAPABILITY")]
+    /// Enable only these capabilities (repeatable); the accepted slugs are listed below.
+    #[arg(long = "with", value_name = "CAPABILITY", value_parser = capability_slugs())]
     pub with: Vec<String>,
 
     /// Disable these capabilities (repeatable). Same slugs as `--with`.
-    #[arg(long = "without", value_name = "CAPABILITY")]
+    #[arg(long = "without", value_name = "CAPABILITY", value_parser = capability_slugs())]
     pub without: Vec<String>,
 
     /// Where to inject usage rules. `auto` (default) detects the source of truth.
     #[arg(long, value_enum, default_value_t = RulesTarget::Auto)]
     pub rules_target: RulesTarget,
+
+    /// Where to add basemind's MCP tools to Claude Code's auto-approved permissions
+    /// (`permissions.allow` in `.claude/settings*.json`). Unset: interactive TTY prompts
+    /// (recommending `local`); a non-interactive run (`--yes` / piped) skips this step entirely
+    /// unless the flag is passed explicitly — broadening auto-approved permissions is not
+    /// something to land unattended.
+    #[arg(long, value_enum)]
+    pub settings_target: Option<init_settings::SettingsTarget>,
 
     /// Skip rules injection entirely (write the config scaffold only).
     #[arg(long)]
@@ -176,11 +269,19 @@ pub struct InitArgs {
     /// Dry run: print what WOULD change and write nothing.
     #[arg(long)]
     pub print: bool,
+
+    /// Write the config under the project-level `.config/` convention instead of the repo root.
+    /// Accepted values: `.config` (writes `.config/basemind.toml`) or `.config/basemind` (writes
+    /// `.config/basemind/config.toml`). Any other value is rejected — basemind auto-discovers only
+    /// these locations, so a config written elsewhere would never be read.
+    #[arg(long, value_name = "DIR")]
+    pub config_dir: Option<String>,
 }
 
 /// One planned filesystem effect, collected before anything is written so `--print` can report a
-/// faithful dry-run and the real run reports the same set.
-enum Change {
+/// faithful dry-run and the real run reports the same set. `pub(crate)` so [`init_settings`] can
+/// build one for the settings-permissions step.
+pub(crate) enum Change {
     /// A file will be created or its content changed. `note` is the human summary.
     Write {
         path: PathBuf,
@@ -200,16 +301,42 @@ pub fn run(root: &Path, args: &InitArgs) -> Result<()> {
     };
 
     let rules_target = resolve_rules_target(root, args)?;
+    let rules_plan = resolve_rules_plan(root, rules_target, args.no_rules);
+    let settings_target = init_settings::resolve_settings_target(args)?;
+    let settings_plan = init_settings::resolve_settings_plan(root, settings_target);
 
     let mut changes = Vec::new();
-    changes.push(plan_config(root)?);
-    if let Some(rule_change) = plan_rules(root, args, rules_target, &caps, sections)? {
+    changes.push(plan_config(root, args.config_dir.as_deref())?);
+    if let Some(rule_change) = plan_rules_change(&rules_plan, &caps, sections)? {
         changes.push(rule_change);
     }
+    if let Some(settings_change) = init_settings::plan_settings_change(&settings_plan)? {
+        changes.push(settings_change);
+    }
+
+    let gitignore_targets = gitignore_targets(&rules_plan, &settings_plan);
 
     if args.print {
         report_dry_run(&changes);
+        for target in &gitignore_targets {
+            if let Some(pattern) = init_gitignore::local_pattern(root, target)
+                && !init_gitignore::is_covered(root, target)?
+            {
+                println!("would add {pattern:?} to .gitignore ({})", target.display());
+            }
+        }
         return Ok(());
+    }
+
+    // ~keep Gitignore coverage runs before the writes below: it never depends on the target
+    // ~keep file existing (a `.gitignore` pattern matches a path whether or not it's on disk yet),
+    // ~keep and doing it first means a `.local` file is never written uncovered, even for an instant.
+    for target in &gitignore_targets {
+        if let Some(pattern) = init_gitignore::local_pattern(root, target)
+            && let Some(gitignore_path) = init_gitignore::ensure_coverage(root, target, &pattern, args.yes)?
+        {
+            println!("added {pattern:?} to .gitignore: {}", gitignore_path.display());
+        }
     }
 
     let mut any_write = false;
@@ -234,6 +361,20 @@ pub fn run(root: &Path, args: &InitArgs) -> Result<()> {
     Ok(())
 }
 
+/// Every path this run's resolved plans would write, that must not land uncommitted-by-convention
+/// without `.gitignore` covering it. `Skip` plans and committed (non-`.local`) targets contribute
+/// nothing — [`init_gitignore::local_pattern`] filters those out.
+fn gitignore_targets(rules_plan: &RulesPlan, settings_plan: &init_settings::SettingsPlan) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    if let Some(path) = rules_plan.target_path() {
+        targets.push(path.to_path_buf());
+    }
+    if let init_settings::SettingsPlan::Write(path) = settings_plan {
+        targets.push(path.clone());
+    }
+    targets
+}
+
 /// Decide the effective rules target, applying the "ask before touching a committed file" policy.
 ///
 /// Precedence: an explicit `--rules-target` (anything but `auto`) or `--no-rules` wins verbatim;
@@ -250,7 +391,11 @@ fn resolve_rules_target(root: &Path, args: &InitArgs) -> Result<RulesTarget> {
         return Ok(args.rules_target);
     }
     if root.join(".ai-rulez").join("config.toml").exists() {
-        return Ok(RulesTarget::AiRulez);
+        // ~keep ai-rulez owns governance here, but the rule file basemind writes is its own
+        // ~keep tool-usage advice, not something the repo's ai-rulez maintainers authored — treat
+        // ~keep it like any other basemind-owned file and default to the gitignored `.local` tree.
+        // ~keep `--rules-target ai-rulez` still opts into the committed file explicitly.
+        return Ok(RulesTarget::AiRulezLocal);
     }
     if !args.yes && std::io::stdin().is_terminal() {
         return prompt_rules_target();
@@ -348,18 +493,20 @@ fn prompt_capabilities() -> Result<Vec<Capability>> {
 }
 
 /// Plan the `basemind.toml` write: scaffold when absent, keep when present.
-fn plan_config(root: &Path) -> Result<Change> {
-    let path = config::config_path(root);
+fn plan_config(root: &Path, config_dir: Option<&str>) -> Result<Change> {
+    let path = resolve_init_config_path(root, config_dir)?;
     if path.exists() {
         return Ok(Change::NoOp {
             note: format!("basemind.toml: kept existing config at {}", path.display()),
         });
     }
+    // ~keep A ROOT scaffold would silently shadow the legacy config (root path wins in resolution), so
+    // ~keep refuse rather than change the effective config behind the user's back. A `.config/` scaffold
+    // ~keep does NOT shadow it — resolution reads legacy before the convention — so only the root target
+    // ~keep is guarded. They migrate it, then re-run init. Matches the pre-onboarding `cmd_init`
+    // ~keep contract (config_root_smoke).
     let legacy = config::legacy_config_path(root);
-    if legacy.exists() {
-        // ~keep A root scaffold would silently shadow the legacy config (root path wins in resolution), so
-        // ~keep refuse rather than change the effective config behind the user's back. They migrate it,
-        // ~keep then re-run init. Matches the pre-onboarding `cmd_init` contract (config_root_smoke).
+    if path == config::config_path(root) && legacy.exists() {
         anyhow::bail!(
             "legacy config at {} is still read as a fallback; move it to {} to migrate — init will \
              not write a scaffold that shadows it",
@@ -372,6 +519,28 @@ fn plan_config(root: &Path) -> Result<Change> {
         note: "wrote basemind.toml scaffold",
         contents: INIT_SCAFFOLD_TOML.to_string(),
     })
+}
+
+/// Map `--config-dir` to the config file `init` writes. Only the two `.config/` convention spellings
+/// are accepted: there is no read-time config-path flag, so a file written anywhere else would never
+/// be auto-discovered — silently producing a config basemind ignores. Unset writes the canonical
+/// root `basemind.toml`.
+fn resolve_init_config_path(root: &Path, config_dir: Option<&str>) -> Result<PathBuf> {
+    let Some(dir) = config_dir.map(str::trim).filter(|dir| !dir.is_empty()) else {
+        return Ok(config::config_path(root));
+    };
+    let normalized = dir.trim_start_matches("./").trim_end_matches('/');
+    if normalized == config::CONFIG_CONVENTION_DIR {
+        return Ok(config::convention_flat_config_path(root));
+    }
+    if normalized == format!("{}/{}", config::CONFIG_CONVENTION_DIR, config::CONFIG_CONVENTION_SUBDIR) {
+        return Ok(config::convention_nested_config_path(root));
+    }
+    anyhow::bail!(
+        "unsupported --config-dir {dir:?}: basemind auto-discovers only the repo root, \
+         `.config/basemind.toml`, and `.config/basemind/config.toml` — pass `.config` or \
+         `.config/basemind`"
+    )
 }
 
 /// Which agent-instructions file owns the rules, after resolving `--rules-target`/`--no-rules`
@@ -395,12 +564,18 @@ fn resolve_rules_plan(root: &Path, target: RulesTarget, no_rules: bool) -> Rules
         return RulesPlan::Skip;
     }
     let ai_rulez_rule = root.join(".ai-rulez").join("rules").join("basemind-usage.md");
+    let ai_rulez_local_rule = root
+        .join(".ai-rulez")
+        .join("local")
+        .join("rules")
+        .join("basemind-usage.md");
     let claude = root.join("CLAUDE.md");
     let claude_local = root.join("CLAUDE.local.md");
     let agents = root.join("AGENTS.md");
     let agents_local = root.join("AGENTS.local.md");
     match target {
         RulesTarget::AiRulez => RulesPlan::AiRulez(ai_rulez_rule),
+        RulesTarget::AiRulezLocal => RulesPlan::AiRulez(ai_rulez_local_rule),
         RulesTarget::Claude => RulesPlan::Delimited(claude),
         RulesTarget::ClaudeLocal => RulesPlan::Delimited(claude_local),
         RulesTarget::Agents => RulesPlan::Delimited(agents),
@@ -408,11 +583,12 @@ fn resolve_rules_plan(root: &Path, target: RulesTarget, no_rules: bool) -> Rules
         RulesTarget::None => RulesPlan::Skip,
         RulesTarget::Auto => {
             // ~keep Never auto-write a COMMITTED agent-instructions file — that's a shared,
-            // ~keep version-controlled surface the user must opt into. Prefer ai-rulez governance,
-            // ~keep else the personal `*.local.md` sibling, matching whichever committed convention
-            // ~keep the repo already uses (AGENTS-only repos get AGENTS.local.md).
+            // ~keep version-controlled surface the user must opt into. Prefer the gitignored
+            // ~keep ai-rulez `.local` rule tree when ai-rulez owns governance, else the personal
+            // ~keep `*.local.md` sibling, matching whichever committed convention the repo already
+            // ~keep uses (AGENTS-only repos get AGENTS.local.md).
             if root.join(".ai-rulez").join("config.toml").exists() {
-                RulesPlan::AiRulez(ai_rulez_rule)
+                RulesPlan::AiRulez(ai_rulez_local_rule)
             } else if agents.exists() && !claude.exists() {
                 RulesPlan::Delimited(agents_local)
             } else {
@@ -422,28 +598,35 @@ fn resolve_rules_plan(root: &Path, target: RulesTarget, no_rules: bool) -> Rules
     }
 }
 
-/// Plan the rules write. Returns `None` only when rules are skipped.
-fn plan_rules(
-    root: &Path,
-    args: &InitArgs,
-    target: RulesTarget,
-    caps: &[Capability],
-    sections: BlockSections,
-) -> Result<Option<Change>> {
-    match resolve_rules_plan(root, target, args.no_rules) {
+impl RulesPlan {
+    /// The target path this plan would write, or `None` for [`RulesPlan::Skip`]. Used by the
+    /// `.gitignore`-coverage step, which needs the path regardless of whether the content is
+    /// actually changing this run.
+    fn target_path(&self) -> Option<&Path> {
+        match self {
+            RulesPlan::Skip => None,
+            RulesPlan::AiRulez(path) | RulesPlan::Delimited(path) => Some(path),
+        }
+    }
+}
+
+/// Plan the rules write from an already-resolved `plan`. Returns `None` only when rules are
+/// skipped.
+fn plan_rules_change(plan: &RulesPlan, caps: &[Capability], sections: BlockSections) -> Result<Option<Change>> {
+    match plan {
         RulesPlan::Skip => Ok(Some(Change::NoOp {
             note: "rules: skipped (--no-rules / --rules-target none)".to_string(),
         })),
         RulesPlan::AiRulez(path) => {
             let contents = init_rules::render_ai_rulez_rule(caps, sections);
-            let unchanged = std::fs::read_to_string(&path).is_ok_and(|prev| prev == contents);
+            let unchanged = std::fs::read_to_string(path).is_ok_and(|prev| prev == contents);
             if unchanged {
                 return Ok(Some(Change::NoOp {
                     note: format!("rules: ai-rulez rule already up to date ({})", path.display()),
                 }));
             }
             Ok(Some(Change::Write {
-                path,
+                path: path.clone(),
                 note: "wrote ai-rulez rule (run `ai-rulez generate` to render outputs)",
                 contents,
             }))
@@ -453,7 +636,7 @@ fn plan_rules(
                 "{BEGIN_MARKER}\n\n{}{END_MARKER}\n",
                 init_rules::render_block_body(caps, sections)
             );
-            let existing = match std::fs::read_to_string(&path) {
+            let existing = match std::fs::read_to_string(path) {
                 Ok(c) => Some(c),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(anyhow::Error::new(e).context(format!("read {}", path.display()))),
@@ -466,7 +649,7 @@ fn plan_rules(
                 }));
             }
             Ok(Some(Change::Write {
-                path,
+                path: path.clone(),
                 note: "injected basemind rules block",
                 contents: next,
             }))
@@ -554,6 +737,54 @@ fn report_dry_run(changes: &[Change]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        args: InitArgs,
+    }
+
+    /// `--with` / `--without` must accept and advertise every `Capability`, so the help cannot drift.
+    #[test]
+    fn capability_flags_cover_every_capability_slug() {
+        let mut cmd = Wrapper::command();
+        let help = cmd.render_long_help().to_string();
+        for cap in Capability::ALL {
+            let slug = cap.slug();
+            assert!(help.contains(slug), "help omits `{slug}`");
+            let parsed = Wrapper::try_parse_from(["x", "--with", slug, "--without", slug]).expect("slug accepted");
+            assert_eq!(parsed.args.with, [slug]);
+        }
+        assert!(Wrapper::try_parse_from(["x", "--with", "bogus"]).is_err());
+    }
+
+    /// Uncommenting every `# key = value` line of the scaffold must yield a config that parses and
+    /// validates, so a documented key that drifts from the schema fails here.
+    #[test]
+    fn scaffold_examples_parse_when_uncommented() {
+        let mut uncommented = String::new();
+        for line in INIT_SCAFFOLD_TOML.lines() {
+            let candidate = line.strip_prefix("# ").unwrap_or(line);
+            let is_example = line.starts_with("# ")
+                && !candidate.starts_with(' ')
+                && (candidate.starts_with('[')
+                    || toml::from_str::<toml::Table>(candidate).is_ok_and(|t| !t.is_empty()));
+            uncommented.push_str(if is_example { candidate } else { line });
+            uncommented.push('\n');
+        }
+        let cfg = config::parse_str(&uncommented).expect("uncommented scaffold parses and validates");
+        assert_eq!(
+            cfg.languages.len(),
+            2,
+            "language examples are live: {:?}",
+            cfg.languages
+        );
+        assert!(cfg.languages["jinja2"].preload);
+        assert!(!cfg.languages["vimdoc"].enabled);
+        assert_eq!(cfg.documents.max_file_bytes, 52_428_800);
+        assert!(cfg.scan.floor_allow.is_empty());
+    }
 
     #[test]
     fn splice_appends_block_when_no_markers() {
@@ -678,5 +909,55 @@ mod tests {
             name(resolve_rules_plan(root, RulesTarget::Agents, false)).as_deref(),
             Some("AGENTS.md")
         );
+    }
+
+    #[test]
+    fn auto_resolves_to_ai_rulez_local_when_ai_rulez_owns_governance() {
+        // ~keep When `.ai-rulez/config.toml` is present, Auto must route to the gitignored
+        // ~keep `.ai-rulez/local/` tree, never the committed `.ai-rulez/rules/` one — the whole
+        // ~keep point of `AiRulezLocal` is that Auto never writes a committed file unasked.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".ai-rulez")).expect("mkdir .ai-rulez");
+        std::fs::write(dir.path().join(".ai-rulez").join("config.toml"), "").expect("seed config.toml");
+
+        match resolve_rules_plan(dir.path(), RulesTarget::Auto, false) {
+            RulesPlan::AiRulez(path) => assert_eq!(
+                path,
+                dir.path()
+                    .join(".ai-rulez")
+                    .join("local")
+                    .join("rules")
+                    .join("basemind-usage.md"),
+                "Auto with ai-rulez present must resolve to the local rule tree"
+            ),
+            other => panic!("expected an AiRulez plan, got {other:?}"),
+        }
+
+        assert_eq!(
+            resolve_rules_target(dir.path(), &InitArgs::default()).expect("resolve target"),
+            RulesTarget::AiRulezLocal,
+            "resolve_rules_target must also route to AiRulezLocal, not the committed AiRulez"
+        );
+    }
+
+    #[test]
+    fn explicit_ai_rulez_and_ai_rulez_local_resolve_to_their_own_files() {
+        let root = Path::new("/nonexistent");
+        match resolve_rules_plan(root, RulesTarget::AiRulez, false) {
+            RulesPlan::AiRulez(path) => {
+                assert_eq!(path, root.join(".ai-rulez").join("rules").join("basemind-usage.md"))
+            }
+            other => panic!("expected an AiRulez plan, got {other:?}"),
+        }
+        match resolve_rules_plan(root, RulesTarget::AiRulezLocal, false) {
+            RulesPlan::AiRulez(path) => assert_eq!(
+                path,
+                root.join(".ai-rulez")
+                    .join("local")
+                    .join("rules")
+                    .join("basemind-usage.md")
+            ),
+            other => panic!("expected an AiRulez plan, got {other:?}"),
+        }
     }
 }

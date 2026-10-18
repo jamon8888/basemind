@@ -22,6 +22,8 @@ pub struct ConfigV1 {
     pub cache: CacheConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Per-grammar overrides keyed by tree-sitter-language-pack grammar name (`[languages.jinja2]`):
+    /// disable a grammar, map extra extensions / file names onto it, or pre-fetch it.
     #[serde(default)]
     pub languages: std::collections::BTreeMap<String, LanguageConfig>,
     #[serde(default)]
@@ -50,31 +52,42 @@ pub struct ConfigV1 {
     /// `api_key` `Unset` short-circuits any LLM-backed feature.
     #[serde(default)]
     pub llm: LlmConfig,
-    /// The `[agent]` table, accepted here but interpreted elsewhere.
-    ///
-    /// The agent front-end owns this section and parses it itself, leniently, straight out of the
-    /// TOML document (`crates/basemind-tui/src/config.rs`). The core server never reads it — but it
-    /// must still ACCEPT it, because `deny_unknown_fields` above applies to the whole file: without
-    /// this passthrough, a repo whose `basemind.toml` legitimately carries `[agent]` fails to parse,
-    /// the daemon cannot host that workspace (`host_build_failed`), `serve` dies before `initialize`,
-    /// and every MCP tool silently disappears. Keeping it untyped avoids duplicating the agent
-    /// crate's role schema here while preserving strict typo-checking for every other section.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScanConfig {
+    /// Allow-list of globs (repo-relative, forward-slash, case-sensitive; `*` crosses `/`). A file
+    /// is scanned only when it matches at least one entry, so an empty list is rejected at load
+    /// (it would silently index nothing). A bare name with no glob metacharacters (`src`,
+    /// `docs/api`) matches that path and everything beneath it, like a `.gitignore` entry.
     #[serde(default = "ScanConfig::default_include")]
-    #[schemars(inner(length(min = 1)))]
+    #[schemars(length(min = 1), inner(length(min = 1)))]
     pub include: Vec<String>,
+    /// Deny-list of globs, same syntax as `include`; exclusion beats inclusion. Applied on top of
+    /// the always-on exclude floor (`build`, `out`, `vendor`, `coverage`, `venv`, `dist`, `target`,
+    /// ... see `floor_allow`). A bare name (`generated`) excludes every path segment called that,
+    /// and everything beneath it. For `extra_roots` files the globs match the path relative to the
+    /// extra root, not the absolute path.
     #[serde(default = "ScanConfig::default_exclude")]
     #[schemars(inner(length(min = 1)))]
     pub exclude: Vec<String>,
+    /// Entries to remove from the always-on exclude floor, named by directory (`build`, `vendor`)
+    /// or by the floor pattern itself (`**/build/**`). Use it to index a tree the floor otherwise
+    /// drops. The default `exclude` list is separate: a directory also listed there (`dist`,
+    /// `target`) must be removed from `exclude` too. The floor also drops credential files (`.env`,
+    /// `.env.*`, `.aws`, `.ssh`, `.gnupg`, `.npmrc`, `id_rsa`, `*.pem`, `*.key`, ...); list the
+    /// entry (`.env.*`, `*.pem`) to index one deliberately. A credential entry here is honoured only
+    /// when the operator sets `BASEMIND_ALLOW_REPO_CREDENTIALS`, so a repository's own file cannot
+    /// un-exclude the operator's secrets. `.git` and `.basemind` can never be allowed,
+    /// and an entry naming nothing in the floor is ignored with a warning.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub floor_allow: Vec<String>,
     #[serde(default = "ScanConfig::default_respect_gitignore")]
     pub respect_gitignore: bool,
-    /// Follow symlinks during the walk. Default `false` — symlinks are a common way to escape the
+    /// Follow symlinks during the walk. Ignored (forced `false`) when set by the repository's own
+    /// `basemind.toml` unless the operator sets `BASEMIND_ALLOW_FOLLOW_SYMLINKS=1`. Default `false` — symlinks are a common way to escape the
     /// repo (Bazel's `bazel-*` convenience symlinks point into an external output tree), and
     /// following them can balloon the scan or pull in unrelated files. Set `true` for repos that
     /// deliberately symlink real source into place; the exclude floor still prunes `bazel-*` so a
@@ -105,10 +118,12 @@ pub struct ScanConfig {
     /// (`/private/var/tmp/_bazel_<user>/<hash>/external`) — whose files should resolve in
     /// symbol search, references, outlines, and document search.
     ///
-    /// **Requires the `BASEMIND_ALLOW_EXTRA_ROOTS=1` environment grant.** This key is read from
+    /// **Requires the `BASEMIND_ALLOW_EXTRA_ROOTS` environment grant.** This key is read from
     /// the scanned repository's own `basemind.toml`, so without an operator-side opt-in a cloned
     /// repository could point basemind at `~/.ssh` and read the results back out through the
-    /// search tools. Unset, every entry here is ignored with a warning.
+    /// search tools. Unset, every entry here is ignored with a warning. `1` grants every
+    /// workspace the process scans (including every later workspace of a long-lived daemon); a
+    /// path list (`:`-separated) of workspace roots grants only those workspaces.
     ///
     /// Files under an extra root are keyed by their **absolute** path (repo files stay
     /// repo-relative), so returned paths for external files are absolute. Missing or
@@ -187,6 +202,7 @@ impl Default for ScanConfig {
         Self {
             include: Self::default_include(),
             exclude: Self::default_exclude(),
+            floor_allow: Vec::new(),
             respect_gitignore: Self::default_respect_gitignore(),
             follow_symlinks: Self::default_follow_symlinks(),
             max_file_bytes: Self::default_max_file_bytes(),
@@ -234,6 +250,7 @@ pub struct WatchConfig {
     #[serde(default = "WatchConfig::default_debounce_ms")]
     #[schemars(range(min = 0, max = 60000))]
     pub debounce_ms: u64,
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set).
     #[serde(default)]
     pub live_l2: bool,
 }
@@ -256,7 +273,8 @@ impl Default for WatchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
-    /// Maximum number of extracted FileMaps to keep hot in memory.
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set). The
+    /// outline cache is bounded by `resources.max_map_cache_mb`.
     #[serde(default = "CacheConfig::default_file_map_lru")]
     #[schemars(range(min = 0))]
     pub file_map_lru: usize,
@@ -279,6 +297,7 @@ impl Default for CacheConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
+    /// Reserved: `stdio` is the only variant and nothing reads it.
     #[serde(default = "McpConfig::default_transport")]
     pub transport: McpTransport,
 }
@@ -306,8 +325,27 @@ pub enum McpTransport {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LanguageConfig {
+    /// `false` disables the language: its files are no longer parsed as code and are handled as if
+    /// no grammar recognised them (so they fall through to the document tier, subject to
+    /// `[documents]`). Use it for tree-sitter-language-pack misdetections such as `.txt` (vimdoc)
+    /// or `.conf` (nginx). Already-indexed files of a disabled language are dropped on the next scan.
     #[serde(default = "LanguageConfig::default_enabled")]
     pub enabled: bool,
+    /// Extra file suffixes mapped to this grammar, e.g. `[".mako", ".tpl"]` (leading dot optional,
+    /// case-insensitive, compound suffixes like `.html.erb` allowed). Overrides take precedence over
+    /// built-in detection. The table key must be a tree-sitter-language-pack grammar name.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub extensions: Vec<String>,
+    /// Exact file names mapped to this grammar, e.g. `["BUILD.in"]`. Takes precedence over
+    /// `extensions` and built-in detection.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub filenames: Vec<String>,
+    /// Also fetch this grammar in `basemind lang install` (by default only the languages basemind
+    /// ships queries for are pre-fetched; others download on first use).
+    #[serde(default)]
+    pub preload: bool,
 }
 
 impl LanguageConfig {
@@ -320,6 +358,9 @@ impl Default for LanguageConfig {
     fn default() -> Self {
         Self {
             enabled: Self::default_enabled(),
+            extensions: Vec::new(),
+            filenames: Vec::new(),
+            preload: false,
         }
     }
 }
@@ -327,14 +368,17 @@ impl Default for LanguageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// Master switch. Only meaningful when the `memory` cargo feature is compiled in.
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
+    /// non-default value); the `memory` cargo feature alone decides whether memory is available.
     #[serde(default = "MemoryConfig::default_enabled")]
     pub enabled: bool,
-    /// How to derive the scope key for an opened repository.
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
+    /// non-default value). Would choose how the scope key of an opened repository is derived.
     #[serde(default)]
     pub scope_strategy: MemoryScopeStrategy,
-    /// Default memory tier when a `memory_*` call omits `visibility`. `group` (shared) keeps
-    /// today's behavior; set to `individual` so a user's writes default to their private tier.
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
+    /// non-default value). Would set the default memory tier when a `memory_*` call omits
+    /// `visibility`.
     #[serde(default)]
     pub default_visibility: crate::mcp::params::Visibility,
 }
@@ -396,9 +440,11 @@ pub struct CrawlConfig {
     /// Allow crawling URLs that resolve to private, loopback, or link-local
     /// addresses (`127.0.0.0/8`, `10.0.0.0/8`, `169.254.0.0/16`, …). Default
     /// `false`: the engine rejects them with an SSRF-policy violation. Flip this
-    /// on only to scrape an internal docs server you control. (The
-    /// `CRAWLBERG_ALLOW_PRIVATE_NETWORK` env var is honoured as a process-wide
-    /// override regardless of this setting.)
+    /// on only to scrape an internal docs server you control. **`true` in the repository's own
+    /// `basemind.toml` is ignored (with a warning) unless the operator sets
+    /// `BASEMIND_ALLOW_PRIVATE_HOSTS=1` in the environment**, because a cloned repository could
+    /// otherwise aim the crawler at internal services. (The `CRAWLBERG_ALLOW_PRIVATE_NETWORK` env
+    /// var is honoured as a process-wide override regardless of this setting.)
     #[serde(default = "CrawlConfig::default_allow_private_network")]
     pub allow_private_network: bool,
 }
@@ -458,7 +504,6 @@ impl ConfigV1 {
             crawl: CrawlConfig::default(),
             shells: ShellsConfig::default(),
             llm: LlmConfig::default(),
-            agent: None,
         }
     }
 }

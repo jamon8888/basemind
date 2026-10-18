@@ -182,6 +182,30 @@ pub fn ensure_grammars() -> Result<Arc<BootstrapSummary>, Arc<LangError>> {
         .clone()
 }
 
+/// Fetch `names` (configured via `[languages.<name>] preload = true`) that are not yet in the tslp
+/// cache. The shipped `OVERRIDE_LANGUAGES` are [`ensure_grammars`]'s job and are skipped here.
+/// Returns the names that were downloaded.
+pub fn ensure_extra_grammars(names: &[LangId]) -> Result<Vec<String>, LangError> {
+    let installed = tree_sitter_language_pack::downloaded_languages();
+    let mut missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !OVERRIDE_LANGUAGES.contains(n) && !installed.iter().any(|i| i == n))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    if std::env::var("BASEMIND_GRAMMAR_OFFLINE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        return Err(LangError::Download(format!(
+            "offline mode: missing grammars {missing:?} and BASEMIND_GRAMMAR_OFFLINE is set",
+        )));
+    }
+    tree_sitter_language_pack::prefetch(&missing).map_err(|e| LangError::Download(format!("{e}")))?;
+    Ok(missing.into_iter().map(str::to_string).collect())
+}
+
 /// Languages currently downloaded in the tslp cache (does not hit the network).
 pub fn downloaded_languages() -> Vec<String> {
     tree_sitter_language_pack::downloaded_languages()
@@ -202,6 +226,32 @@ pub fn clean_grammar_cache() -> Result<(), LangError> {
 /// extensions; the scanner skips those files entirely.
 pub fn detect(path: &Path) -> Option<LangId> {
     tree_sitter_language_pack::detect_language(path.to_str()?)
+}
+
+/// Grammars for files that are prose, data or configuration rather than code. The code map keeps
+/// only code (symbols an agent can navigate); these go to the document tier, where they are
+/// chunked and searched as text. Indexing a JSON file's keys or a README's headings as "symbols"
+/// only pollutes `symbols`/`outline`/`grep` results with noise.
+pub fn is_non_code(lang: &str) -> bool {
+    matches!(
+        lang,
+        "markdown"
+            | "rst"
+            | "asciidoc"
+            | "vimdoc"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "toml"
+            | "ini"
+            | "xml"
+            | "properties"
+            | "dotenv"
+            | "diff"
+            | "gitignore"
+            | "gitattributes"
+            | "fluent"
+    )
 }
 
 /// Fetch the underlying tree-sitter Language for a given `LangId`.

@@ -1,6 +1,12 @@
 ---
-priority: medium
-description: "End-to-end checklist for adding a mode to one of basemind's MCP domains"
+type: Playbook
+title: Mcp Tool Checklist
+description: End-to-end checklist for adding a mode to one of basemind's MCP domains
+x-ai-rulez:
+  kind: skill
+  id: mcp-tool-checklist
+  metadata:
+    priority: medium
 ---
 
 # MCP Tool Checklist
@@ -41,11 +47,11 @@ file stays under the **1000-line cap** enforced by `tests/max_lines.rs` — spli
    that honoured it. Apply `scan_cap = limit * 8` when iterating an index range.
 
 4. **`src/cli/<domain>.rs`** — add the matching clap subcommand. **Parity is a strict bijection and
-   it is enforced**: `tests/cli_parity.rs` walks `mode::domain_modes()` and fails if any advertised
+   it is enforced**: `tests/cli_parity/` walks `mode::domain_modes()` and fails if any advertised
    mode has no resolving `basemind <domain> <mode> --help`. The CLI uses real subcommands, not
    `--mode`, so each gets its own `--help` and argument validation.
 
-5. **`tests/cli_parity.rs`** — add the `(tool, Some("mode"), "cli path")` row. Keyed on the pair, not
+5. **`tests/cli_parity/capabilities.rs`** — add the `(tool, Some("mode"), "cli path")` row. Keyed on the pair, not
    the tool name: keyed on names alone the test would verify nine tools and silently stop covering
    the modes beneath them.
 

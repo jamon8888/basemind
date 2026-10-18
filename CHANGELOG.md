@@ -127,6 +127,650 @@ designed at all; see issues #7–#12.
 
 ## [0.26.0] - 2026-09-01
 
+## [0.29.3] - 2026-10-13
+
+### Changed
+
+- Dependencies: `xberg` 1.3.9, `tree-sitter-language-pack` 1.22.1, `oxc_*` 0.154, plus compatible lockfile updates. `ort` stays at 2.0.0-rc.13, `arrow` at 58 and `bincode` at 2.x.
+
+### Fixed
+
+- **Document scans no longer accumulate tens of thousands of LanceDB versions** ([#76](https://github.com/Goldziher/basemind/issues/76)).
+  The `documents`, `doc_links` and `code_chunks` tables took one delete and one append commit per file, so a
+  14,664-document scan produced ~28k versions per table and spent about two hours in commit latency. A scan now
+  writes one delete plus one append per batch (256 files or 4,096 rows), skips the delete on an empty table,
+  purges stale documents with bulk `IN (...)` deletes, and ends with a compaction and a prune of versions older
+  than 60 seconds. The incremental and watch paths prune versions older than five minutes every 32 commits and
+  compact every 128, so the table directories stay bounded. Existing bloated indexes shrink on their next scan.
+- **`git` responses are bounded when commit messages are huge** ([#74](https://github.com/Goldziher/basemind/issues/74)).
+  `git` mode `search` returned every hit's commit body whole; squash-merge bodies reach 285 KB, so one
+  `limit` 100 call cost 2.6 MB. Each hit's body is now cut at `body_chars` (default 1000, `0` omits it)
+  with a marker, `body_truncated` and `body_bytes`, and the commit-list modes (`search`, `recent`,
+  `touching`, `by_path`) hold their output to `max_tokens` (default 20000), setting `budgeted` and
+  resuming through `next_cursor`. Both are available on `basemind git` as `--body-chars` and
+  `--max-tokens`.
+- **Cache budget no longer evicts the workspace you just built** ([#75](https://github.com/Goldziher/basemind/issues/75)).
+  A 28 GB workspace over the 20 GiB `BASEMIND_CACHE_BUDGET_MB` default was evicted about ten minutes after
+  its scan, because the 24 h "hot" floor only reordered candidates. Budget eviction now skips a workspace
+  that is locked by a live writer, the most recently used one across all worktrees, or built within a grace
+  window (`BASEMIND_CACHE_GRACE_MINUTES`, default 360, `0` disables the window). The cache is left over
+  budget, a warning is logged, `cache_stats.last_gc` reports `over_budget` with the new
+  `protected_workspaces` list, and `basemind doctor` gains a `cache` row that warns about it. Raise
+  `BASEMIND_CACHE_BUDGET_MB` to clear the warning.
+- **Code-only scans no longer peak above 12 GB in the resolve phase** ([#77](https://github.com/Goldziher/basemind/issues/77)).
+  The vendored stack-graphs stitcher polled its cancellation flag once per phase, and a phase extended
+  every path of the previous one without limit, so the per-file step and path budgets were only compared
+  between phases and a pathological Python or Java file could allocate gigabytes before they were ever
+  consulted. A phase now performs at most 256 path extensions before the budgets are checked (unfinished
+  work stays queued, so the paths found are unchanged), the stitcher has its own budget of 4,096 phases,
+  and the resolve pass waits at the `max_footprint_mb` gate between chunks as the extraction phase does.
+  A file that exhausts a budget still falls back to tree-sitter locals binding. `RUST_LOG=basemind=debug`
+  logs each file's `steps`/`phases`/`paths` counters.
+- **Short memory spikes are now visible in the scan log** ([#77](https://github.com/Goldziher/basemind/issues/77)).
+  The footprint is sampled every 200 ms instead of once per 5 s line; each `memory` line adds
+  `window_peak_mb` and `process_peak_rss_mb`, and a gibibyte jump over anything already logged writes a
+  `spike=true` line immediately.
+- **Text documents rejected by xberg are indexed as plain text instead of failing** ([#78](https://github.com/Goldziher/basemind/issues/78)).
+  A monorepo scan lost 489 documents to extractor verdicts on readable text: Helm `templates/*.yaml`
+  (Go templates, `Failed to parse YAML`), CSVs past the table-cell limit and SVG/YAML files with an
+  oversized entity. When xberg fails with a parse or security-limit error on a text-like format, the file
+  is re-read as `text/plain` through the linear chunker under the same extraction budget. These count as
+  `docs_degraded` and, separately, as the new `docs_text_fallback` (scan summary, `rescan`, daemon
+  `Rescanned` reply and MCP `rescan`; additive, defaults to 0). Binary formats, corrupt PDFs, IO errors and
+  timeouts stay failures.
+
+### Changed
+
+- **Linear-chunker cutovers raised, measured on a release build with xberg 1.3.8.**
+  `[documents] markdown_chunk_max_bytes` goes 256 KiB to 1 MiB and `plain_text_chunk_max_bytes` 128 KiB to
+  4 MiB. The splitter is linear for ordinary text now; only a single markdown block dense with inline
+  markup stays quadratic, and the linear fallback still bounds it. Documents already routed through the
+  linear chunker keep their index entry until the file changes.
+
+### Added
+
+- **`git` mode `show` / `basemind git show <sha>`** returns one commit with its full, untruncated message and
+  changed files, the way back to a body that `search` cut.
+- **Document-guard counters on every scan surface** ([#72](https://github.com/Goldziher/basemind/issues/72)).
+  `docs_degraded` and `doc_timeouts` now travel through the daemon `Rescanned` reply, the MCP `rescan`
+  result and `basemind rescan` when it is forwarded to the daemon, not just the in-process scan summary.
+  The fields are additive and default to 0, so mixed old and new daemon/client pairs keep working
+  (no `PROTO_VER` bump).
+- **Agent Plugins distribution** ([#69](https://github.com/Goldziher/basemind/issues/69)). The repository
+  root now carries a conformant [Agent Plugins](https://agent-plugins.org) 1.0.0 package (`plugin.json`,
+  `mcp.json`, `skills/`), generated by ai-rulez (`generate --plugin`) and checked by
+  `validate --strict`. Its MCP server runs `basemind serve` from `PATH`.
+
+### Changed
+
+- **Document extraction bounds** ([#72](https://github.com/Goldziher/basemind/issues/72)). The default
+  `[documents] extraction_timeout_secs` drops from 600 to 120, so a few documents timing out together no
+  longer cost ten minutes each, and a new `phase_budget_secs` (default 1800) bounds the whole document
+  phase of a scan. Once it is spent the remaining documents are deferred, not failed, and the next scan
+  picks them up (`docs_deferred` in the scan summary). Raise `extraction_timeout_secs` if your corpus has
+  legitimately slow documents (large scanned PDFs).
+- **Timed-out documents are no longer retried on every scan.** A document that overruns its budget is
+  recorded in the index by content hash together with the extraction limits (timeout, chunk cutovers,
+  `max_pages` and the extraction settings). While both are unchanged the file is skipped and counted as
+  `docs_tombstoned`; editing it, or changing a limit, retries it. Existing indexes stay readable (the
+  record is an additive field).
+- **Abandoned extraction threads are capped.** A timed-out extraction cannot be cancelled and keeps a
+  core busy until it finishes. `[documents] max_abandoned_extractions` (default 4) caps how many may still
+  run; at the cap further documents are deferred instead of spawning more. The live count is logged and
+  shown as `abandoned_extractions` in the scan summary. Running extraction in a killable subprocess was
+  evaluated and rejected, see ADR-0015.
+
+## [0.29.2] - 2026-10-12
+
+### Added
+
+- **Agent Plugins distribution** ([#69](https://github.com/Goldziher/basemind/issues/69)). The repository
+  root now carries a conformant [Agent Plugins](https://agent-plugins.org) 1.0.0 package (`plugin.json`,
+  `mcp.json`, `skills/`), generated by ai-rulez (`generate --plugin`) and checked by
+  `validate --strict`. Its MCP server runs `basemind serve` from `PATH`.
+
+### Fixed
+
+- A daemon from an older build that ignores `Stop` no longer wedges new sessions with "a previous basemind comms daemon ... did not stop": the takeover now escalates to SIGTERM, then SIGKILL, by pid.
+
+## [0.29.1] - 2026-10-11
+
+Patch release: 0.29.0 shipped everywhere except crates.io, which rejected it. No index or blob format
+change.
+
+### Fixed
+
+- **`basemind` 0.29.x can be published to crates.io.** The vendored forks `basemind-lsp-positions`,
+  `basemind-tree-sitter-graph` and `basemind-tree-sitter-stack-graphs` had moved to tree-sitter 0.27
+  without a version bump, so crates.io still served their 0.26 builds and `basemind` could not resolve a
+  single `tree-sitter`. They are now 0.3.5, 0.12.1 and 0.10.1.
+- Windows build: an unused constant and unused test imports failed the `-D warnings` build; unix-only
+  test fixtures no longer compile on Windows.
+
+## [0.29.0] - 2026-10-09
+
+0.29.0 reshapes the CLI (one home for each command, a documented exit-code contract, honest output and
+daemon forwarding), makes the code map code-only with a separate document tier, adds a trigram prefilter
+for `code grep`, MCP resources, and a more robust comms protocol (v4). Read **Breaking changes** and
+[Upgrading](website/src/content/docs/start/upgrading.mdx) before installing.
+
+### Breaking changes
+
+- **First scan after upgrading rebuilds the index.** `RELEASE_MINOR` goes 28 to 29, so every view's
+  `index.msgpack` and Fjall index are reset on open and every file is re-extracted (blobs are
+  overwritten in place at their content-hash path; the git cache refills lazily). The LanceDB document
+  tables and the blob store are not wiped; orphaned blobs are reclaimed by the post-scan sweep. Stop
+  the old daemon first with `basemind comms stop` so the new binary starts its own.
+- **CLI renames and removals, no aliases kept** (the MCP `admin` tool is unchanged):
+
+  | Removed | Use instead |
+  | --- | --- |
+  | `admin status` | `status` |
+  | `admin rescan` | `rescan` (also takes `--no-git-history`, `--rebuild-git-history`; runs the root guard) |
+  | `admin cache-stats` / `admin gc` / `admin cache-clear` | `cache stats` / `cache gc` / `cache clear` |
+  | `admin delta` / `admin checkpoint` / `admin waste` | `delta` / `checkpoint` / `detect-waste` |
+  | `graph map --include-churn` | `graph map --no-churn` (churn is on by default) |
+  | `serve --git-cache-mem`, `--no-git-cache-disk`, `--no-watch`, `--documents-*` | none; `serve` is a stdio relay to the daemon and ignored them |
+
+  `admin` keeps `repo`, `telemetry`, `compress`, `tokens` and `eval`.
+- **Exit-code contract:** `0` ok, `1` error, `2` usage, `3` writer lock held by another process, `4`
+  required daemon unreachable, `130` interrupted. `scan` and `rescan` used to print the lock notice and
+  exit `0`; they now exit `3`. An invalid `rescan` path (outside the repo, or neither on disk nor
+  indexed) and invalid tool parameters exit `2`.
+- **`cache clear` needs `--yes`** (or a terminal confirmation) for every component except `git-cache`,
+  refuses with exit `3` while a writer holds the workspace lock, and refuses `blobs` while the daemon
+  runs. `blobs` is the machine-global store shared by every workspace.
+- **`cache gc` deletes; `--dry-run` reports.** The old `admin gc` reported while `cache gc` was a no-op.
+- **Output changes:** the human-mode timing footer moved from stdout to stderr (`--json` keeps
+  `elapsed_us` / `startup_us`); human output no longer truncates strings to 200 characters (only table
+  cells are shortened, and stderr says so).
+- **`--format` accepts only `json` or `toon`** on `code semantic` and `memory documents`; the other
+  closed-set flags are now value enums (see Added).
+- **`agents` / `workspace` `--json` reshaped** to the MCP response types and pretty-printed. `agents
+  list` gains `description`, `skills`, `first_seen`, `last_seen`; threads use `last_activity_micros`;
+  message rows gain `age_secs` and `body_sha`; empty optionals are omitted.
+- **`hook install` is safer, so old hooks should be refreshed.** It asks git for the hooks directory
+  (honours `core.hooksPath` and linked worktrees), refuses to overwrite a pre-commit hook it did not
+  write unless `--force` (the old one is kept as `pre-commit.bak`), and the generated hook is
+  fail-open (exit 0 when `basemind` is missing or the scan fails). Re-run `hook install`.
+- **Code map is code-only.** Markdown, reStructuredText, AsciiDoc, vimdoc, CSV, JSON, YAML, TOML, INI,
+  XML, `.properties`, `.env`, diffs, `.gitignore` / `.gitattributes` and Fluent files go to the document
+  tier (searchable with `memory documents`), so `symbols`, `outline` and `grep` no longer return README
+  headings or config keys. `[documents] include` / `exclude` and the MIME allowlist gate them. Builds
+  without the `documents` feature keep the old behaviour.
+- **`code outline` / `symbols` no longer index names bound inside function, method or lambda bodies**
+  (locals, nested functions); module- and class-level definitions are unchanged. Value-like symbols
+  store a shorter signature (`MAX_RETRIES = 3` becomes `= 3`; initialisers cut at 80 characters).
+- **MCP logging is retired** (SEP-2577): no `logging` capability, no `logging/setLevel`, and `rescan`
+  no longer emits the `rescan_complete` log notification. Counts are in the tool result; progress
+  notifications are unchanged.
+- **MCP `memory` tool schema dropped ~26 `documents.*` / `llm.*` override fields** (`llm_api_key`,
+  `llm_model`, `reranker_*`, `embedding_preset`, ...). They remain CLI flags, env vars and
+  `basemind.toml` keys; `memory` mode `documents` keeps `format`, `max_tokens`, `mime_type`, `scope`,
+  `entity_category` and `keywords_contains`. No API key travels as a tool argument any more.
+- **`agents` `wait` is capped at 40 s** (was 300).
+- **Comms protocol version 4:** requests carry ids. Stop the old daemon (`basemind comms stop`) after
+  upgrading so clients and daemon speak the same version.
+
+### Added
+
+- `basemind doctor` (root, config, index, grammars, pre-commit hook and daemon checked with filesystem
+  and process probes only; `--json`; exits 1 when a check fails), top-level `status`, `completions
+  <shell>` (bash, zsh, fish, elvish, powershell) and `man`.
+- `hook install --force`, `cache gc --dry-run`, `delta --new <FILE>`, `detect-waste --log <FILE>`.
+- Value-enum flags (parse-time errors listing the choices, shell completion): `graph` `--direction` /
+  `--edges` / `--algorithm` / `--granularity` / `--format`, `code semantic` `--lane` / `--format`, `git
+  search --field`, `git symbol-history --hash-mode`, `memory proposals --kind`, `admin telemetry
+  --window`, `admin compress --level`.
+- CLI pagination and size controls passed straight to the MCP params: `--cursor` on `code`
+  symbols / grep / files / find / references / callers / implementations, `git` recent / search /
+  touching / by-path / blame / blame-symbol / symbol-history and `memory` list / proposals;
+  `--max-tokens` on `code` outline / symbols / grep / files / find / references / callers /
+  implementations / semantic and `memory documents`; `--rerank-top-k` on `code semantic`; `--format
+  json|toon` on the `code` list modes and `memory documents`.
+- CLI forwards to a running daemon: `memory`, references / callers / graph reads and the grep prefilter
+  no longer fail with `memory_by_key index not available` or degrade to a truncating in-RAM
+  projection. With no daemon and another process holding the index lock, the error names the remedy
+  and exits `3`.
+- Tool subcommand paths (including `git` paths and `graph --focus`) normalize to the repo-relative
+  index key: absolute, `./`-prefixed and relative spellings are the same file. `rescan` also
+  validates paths and routes through the daemon instead of racing it.
+- CLI/MCP parity test (`tests/cli_parity/`): a capability table maps every MCP tool and mode to a CLI
+  command (or declares it `cli_only` / `mcp_only` with a reason), compares per-mode parameters
+  against reasoned exceptions, and checks that representative reads return equal `--json` payloads.
+- MCP resources `basemind://status`, `basemind://repo/map` and the templates
+  `basemind://outline/{path}` and `basemind://memory/{key}` (with `{path}` completion). Bodies equal
+  the tool results; paths are validated against traversal; listed on demand; no subscribe support.
+- Human-readable `title` on each of the nine tools.
+- `agents post` takes an optional `idempotency_key` (generated when omitted); the daemon stores it per
+  (agent, thread) for an hour and returns the original message id on a repeat. The stdio relay
+  replays keyed posts and read-only requests once on a replacement backend instead of failing with
+  `backend_restarted`.
+- Cancellation: `code grep`, `code semantic`, `graph map`, `graph calls`, `memory documents` and
+  `agents wait` honour `notifications/cancelled` (answering `-32800 request_cancelled`), and
+  cancelling an offloaded task reaches the running tool. Mutating modes (`rescan`, `put`, ...) always
+  run to completion.
+- `web crawl` reports MCP progress per page; task `statusMessage` mirrors rescan and crawl progress.
+- `code grep` trigram bloom prefilter: one bloom filter per indexed file (new `grep_bloom` keyspace,
+  about 12.8 % of indexed code bytes) lets grep skip files that cannot match a required literal.
+  Results, totals, hit order and cursors are identical to the full sweep, including for files edited
+  since the last scan. No index wipe; blooms are built on the next scan. `BASEMIND_GREP_BLOOM=0`
+  forces the full sweep. See ADR-0012.
+- `EXTRACT_EPOCH`: extractor-output revision on every file entry and blob. The next scan re-extracts
+  only stale files, so a patch release can fix extraction without a minor bump. The scan summary shows
+  `tier_migrated` and `refreshed`. Epoch 1 refreshes signatures produced before the header-only fix.
+- Comms: `BASEMIND_COMMS_REQUEST_TIMEOUT_SECS`, `BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS` (default 30 s),
+  `BASEMIND_RELAY_REQUEST_TIMEOUT_SECS`; the detached daemon logs to a size-rotated
+  `<comms_dir>/daemon.log`, shown by `comms doctor`.
+- `BASEMIND_BLOB_GC_GRACE_SECS` overrides the 6 hour age below which the blob sweep keeps a blob.
+
+### Changed
+
+- `code find` and `code files` cover every indexed path (code map plus document tier), labelling
+  documents by grammar name or extension. `find` drops candidates scoring under 85 % of the best match.
+  On a 90-task eval: recall 0.59 to 0.83, hit@1 0.58 to 0.82, precision 0.28 to 0.62.
+- Outline eval precision rises from 0.67 to 1.00 and the mean outline response shrinks from 1384 to
+  747 tokens with the narrower symbol scope.
+- Token-savings estimates are recalibrated from measured eval ratios (outline 1.2x, symbols 25x,
+  references and implementations 1.2x, docs 2.5x; callers, dependents, find and files claim no saving).
+- Upgrading is self-cleaning: the blob sweep is tier-aware, and `cache gc` performs it (serialised
+  machine-wide by `cache/gc.lock`; blobs younger than 6 hours are kept). A scan that migrated paths,
+  re-extracted blobs or reset a view prints `cleanup: reclaimed N orphaned blob(s)`; the daemon does the
+  same a minute later. The MCP `admin` mode `gc` stays a non-destructive report. See
+  `docs/UPGRADING.md`.
+- Performance: `symbols` and `dependents` answer from a resident term index; `references`,
+  `callers` and `implementations` use a resident name dictionary (needles matching over 5 % of names
+  fall back to the full walk); `code grep` reuses a per-thread read buffer. Results are unchanged.
+- Comms daemon runtime has 8 workers (was 4) and liveness probes run off the async workers.
+- The production `rmcp` dependency drops its default features. Dependencies upgraded: `lancedb` 0.37 to
+  0.40 (with its `remote` feature; `lance` 10 to 13), `gix` 0.89, `oxc_*` 0.153, `crawlberg` 1.10,
+  `xberg` 1.3.8 and `tree-sitter-language-pack` 1.21.3 (both now chunk in linear time, so the
+  quadratic stalls behind the Fixed entries below are fixed at the source; the cutovers stay as a
+  backstop), `zstd` 0.14.2, plus lockfile refreshes. `arrow-*` stays on 58 to match `lancedb` 0.40.
+- Eval generators follow the new symbol scope; `gen_find.py` takes `--indexed FILE`.
+
+### Fixed
+
+- CLI `--format toon` crashed the renderer; human mode now renders the TOON response.
+- `code references`, `callers` and `implementations` from a daemon-backed session are complete. They
+  used to answer from an in-RAM projection capped at `[resources] max_map_cache_mb` and returned a
+  truncated lower bound behind a `projections_capped` notice. The scan is now forwarded to the daemon
+  (`IndexRead`); the projection is a last-resort fallback only.
+- Ctrl-C during `scan` / `rescan` stops at a file boundary (completed batches stay committed, the stale
+  purge is skipped), prints the summary and exits `130`; a second Ctrl-C exits immediately.
+- Comms unresponsiveness: replies are correlated by request id, so an abandoned request (such as the
+  delivery-notice probe timing out) can no longer leave a stale reply misread as `unexpected response
+  shape`; requests and handshakes time out with a retryable `comms: broker unresponsive`, the relay
+  answers `backend_timeout`, and a slow connect for one identity no longer blocks the others.
+- Comms daemon stalls under slow disk: blocking `CommsStore` calls and registry writes run on the
+  blocking pool (mutations stay serialized through one write gate, so `seq` order holds), and the hourly
+  retention sweep moved off the runtime.
+- The inbox read bounds its unread scan (`unread` is a lower bound past roughly 500 rows) and the
+  delivery probe uses its own connection, at most once every 2 s.
+- `agents wait` stops as soon as the host cancels or the connection closes, and no longer returns
+  instantly on messages a previous `wait` already returned.
+- A comms or shells daemon starting as the previous one exits no longer mistakes a just-released lock
+  for a live peer and exits silently (the lock waits up to 300 ms).
+- Symbol signatures in indentation-based languages end at the grammar's body field instead of embedding
+  the whole body; existing indexes refresh through `EXTRACT_EPOCH`.
+- macOS: the heap no longer shows up as GBs of "GPU" memory; mimalloc's default Mach VM tag 100
+  (`VM_MEMORY_IOACCELERATOR`) is retagged to 254 at startup.
+- A panic inside an embedding job no longer aborts the process; it surfaces as an `embedding worker
+  panicked` error.
+- Flaky `daemon_lock` and `store_layout` tests (a sibling test's fork/exec holding a released flock; a
+  test mutating the process-global `BASEMIND_DATA_HOME`).
+- Stale docs: `serve` flags, `memory mine` flags, `--json` help text and the admin command tables.
+
+## [0.28.1] - 2026-10-06
+
+### Added
+
+- `basemind admin eval`: a repo-agnostic retrieval-quality and token-savings evaluation. It runs a
+  JSONL task file (modes `symbols`, `outline`, `references`, `callers`, `grep`, `find`,
+  `dependents`, `git_search`, `docs`) through the same in-process tool code the MCP server uses,
+  scores answers against gold (set P/R/F1; hit@1/@5, MRR and nDCG for ranked tasks), records
+  per-call latency and response tokens, and reports per-mode p50/p95 latency and quality as NDJSON,
+  JSON and markdown. Tasks may carry a `baseline` (grep command and/or whole-file reads); its
+  output is counted with the same tokenizer and savings are only credited when recall reaches
+  `--min-recall`, then compared with the fixed multipliers in `src/mcp/savings.rs` (modes deviating
+  more than 25% are flagged). `--baseline <report.json>` exits non-zero on a regression beyond
+  `--tolerance` / `--cost-tolerance`.
+- `benchmarks/eval/`: stdlib-only Python gold generators (`gen_symbols`, `gen_outline`,
+  `gen_references`, `gen_dependents`, `gen_grep`, `gen_find`, `gen_git_search`, `gen_docs`), deterministic
+  for a fixed HEAD sha and seed, with a workflow README.
+
+### Changed
+
+- **`[resources] onnx_provider` (new) defaults to `cpu`.** basemind previously left ONNX Runtime on
+  its platform default, which on macOS is CoreML. CoreML compiles a new graph per input shape and
+  measured 7.6 GB resident after embedding one 2 KB SVG, against 0.8 GB on the CPU provider (which
+  is also ~3x faster end to end here); a scan of a repository with images and office documents grew
+  to 33 GB. The setting covers the embedder, reranker, layout detection and NER. Set
+  `onnx_provider = "auto"` to restore the old platform default, or `"coreml"` / `"cuda"` /
+  `"tensorrt"` to pin one. Existing configs keep parsing; only the resource behaviour changes.
+- The document tier now serialises over the memory ceiling. `FootprintGate::admit` (unchanged, still
+  advisory for the drive governor and large-file parses) admitted every waiter after five seconds, so
+  N workers over `max_footprint_mb` meant N simultaneous extractions. Documents use the new
+  `admit_exclusive`: over the ceiling exactly one document runs at a time, and an otherwise idle
+  process is admitted immediately instead of stalling every item for the full wait.
+- `[documents] max_archive_bytes` (default 64 MiB) and `max_archive_entries` (default 1000) bound
+  archive extraction when `extract_archives = true` (xberg's own defaults were 500 MB and 10,000).
+
+### Fixed
+
+- Stack-graph (L2) resolution no longer drives scan memory: each file is abandoned past 600,000
+  steps, 50,000 partial paths or 3 s, and at most two builds run at once. A wall-clock budget alone let
+  parallel workers stitching 100-200 KB files take a large-monorepo scan from ~2 GB to 9-13 GB.
+- A scan could deadlock with `max_concurrent_documents` set: a scan worker holding a document slot
+  waited on the embedding pool with `ThreadPool::install`, which keeps running queued jobs from the
+  worker's own pool, so it started a second document that blocked on the slot the first still held
+  (one scan thread and one slot hangs forever; more threads hang once every slot is held by a
+  blocked frame). The embed hand-off now blocks on a channel and never runs foreign work.
+- Documents whose own estimated working set exceeds `max_footprint_mb` are skipped (counted as too
+  large, with a warning naming the estimate and the limit) rather than extracted: a 7 MB-of-XML
+  `.docx` measured 12 GB with CoreML, and a 30,000 x 30,000 pixel image header is priced from its
+  dimensions, not its byte size.
+- **A large text document could stall a scan for tens of minutes.** xberg's markdown splitter (before 1.3.8) re-collects
+  and re-sorts every remaining element for each chunk it emits, so chunking time grows with the square of
+  the document (measured: 0.9 s at 256 KB, 3.3 s at 512 KB, 11.6 s at 1 MB, 40 s at 2 MB of log text, and 17 s at 256 KB of
+  densely marked-up markdown, in a debug build). 0.29.0 routes csv, json, yaml, xml, txt and similar files to the document tier, so
+  multi-megabyte data files reached it. Text-like documents over the new `[documents]
+  markdown_chunk_max_bytes` (default 256 KiB) / `plain_text_chunk_max_bytes` (default 128 KiB) cutovers
+  are now chunked by a linear fixed-size chunker; smaller documents chunk exactly as before. Degraded
+  documents are logged and counted as `docs_degraded` in the scan summary.
+- **`[documents] extraction_timeout_secs` is now enforced.** It was passed to xberg but could not
+  interrupt CPU-bound work. Extraction now runs under a watchdog: an overrunning document is abandoned,
+  logged, skipped, retried on the next scan, and counted as `doc_timeouts` (also in `failed`).
+
+## [0.28.0] - 2026-10-04
+
+> **Minor release — persisted schema bumped (`RELEASE_MINOR` 27 → 28).** The first `basemind scan`
+> after upgrading wipes and rebuilds the on-disk cache (blobs, the Fjall index, vector rows) from
+> source. No manual step is needed; a full re-scan is automatic.
+
+### Added
+
+- Project-level `.config/` convention (<https://github.com/pi0/config-dir>): configuration is now
+  also discovered at `.config/basemind.toml` or `.config/basemind/config.toml` when no root
+  `basemind.toml` (or legacy `.basemind/basemind.toml`) exists. The root file still wins when both
+  are present. Any of these locations now counts as the durable "this is a basemind-managed root"
+  marker for upward root discovery and the workspace-root guard, so a project that keeps its config
+  under `.config/` no longer needs `--root`.
+- `basemind init --config-dir`: scaffold the config under the `.config/` convention. Accepts
+  `.config` (writes `.config/basemind.toml`) or `.config/basemind` (writes
+  `.config/basemind/config.toml`); any other value is rejected, since there is no read-time
+  config-path flag and a config written elsewhere would never be auto-discovered.
+- `[languages.<grammar>]` per-grammar overrides keyed by tree-sitter-language-pack grammar name:
+  `enabled = false` stops parsing that grammar's files as code (they fall through to the document
+  tier; fixes `.txt` detected as vimdoc and `.conf` as nginx), `extensions` / `filenames` map extra
+  suffixes and exact file names onto a grammar ahead of built-in detection, and `preload` makes
+  `basemind lang install` fetch it. An unknown grammar name is a config error with near-match
+  suggestions.
+- `[scan] floor_allow`: remove entries from the always-on exclude floor by directory, file name,
+  glob or floor pattern. `.git` and `.basemind` can never be allowed; an entry naming nothing in the
+  floor is ignored with a warning.
+- `[documents] include` / `exclude` (which non-code files become documents), `max_file_bytes`
+  (per-document cap, default 50 MiB, independent of `[scan] max_file_bytes`), and `embed_include`
+  alongside the existing `embed_exclude`; `[code_search] embed_include` with the same semantics
+  (allow-list, `embed_exclude` wins, left-out files stay keyword-searchable).
+- Cached chunks and documents are fingerprinted against the settings that shape them, so changing a
+  chunk-size, page-cap, keyword, NER, summarization or `[llm] model` setting re-processes only the
+  affected files. The first scan after an embedding-scope change (`embed`, `embed_include`,
+  `embed_exclude`, the `enabled` switches) deletes the vector rows of files that are no longer
+  eligible and rebuilds the rows of newly eligible ones from cached blobs without re-embedding.
+- The shared daemon loads each workspace's config once, applies operator-raisable resource ceilings
+  (`BASEMIND_DAEMON_MAX_SCAN_THREADS`, `_EMBED_THREADS`, `_EMBED_BATCH`, `_CONCURRENT_DOCUMENTS`,
+  `_FOOTPRINT_MB`, `_MAP_CACHE_MB`, `_CANDIDATES`, `_FILE_BYTES`, `_DOCUMENT_BYTES`,
+  `_DOCUMENT_PAGES`, `_EXTRACTION_SECS`, `_CHUNKS_PER_DOCUMENT`, `_CRAWL_PAGES`, `_CRAWL_DEPTH`,
+  `_CRAWL_BODY_BYTES`, and the `BASEMIND_DAEMON_MIN_DEBOUNCE_MS` floor), and reloads a workspace's
+  `basemind.toml` on the next request after it changes. A file that no longer parses keeps the last
+  good config and logs a warning. `admin status` reports `config_stamp` to spot an edit.
+- Operator environment grants for settings a repository's own `basemind.toml` cannot set itself:
+  `BASEMIND_ALLOW_REPO_LLM`, `BASEMIND_ALLOW_FOLLOW_SYMLINKS`, `BASEMIND_ALLOW_EXTRA_ROOTS` and, in
+  the daemon, `BASEMIND_DAEMON_ALLOW_EXTRACT_ARCHIVES`. `BASEMIND_ALLOW_EXTRA_ROOTS` takes `1` /
+  `true` / `yes` for every workspace, or a `:`-separated list of absolute workspace roots that
+  grants only those (`;` on Windows); relative entries are ignored with a warning.
+- A new linked worktree's `working` view is seeded from a sibling checkout with a copy-on-write
+  clone, so its first scan only touches files that differ. A sibling whose workspace lock is held, or
+  one too large to copy without reflinks, is skipped; a crashed clone's `.seed-tmp` debris is swept
+  on open. `BASEMIND_NO_SEED=1` opts out.
+- A linked worktree whose HEAD descends from the indexed git-history head now appends to the shared
+  index instead of skipping it.
+- Reserved config keys that nothing reads log a warning when set to a non-default value.
+
+### Changed
+
+- Bare names in every glob list (`[scan]`, `[documents]`, `[code_search]` `include` / `exclude` /
+  `embed_*`) are gitignore-like: `generated` matches that path segment at any depth and everything
+  beneath it, and `docs/api` is anchored at the root. A leading `./` or `/` and a trailing `/` are
+  ignored. A negated (`!`) pattern, an invalid glob, or an empty `[scan] include` is a config error.
+  For `extra_roots` files, globs match the path relative to the extra root.
+- Repo-supplied `[llm] base_url`, foreign `api_key` env references, `[crawl] allow_private_network`,
+  `[scan] follow_symlinks` and `[scan] extra_roots` now need an operator grant in the environment
+  (`BASEMIND_ALLOW_REPO_LLM`, `BASEMIND_ALLOW_PRIVATE_HOSTS`, `BASEMIND_ALLOW_FOLLOW_SYMLINKS`,
+  `BASEMIND_ALLOW_EXTRA_ROOTS`). An `api_key` env reference is still honoured for the chosen
+  provider's standard variable and `BASEMIND_LLM_API_KEY`.
+- `BASEMIND_ALLOW_PRIVATE_HOSTS` accepts `1`, `true` or `yes` in both the config gate and the URL
+  guard (the URL guard previously accepted only `1`).
+- The daemon treats `[resources]`, `[scan] max_candidates` / `max_file_bytes`, `[documents]` limits,
+  `[crawl]` limits and `[watch] debounce_ms` as ceilings or floors, and clamps the per-call `web`
+  `crawl` `max_pages` / `max_depth` overrides to the same caps.
+- mimalloc is the global allocator. ONNX Runtime memory is bounded in every process (no
+  memory-pattern planning, no retained CPU arena; intra-op threads capped), and the daemon releases
+  resident embedding engines once the last concurrent embedding pass ends.
+- The daemon caps its runtime and pool threads, serializes read-stack builds, defers the startup GC,
+  bounds fjall worker threads and journal size (flushing an oversized journal on open), and runs
+  git-history index sync on a dedicated two-thread pool.
+- Blob chunk state is read from the envelope header alone instead of decoding the blob.
+- Changing a reserved key (`[documents.language] preferred_languages`, `[documents.ocr]`) no longer
+  re-extracts every document.
+- `basemind.toml` scaffold comments written by `basemind init` describe the new keys, the credential
+  floor and the operator grants.
+
+### Fixed
+
+- Linked worktrees no longer wipe and rebuild the shared git-history index when they switch
+  branches.
+- The file watcher rebuilds its include/exclude filter when `basemind.toml` changes, and detects an
+  equal-length rewrite of the config inside one timestamp tick.
+- Incremental scans (watcher, `rescan paths`) evict files that became ineligible, skip symlinks, and
+  cap the bytes read.
+- The embed policy is recorded only after a complete purge, and keyword postings are rebuilt when
+  needed; empty-scope lance deletes are skipped and large ones are batched at 2000.
+- Extraction returns an error instead of panicking when its runtime cannot be built, and the
+  git-history pool falls back to the caller's thread instead of panicking under thread exhaustion.
+- Re-flushing an external-root (`extra_roots`) document replaces its existing vector rows instead of
+  leaving stale duplicates: the delete now uses the document's own per-root scope, matching the rows
+  it inserts.
+- The last concurrent embedding pass releases resident engines under a lock, so a pass that starts
+  concurrently cannot have the engines it is about to use freed underneath it.
+
+### Security
+
+- Credential and key material is excluded from the index by default, so no secret becomes
+  searchable by every agent that can query it: `.env` and `.env.*` (including `.env.example`),
+  `.aws/`, `.ssh/`, `.gnupg/`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `id_rsa` /
+  `id_dsa` / `id_ecdsa` / `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`.
+  `[scan] floor_allow` opts a class back in, but a credential entry needs the operator's
+  `BASEMIND_ALLOW_REPO_CREDENTIALS` grant — a cloned repository's own `basemind.toml` cannot
+  un-exclude the operator's untracked secrets (build-artifact entries still need no grant).
+- `follow_symlinks` is an operator decision: the repository's own `basemind.toml` cannot turn it on.
+  Working-tree reads, including the watcher and `rescan paths`, refuse symlinked files and paths that
+  resolve outside the workspace, and a `basemind.toml` that is a symlink leaving the workspace is not
+  followed.
+- Repository-authored `basemind.toml` can no longer redirect an LLM endpoint or read an arbitrary
+  environment variable as an API key, reach private hosts, follow symlinks, index directories outside
+  the repository, or expand archives in the daemon, without an operator grant (see Changed).
+  `extra_roots` additionally refuses credential directories (`.ssh`, `.aws`, `.gnupg`, `/etc`),
+  filesystem roots and roots inside the repository, grant or not.
+- Daemon resource ceilings bound what a hostile repository config can cost: scan and embed threads,
+  batch size, footprint, candidates, file and document sizes, pages, extraction time, chunks and
+  crawl pages, depth and body size.
+
+### Removed
+
+- The TUI and agent stack was removed upstream and is not part of this release: the
+  `basemind-tui`, `basemind-agent`, `basemind-agent-ipc` and `basemind-ui` crates, the
+  `basemind ui` and `basemind agent` subcommands, the `agent-tui` / `desktop-ui` features, and the
+  `[agent]` config table (now rejected as an unknown key; delete it from `basemind.toml`). None of it
+  was ever part of a release archive: the `agent-tui` / `desktop-ui` features were omitted from
+  `full` and the release workflow built only the `basemind` binary. `basemind agents` (multi-agent
+  comms) is unrelated and unchanged.
+  ADR-0006 is marked withdrawn.
+
+## [0.27.4] - 2026-09-28
+
+> **Patch release — `init` defaults to local/gitignored config, a benchmark harness, and a
+> read-only-store flush fix.** No schema or MCP-surface change: `RELEASE_MINOR` stays 27, so
+> the on-disk blob and index formats are untouched.
+
+### Added
+
+- `basemind init` now defaults every writable target to its `.local`/gitignored form: an
+  ai-rulez config routes to `.ai-rulez/local/rules/basemind-usage.md` instead of the
+  committed rules tree, and a new `.gitignore`-coverage check prompts (or, with `--yes`,
+  auto-appends) a pattern for any `.local` target `.gitignore` doesn't already cover.
+- A new `.claude/settings.local.json` step in `init`, adding the basemind MCP permission
+  entries via a surgical JSON merge (`serde_json`'s `preserve_order` feature) that only
+  touches the keys basemind owns — an existing `skillOverrides` or other hand-ordered
+  content in that file is left untouched.
+- `basemind admin tokens --stdin`: counts stdin with the real o200k tokenizer
+  (`src/mcp/tokens.rs`) and prints just the integer. Gated behind the `tokenizer` feature
+  (already implied by `documents`), not the heavier `documents`/`code-search` builds.
+- `benchmarks/`: a harness (`run.sh` + `tasks.example.yaml`) that runs a fixed task list
+  twice — once via a `basemind` command, once via the equivalent `grep`/`cat`/`find`
+  baseline — and reports real token counts (via `admin tokens --stdin`) and wall-clock time
+  for each side, plus totals. See `benchmarks/README.md`.
+
+### Fixed
+
+- **`admin rescan` / `scan_and_refresh` could fail with ENOENT on
+  `views/working/index.msgpack.tmp`** on a workspace's first scan, whenever the `Store` was
+  opened via `open_read_only` (which — unlike `open_with_holder` — never creates `view_dir`
+  on disk). The MCP `admin rescan` tool and its CLI shim both open their `Store` this way, so
+  this reproduced on any workspace's first-ever scan through either surface. Fixed with a new
+  `Store::ensure_dirs()`, called inside `scan_and_refresh` right after acquiring the write
+  lock, so a store opened read-only still gets its rebuildable directories materialized
+  before the first `flush()`.
+- `Store::open_with_holder` now acquires its lock before creating rebuildable cache
+  subdirectories, closing a lock-ordering gap that could race a concurrent opener.
+
+## [0.27.3] - 2026-09-27
+
+> **Patch release — the first publish that completes on every platform.** Supersedes the
+> unpublished v0.27.1 and v0.27.2 drafts: no crates.io, npm or PyPI version was cut from either.
+
+### Fixed
+
+- The release helpers no longer pass `gh api` an endpoint with a leading slash. Git Bash on the
+  Windows runner rewrites an argument beginning with `/` into a filesystem path, so
+  `gh api "/repos/…"` became `C:/Program Files/Git/repos/…` and the call failed with
+  *invalid API endpoint*. The Windows build job hit this on its pre-upload resolve and skipped the
+  upload, and `finalize_release` runs on every leg via `always()`. The endpoints now omit the
+  leading slash, as the CLI's own error recommends; the absolute `uploads.github.com` URL is
+  unaffected.
+
+## [0.27.2] - 2026-09-27
+
+> **Never published as a GitHub release.** The Linux builds were fixed below, but the Windows
+> upload and the promotion still failed, so no registry version was cut. Superseded by
+> [0.27.3].
+
+### Fixed
+
+- The `shells` feature no longer fails to compile on Linux. `rustix` was refreshed to 1.1.5, which
+  renamed its experimental `runtime` module to a rotating mangled name (`runtime_448b8ad740e2a26f`)
+  and reduced the old `runtime` path to a private alias. `rmux-client` 0.10.0 imports
+  `rustix::runtime::{…}` from its Linux attach-resize path, so only the Linux builds broke
+  (E0603); macOS and Windows were unaffected. `rustix` is now held at 1.1.4, the last release whose
+  `runtime` module is public and the version `rmux-client` itself declares.
+
+## [0.27.1] - 2026-09-27
+
+> **Never published as a GitHub release.** The source below was tagged and pushed, but the Linux
+> archives failed to build and the release record was never promoted. It is superseded by
+> [0.27.3]; no registry version was cut from it.
+>
+> **Patch release — memory-safety follow-ups to [#62], a stricter plugin launcher, and a
+> release-workflow fix.** No schema or MCP-surface change: `RELEASE_MINOR` stays 27, so the
+> on-disk blob and index formats are untouched.
+
+### Changed
+
+- Dependency refresh: `crawlberg` 1.7.1 → 1.8.0, `gix` 0.87.1 → 0.88.0, `jsonschema` 0.56 → 0.58,
+  and `lru` 0.18.4 → 0.18.5. `lancedb` stays held at 0.37: 0.38 and 0.39 still gate the
+  `Error::Http` variant behind their `remote` feature while `job.rs` references it unconditionally,
+  and enabling `remote` would pull an HTTP client stack in for no benefit here.
+
+### Fixed
+
+- **Comms daemon memory growth ([#62])**, continued:
+  - The per-connection comms client map is now bounded with an LRU. It is keyed by the
+    caller-supplied `as_agent`, so it previously grew one broker socket and one notification queue
+    for every identity a session ever named.
+  - The pending-notification queue is now capped, dropping the oldest entries. Clients that only
+    issue ordinary requests never drain it, so it grew for the life of the link.
+- The git-cache RAM categories are now charged by bytes as well as entry count, each held to
+  32 MiB. A single `CommitInfo` or `BlameResult` has no natural size, so 1024 entries could reach
+  gigabytes.
+- The file watcher's debounce queues are bounded, and overflow coalesces into a path set instead of
+  queueing without limit. A rescan slower than the debounce interval could otherwise let batches
+  accumulate unbounded.
+- `gix` 0.88 no longer accepts the `Infallible` turbofish, which `src/git/commit.rs` still passed.
+- The plugin launcher never falls back below 0.26.0, verifies each candidate is installable, and
+  honours `BASEMIND_BIN`. With v0.27.0 incomplete, the old fallback exec'd 0.25.2, which predates
+  the [#62] memory bounds and OOM-killed the machine.
+- The release workflow now addresses assets by release id rather than by tag. A hand-promoted
+  v0.27.0 draft left two records on one tag and split the archives across them; uploads replace in
+  place, and every stage refuses an ambiguous tag.
+
+## [0.27.0] - 2026-09-18
+
+> **Minor release — a toolchain dependency refresh and a lint-driven hardening pass.** The agent
+> tool surface and the config schema are unchanged, but `RELEASE_MINOR` advances 26 → 27, so the
+> first scan after upgrading rebuilds the content-addressed blob cache automatically.
+
+### Changed
+
+- **tree-sitter 0.27** (was 0.26), with tree-sitter-language-pack 1.20.0 to match. Two breaking API
+  moves were adapted:
+  - `QueryMatch.captures` became the method `QueryMatch::captures()`. The L1/L2 extractors
+    (`src/extract/l1.rs`, `src/extract/l2.rs`, `src/extract/locals.rs`) and the intel resolver
+    (`src/intel/stackgraph.rs`) were migrated.
+  - `Node::kind()` now returns a tree-borrowing `&str`. The vendored tree-sitter-graph keeps
+    `SyntaxNodeRef`'s kind `'static` by interning node-kind names into a small global table
+    (`crates/tree-sitter-graph/src/graph.rs`).
+- **rmcp 3.4** (was 3.2). The handshake types that collided with the wire protocol's
+  `serverInfo`/`clientInfo` fields were renamed: `ServerInfo` → `ServerConfig`
+  (`src/mcp/server_handler.rs`) and `ClientInfo` → `ClientConfig` (`tests/tasks_smoke.rs`). The
+  server still advertises MCP logging; that capability line now carries `#[allow(deprecated)]` until
+  the SEP-2577 deprecation removes logging in a future rmcp.
+- **jsonschema 0.56** (was 0.52), **crawlberg 1.7.1** (was 1.5.0), **lru 0.18.4** (was 0.18.3),
+  **zstd 0.14.0** (was 0.13.3), and **liter-llm 2.0.2** in the agent crate (was 1.19.1). `lancedb`
+  stays pinned at 0.37: 0.38 and 0.39 still fail to compile without an HTTP-client stack basemind
+  has no use for.
+- The provenance ledger in the layered config merge (`src/config/layered.rs`) is no longer inlined
+  per field. The merge now records a field's `ConfigSource` through one `record_provenance`
+  helper — which also skips the ledger entirely on the MCP override path that throws it away — and
+  the merge's cyclomatic complexity drops from 43 to under the 40 ceiling. The two override tests
+  pin the behaviour.
+
+### Fixed
+
+- The npm and pip installers' network paths were lint-harded: `npm-package/install.js` no longer
+  returns from a Promise executor or reads the deprecated `RegExp` last-match globals
+  (`parseInt` → `Number`), and its thrown errors carry `{ cause }`; `pip-package/basemind/
+  downloader.py` moves the type-only import under `TYPE_CHECKING`.
+- Typos in tests (a misspelled `repositories` in a test name and a stray fixture path) and a
+  dangling `return;` in `scripts/codex-mcp-launch.mjs`. The opencode plugin's console fallback
+  explains why it exists instead of carrying a bare suppression directive (`no-console` was already
+  ignored for JS in `poly.toml`, so the rule it guarded never fires).
+- `poly.toml` gained per-file ignores for the vendored fork crates and for `CHANGELOG.md` (length is
+  intentional), and the shipped shell scripts were re-rendered by the shell formatter —
+  whitespace-only, no behaviour change.
+
+## [0.26.0] - 2026-09-01
+
 > **Minor release — cache rebuild, breaking changes, and a security fix.** Read *Breaking changes*
 > and *Security* before upgrading. Almost all of this release is issue [#62]: a comms daemon reached
 > 43.8 GiB RSS in about two minutes on an initial scan of a large monorepo and was OOM-killed,

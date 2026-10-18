@@ -15,7 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use xberg::LanguageDetectionConfig;
@@ -24,10 +24,11 @@ use xberg::core::config::{ConcurrencyConfig, ExtractionConfig};
 use xberg::extractors::security::SecurityLimits;
 use xberg::{ExtractInput, extract};
 
+use super::doc_guard::{self, ChunkCutovers, DeadlineError, DocPhase};
 use super::{ExtractError, SCHEMA_VER};
 use crate::config::{
     DocLanguageConfig, DocumentModelProfile, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    RedactionConfig, RedactionStrategy, SummarizationConfig, SummarizationStrategy,
+    OnnxProvider, RedactionConfig, RedactionStrategy, SummarizationConfig, SummarizationStrategy,
 };
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
@@ -110,8 +111,22 @@ pub struct FileMapDoc {
     /// to encrypt and store as a content-addressed blob, then cleared.
     #[serde(skip)]
     pub pending_rehydration: Option<std::collections::HashMap<String, String>>,
+    /// Fingerprint ([`crate::config::rules::doc_digest`]) of the extraction settings this document
+    /// was produced under; a blob under a different digest is re-extracted. Stamped by the scanner,
+    /// empty straight out of `extract_doc` and on blobs that predate the field (adopted on first
+    /// reuse). Tail field for the same reason as `language_confidences`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub config_digest: String,
+    /// True when the chunks came from the linear fixed-size chunker instead of xberg's markdown
+    /// splitter (large text-like files; see [`super::doc_guard`]). Tail field, absent in older blobs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linear_chunked: bool,
+    /// True when xberg's structured extractor rejected the file (parse error or security limit) and
+    /// it was re-read as `text/plain` instead; implies `linear_chunked`. Tail field, absent in older
+    /// blobs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_fallback: bool,
 }
-
 /// One redaction finding captured during document extraction. Mirrors xberg's
 /// `RedactionFinding` to avoid coupling the persisted blob schema to xberg internals.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,6 +237,18 @@ pub struct DocChunk {
 pub struct DocConfig {
     pub max_pages: usize,
     pub extraction_timeout_secs: u64,
+    /// Cap on timed-out extraction threads still running (`[documents] max_abandoned_extractions`).
+    /// At the cap, further extractions are deferred instead of spawning another thread.
+    pub max_abandoned_extractions: usize,
+    /// Whole-scan document-phase budget, shared by every document of one scan. `None` (direct callers,
+    /// tests) means unbounded.
+    pub phase: Option<Arc<DocPhase>>,
+    /// Size cutovers above which text-like files skip xberg's quadratic markdown splitter.
+    pub chunk_cutovers: ChunkCutovers,
+    /// Chunk-count cap (`[documents] max_chunks_per_document`). Beyond it no vector rows are written, so
+    /// a linearly-chunked document over the cap skips embedding entirely rather than embedding chunks
+    /// that would be thrown away.
+    pub max_chunks_per_document: usize,
     pub max_characters: usize,
     pub overlap: usize,
     pub embedding_preset: Option<String>,
@@ -250,13 +277,27 @@ pub struct DocConfig {
     /// The rehydration map is returned via `ExtractedDocument.redaction_report` — it is
     /// NOT stored by basemind; callers should use `basemind vault-encrypt` to persist it.
     pub redaction: RedactionConfig,
+    /// ONNX execution provider for the embedder and xberg's layout / NER models (from
+    /// `[resources].onnx_provider`).
+    pub onnx_provider: OnnxProvider,
+    /// Cap on total uncompressed bytes unpacked from one archive (from `[documents].max_archive_bytes`).
+    pub max_archive_bytes: usize,
+    /// Cap on entries in one archive (from `[documents].max_archive_entries`).
+    pub max_archive_entries: usize,
 }
 
 impl Default for DocConfig {
     fn default() -> Self {
         Self {
             max_pages: 500,
-            extraction_timeout_secs: 600,
+            extraction_timeout_secs: 120,
+            max_abandoned_extractions: 4,
+            phase: None,
+            chunk_cutovers: ChunkCutovers {
+                markdown_bytes: 1024 * 1024,
+                plain_text_bytes: 4 * 1024 * 1024,
+            },
+            max_chunks_per_document: 2000,
             max_characters: 1000,
             overlap: 200,
             embedding_preset: Some("balanced".to_string()),
@@ -270,6 +311,9 @@ impl Default for DocConfig {
             embed_batch_size: 32,
             document_models: DocumentModelProfile::default(),
             redaction: RedactionConfig::default(),
+            onnx_provider: OnnxProvider::default(),
+            max_archive_bytes: 64 * 1024 * 1024,
+            max_archive_entries: 1000,
         }
     }
 }
@@ -307,9 +351,13 @@ impl DocConfig {
         let bounded = crate::embeddings::resolve_embed_threads(self.embed_max_threads);
         let concurrency = Some(ConcurrencyConfig {
             max_threads: Some(bounded),
+            // Defer to `max_threads` for the OCR session count. ~keep
+            max_concurrent_ocr: None,
         });
         let security_limits = SecurityLimits {
             max_pages: Some(self.max_pages),
+            max_archive_size: self.max_archive_bytes,
+            max_files_in_archive: self.max_archive_entries,
             ..SecurityLimits::default()
         };
         ExtractionConfig {
@@ -321,6 +369,7 @@ impl DocConfig {
             summarization,
             redaction: self.redaction.to_xberg(),
             disable_ocr: strip_enrichment,
+            acceleration: crate::embeddings::acceleration(self.onnx_provider),
             concurrency,
             extraction_timeout_secs: Some(self.extraction_timeout_secs),
             security_limits: Some(security_limits),
@@ -468,13 +517,66 @@ impl DocConfig {
 /// so basemind owns the sync bridge. Built once and never dropped; rayon workers
 /// `block_on` it concurrently (each future is driven to completion on the shared
 /// worker pool).
-fn extraction_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+///
+/// A failed build (thread exhaustion) surfaces as an [`ExtractError`] for the file at hand instead of
+/// panicking a scan worker; the failure is cached, so later files fail fast the same way.
+fn extraction_runtime() -> Result<&'static tokio::runtime::Runtime, ExtractError> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     RT.get_or_init(|| {
+        // Capped: the default is one worker per core plus a 512-thread blocking pool, on top of the
+        // scanner's own per-core rayon pool that drives it.
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4)))
+            .max_blocking_threads(16)
+            .thread_keep_alive(std::time::Duration::from_secs(5))
             .enable_all()
             .build()
-            .expect("build xberg extraction runtime")
+            .map_err(|e| format!("build xberg extraction runtime: {e}"))
+    })
+    .as_ref()
+    .map_err(|message| ExtractError::Document(message.clone()))
+}
+
+/// One guarded xberg call. It runs on its own thread under the wall-clock budget, so the text/plain
+/// retry in [`extract_doc`] is bounded exactly like the first attempt.
+fn run_guarded(
+    path: &Path,
+    mime_type: Option<&str>,
+    krz_config: ExtractionConfig,
+    config: &DocConfig,
+) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
+    let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+    input.mime_type = mime_type.map(str::to_string);
+    let runtime = extraction_runtime()?;
+    let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
+    let ledger = doc_guard::AbandonedThreads::global();
+    doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
+        runtime.block_on(extract(input, &krz_config))
+    })
+    .map_err(|error| match error {
+        DeadlineError::Elapsed => {
+            tracing::warn!(
+                path = %path.display(),
+                budget_secs = budget.as_secs(),
+                abandoned_live = ledger.live(),
+                abandoned_cap = config.max_abandoned_extractions,
+                "document extraction exceeded [documents] extraction_timeout_secs; abandoning it"
+            );
+            ExtractError::DocTimeout(budget)
+        }
+        DeadlineError::AtCapacity { live, cap } => {
+            tracing::warn!(
+                path = %path.display(),
+                abandoned_live = live,
+                abandoned_cap = cap,
+                "deferring document: abandoned extraction threads are at [documents] max_abandoned_extractions"
+            );
+            ExtractError::DocDeferred(format!(
+                "{live} timed-out extraction threads are still running (cap {cap}, \
+                 [documents] max_abandoned_extractions)"
+            ))
+        }
+        DeadlineError::Failed(message) => ExtractError::Document(message),
     })
 }
 
@@ -500,11 +602,56 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         krz_config.redaction = None;
     }
 
-    let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-    input.mime_type = mime_type.map(str::to_string);
-    let mut extraction = extraction_runtime()
-        .block_on(extract(input, &krz_config))
-        .map_err(|e| ExtractError::Document(e.to_string()))?;
+    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
+    let linear = doc_guard::prefers_linear_chunking(mime_type.unwrap_or(""), file_len, config.chunk_cutovers);
+    if linear {
+        tracing::info!(
+            path = %path.display(),
+            bytes = file_len,
+            "large text document: using linear chunking instead of the markdown splitter"
+        );
+        krz_config.chunking = None;
+    }
+    if let Some(phase) = &config.phase {
+        phase.admit().map_err(|spent| {
+            tracing::warn!(
+                path = %path.display(),
+                elapsed_secs = spent.elapsed.as_secs(),
+                budget_secs = spent.budget.as_secs(),
+                "document-phase budget spent ([documents] phase_budget_secs); deferring the document to the next scan"
+            );
+            ExtractError::DocDeferred(format!(
+                "the {}s document-phase budget ([documents] phase_budget_secs) is spent",
+                spent.budget.as_secs()
+            ))
+        })?;
+    }
+    let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
+    let mut text_fallback = false;
+    if let Err(error) = &outcome
+        && super::doc_fallback::should_retry_as_text(mime_type, error)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            mime = mime_type.unwrap_or(""),
+            error = %error,
+            "structured document extraction failed; retrying as text/plain with linear chunking"
+        );
+        krz_config.chunking = None;
+        match run_guarded(path, Some("text/plain"), krz_config, config)? {
+            Ok(result) => {
+                outcome = Ok(result);
+                text_fallback = true;
+            }
+            Err(retry_error) => tracing::warn!(
+                path = %path.display(),
+                error = %retry_error,
+                "text/plain retry also failed; reporting the original error"
+            ),
+        }
+    }
+    let linear = linear || text_fallback;
+    let mut extraction = outcome.map_err(|e| ExtractError::Document(e.to_string()))?;
     let mut result = extraction.results.pop().ok_or_else(|| {
         let message = extraction
             .errors
@@ -524,7 +671,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         None
     };
     if capture_rehydration && let Some(xberg_redaction_cfg) = config.redaction.to_xberg() {
-        let map = extraction_runtime()
+        let map = extraction_runtime()?
             .block_on(xberg::text::redaction::redact_capturing_rehydration_map(
                 &mut result,
                 &xberg_redaction_cfg,
@@ -555,7 +702,19 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
-    if let Some(input_chunks) = result.chunks {
+    if linear {
+        for (start, end) in doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap) {
+            let (chunk, dense_input) = prepare_doc_chunk(
+                result.content[start..end].to_string(),
+                start,
+                end,
+                None,
+                embed_requested,
+            );
+            chunks.push(chunk);
+            dense_inputs.extend(dense_input);
+        }
+    } else if let Some(input_chunks) = result.chunks {
         for c in input_chunks {
             let (chunk, dense_input) = prepare_doc_chunk(
                 c.content,
@@ -571,12 +730,25 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         }
     }
 
+    if linear && chunks.len() > config.max_chunks_per_document {
+        tracing::warn!(
+            path = %path.display(),
+            chunks = chunks.len(),
+            cap = config.max_chunks_per_document,
+            "linearly chunked document exceeds max_chunks_per_document; skipping embedding"
+        );
+        dense_inputs.clear();
+    }
     let mut embedding_dim = 0;
     if embed_requested && !dense_inputs.is_empty() {
         let preset = config.embedding_preset.as_deref().unwrap_or("balanced");
-        let embedder =
-            crate::embeddings::SharedEmbedder::load(preset, config.embed_max_threads, config.embed_batch_size)
-                .map_err(|error| ExtractError::Document(format!("loading dense embedder: {error}")))?;
+        let embedder = crate::embeddings::SharedEmbedder::load_with_provider(
+            preset,
+            config.embed_max_threads,
+            config.embed_batch_size,
+            config.onnx_provider,
+        )
+        .map_err(|error| ExtractError::Document(format!("loading dense embedder: {error}")))?;
         let input_refs: Vec<&str> = dense_inputs.iter().map(String::as_str).collect();
         let vectors = embedder
             .embed_batch(&input_refs)
@@ -635,6 +807,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
     let language_confidences = map_language_confidences(result.detected_language_confidences.unwrap_or_default());
 
     Ok(FileMapDoc {
+        config_digest: String::new(),
         schema_ver: SCHEMA_VER,
         mime_type: result.mime_type.into_owned(),
         content: result.content,
@@ -651,6 +824,8 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         redaction_fingerprint,
         rehydration_ref: None,
         pending_rehydration,
+        linear_chunked: linear,
+        text_fallback,
     })
 }
 
@@ -794,164 +969,7 @@ fn metadata_pairs(metadata: &xberg::types::Metadata) -> Vec<(String, String)> {
 #[cfg(test)]
 mod heading_path_tests;
 
+/// The module's tests live in a subdirectory by the 1000-line module cap
+/// (`tests/max_lines.rs`), the same shape `heading_path_tests` above uses.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use xberg::types::{HeadingContext, HeadingLevel};
-
-    /// Build a `DocConfig` with every enrichment post-processor turned on so a
-    /// profile that strips them is observable in `to_xberg`'s output.
-    fn doc_config_all_enrichment_on(profile: DocumentModelProfile) -> DocConfig {
-        DocConfig {
-            keywords: KeywordsConfig {
-                enabled: true,
-                ..KeywordsConfig::default()
-            },
-            ner: NerConfig {
-                enabled: true,
-                ..NerConfig::default()
-            },
-            summarization: SummarizationConfig {
-                enabled: true,
-                ..SummarizationConfig::default()
-            },
-            document_models: profile,
-            ..DocConfig::default()
-        }
-    }
-
-    #[test]
-    fn to_xberg_full_profile_keeps_enrichment_and_ocr() {
-        let cfg = doc_config_all_enrichment_on(DocumentModelProfile::Full);
-        let x = cfg.to_xberg();
-        assert!(x.keywords.is_some(), "Full keeps keyword extraction");
-        assert!(x.ner.is_some(), "Full keeps NER");
-        assert!(x.summarization.is_some(), "Full keeps summarisation");
-        assert!(!x.disable_ocr, "Full leaves OCR enabled");
-        assert!(x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none());
-    }
-
-    #[test]
-    fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
-        let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
-        let x = cfg.to_xberg();
-        assert!(x.keywords.is_none(), "CodeOnly forces keywords off");
-        assert!(x.ner.is_none(), "CodeOnly forces NER off");
-        assert!(x.summarization.is_none(), "CodeOnly forces summarisation off");
-        assert!(x.disable_ocr, "CodeOnly disables OCR");
-        assert!(x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none());
-    }
-
-    #[test]
-    fn to_xberg_none_profile_strips_everything_including_embeddings() {
-        let cfg = doc_config_all_enrichment_on(DocumentModelProfile::None_);
-        let x = cfg.to_xberg();
-        assert!(x.keywords.is_none(), "None strips keywords");
-        assert!(x.ner.is_none(), "None strips NER");
-        assert!(x.summarization.is_none(), "None strips summarisation");
-        assert!(x.disable_ocr, "None disables OCR");
-        assert!(
-            x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none(),
-            "None skips embeddings entirely even when embed = true"
-        );
-    }
-
-    #[test]
-    fn to_xberg_defers_embedding_to_basemind() {
-        let cfg = DocConfig {
-            embed: true,
-            embed_batch_size: 8,
-            ..DocConfig::default()
-        };
-        let x = cfg.to_xberg();
-        assert!(
-            x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none(),
-            "basemind must embed the breadcrumbed retrieval view after extraction"
-        );
-    }
-
-    #[test]
-    fn to_xberg_bounds_pages_timeout_and_disables_duplicate_cache() {
-        let cfg = DocConfig {
-            max_pages: 37,
-            extraction_timeout_secs: 42,
-            ..doc_config_all_enrichment_on(DocumentModelProfile::Full)
-        };
-
-        let xberg = cfg.to_xberg();
-        let security = xberg.security_limits.expect("security limits configured");
-        let chunking = xberg.chunking.expect("chunking configured");
-
-        assert!(
-            !xberg.use_cache,
-            "basemind's content-addressed blob cache is the only extraction cache"
-        );
-        assert_eq!(xberg.extraction_timeout_secs, Some(42));
-        assert_eq!(security.max_pages, Some(37));
-        assert_eq!(chunking.chunker_type, ChunkerType::Markdown);
-    }
-
-    #[test]
-    fn dense_retrieval_text_adds_breadcrumb_without_changing_source() {
-        let source = "## Setup\n\nInstall dependencies.".to_string();
-        let context = HeadingContext {
-            headings: vec![
-                HeadingLevel {
-                    level: 1,
-                    text: "Guide".to_string(),
-                },
-                HeadingLevel {
-                    level: 2,
-                    text: "Setup".to_string(),
-                },
-            ],
-        };
-
-        let (stored, retrieval) = prepare_doc_chunk(source, 10, 44, Some(&context), true);
-
-        assert_eq!(stored.text, "## Setup\n\nInstall dependencies.");
-        assert_eq!(stored.byte_start, 10);
-        assert_eq!(stored.byte_end, 44);
-        assert_eq!(
-            retrieval.as_deref(),
-            Some("# Guide > ## Setup\n\nInstall dependencies.")
-        );
-    }
-
-    #[test]
-    fn dense_retrieval_text_borrows_exact_source_without_heading_context() {
-        let retrieval = dense_retrieval_text("Exact source span", None);
-
-        assert!(matches!(retrieval, Cow::Borrowed("Exact source span")));
-    }
-
-    #[test]
-    fn embedding_disabled_keeps_exact_text_without_allocating_retrieval_input() {
-        let (stored, retrieval) = prepare_doc_chunk("Exact source span".to_string(), 0, 17, None, false);
-
-        assert_eq!(stored.text, "Exact source span");
-        assert!(retrieval.is_none());
-    }
-
-    #[test]
-    fn language_confidences_are_persisted_without_xberg_types() {
-        let mapped = map_language_confidences(vec![xberg::types::LanguageConfidence {
-            language: "eng".to_string(),
-            confidence: 0.98,
-            proportion: 0.75,
-            script: "Latin".to_string(),
-            reliable: true,
-        }]);
-
-        assert_eq!(
-            mapped,
-            vec![DocLanguageConfidence {
-                language: "eng".to_string(),
-                confidence: 0.98,
-                proportion: 0.75,
-                script: "Latin".to_string(),
-                reliable: true,
-            }]
-        );
-    }
-}
+mod tests;

@@ -17,6 +17,7 @@ use super::types_vault::VaultParams;
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_vault")]
 impl BasemindServer {
     #[tool(
+        title = "Vault",
         description = "Manage encrypted PII rehydration maps produced by document ingestion with \
         `redaction.enabled = true`. basemind does NOT store the vault blob — the caller (TypeScript \
         layer) persists it to `{appData}/vaults/`. This tool only encrypts, decrypts, searches, and \

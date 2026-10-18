@@ -25,17 +25,13 @@ use crate::registry::{BranchRecord, WorkspaceKind, WorkspaceRecord, WorktreeReco
 pub struct WorkspaceParams {
     /// Which operation to run.
     pub mode: WorkspaceMode,
-    /// Required by `worktrees`, `branches`, `claim` and `release`; rejected by `workspaces`. The
-    /// repo id is a normalized remote URL, else `path:<root>` — run mode `workspaces` to see the
-    /// known ids.
+    /// Required by `worktrees`, `branches`, `claim`, `release`. Normalized remote URL or `path:<root>`; see `workspaces`.
     #[serde(default)]
     pub repo_id: Option<String>,
-    /// Required by `claim` and `release`; rejected by the list modes. The worktree name is `(main)`
-    /// for the primary checkout, else the linked-worktree directory name.
+    /// Required by `claim` and `release`: `(main)` or the linked-worktree directory name.
     #[serde(default)]
     pub name: Option<String>,
-    /// Every mode. Optional sub-identity to act as; defaults to the server's own agent. Lets one
-    /// orchestrator drive many named subagents, each claiming worktrees under its own identity.
+    /// Sub-identity to act as; defaults to this server's agent.
     #[serde(default)]
     pub as_agent: Option<String>,
 }
@@ -51,7 +47,7 @@ pub struct WorkspacesParams {
 
 /// One workspace row in a mode-`workspaces` response.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct WorkspaceDto {
+pub(crate) struct WorkspaceDto {
     /// Stable workspace key (blake3 of the canonical root); also the cache-dir identity.
     pub key: String,
     /// `"git"` or `"plain"`.
@@ -86,7 +82,7 @@ impl From<&WorkspaceRecord> for WorkspaceDto {
 
 /// Response for mode `workspaces`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct WorkspacesResponse {
+pub(crate) struct WorkspacesResponse {
     /// Number of workspaces returned.
     pub total: usize,
     /// The workspace rows, sorted by key.
@@ -105,7 +101,7 @@ pub struct WorktreesParams {
 
 /// One worktree row in a mode-`worktrees` response.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct WorktreeDto {
+pub(crate) struct WorktreeDto {
     /// Owning repo id.
     pub repo_id: String,
     /// `"(main)"` or the linked-worktree directory name.
@@ -144,7 +140,7 @@ impl From<&WorktreeRecord> for WorktreeDto {
 
 /// Response for mode `worktrees`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct WorktreesResponse {
+pub(crate) struct WorktreesResponse {
     /// The repo id queried.
     pub repo_id: String,
     /// Number of worktrees returned.
@@ -165,7 +161,7 @@ pub struct BranchesParams {
 
 /// One branch row in a mode-`branches` response.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct BranchDto {
+pub(crate) struct BranchDto {
     /// Owning repo id.
     pub repo_id: String,
     /// Short branch name (`refs/heads/` stripped).
@@ -189,7 +185,7 @@ impl From<&BranchRecord> for BranchDto {
 
 /// Response for mode `branches`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct BranchesResponse {
+pub(crate) struct BranchesResponse {
     /// The repo id queried.
     pub repo_id: String,
     /// Number of branches returned.
@@ -224,7 +220,7 @@ pub struct WorktreeReleaseParams {
 
 /// Response for modes `claim` / `release`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct WorktreeClaimResponse {
+pub(crate) struct WorktreeClaimResponse {
     /// The owning repo id.
     pub repo_id: String,
     /// The worktree name acted on.

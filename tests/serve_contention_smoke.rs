@@ -92,9 +92,10 @@ fn cli_scan_exits_cleanly_when_a_writer_holds_the_lock() {
         .expect("run basemind scan");
     let elapsed = started.elapsed();
 
-    assert!(
-        output.status.success(),
-        "scan against a held lock must exit cleanly (0), got {:?}\nstderr: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "scan against a held lock must exit busy (3), got {:?}\nstderr: {}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -108,7 +109,9 @@ fn cli_scan_exits_cleanly_when_a_writer_holds_the_lock() {
         "notice must name the `basemind serve` holder and point at its `rescan` tool, got:\n{combined}"
     );
     assert!(
-        elapsed < Duration::from_secs(10),
+        // Includes spawning the debug binary, which a loaded macOS runner can take ~10s to start;
+        // a lock-retry loop would block far longer than this.
+        elapsed < Duration::from_secs(30),
         "pre-flight scan took {elapsed:?} — should short-circuit, not block on lock retries"
     );
 }

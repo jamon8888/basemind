@@ -43,20 +43,30 @@ Finding the binary (in order of preference):
 
 - The scan writes the content-addressed blob store + Fjall inverted index into the machine-global
   cache (never inside the repo). Seconds for small repos; ~22 s for an ~80k-file TypeScript monorepo.
-- Files tree-sitter doesn't recognize as code go through the document tier; anything that isn't an
-  extractable document (e.g. an exotic source file) is **skipped**, not counted as a failure.
+- The code map holds code only. Markdown, JSON, YAML, TOML, XML, CSV, INI and similar prose/config/data
+  files go to the document tier instead (chunked, searchable with `memory` mode `documents`; they
+  never appear in `symbols`, `outline` or `grep`; `files` and `find` list them). Anything that is neither code nor an
+  extractable document is **skipped**, not counted as a failure. Existing indexes migrate on the
+  next scan, which also reclaims stale blobs (`cleanup: reclaimed N orphaned blob(s)`).
 - If a `basemind serve` MCP server is already running for this repo it holds the store lock, so a
-  CLI `scan` will fail with a lock error. Use `admin { mode: "rescan" }` over MCP (it re-indexes in-process)
-  instead, or stop the server first.
+  CLI `scan` will fail with a lock error. Use `basemind rescan [path…]` (the CLI forwards to the running daemon) or
+  `admin { mode: "rescan" }` over MCP instead; the lock error exits with code 3.
 - **Indexing directories outside the repo** — set `scan.extra_roots` in the repo-root `basemind.toml`
   to a list of absolute paths (e.g. a Bazel external repo cache) to index them alongside the repo.
-  This needs `BASEMIND_ALLOW_EXTRA_ROOTS=1` in the environment that launches basemind: the config
-  file lives inside the repository, so without that operator opt-in the entries are ignored with a
-  warning. A filesystem or volume root is refused either way.
+  This needs `BASEMIND_ALLOW_EXTRA_ROOTS` in the environment that launches basemind (`1`, or a
+  `:`-separated list of absolute workspace roots to grant only those): the config file lives inside
+  the repository, so without that operator opt-in the entries are ignored with a warning. A
+  filesystem or volume root and credential directories (`.ssh`, `.aws`, `.gnupg`, `/etc`) are
+  refused either way.
   Their files are keyed by absolute path (so results for them are absolute, not repo-relative) and
   are (re-)indexed on a full `scan` only — the live watcher does not track them. Git tools (blame)
   don't apply to external files; the code map (symbols / references / outlines) and document search
   do.
+- Credential and key files (`.env*`, `.aws/`, `.ssh/`, `.npmrc`, `*.pem`, `*.key`, ...) are never
+  indexed. `[scan] floor_allow` opts a class back in (`.env.*` also matches `.env.example`), but a
+  credential entry needs `BASEMIND_ALLOW_REPO_CREDENTIALS` in the environment that launches
+  basemind — a repository's own file cannot un-exclude your secrets.
+  `[languages.<grammar>]` re-maps or disables a misdetected grammar.
 - After a successful scan, both the MCP tools and `basemind code …` have a fresh index.
 - The CLI shares the exact same machine-global cache as the MCP server — see the `basemind-cli`
   skill for the full query surface, or `basemind-code-search` / `basemind-git-history` /

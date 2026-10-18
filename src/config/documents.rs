@@ -23,9 +23,28 @@ pub struct DocumentsConfig {
     #[serde(default)]
     #[schemars(inner(length(min = 1)))]
     pub mime_allowlist: Vec<String>,
-    /// Extra file extensions (lowercase, no dot) to skip on top of the built-in archive/binary
-    /// denylist. The built-in floor (`.zip/.tar/.jar/.so/.wasm/...`) is always applied — this only
-    /// adds to it — so archives and binaries are never routed to xberg extraction + embedding.
+    /// Allow-list of globs (repo-relative, forward-slash) selecting which non-code files are indexed
+    /// as documents. Empty (default) = every non-code file that passes `[scan]`. A bare name with no
+    /// glob metacharacters (`docs`) matches that path and everything beneath it. `exclude` wins over
+    /// `include`.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub include: Vec<String>,
+    /// Deny-list of globs applied to document indexing itself (not just embedding): matching files
+    /// are not extracted, chunked or searchable as documents. Same syntax as `include`.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub exclude: Vec<String>,
+    /// Per-document size cap in bytes, independent of `[scan] max_file_bytes` (which only bounds
+    /// source files). Default 50 MiB, so PDFs and Office files above the 2 MiB scan cap are still
+    /// extracted. Larger files are skipped and counted in the scan summary as too large.
+    #[serde(default = "DocumentsConfig::default_max_file_bytes")]
+    #[schemars(range(min = 1024))]
+    pub max_file_bytes: u64,
+    /// File extensions to skip on top of the built-in archive/binary denylist (`pdf` and `.PDF` are
+    /// equivalent: case-insensitive, leading dot optional). The built-in floor
+    /// (`.zip/.tar/.jar/.so/.wasm/...`) is always applied — this only adds to it — so archives and
+    /// binaries are never routed to xberg extraction + embedding.
     #[serde(default)]
     #[schemars(inner(length(min = 1)))]
     pub extension_denylist: Vec<String>,
@@ -40,10 +59,43 @@ pub struct DocumentsConfig {
     #[serde(default = "DocumentsConfig::default_max_pages")]
     #[schemars(range(min = 1))]
     pub max_pages: usize,
-    /// Maximum wall-clock time xberg may spend extracting one document.
+    /// Maximum wall-clock time one document's extraction (including chunking) may take. Enforced by a
+    /// watchdog: a document that overruns is abandoned, skipped and counted as `doc_timeouts` in the scan
+    /// summary, so one pathological file cannot stall a scan. A timed-out document is remembered by
+    /// content hash and not retried while it is unchanged and the extraction limits are unchanged;
+    /// editing the file or changing this value (or the chunk cutovers or `max_pages`) retries it.
     #[serde(default = "DocumentsConfig::default_extraction_timeout_secs")]
     #[schemars(range(min = 1))]
     pub extraction_timeout_secs: u64,
+    /// Wall-clock budget for the whole document phase of one scan, started at the first document that
+    /// needs a real extraction. Once spent, the remaining documents are deferred (counted as
+    /// `docs_deferred`, not failed) and picked up by the next scan, so several documents timing out
+    /// together cost this budget rather than `extraction_timeout_secs` each. Documents already running
+    /// finish or hit their own timeout, so a scan can overshoot by up to one `extraction_timeout_secs`. Never
+    /// less than `extraction_timeout_secs` in effect.
+    #[serde(default = "DocumentsConfig::default_phase_budget_secs")]
+    #[schemars(range(min = 1))]
+    pub phase_budget_secs: u64,
+    /// Cap on timed-out extraction threads still running. A timed-out extraction cannot be cancelled
+    /// and keeps a core busy until it finishes on its own; at the cap, further documents are deferred
+    /// (counted as `docs_deferred`) instead of spawning another thread, and picked up by a later scan.
+    /// A soft bound: extractions already in flight when it is reached may still time out.
+    #[serde(default = "DocumentsConfig::default_max_abandoned_extractions")]
+    #[schemars(range(min = 1, max = 64))]
+    pub max_abandoned_extractions: usize,
+    /// Largest text-like document (markdown, csv, json, yaml, xml, toml, ini, ...) in bytes still chunked
+    /// with xberg's structure-aware markdown splitter. The splitter re-scans every remaining element
+    /// per chunk, so its cost grows with the square of the document: a multi-megabyte file can stall a
+    /// scan worker for minutes. Larger files are chunked by a linear fixed-size chunker instead (counted
+    /// as `docs_degraded` in the scan summary). Never applies to binary formats (PDF, Office, ...).
+    #[serde(default = "DocumentsConfig::default_markdown_chunk_max_bytes")]
+    #[schemars(range(min = 1024))]
+    pub markdown_chunk_max_bytes: u64,
+    /// Like `markdown_chunk_max_bytes` but for plain text (`text/plain`: `.txt`, `.log`, ...), which has no
+    /// markdown structure for the splitter to exploit, so the cutover is lower.
+    #[serde(default = "DocumentsConfig::default_plain_text_chunk_max_bytes")]
+    #[schemars(range(min = 1024))]
+    pub plain_text_chunk_max_bytes: u64,
     /// Maximum chunk size in characters.
     #[serde(default = "DocumentsConfig::default_max_characters")]
     #[schemars(range(min = 64))]
@@ -64,10 +116,17 @@ pub struct DocumentsConfig {
     /// Generate embeddings (`true`) or skip vector storage entirely (`false`).
     #[serde(default = "DocumentsConfig::default_embed")]
     pub embed: bool,
+    /// Allow-list of globs for embedding: when non-empty only matching documents are embedded; the
+    /// rest stay extracted + keyword-searchable. It only narrows what `include`/`exclude` already
+    /// index. Empty (default) = every indexed document is embedded. Only consulted when `embed = true`.
+    #[serde(default)]
+    #[schemars(inner(length(min = 1)))]
+    pub embed_include: Vec<String>,
     /// Glob patterns (repo-relative, forward-slash) for documents that are still extracted +
     /// indexed but **never** embedded. Keeps ONNX vectors off selected large or low-value documents
-    /// while leaving their text searchable by keyword. Empty by default; only consulted when
-    /// `embed = true`.
+    /// while leaving their text searchable by keyword. Beats `embed_include`. Empty by default; only
+    /// consulted when `embed = true`. Changing it removes the vector rows of newly excluded
+    /// documents on the next scan.
     #[serde(default)]
     #[schemars(inner(length(min = 1)))]
     pub embed_exclude: Vec<String>,
@@ -78,6 +137,17 @@ pub struct DocumentsConfig {
     /// work. True binaries (`.so/.wasm/.exe/...`) are always rejected regardless of this flag.
     #[serde(default = "DocumentsConfig::default_extract_archives")]
     pub extract_archives: bool,
+    /// Cap on the total *uncompressed* bytes xberg may unpack from one archive when
+    /// `extract_archives = true`. An archive past the cap fails extraction (counted as an extract
+    /// failure) instead of being unpacked into memory. Default 64 MiB; xberg's own default is 500 MB.
+    #[serde(default = "DocumentsConfig::default_max_archive_bytes")]
+    #[schemars(range(min = 1024))]
+    pub max_archive_bytes: u64,
+    /// Cap on the number of entries in one archive when `extract_archives = true`. Default 1000;
+    /// xberg's own default is 10,000.
+    #[serde(default = "DocumentsConfig::default_max_archive_entries")]
+    #[schemars(range(min = 1))]
+    pub max_archive_entries: usize,
     /// Language detection + preferred languages for chunking / extraction.
     #[serde(default)]
     pub language: DocLanguageConfig,
@@ -140,14 +210,35 @@ impl DocumentsConfig {
     fn default_extract_archives() -> bool {
         false
     }
+    fn default_max_archive_bytes() -> u64 {
+        64 * 1024 * 1024
+    }
+    fn default_max_archive_entries() -> usize {
+        1000
+    }
     fn default_max_chunks_per_document() -> usize {
         2000
     }
     fn default_max_pages() -> usize {
         500
     }
+    fn default_max_file_bytes() -> u64 {
+        52_428_800
+    }
     fn default_extraction_timeout_secs() -> u64 {
-        600
+        120
+    }
+    fn default_phase_budget_secs() -> u64 {
+        1_800
+    }
+    fn default_max_abandoned_extractions() -> usize {
+        4
+    }
+    fn default_markdown_chunk_max_bytes() -> u64 {
+        1024 * 1024
+    }
+    fn default_plain_text_chunk_max_bytes() -> u64 {
+        4 * 1024 * 1024
     }
 }
 
@@ -156,16 +247,26 @@ impl Default for DocumentsConfig {
         Self {
             enabled: Self::default_enabled(),
             mime_allowlist: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_file_bytes: Self::default_max_file_bytes(),
             extension_denylist: Vec::new(),
             max_chunks_per_document: Self::default_max_chunks_per_document(),
             max_pages: Self::default_max_pages(),
             extraction_timeout_secs: Self::default_extraction_timeout_secs(),
+            phase_budget_secs: Self::default_phase_budget_secs(),
+            max_abandoned_extractions: Self::default_max_abandoned_extractions(),
+            markdown_chunk_max_bytes: Self::default_markdown_chunk_max_bytes(),
+            plain_text_chunk_max_bytes: Self::default_plain_text_chunk_max_bytes(),
             max_characters: Self::default_max_characters(),
             overlap: Self::default_overlap(),
             embedding_preset: Self::default_embedding_preset(),
             embed: Self::default_embed(),
+            embed_include: Vec::new(),
             embed_exclude: Vec::new(),
             extract_archives: Self::default_extract_archives(),
+            max_archive_bytes: Self::default_max_archive_bytes(),
+            max_archive_entries: Self::default_max_archive_entries(),
             language: DocLanguageConfig::default(),
             reranker: RerankerConfig::default(),
             keywords: KeywordsConfig::default(),
@@ -212,7 +313,7 @@ pub struct DocLanguageConfig {
     /// instead of just the top match. Off by default to match xberg.
     #[serde(default)]
     pub detect_multiple: bool,
-    /// Reserved — accepts ISO 639-3 codes (e.g. `"fra"`, `"deu"`) for future use.
+    /// Reserved: currently has no effect (a load-time warning is logged when set) — accepts ISO 639-3 codes (e.g. `"fra"`, `"deu"`) for future use.
     /// Xberg rc.10 does not honor a preferred-language hint, but the field
     /// is kept on the schema so users can populate it without a config break.
     #[serde(default)]
@@ -243,7 +344,6 @@ impl Default for DocLanguageConfig {
 pub use super::enrichment::{
     CustomRerankerModel, KeywordAlgorithm, KeywordsConfig, RerankerConfig, ResolvedRerankerModel,
 };
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NerConfig {
@@ -528,6 +628,12 @@ impl RedactionConfig {
             preserve_offsets: self.preserve_offsets,
             custom_terms,
             custom_patterns,
+            // External-inspection findings (xberg >= 1.3): basemind runs its own
+            // detection and supplies none inline or through a findings file.
+            findings: Vec::new(),
+            min_score: None,
+            findings_path: None,
+            findings_offset_encoding: xberg::RedactionOffsetEncoding::default(),
         })
     }
 }
@@ -535,8 +641,8 @@ impl RedactionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
-    /// Backend selection. `tesseract` is the default; `paddle` for CJK-heavy
-    /// corpora; `vlm` routes through `[llm]` for vision-language OCR.
+    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
+    /// non-default value); OCR runs with xberg's defaults.
     #[serde(default)]
     pub backend: OcrBackend,
     /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`).
@@ -609,10 +715,18 @@ pub struct LlmConfig {
     pub model: String,
     /// API key — either a literal (discouraged; keeps secrets in version control)
     /// or an `{ env = "OPENAI_API_KEY" }` reference. `Unset` lets the underlying
-    /// provider SDK fall back to its standard environment variable lookup.
+    /// provider SDK fall back to its standard environment variable lookup. In the repository's
+    /// own `basemind.toml`, an env reference is honoured only for the chosen provider's standard
+    /// variable (`OPENAI_API_KEY` for `openai/...`, `ANTHROPIC_API_KEY` for `anthropic/...`, ...)
+    /// or `BASEMIND_LLM_API_KEY`; any other name is ignored with a warning unless
+    /// `BASEMIND_ALLOW_REPO_LLM=1` is set.
     #[serde(default)]
     pub api_key: ApiKey,
-    /// Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …).
+    /// Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). **Ignored (with a
+    /// warning) when it comes from the repository's own `basemind.toml`** unless the operator sets
+    /// `BASEMIND_ALLOW_REPO_LLM=1` in the environment: a cloned repository could otherwise point
+    /// the summarizer and NER at a host that collects your API key and document text. A value
+    /// passed by CLI flag or environment override is operator-supplied and always honoured.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Sampling temperature. Provider-default when unset.
@@ -620,6 +734,7 @@ pub struct LlmConfig {
     pub temperature: Option<f64>,
     /// Request timeout in seconds. Maps to xberg's `timeout_secs` (default 60).
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub timeout_secs: Option<u64>,
     /// Maximum retry attempts on transient errors. Maps to xberg's
     /// `max_retries` (default 3).
@@ -759,199 +874,7 @@ impl fmt::Display for SecretString {
     }
 }
 
+/// The module's tests live in a subdirectory by the 1000-line module cap
+/// (`tests/max_lines.rs`), the same shape `pii_patterns` above uses.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secret_string_redacts_in_debug() {
-        let s = SecretString::new("hunter2".to_string());
-        assert_eq!(format!("{s:?}"), "\"<redacted>\"");
-        assert_eq!(format!("{s}"), "<redacted>");
-        assert_eq!(s.expose(), "hunter2");
-    }
-
-    #[test]
-    fn api_key_unset_resolves_to_none() {
-        assert!(ApiKey::Unset.resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_literal_resolves_to_value() {
-        let k = ApiKey::Literal("sk-test".to_string());
-        let resolved = k.resolve().expect("literal resolves");
-        assert_eq!(resolved.expose(), "sk-test");
-    }
-
-    #[test]
-    fn api_key_literal_empty_resolves_to_none() {
-        assert!(ApiKey::Literal(String::new()).resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_env_reads_environment() {
-        // SAFETY: scoped to this single test; the env var name is uniquely
-        unsafe {
-            std::env::set_var("BASEMIND_TEST_API_KEY_PRESENT", "value-123");
-        }
-        let k = ApiKey::Env {
-            env: "BASEMIND_TEST_API_KEY_PRESENT".to_string(),
-        };
-        let resolved = k.resolve().expect("env resolves");
-        assert_eq!(resolved.expose(), "value-123");
-        unsafe {
-            std::env::remove_var("BASEMIND_TEST_API_KEY_PRESENT");
-        }
-    }
-
-    #[test]
-    fn api_key_env_missing_resolves_to_none() {
-        // SAFETY: the variable is removed before the test so the env lookup
-        unsafe {
-            std::env::remove_var("BASEMIND_TEST_API_KEY_MISSING");
-        }
-        let k = ApiKey::Env {
-            env: "BASEMIND_TEST_API_KEY_MISSING".to_string(),
-        };
-        assert!(k.resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_deserialises_literal_string() {
-        let k: ApiKey = serde_json::from_str("\"sk-test\"").expect("parse");
-        match k {
-            ApiKey::Literal(s) => assert_eq!(s, "sk-test"),
-            other => panic!("expected Literal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn api_key_deserialises_env_table() {
-        let k: ApiKey = serde_json::from_str(r#"{"env":"OPENAI_API_KEY"}"#).expect("parse");
-        match k {
-            ApiKey::Env { env } => assert_eq!(env, "OPENAI_API_KEY"),
-            other => panic!("expected Env, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn api_key_literal_never_serializes_cleartext() {
-        let key = ApiKey::Literal("sk-supersecret".to_string());
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert!(!json.contains("sk-supersecret"), "raw secret leaked: {json}");
-        assert!(json.contains("<redacted>"), "redaction marker missing: {json}");
-    }
-
-    #[test]
-    fn api_key_env_serializes_env_name_only() {
-        let key = ApiKey::Env {
-            env: "OPENAI_API_KEY".to_string(),
-        };
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert!(json.contains("OPENAI_API_KEY"), "env name missing: {json}");
-        assert!(json.contains("\"env\""), "env field missing: {json}");
-    }
-
-    #[test]
-    fn api_key_unset_serializes_to_null() {
-        let key = ApiKey::Unset;
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert_eq!(json, "null");
-    }
-
-    #[test]
-    fn reranker_defaults_follow_eu_spec() {
-        let r = RerankerConfig::default();
-        assert!(!r.enabled);
-        assert_eq!(r.preset, "bge-reranker-v2-m3");
-        assert_eq!(r.top_k, 20);
-        assert!(r.custom_model.is_none());
-    }
-
-    #[test]
-    fn reranker_resolve_explicit_preset_wins_over_custom() {
-        let r = RerankerConfig {
-            custom_model: Some(CustomRerankerModel {
-                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
-                model_file: Some("onnx/model_int8.onnx".to_string()),
-            }),
-            ..RerankerConfig::default()
-        };
-        match r.resolve_model(Some("bge-reranker-base")) {
-            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-base"),
-            other => panic!("expected Preset, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reranker_resolve_custom_without_override() {
-        let r = RerankerConfig {
-            custom_model: Some(CustomRerankerModel {
-                model_id: "onnx-community/gte-multilingual-reranker-base".to_string(),
-                model_file: Some("onnx/model_int8.onnx".to_string()),
-            }),
-            ..RerankerConfig::default()
-        };
-        match r.resolve_model(None) {
-            ResolvedRerankerModel::Custom {
-                model_id, model_file, ..
-            } => {
-                assert_eq!(model_id, "onnx-community/gte-multilingual-reranker-base");
-                assert_eq!(model_file, "onnx/model_int8.onnx");
-            }
-            other => panic!("expected Custom, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reranker_resolve_custom_defaults_model_file() {
-        let r = RerankerConfig {
-            custom_model: Some(CustomRerankerModel {
-                model_id: "org/model".to_string(),
-                model_file: None,
-            }),
-            ..RerankerConfig::default()
-        };
-        match r.resolve_model(None) {
-            ResolvedRerankerModel::Custom { model_file, .. } => {
-                assert_eq!(model_file, "onnx/model.onnx");
-            }
-            other => panic!("expected Custom, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reranker_resolve_falls_back_to_preset() {
-        let r = RerankerConfig::default();
-        match r.resolve_model(None) {
-            ResolvedRerankerModel::Preset { name } => assert_eq!(name, "bge-reranker-v2-m3"),
-            other => panic!("expected Preset, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reranker_custom_model_deserialises_from_toml_section() {
-        let cfg: RerankerConfig = toml::from_str(
-            "preset = \"bge-reranker-v2-m3\"\n[custom_model]\nmodel_id = \"onnx-community/gte-multilingual-reranker-base\"\nmodel_file = \"onnx/model_int8.onnx\"\n",
-        )
-        .expect("parse");
-        let custom = cfg.custom_model.expect("custom_model");
-        assert_eq!(custom.model_id, "onnx-community/gte-multilingual-reranker-base");
-        assert_eq!(custom.model_file.as_deref(), Some("onnx/model_int8.onnx"));
-    }
-
-    #[test]
-    fn ocr_defaults_cover_eu_id_languages() {
-        let o = OcrConfig::default();
-        for lang in ["eng", "deu", "fra", "spa", "ita", "nld", "pol"] {
-            assert!(o.languages.contains(&lang.to_string()), "missing {lang}");
-        }
-    }
-
-    #[test]
-    fn embedding_preset_default_is_multilingual() {
-        // Changing the preset changes the LanceDB dim triple and wipes every
-        // existing index — pick the default deliberately before first index.
-        assert_eq!(DocumentsConfig::default().embedding_preset, "multilingual");
-    }
-}
+mod tests;

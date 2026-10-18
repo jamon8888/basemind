@@ -1,6 +1,6 @@
 //! Single-owner daemon lock, pidfile, and the machine-wide live-daemon registry + ceiling.
 //!
-//! Shared by every daemon family basemind spawns — the comms broker, the agent-ipc daemon, the
+//! Shared by every daemon family basemind spawns — the comms broker and the
 //! shells/rmux daemon (see [`DaemonKind`]) — so one lock discipline, one registry and one ceiling
 //! cover all of them. The registry itself is feature-independent; its consumers stay feature-gated.
 //!
@@ -70,8 +70,6 @@ pub enum DaemonKind {
     // field at all — still deserializes instead of being pruned as corrupt. See `read_record`. ~keep
     #[default]
     Comms,
-    /// The agent-ipc daemon backing `basemind agent`.
-    Agent,
     /// The shells / rmux daemon.
     Shells,
 }
@@ -82,7 +80,6 @@ impl DaemonKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Comms => "comms",
-            Self::Agent => "agent",
             Self::Shells => "shells",
         }
     }
@@ -243,6 +240,33 @@ pub enum DaemonLockOutcome {
     AlreadyHeld(Option<DaemonRecord>),
 }
 
+/// Total time [`contend_for_lock`] waits out a lock that looks held but has no live holder record.
+const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Try to take the flock on `file`. `None` means it is now ours; `Some(holder)` means a live peer
+/// owns it.
+///
+/// A flock lives on the open file *description*, so a just-released lock can still read as held
+/// while a concurrent fork/exec elsewhere in the machine briefly carries a copy of the holder's fd
+/// (until the child execs and close-on-exec drops it). `Drop` removes the pidfile before the lock
+/// is released, so that window shows up as a lock that is held yet has no record naming a live
+/// process. Only then do we poll for [`RELEASE_GRACE`]; a record naming a live pid is a genuine peer
+/// and converges immediately, so the common redundant-spawn path stays instant.
+fn contend_for_lock(file: &File, pid_path: &Path) -> Option<Option<DaemonRecord>> {
+    let deadline = std::time::Instant::now() + RELEASE_GRACE;
+    loop {
+        if file.try_lock_exclusive().is_ok() {
+            return None;
+        }
+        let record = read_record(pid_path);
+        if record.as_ref().is_some_and(|r| pid_is_live(r.pid)) || std::time::Instant::now() >= deadline {
+            return Some(record);
+        }
+        std::thread::sleep(RELEASE_POLL);
+    }
+}
+
 impl DaemonLock {
     /// Try to acquire single-ownership of `comms_dir` for a comms broker at `version`. Shorthand for
     /// [`acquire_kind`](Self::acquire_kind) with [`DaemonKind::Comms`].
@@ -274,9 +298,8 @@ impl DaemonLock {
             .write(true)
             .truncate(false)
             .open(&lock_path)?;
-        if file.try_lock_exclusive().is_err() {
-            let pid_path = dir.join(DAEMON_PID_FILE);
-            return Ok(DaemonLockOutcome::AlreadyHeld(read_record(&pid_path)));
+        if let Some(holder) = contend_for_lock(&file, &dir.join(DAEMON_PID_FILE)) {
+            return Ok(DaemonLockOutcome::AlreadyHeld(holder));
         }
 
         let record = DaemonRecord {
@@ -405,21 +428,40 @@ mod tests {
     fn the_ceiling_counts_each_kind_separately() {
         let machine = tempfile::tempdir().expect("machine tempdir");
         let comms = tempfile::tempdir().expect("comms tempdir");
-        let agent = tempfile::tempdir().expect("agent tempdir");
+        let shells = tempfile::tempdir().expect("shells tempdir");
         let _comms_lock =
             DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("comms acquire");
-        let _agent_lock =
-            DaemonLock::acquire_at(DaemonKind::Agent, agent.path(), "9.9.9", machine.path()).expect("agent acquire");
+        let _shells_lock =
+            DaemonLock::acquire_at(DaemonKind::Shells, shells.path(), "9.9.9", machine.path()).expect("shells acquire");
 
         assert_eq!(live_daemons_in(machine.path()).len(), 2, "both families are registered");
         let comms_only = live_daemons_of_in(machine.path(), DaemonKind::Comms);
-        assert_eq!(comms_only.len(), 1, "an agent daemon does not count against comms");
+        assert_eq!(comms_only.len(), 1, "a shells daemon does not count against comms");
         assert_eq!(comms_only[0].dir, comms.path(), "the comms entry names the comms dir");
         assert_eq!(
             live_daemons_of_in(machine.path(), DaemonKind::Shells).len(),
-            0,
-            "no shells daemon is registered"
+            1,
+            "the shells daemon is counted under its own kind"
         );
+    }
+
+    #[test]
+    fn a_record_naming_the_removed_agent_kind_is_reaped_without_crashing() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let path = machine.path().join("legacy.pid");
+        let record = |kind: &str| {
+            format!(
+                r#"{{"pid":{},"kind":"{kind}","dir":"/tmp/x","version":"1","started_unix":1}}"#,
+                std::process::id()
+            )
+        };
+        // Control: the same record with a live kind parses, so only the kind can explain the reap.
+        std::fs::write(&path, record("comms")).expect("write control record");
+        assert!(read_record(&path).is_some(), "fixture is otherwise valid");
+        std::fs::write(&path, record("agent")).expect("write legacy record");
+        assert!(read_record(&path).is_none(), "the removed kind no longer parses");
+        assert!(live_daemons_in(machine.path()).is_empty());
+        assert!(!path.exists(), "the unreadable record is reaped like any corrupt one");
     }
 
     #[test]
@@ -437,11 +479,51 @@ mod tests {
             0,
             "dropping the lock deregisters the daemon"
         );
-        match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path())
-            .expect("re-acquire after drop")
-        {
-            DaemonLockOutcome::Acquired(_) => {}
-            other => panic!("the lock is free after drop, got {other:?}"),
+        // flock belongs to the open file description, so a sibling test thread that forks (any
+        // `Command::spawn`) inherits it until its exec closes the CLOEXEC fd. That window is a few
+        // milliseconds, so the lock can read as held right after our drop; wait it out rather than
+        // asserting on a race the production code cannot and need not prevent. ~keep
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path())
+                .expect("re-acquire after drop")
+            {
+                DaemonLockOutcome::Acquired(_) => break,
+                other if std::time::Instant::now() >= deadline => panic!("the lock is free after drop, got {other:?}"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
         }
+    }
+
+    /// A concurrent fork/exec carries a copy of a just-dropped lock's fd until it execs, so the lock
+    /// reads as held for a few ms with no record behind it. Re-acquiring right after a drop must
+    /// still win rather than report a phantom peer.
+    #[test]
+    fn reacquire_after_drop_wins_despite_concurrent_fork_exec() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut phantom_holders = 0;
+        for _ in 0..200 {
+            match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("acquire") {
+                DaemonLockOutcome::Acquired(lock) => drop(lock),
+                DaemonLockOutcome::AlreadyHeld(_) => phantom_holders += 1,
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().expect("spawner thread");
+        }
+        assert_eq!(phantom_holders, 0, "a released lock was reported as held by a peer");
     }
 }

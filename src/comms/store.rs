@@ -35,7 +35,10 @@ use super::model::{
     AgentRecord, MESSAGE_REFERENCE_PREFIX, Membership, MessageBody, MessageMeta, Thread, message_reference, now_micros,
 };
 
+mod idempotency;
 mod retention;
+
+pub use idempotency::{IDEMPOTENCY_TTL, MAX_IDEMPOTENCY_KEY_BYTES, PostOutcome, valid_idempotency_key};
 
 const META_SCHEMA_VER: &[u8] = b"schema_ver";
 const META_LAST_MAINTENANCE: &[u8] = b"last_maintenance_micros";
@@ -124,6 +127,8 @@ pub struct CommsStore {
     thread_subs: Keyspace,
     cursors: Keyspace,
     agents: Keyspace,
+    /// Serializes keyed posts so a retry racing its original cannot both pass the dedup lookup.
+    post_lock: std::sync::Mutex<()>,
     /// Held for the lifetime of the store; released on drop (Draining → Stopped).
     _lock: File,
 }
@@ -157,7 +162,7 @@ impl CommsStore {
             path: dir.clone(),
             source,
         })?;
-        let mut db = Database::builder(&dir).open()?;
+        let mut db = Database::builder(&dir).worker_threads(1).open()?;
         let mut meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
         let on_disk_ver = meta
             .get(META_SCHEMA_VER)?
@@ -174,7 +179,7 @@ impl CommsStore {
                 path: dir.clone(),
                 source,
             })?;
-            db = Database::builder(&dir).open()?;
+            db = Database::builder(&dir).worker_threads(1).open()?;
             meta = db.keyspace("meta", KeyspaceCreateOptions::default)?;
         }
         let threads = db.keyspace("threads", KeyspaceCreateOptions::default)?;
@@ -197,6 +202,7 @@ impl CommsStore {
             thread_subs,
             cursors,
             agents,
+            post_lock: std::sync::Mutex::new(()),
             _lock: lock,
         })
     }
@@ -334,8 +340,22 @@ impl CommsStore {
         meta: MessageMeta,
         body: MessageBody,
     ) -> Result<(u64, MessageMeta), CommsStoreError> {
+        self.post_with_row(thread, meta, body, None)
+    }
+
+    /// [`Self::post`] plus an optional extra `meta`-keyspace row committed in the same batch.
+    fn post_with_row(
+        &self,
+        thread: &ThreadId,
+        meta: MessageMeta,
+        body: MessageBody,
+        extra_meta_row: Option<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(u64, MessageMeta), CommsStoreError> {
         let seq = self.current_seq(thread)?.saturating_add(1);
         let mut batch = self.db.batch();
+        if let Some((key, value)) = extra_meta_row {
+            batch.insert(&self.meta, key, value);
+        }
         batch.insert(
             &self.meta,
             keys::thread_seq_meta_key(thread.as_str()),
@@ -412,9 +432,12 @@ impl CommsStore {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<(u64, MessageMeta)>, CommsStoreError> {
-        let prefix = keys::messages_by_thread_prefix(thread.as_str());
+        // Seek straight to `after_seq + 1` (the seq suffix is big-endian, so keys sort by seq) rather
+        // than walking the thread from its first message past every already-read row.
+        let start = keys::message_by_thread(thread.as_str(), after_seq.saturating_add(1));
+        let end = keys::message_by_thread(thread.as_str(), u64::MAX);
         let mut out = Vec::new();
-        for guard in self.messages_by_thread.prefix(&prefix) {
+        for guard in self.messages_by_thread.range(start..=end) {
             let (k, v) = guard.into_inner()?;
             let Some((_, seq)) = keys::parse_message_by_thread(&k) else {
                 continue;

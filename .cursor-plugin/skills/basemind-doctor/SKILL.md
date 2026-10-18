@@ -22,12 +22,17 @@ make sure the index is healthy and clear anything blocking a restart.
 ## 1. Is there an index?
 
 ```sh
-basemind admin status
+basemind doctor   # root, config, index, grammars, hook, daemon; exits 1 when a check fails
+basemind status
 ```
 
 - Errors / "no index" / `file_count: 0` with blobs present → the index is missing or lost. Build
   it: `basemind scan` (see the `basemind-scan` skill / `/bm-scan`).
 - Healthy `file_count` → the index is fine; the problem is the server connection (step 4).
+- `outline` says "file not indexed" for a README, JSON, YAML or TOML file → expected, not a fault:
+  those are documents, not code. Use `memory { mode: "documents", query }` (or Read the file).
+- A `notice` of `warming_up` / `building_index` means the index is still loading: wait and retry
+  (`admin { mode: "status" }` shows `indexing` / `warming`).
 
 ## 2. Is a server already running (holding the lock)?
 
@@ -39,7 +44,7 @@ directory under the machine-global cache (Linux `~/.local/share/basemind/`, macO
 in the repo.
 
 - If that `pid` is **alive** (`ps -p <pid>`), the server is up — use the MCP tools, or the
-  `admin { mode: "rescan" }` to refresh. Don't run a CLI `scan` (it will contend on the lock).
+  `admin { mode: "rescan" }` or `basemind rescan` to refresh. Don't run a CLI `scan` (it will contend on the lock and exit 3).
 - If that `pid` is **dead**, the lock is stale. The OS releases the advisory lock when a process
   dies, so a fresh `basemind scan` / `basemind serve` should just work — retry it. (You may delete
   the stale `.lock.meta` sidecar in that workspace cache dir to clear the advisory holder record.)

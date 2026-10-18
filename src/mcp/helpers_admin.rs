@@ -7,12 +7,12 @@
 //!
 //! ## GC is a non-destructive report while the blob store is machine-global
 //!
-//! The blob store is a single machine-global directory shared by every workspace, so neither the
-//! MCP `cache_gc` tool (this file) nor the offline CLI `cache gc`
-//! ([`crate::store_gc::run_gc`]) can safely mark-and-sweep: a single session enumerates only ONE
-//! workspace's references and would reap blobs other workspaces still need. Both paths therefore
-//! return a non-destructive report ([`crate::store_gc::gc_report_only`], `removed == 0`).
-//! Reference-counted GC that spans every workspace is the daemon's job (Track E).
+//! The blob store is a single machine-global directory shared by every workspace, so the MCP
+//! `cache_gc` tool (this file) cannot mark-and-sweep from inside a session: it would race that
+//! session's own rescans. It returns a non-destructive report ([`crate::store_gc::gc_report_only`],
+//! `removed == 0`). The cross-workspace reference-counted sweep is the daemon's maintenance task
+//! and the offline CLI `cache gc` ([`crate::store_gc::run_gc`]), both via
+//! [`crate::store_gc::gc_global_blobs`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::store_gc::{self, CacheComponent};
 
 /// The progress channel `rescan` reports on: the calling peer and the progress token it supplied.
 /// `None` on the CLI path, which has no MCP peer.
-type Progress<'a> = Option<(&'a rmcp::Peer<rmcp::RoleServer>, Option<rmcp::model::ProgressToken>)>;
+pub(super) type Progress<'a> = Option<(&'a rmcp::Peer<rmcp::RoleServer>, Option<rmcp::model::ProgressToken>)>;
 
 /// Fail a mode that was given a field belonging to some other mode.
 ///
@@ -246,6 +246,7 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
                     .as_ref()
                     .map(|r| r.submodule_paths())
                     .unwrap_or_default(),
+                config_stamp: config_stamp(state),
                 elapsed_us: elapsed_us(body),
             });
         }
@@ -285,8 +286,13 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
         schema_version: crate::extract::SCHEMA_VER,
         root: state.shared.root.display().to_string(),
         submodules,
+        config_stamp: config_stamp(state),
         elapsed_us: elapsed_us(body),
     })
+}
+
+fn config_stamp(state: &ServerState) -> String {
+    crate::config::daemon::ConfigStamp::of(&state.shared.root).to_string()
 }
 
 /// Body for `admin` mode `repo`: repository identity — workdir, branch, full + short HEAD sha.
@@ -422,10 +428,10 @@ async fn clear_live_component(state: Arc<ServerState>, component: CacheComponent
 
 /// Body for `admin` mode `rescan`. Re-indexes the working tree (or `paths`) in-process and,
 /// because it is one of the few genuinely slow operations, emits MCP progress (when the client
-/// supplies a token) and a completion logging notification.
+/// supplies a token); the summary counts are in the tool result.
 ///
 /// `peer` is `None` on the CLI path: a one-shot `basemind admin rescan` has no MCP peer to notify,
-/// so the notifications are skipped while the scan itself is identical.
+/// so the progress notifications are skipped while the scan itself is identical.
 async fn run_rescan(
     state: Arc<ServerState>,
     params: super::types::RescanParams,
@@ -489,6 +495,9 @@ async fn run_rescan(
         scanned: stats.scanned,
         updated: stats.updated,
         docs_indexed: stats.docs_indexed,
+        docs_degraded: stats.docs_degraded,
+        docs_text_fallback: stats.docs_text_fallback,
+        doc_timeouts: stats.doc_timeouts,
         removed: stats.removed,
         skipped_unchanged: stats.skipped_unchanged,
         skipped_no_lang: stats.skipped_no_lang,
@@ -504,6 +513,9 @@ struct RescanStats {
     scanned: usize,
     updated: usize,
     docs_indexed: usize,
+    docs_degraded: usize,
+    docs_text_fallback: usize,
+    doc_timeouts: usize,
     removed: usize,
     skipped_unchanged: usize,
     skipped_no_lang: usize,
@@ -528,6 +540,9 @@ async fn fetch_rescan_stats(
             scanned: report.scanned,
             updated: report.updated,
             docs_indexed: report.docs_indexed,
+            docs_degraded: report.docs_degraded,
+            docs_text_fallback: report.docs_text_fallback,
+            doc_timeouts: report.doc_timeouts,
             removed: report.removed,
             skipped_unchanged: 0,
             skipped_no_lang: 0,
@@ -539,6 +554,9 @@ async fn fetch_rescan_stats(
         scanned: report.stats.scanned,
         updated: report.stats.updated,
         docs_indexed: report.stats.docs_indexed,
+        docs_degraded: report.stats.docs_degraded,
+        docs_text_fallback: report.stats.docs_text_fallback,
+        doc_timeouts: report.stats.doc_timeouts,
         removed: report.stats.removed,
         skipped_unchanged: report.stats.skipped_unchanged,
         skipped_no_lang: report.stats.skipped_no_lang,

@@ -76,6 +76,10 @@ flooding your context — you pull the messages relevant to your task, not the w
 
 Keep posts concise — subject is a one-liner, body is a few sentences. No fluff, no emojis.
 
+To make a retried post safe, pass `idempotency_key` on `post`: a repeat with the same key returns the
+original `message_id` instead of storing a duplicate (a key is generated when omitted). The MCP relay
+also replays reads and keyed posts after a broker restart, so reuse the same key when you retry.
+
 ## Delivery and explicit waiting
 
 Do not build a polling loop. New-message notices are delivered once at the next supported host turn
@@ -112,6 +116,8 @@ didn't load; check the CLI before assuming silence. Use the `basemind-doctor` sk
 | `agents { mode: "register", … }` | `basemind agents register --name <handle>` | Record your handle. |
 | `agents { mode: "list" }` | `basemind agents list` | List active agents. |
 | `agents { mode: "wait" }` | `basemind agents wait [--thread …]` | Wait for a peer message. |
+| `agents { mode: "status" }` | `basemind agents status` | Active/stale agent counts, last maintenance. |
+| `agents { mode: "cleanup" }` | `basemind agents cleanup [--apply]` | Preview retention; MCP is preview-only, `--apply` is CLI-only. |
 
 ## Notes
 

@@ -118,6 +118,10 @@ impl ScanObserver for CollectObserver {
 /// parallelism.
 const RECOVERY_CLEAR_ADMITS: usize = 4;
 
+/// Scan workers allowed while embedding inline: more than the embed pool can serve only queue chunk
+/// data in memory.
+const EMBED_PASS_MAX_WORKERS: usize = 2;
+
 /// Floor on the drive chunk, independent of the worker count: below this the serial absorb pass
 /// dominates and the drive stops being a parallel scan at all.
 const MIN_BASE_CHUNK_ITEMS: usize = 1024;
@@ -190,7 +194,7 @@ where
     /// counts toward recovery.
     pub(crate) fn admit(&mut self) -> DrivePlan {
         match self.gate.admit() {
-            AdmitOutcome::WaitedOut => self.narrow(),
+            AdmitOutcome::WaitedOut | AdmitOutcome::Serialized => self.narrow(),
             AdmitOutcome::Throttled => self.clear_streak = 0,
             AdmitOutcome::Clear | AdmitOutcome::Disabled | AdmitOutcome::Unavailable => self.widen(),
         }
@@ -282,6 +286,11 @@ pub(crate) fn drive_scan(
     // later on the same thread. A `Cell` passes it across without either closure having to ~keep
     // borrow the governor, which only one of them may. ~keep
     let workers = Cell::new(pool_threads);
+    #[cfg(feature = "documents")]
+    drive
+        .filters
+        .doc_phase
+        .begin(std::time::Duration::from_secs(drive.filters.doc_phase_budget_secs));
     let mut ctx = DriveCtx {
         store,
         stats,
@@ -304,11 +313,19 @@ pub(crate) fn drive_scan(
         // the bytes a chunk touches are held by at most one worker each, never by the chunk.
         |_, _| 0,
         |ctx: &DriveCtx<'_>, chunk| {
-            let max_workers = if workers.get() >= pool_threads {
+            let mut max_workers = if workers.get() >= pool_threads {
                 0
             } else {
                 workers.get()
             };
+            // Inference serializes on the embed pool (two threads by default), so extra scan workers
+            // in the embedding pass only hold file and chunk data while they wait their turn.
+            if matches!(drive.embed, crate::scanner::EmbedMode::Inline) {
+                max_workers = match max_workers {
+                    0 => EMBED_PASS_MAX_WORKERS,
+                    n => n.min(EMBED_PASS_MAX_WORKERS),
+                };
+            }
             run_candidates(
                 chunk,
                 drive.root,
@@ -325,6 +342,17 @@ pub(crate) fn drive_scan(
         |ctx: &mut DriveCtx<'_>, produced| apply_outcomes(ctx, produced),
     );
 
+    #[cfg(feature = "documents")]
+    {
+        ctx.stats.abandoned_extractions = crate::extract::doc_guard::abandoned_extractions();
+        if ctx.stats.abandoned_extractions > 0 {
+            tracing::warn!(
+                abandoned_live = ctx.stats.abandoned_extractions,
+                abandoned_cap = drive.config.documents.max_abandoned_extractions,
+                "timed-out document extraction threads are still running"
+            );
+        }
+    }
     ctx.out
 }
 
@@ -341,6 +369,13 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
                 reused,
             } => {
                 ctx.stats.updated += 1;
+                if ctx
+                    .store
+                    .lookup(&o.path)
+                    .is_some_and(|prior| prior.extract_epoch < crate::extract::EXTRACT_EPOCH)
+                {
+                    ctx.stats.refreshed_extraction += 1;
+                }
                 if *had_errors {
                     ctx.stats.updated_with_warnings += 1;
                 }
@@ -349,6 +384,8 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
                 }
             }
             FileStatus::Unchanged => ctx.stats.skipped_unchanged += 1,
+            #[cfg(feature = "documents")]
+            FileStatus::DocUnchanged => ctx.stats.skipped_unchanged += 1,
             FileStatus::SkippedTooLarge { .. } => ctx.stats.skipped_too_large += 1,
             FileStatus::SkippedNonUtf8 => ctx.stats.skipped_non_utf8 += 1,
             FileStatus::SkippedNoLang => ctx.stats.skipped_no_lang += 1,
@@ -361,12 +398,33 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
                 ctx.stats.parse_timeouts += 1;
             }
             #[cfg(feature = "documents")]
-            FileStatus::DocIndexed { reused, .. } => {
+            FileStatus::DocIndexed {
+                reused,
+                degraded,
+                text_fallback,
+                ..
+            } => {
                 ctx.stats.docs_indexed += 1;
                 if *reused {
                     ctx.stats.reused_doc_extraction += 1;
                 }
+                if *degraded {
+                    ctx.stats.docs_degraded += 1;
+                }
+                if *text_fallback {
+                    ctx.stats.docs_text_fallback += 1;
+                }
+                ctx.store.remove_doc_tombstone(&o.path);
             }
+            #[cfg(feature = "documents")]
+            FileStatus::DocTimedOut => {
+                ctx.stats.extract_failed += 1;
+                ctx.stats.doc_timeouts += 1;
+            }
+            #[cfg(feature = "documents")]
+            FileStatus::DocTombstoned => ctx.stats.docs_tombstoned += 1,
+            #[cfg(feature = "documents")]
+            FileStatus::DocDeferred => ctx.stats.docs_deferred += 1,
         }
         if matches!(o.status, FileStatus::Updated { .. } | FileStatus::Unchanged) {
             ctx.out.seen.insert(o.path.clone());
@@ -374,14 +432,20 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
         // A `DocIndexed` status is set by exactly the `process_doc` arm that attaches a doc batch, ~keep
         // so the status is a faithful stand-in for a `doc_batch` this loop is about to take. ~keep
         #[cfg(feature = "documents")]
+        // A deferred document keeps whatever entry it already has: running out of budget is not a ~keep
+        // verdict on the file, so the stale purge must not drop its rows until the next scan retries. ~keep
         if matches!(
             o.status,
-            FileStatus::DocIndexed { .. } | FileStatus::Updated { .. } | FileStatus::Unchanged
+            FileStatus::DocIndexed { .. } | FileStatus::DocUnchanged | FileStatus::DocDeferred
         ) {
             ctx.out.doc_seen.insert(o.path.clone());
         }
         if let Some(entry) = o.upsert.take() {
             ctx.store.upsert(&o.path, entry);
+        }
+        #[cfg(feature = "documents")]
+        if let Some(tombstone) = o.doc_tombstone.take() {
+            ctx.store.upsert_doc_tombstone(&o.path, tombstone);
         }
         #[cfg(feature = "documents")]
         if let Some(entry) = o.doc_upsert.take() {

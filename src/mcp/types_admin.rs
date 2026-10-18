@@ -24,16 +24,15 @@ use crate::path::RelPath;
 pub struct AdminParams {
     /// Which operation to run.
     pub mode: AdminMode,
-    /// `rescan` only. Repo-relative paths to re-index incrementally. Omit to walk the whole
-    /// working tree. Forward-slash, no leading `/`.
+    /// `rescan`: repo-relative paths to re-index (omit for the whole tree).
     #[serde(default)]
     pub paths: Option<Vec<String>>,
-    /// `rescan` only. Force a complete working-tree re-index even when `paths` is supplied
-    /// (full wins). Use when the index is stale or reports "no indexed files".
+    /// `rescan`: force a complete re-index; wins over `paths`.
     #[serde(default)]
     pub full: Option<bool>,
     /// `telemetry` only. Aggregation window: `today` (default), `1h`, `24h`, `all`.
     #[serde(default)]
+    #[schemars(extend("enum" = ["today", "1h", "24h", "all"]))]
     pub window: Option<String>,
     /// `telemetry` only. Exact tool-name filter, e.g. `"code"` or `"admin:rescan"`.
     #[serde(default)]
@@ -42,8 +41,7 @@ pub struct AdminParams {
     /// `views:<name>` for a single non-live view. Required by that mode.
     #[serde(default)]
     pub component: Option<String>,
-    /// `cache_clear` only. Required gate for the destructive components that back the live code
-    /// map. Ignored for the non-live caches.
+    /// `cache_clear`: required for components backing the live code map.
     #[serde(default)]
     pub confirm: Option<bool>,
     /// `compress` (prose input) and `checkpoint` (session transcript). Required by `checkpoint`;
@@ -54,13 +52,14 @@ pub struct AdminParams {
     /// Mutually exclusive with `text`.
     #[serde(default)]
     pub path: Option<RelPath>,
-    /// `compress` only. Reduction intensity: `off|light|moderate|aggressive|maximum`.
+    /// `compress`: `off|light|moderate|aggressive|maximum`.
     #[serde(default)]
+    #[schemars(extend("enum" = ["off", "light", "moderate", "aggressive", "maximum"]))]
     pub level: Option<String>,
     /// `compress` only. When true (the default), code blocks inside prose are left intact.
     #[serde(default)]
     pub preserve_code: Option<bool>,
-    /// `compress` only. Soft token budget hint, echoed back; it does not hard-cap the output.
+    /// `compress`: soft token budget hint; not a hard cap.
     #[serde(default)]
     pub target_tokens: Option<u32>,
     /// `delta` only. Previously seen content. Required by that mode.
@@ -128,7 +127,7 @@ pub(super) struct CacheStatsResponse {
     pub other_bytes: u64,
     /// Total blob files on disk (every suffix counts as one file).
     pub blob_count: usize,
-    /// Blob files whose hex stem is referenced by no view — reclaimable by `cache_gc`. Meaningful
+    /// Blob files whose hex stem is referenced by no view — reclaimable by `basemind cache gc`. Meaningful
     /// only when `blob_accounting_ok` is `true`.
     pub orphan_blob_count: usize,
     /// Whether orphan accounting ran. `false` = a view index was unreadable (stale schema /
@@ -183,6 +182,9 @@ pub(super) struct LastGcResponse {
     pub hot_workspaces_evicted: usize,
     /// Workspaces skipped because they were locked.
     pub locked_workspaces_skipped: usize,
+    /// Workspaces kept although the cache is over budget: locked, most recently used, or built
+    /// within the grace window.
+    pub protected_workspaces: Vec<crate::store_gc_protect::ProtectedWorkspace>,
 }
 
 impl From<crate::store_gc_budget::GcState> for LastGcResponse {
@@ -204,6 +206,7 @@ impl From<crate::store_gc_budget::GcState> for LastGcResponse {
             cache_bytes_after: s.cache_bytes_after,
             hot_workspaces_evicted: s.hot_workspaces_evicted,
             locked_workspaces_skipped: s.locked_workspaces_skipped,
+            protected_workspaces: s.protected_workspaces,
         }
     }
 }

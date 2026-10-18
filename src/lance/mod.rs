@@ -11,6 +11,7 @@
 //! can share the same sync API surface without each callsite worrying about
 //! runtime context.
 
+mod batch;
 #[cfg(feature = "documents")]
 mod doc_links;
 /// Documents-tier row/schema tests, likewise out of line.
@@ -28,6 +29,8 @@ mod store_tests;
 /// Test-only inherent methods; out of line by the line cap.
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
+
+pub use batch::{BATCH_MAX_DOCS, BATCH_MAX_ROWS, PendingBatch, SCAN_RETENTION};
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;
@@ -184,6 +187,8 @@ struct LanceStoreInner {
     dim: u16,
     embedding_model: String,
     dir: PathBuf,
+    /// Commits per table since the last maintenance pass; drives bounded version retention.
+    commits: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LanceStoreInner {
@@ -246,6 +251,7 @@ impl LanceStore {
                 dim,
                 embedding_model: embedding_model.to_string(),
                 dir: dir.to_path_buf(),
+                commits: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -282,6 +288,7 @@ impl LanceStore {
                 .delete(&predicate)
                 .await
                 .with_context(|| format!("delete existing rows for {scope}/{path}"))?;
+            self.after_commit(&table, DOCUMENTS_TABLE).await;
             if rows.is_empty() {
                 return Ok(());
             }
@@ -291,6 +298,7 @@ impl LanceStore {
                 .execute()
                 .await
                 .with_context(|| format!("insert {} documents rows", rows.len()))?;
+            self.after_commit(&table, DOCUMENTS_TABLE).await;
             anyhow::Ok(())
         })
     }
@@ -310,6 +318,7 @@ impl LanceStore {
             table.delete(&predicate).await.context("delete previous memory entry")?;
             let batch = build_memory_batch(self.inner.dim, std::slice::from_ref(&row))?;
             table.add(batch).execute().await.context("insert memory row")?;
+            self.after_commit(&table, MEMORY_TABLE).await;
             anyhow::Ok(())
         })
     }
@@ -438,6 +447,7 @@ impl LanceStore {
                 .delete(&predicate)
                 .await
                 .with_context(|| format!("delete existing code chunks for {scope}/{path}"))?;
+            self.after_commit(&table, schema::CODE_CHUNKS_TABLE).await;
             if rows.is_empty() {
                 return Ok(());
             }
@@ -447,6 +457,7 @@ impl LanceStore {
                 .execute()
                 .await
                 .with_context(|| format!("insert {} code_chunks rows", rows.len()))?;
+            self.after_commit(&table, schema::CODE_CHUNKS_TABLE).await;
             anyhow::Ok(())
         })
     }
@@ -473,6 +484,67 @@ impl LanceStore {
                 .delete(&predicate)
                 .await
                 .with_context(|| format!("delete code chunks for {scope}/{path}"))?;
+            anyhow::Ok(())
+        })
+    }
+
+    /// Delete every `code_chunks` row of `paths` in `scope`, batching the paths into `IN (...)`
+    /// predicates so a purge of N files is a handful of deletes rather than N table versions.
+    #[cfg(feature = "code-search")]
+    pub fn delete_code_chunks_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
+        self.delete_paths_in(schema::CODE_CHUNKS_TABLE, "path", scope, paths)
+    }
+
+    /// Delete every `documents` row of `paths` in `scope`; the batched counterpart of
+    /// [`Self::replace_document`] with no replacement rows.
+    pub fn delete_documents_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
+        self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths)
+    }
+
+    /// Delete every `doc_links` row of the given documents (ADR-0008) in bulk.
+    #[cfg(feature = "documents")]
+    pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
+        self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
+    }
+
+    pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {
+        // Each batch is one delete transaction (a new table version plus a scan of `path`), so a
+        // large purge is dominated by the batch COUNT; 2000 literals keep the predicate small.
+        const BATCH: usize = 2_000;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(table_name)
+                .execute()
+                .await
+                .with_context(|| format!("open {table_name} table"))?;
+            // Nothing stored for this scope (the common case on the first scan after an upgrade, or
+            // with embeddings off): skip the N/200 deletes, each of which scans the table and may
+            // commit a table version.
+            let in_scope = table
+                .count_rows(Some(format!("scope = '{}'", escape_sql_literal(scope))))
+                .await
+                .with_context(|| format!("count {table_name} rows in {scope}"))?;
+            if in_scope == 0 {
+                return anyhow::Ok(());
+            }
+            for batch in paths.chunks(BATCH) {
+                let list = batch
+                    .iter()
+                    .map(|p| format!("'{}'", escape_sql_literal(p)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let predicate = format!("scope = '{}' AND {key_col} IN ({list})", escape_sql_literal(scope));
+                table
+                    .delete(&predicate)
+                    .await
+                    .with_context(|| format!("delete {} paths from {table_name} in {scope}", batch.len()))?;
+                self.after_commit(&table, table_name).await;
+            }
             anyhow::Ok(())
         })
     }
@@ -911,3 +983,7 @@ pub fn now_micros() -> i64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

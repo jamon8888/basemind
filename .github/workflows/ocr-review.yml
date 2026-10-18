@@ -71,7 +71,16 @@ permissions:
 jobs:
   code-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    env:
+      # Pinned twice on purpose: the isolated-prefix install below and the
+      # action's ocr_version input must agree, and one variable keeps them so.
+      OCR_VERSION: 1.12.13
+    # A giant sync PR (558 files) outlasted 30, then 55, minutes at
+    # concurrency 2: each raise cancelled a real review mid-flight, because
+    # `--format json` prints nothing until the whole review ends there is no
+    # in-log pace to tell "slow" from "almost done". Give the ceiling real
+    # headroom and stream progress so the pace is observable while it runs.
+    timeout-minutes: 300
     # Two gates. For `pull_request`, only same-repository PRs are reviewed:
     # GitHub withholds secrets from fork PRs on this event, so reviewing one
     # would fail on a missing secret instead of skipping. For `issue_comment`,
@@ -100,9 +109,28 @@ jobs:
         )
       )
     steps:
+      # The runner's shared npm prefix is not stable: /usr/local/bin/ocr resolved
+      # for a dozen `ocr config set` calls and then lost its target mid-step
+      # (MODULE_NOT_FOUND) while the image's npm lifecycle kept rewriting the
+      # shared prefix after its install printed completion. Install to a private
+      # prefix and put it first on PATH so every `ocr` the composite action
+      # invokes is this pinned copy, untouched by the image or other npm churn.
+      - name: Install OpenCodeReview to an isolated prefix
+        run: |
+          npm install -g --prefix "$HOME/.ocr" "@alibaba-group/open-code-review@${{ env.OCR_VERSION }}"
+          echo "$HOME/.ocr/bin" >> "$GITHUB_PATH"
+          "$HOME/.ocr/bin/ocr" version
+
       - name: Seed OCR prompt ceiling
         run: |
           mkdir -p ~/.opencodereview
+          # Only the 27B was measured. A lower ceiling is required for any model
+          # with a smaller context window — frognano-4b tops out at 24576 and
+          # would need roughly 16000. Thinking-disable does not belong in this
+          # file: the composite action owns the llm.extra_body config key and
+          # overwrites any seeded value from its llm_extra_body input below, so
+          # a seeded llm_extra_body key here would be an unknown config key that
+          # is silently ignored.
           printf '%s\n' '{"max_tokens": 160000}' > ~/.opencodereview/config.json
 
       - name: Resolve PR refs
@@ -127,19 +155,26 @@ jobs:
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
           llm_model: ${{ vars.OCR_LLM_MODEL }}
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC }}
+          # Disables response thinking on the serving model: the two shapes
+          # cover both request schemas the endpoint may honour (`thinking.type`
+          # and the Qwen-style `chat_template_kwargs`); an unrecognised field is
+          # ignored by the OpenAI-compatible server. The action writes this to
+          # llm.extra_body and folds it into the checkpoint fingerprint.
+          llm_extra_body: '{"thinking": {"type": "disabled"}, "chat_template_kwargs": {"enable_thinking": false}}'
           # Pin the CLI to match the pinned action so a review is repeatable.
-          ocr_version: 1.12.13
+          ocr_version: ${{ env.OCR_VERSION }}
           # One machine serves the model; the default of 8 concurrent file
           # groups saturates it.
           review_concurrency: "2"
           # Passed as `--rule`, which outranks both the project and the system
           # rule layer. The file must be committed for this step to succeed.
           rule: .opencodereview/rule.json
-          # Only the 27B was measured. A lower ceiling is required for any model
-          # with a smaller context window — frognano-4b tops out at 24576 and
-          # would need roughly 16000.
           sticky_summary: "true"
           incremental: "false"
+          # `--format json` reports only at the end; streaming emits per-group
+          # progress lines so a long review shows its pace instead of a
+          # silent wall before the job timeout.
+          stream_progress: "true"
           upload_artifacts: "true"
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}

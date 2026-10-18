@@ -1,12 +1,11 @@
-//! Server→client notifications: MCP logging (`notifications/message`) and progress
-//! (`notifications/progress`).
+//! Server→client progress notifications (`notifications/progress`).
 //!
-//! Both are best-effort and fire-and-forget — a delivery error is logged via `tracing` and
-//! swallowed so a chatty client connection can never fail a tool call. Logging respects the
-//! client's `logging/setLevel`: the minimum severity the client asked for is held on
-//! [`super::ServerState`] as an atomic ordinal and checked before every emit.
-
-use std::sync::atomic::{AtomicU8, Ordering};
+//! Best-effort and fire-and-forget — a delivery error is logged via `tracing` and swallowed so a
+//! chatty client connection can never fail a tool call. Upstream deprecated MCP logging
+//! (SEP-2577) and stopped advertising it; this fork keeps the `logging/setLevel` handler, which
+//! records the client's minimum severity on `super::ServerState::log_level` as an ordinal (see
+//! [`level_ordinal`]), and the rescan path emits a threshold-gated `rescan_complete` notification
+//! through [`emit_log`].
 
 use rmcp::Peer;
 use rmcp::RoleServer;
@@ -14,6 +13,7 @@ use rmcp::model::ProgressNotificationParam;
 #[allow(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Severity ordinal (RFC 5424 order: lower = more verbose). `logging/setLevel L` means "send me
 /// messages at severity `L` and above", so a message is emitted when its ordinal `>=` the stored
@@ -70,7 +70,11 @@ pub(super) async fn emit_progress(
     total: Option<f64>,
     message: impl Into<String>,
 ) {
-    // `ProgressNotificationParam` is #[non_exhaustive] in rmcp 2.1; build it via the constructor.
+    let message: String = message.into();
+    // Inside a task-offloaded call, mirror the message onto the task's `statusMessage` so a client
+    // polling `tasks/get` sees what a progress-token subscriber sees.
+    let _ = super::tasks::CURRENT_TASK.try_with(|task| task.set_status_message(message.clone()));
+    // `ProgressNotificationParam` is #[non_exhaustive] in rmcp 3.x; build it via the constructor.
     let mut param = ProgressNotificationParam::new(token, progress).with_message(message);
     if let Some(total) = total {
         param = param.with_total(total);

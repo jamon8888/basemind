@@ -402,6 +402,33 @@ pub fn phys_footprint() -> Option<u64> {
     memory_reading().map(|reading| reading.used_bytes)
 }
 
+/// The memory *this process* occupies, in bytes — the per-process counterpart of
+/// [`phys_footprint`] for callers whose budget is scoped to one process, namely
+/// [`crate::backpressure::FootprintGate`].
+///
+/// On macOS and Windows [`phys_footprint`] already reads this process; on Linux it reads the
+/// whole cgroup the process runs in, because the OOM killer strikes the cgroup. That is the
+/// right signal for a shared ceiling and the wrong one for a per-process scan budget: on a
+/// shared cgroup — a CI job running cargo and several test binaries, or a desktop user slice —
+/// the number is dominated by other processes, and the gate false-trips, throttling a healthy
+/// scan to one file per admission wait. This entry point keeps macOS's compression-aware
+/// footprint and gives Linux the process's own resident set (`/proc/self/statm`).
+///
+/// The Linux trade-off is plain RSS: it reads low when the OS swaps this process's pages out,
+/// where a working-set reading would not. Under that condition the gate admits — the same
+/// best-effort direction as an unreadable sample — rather than throttling on memory the
+/// process does not own.
+pub fn process_rss() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        current_rss()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        phys_footprint()
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------------------
@@ -689,5 +716,12 @@ mod tests {
     fn phys_footprint_reports_positive_bytes() {
         let footprint = phys_footprint().expect("phys_footprint should be readable here");
         assert!(footprint > 0, "phys_footprint must be positive, got {footprint}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn process_rss_reports_positive_bytes() {
+        let rss = process_rss().expect("process_rss should be readable here");
+        assert!(rss > 0, "process_rss must be positive, got {rss}");
     }
 }

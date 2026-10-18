@@ -131,6 +131,57 @@ pub fn render_summary(w: &mut AutoStream<std::io::Stdout>, stats: &ScanStats, ve
         let docs_line = pair("docs_indexed", stats.docs_indexed, style_ok);
         let _ = writeln!(w, "{docs_line}");
     }
+    if stats.docs_degraded > 0 || stats.doc_timeouts > 0 {
+        let _ = writeln!(
+            w,
+            "{degraded}  {timeouts} (large text documents use linear chunking; see [documents] markdown_chunk_max_bytes)",
+            degraded = pair("docs_degraded", stats.docs_degraded, style_warn),
+            timeouts = pair("doc_timeouts", stats.doc_timeouts, style_fail),
+        );
+    }
+    if stats.docs_text_fallback > 0 {
+        let _ = writeln!(
+            w,
+            "{fallback} (of docs_degraded: structured extraction failed, so the file was read as plain text)",
+            fallback = pair("docs_text_fallback", stats.docs_text_fallback, style_warn),
+        );
+    }
+    if stats.docs_tombstoned > 0 || stats.docs_deferred > 0 || stats.abandoned_extractions > 0 {
+        let _ = writeln!(
+            w,
+            "{tombstoned}  {deferred}  {abandoned} (see [documents] phase_budget_secs, max_abandoned_extractions)",
+            tombstoned = pair("docs_tombstoned", stats.docs_tombstoned, style_warn),
+            deferred = pair("docs_deferred", stats.docs_deferred, style_warn),
+            abandoned = pair("abandoned_extractions", stats.abandoned_extractions, style_warn),
+        );
+    }
+    if stats.tier_migrated > 0 || stats.refreshed_extraction > 0 {
+        let _ = writeln!(
+            w,
+            "{migrated}  {refreshed}",
+            migrated = pair("tier_migrated", stats.tier_migrated, style_warn),
+            refreshed = pair("refreshed", stats.refreshed_extraction, style_warn),
+        );
+    }
+    if stats.skipped_too_large > 0 {
+        let too_large = pair("too_large", stats.skipped_too_large, style_warn);
+        let _ = writeln!(
+            w,
+            "{too_large} (over [scan] max_file_bytes, or [documents] max_file_bytes for documents)"
+        );
+    }
+}
+
+/// Print what the post-scan blob cleanup reclaimed. Silent when nothing was orphaned.
+pub fn render_cleanup(w: &mut AutoStream<std::io::Stdout>, report: &crate::store_gc::GcReport) {
+    if report.removed == 0 {
+        return;
+    }
+    let _ = writeln!(
+        w,
+        "cleanup: reclaimed {} orphaned blob(s), {} bytes",
+        report.removed, report.bytes_freed
+    );
 }
 
 /// Print a one-line summary of the grammar bootstrap.
@@ -286,6 +337,19 @@ fn row_for(res: &FileResult, verbosity: Verbosity) -> Option<Row<'_>> {
                 })
             }
         }
+        #[cfg(feature = "documents")]
+        FileStatus::DocUnchanged => {
+            if v == Verbosity::Verbose {
+                Some(Row {
+                    symbol: '·',
+                    label: "same",
+                    style: Style::new().dimmed(),
+                    detail: String::new(),
+                })
+            } else {
+                None
+            }
+        }
         FileStatus::Unchanged => {
             if v == Verbosity::Verbose {
                 Some(Row {
@@ -370,6 +434,34 @@ fn row_for(res: &FileResult, verbosity: Verbosity) -> Option<Row<'_>> {
             style: Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red))),
             detail: format!("(read failed: {msg})"),
         }),
+        #[cfg(feature = "documents")]
+        FileStatus::DocTimedOut => Some(Row {
+            symbol: '✗',
+            label: "fail",
+            style: Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red))),
+            detail: "(document extraction timed out; see [documents] extraction_timeout_secs)".to_string(),
+        }),
+        #[cfg(feature = "documents")]
+        FileStatus::DocTombstoned => {
+            if v == Verbosity::Verbose {
+                Some(Row {
+                    symbol: '·',
+                    label: "skip",
+                    style: Style::new().dimmed(),
+                    detail: "(timed out before, unchanged; edit the file or raise [documents] extraction_timeout_secs to retry)".to_string(),
+                })
+            } else {
+                None
+            }
+        }
+        #[cfg(feature = "documents")]
+        FileStatus::DocDeferred => Some(Row {
+            symbol: '·',
+            label: "defer",
+            style: Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
+            detail: "(document deferred to the next scan: phase budget spent or too many stuck extractions)"
+                .to_string(),
+        }),
         FileStatus::ExtractFailed { msg } => Some(Row {
             symbol: '✗',
             label: "fail",
@@ -381,11 +473,20 @@ fn row_for(res: &FileResult, verbosity: Verbosity) -> Option<Row<'_>> {
             chunk_count,
             embedding_dim,
             reused,
+            degraded,
+            text_fallback,
         } => {
             if v == Verbosity::Quiet {
                 None
             } else {
                 let cached = if *reused { ", cached" } else { "" };
+                let cached = if *text_fallback {
+                    format!("{cached}, read as plain text after a parse failure")
+                } else if *degraded {
+                    format!("{cached}, linear chunking")
+                } else {
+                    cached.to_string()
+                };
                 Some(Row {
                     symbol: '✓',
                     label: "doc",
