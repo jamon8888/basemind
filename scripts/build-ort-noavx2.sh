@@ -77,7 +77,8 @@ git submodule update --init --recursive --depth 1
 # to AlmaLinux 8's 3.6. Pick ORT_PYTHON if given, else the newest
 # interpreter the image bundles under /opt/python (version-sorted so cp313
 # wins over cp39), else any python3 >= 3.10; build.py drives the rest of
-# the toolchain through sys.executable.
+# the toolchain through sys.executable. --allow_running_as_root: the CI
+# container runs as root and build.py guards against that by default.
 pick_python() {
   local cands=() c
   [ -n "${ORT_PYTHON:-}" ] && cands+=("$ORT_PYTHON")
@@ -104,6 +105,7 @@ echo "ONNX build.py python: $PY ($("$PY" --version 2>&1))"
   --build_shared_lib \
   --parallel "$(nproc)" \
   --skip_tests \
+  --allow_running_as_root \
   --cmake_extra_defines \
   onnxruntime_ENABLE_CPUINFO=ON \
   onnxruntime_USE_AVX=OFF \
