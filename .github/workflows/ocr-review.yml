@@ -75,9 +75,12 @@ jobs:
       # Pinned twice on purpose: the isolated-prefix install below and the
       # action's ocr_version input must agree, and one variable keeps them so.
       OCR_VERSION: 1.12.13
-    # A giant sync PR (500+ files) reviews for longer than 30 minutes at
-    # concurrency 2; the timeout cancelled a real review mid-flight.
-    timeout-minutes: 55
+    # A giant sync PR (558 files) outlasted 30, then 55, minutes at
+    # concurrency 2: each raise cancelled a real review mid-flight, because
+    # `--format json` prints nothing until the whole review ends there is no
+    # in-log pace to tell "slow" from "almost done". Give the ceiling real
+    # headroom and stream progress so the pace is observable while it runs.
+    timeout-minutes: 300
     # Two gates. For `pull_request`, only same-repository PRs are reviewed:
     # GitHub withholds secrets from fork PRs on this event, so reviewing one
     # would fail on a missing secret instead of skipping. For `issue_comment`,
@@ -168,6 +171,10 @@ jobs:
           rule: .opencodereview/rule.json
           sticky_summary: "true"
           incremental: "false"
+          # `--format json` reports only at the end; streaming emits per-group
+          # progress lines so a long review shows its pace instead of a
+          # silent wall before the job timeout.
+          stream_progress: "true"
           upload_artifacts: "true"
           base_ref: ${{ steps.pr-context.outputs.base_ref }}
           head_sha: ${{ steps.pr-context.outputs.head_sha }}
