@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [0.34.0] - 2026-10-18
+
+> **Minor release — an upstream sync, the self-scoped scan gate, and release-pipeline
+> repairs.** `RELEASE_MINOR` goes 33 → 34, so the first scan after upgrading pays one full
+> re-index; `Store::open` resets each view in place and the next scan rebuilds it — the
+> content-addressed blob store is never deleted. Published GitHub-release-only (binaries and
+> checksums); npm, PyPI, crates.io and Homebrew keep their previous version until the next
+> full publish.
+
+### Changed
+
+- **Upstream sync: Goldziher/basemind `v0.29.3` → `449aa8f0` (2026-10-13), 1,202 commits.**
+  Highlights now in tree: document extraction runs on a per-phase budget (abandoned extractor
+  threads capped, timed-out documents tombstoned) with `docs_degraded`/`doc_timeouts`
+  forwarded through the daemon, comms and MCP rescan reports; text-like documents rejected by
+  xberg on a parse or security limit retry as `text/plain`; linear-chunker cutovers rise to
+  1 MiB markdown / 4 MiB plain text from release-build measurements; git responses cap commit
+  bodies and budget commit lists by `max_tokens`, plus a `git show` mode; lance
+  document/code/doc_links writes batch (bench added) and locked, most-recently-used and
+  freshly built workspaces are protected from cache-budget eviction; the resolve pass gates
+  on the footprint ceiling with 200 ms sampling while stack-graph stitcher phases poll the
+  budget mid-phase; Agent Plugins 1.0.0 ships; vendored forks move to tree-sitter 0.27; a
+  `Stop` that ignores a predecessor daemon force-terminates it.
+- **Release builds and plugin manifests are versioned in lockstep.** The twelve surfaces the
+  publish guard checks — Cargo, root and npm-package `package.json`, both pip surfaces, the
+  Hermes package, the OpenCode, Claude, Codex and Cursor plugin manifests, the Claude
+  marketplace entry and `gemini-extension.json` — move together to 0.34.0, along with the
+  unguarded twins the tree also carries (the Kimi manifest, the ai-rulez config and the
+  Hermes plugin's own `plugin.yaml`/`__init__.py` copies).
+
+### Fixed
+
+- **The drive gate measures the process, not the cgroup.** On Linux `FootprintGate` sampled
+  the whole cgroup, so foreign memory (cargo, a sibling binary) counted against the scan
+  budget: admissions fell to one file per five seconds and a CI job hung thirty minutes
+  awaiting a SIGTERM the gate kept deferring. The gate now samples `/proc/self/statm`
+  (self-scoped); macOS keeps its compression-aware mach footprint, the cgroup-derived ceiling
+  from the 1 GiB job and the `memory` reporter line are unchanged, and with a lone daemon the
+  two readings coincide.
+- **Vault parameter parity is declared, not drifted.** `basemind vault`'s flat `VaultParams`
+  cannot mirror per-mode CLI flags (`--map` reads stdin), so the eight divergent rows are
+  explicit harness waivers instead of a red suite.
+- **OpenCodeReview's three failure modes.** The thinking-disable extra body travels through
+  the action's own `llm_extra_body` input in both serving shapes (`thinking.type` and
+  `chat_template_kwargs`); the CLI installs into an isolated npm prefix so a runner rewriting
+  the shared `/usr/local/bin` mid-step can no longer phantom it away; and the review ceiling
+  (300 minutes, progress streamed) outlasts a 558-file diff instead of being killed at the
+  halfway mark.
+- **The no-AVX2 release container pulls again.** Its manylinux image was pinned by digest to
+  a manifest quay.io has since pruned (`manifest unknown`), which made the required
+  `-noavx2` asset missing and left every release as a draft; it now floats on `:latest` like
+  the stock legs, whose glibc-floor audit still catches any drift.
+
 ## [0.33.1] - 2026-10-10
 
 > **Patch release — the Linux ARM64 binary and a GitHub-only publish mode.** No index migration:

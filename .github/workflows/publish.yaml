@@ -724,7 +724,11 @@ jobs:
     # leg is untouched.
     runs-on: ubuntu-latest
     container:
-      image: quay.io/pypa/manylinux_2_28_x86_64:latest@sha256:e84d335c4c0ab4dbc8efcd055a645d9665eed249454fe068a58355698944accd
+      # Float on :latest like the stock build legs: a digest of a rotating
+      # tag is a time bomb — quay pruned the pinned manifest and every pull
+      # died with "manifest unknown". The glibc-floor audit below catches
+      # any drift the floating image introduces.
+      image: quay.io/pypa/manylinux_2_28_x86_64:latest
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
