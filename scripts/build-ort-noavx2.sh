@@ -71,7 +71,33 @@ git submodule update --init --recursive --depth 1
 # flatbuffers >= 23.5.9 over fetching v23.5.26 — dev machines with Android SDK
 # installed resolve the emulator's flatbuffers v25.1, which breaks the
 # checked-in v23-generated headers (static_assert failure).
-python3 tools/ci_build/build.py \
+#
+# build.py needs Python >= 3.7 (`from __future__ import annotations`), but the
+# manylinux container's PATH resolves `python3` to AlmaLinux 8's 3.6, where
+# that import is a SyntaxError. Pick ORT_PYTHON if given, else the newest
+# interpreter the image bundles under /opt/python, else any python3 >= 3.7;
+# build.py drives the rest of the toolchain through sys.executable.
+pick_python() {
+  local cands=() c
+  [ -n "${ORT_PYTHON:-}" ] && cands+=("$ORT_PYTHON")
+  while IFS= read -r c; do cands+=("$c"); done < <(ls -d /opt/python/cp3*/bin/python3 2>/dev/null | sort -r)
+  cands+=(python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3)
+  for c in "${cands[@]}"; do
+    if { command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; } &&
+      "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' 2>/dev/null; then
+      printf '%s\n' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+PY="$(pick_python)" || {
+  echo "no Python >= 3.7 found for ONNX build.py" >&2
+  exit 1
+}
+echo "ONNX build.py python: $PY ($("$PY" --version 2>&1))"
+"$PY" -m pip install --quiet --disable-pip-version-check pyyaml numpy
+"$PY" tools/ci_build/build.py \
   --build_dir "$BUILD" \
   --config Release \
   --build_shared_lib \
