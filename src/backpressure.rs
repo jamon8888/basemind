@@ -22,7 +22,7 @@
 //!   on an idle process can never free memory.
 //!
 //! The gate holds no global state: the scanner constructs one per admit point from the
-//! injected [`Config`](crate::config), sampling [`crate::sysres::phys_footprint`]. Tests
+//! injected [`Config`](crate::config), sampling [`crate::sysres::process_rss`]. Tests
 //! inject a stub sampler to drive the over-then-under transition deterministically without
 //! touching real memory.
 
@@ -140,7 +140,7 @@ where
 
 impl FootprintGate {
     /// Construct a gate for the `[resources] max_footprint_mb` setting, sampling the real
-    /// process footprint via [`crate::sysres::phys_footprint`].
+    /// process footprint via [`crate::sysres::process_rss`].
     ///
     /// The setting is resolved here rather than by the caller because auto mode has to consult
     /// the environment — see [`MaxFootprint::resolve_mb`]. That sample is rate-limited inside
@@ -148,7 +148,7 @@ impl FootprintGate {
     /// (`"off"`, or auto with no detectable limit) yields a disabled gate whose
     /// [`admit`](FootprintGate::admit) is a no-op.
     pub fn new(setting: MaxFootprint) -> Self {
-        FootprintGate::with_sampler(setting.resolve_mb(), crate::sysres::phys_footprint)
+        FootprintGate::with_sampler(setting.resolve_mb(), crate::sysres::process_rss)
     }
 }
 

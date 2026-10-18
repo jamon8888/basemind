@@ -88,6 +88,7 @@ const GRAPH_KNOBS: &str =
     "TODO parity: graph traversal knob not exposed on the CLI; the command runs with the MCP default";
 const INVERTED: &str = "CLI spells the negation (`--no-X`) of the MCP boolean `X`";
 const STDIN: &str = "CLI reads this from stdin, MCP takes it as a required parameter";
+const VAULT_RUNTIME_REQUIRED: &str = "the MCP field rides the flat VaultParams object as optional and the mode validates it at runtime; the CLI declares the flag required up front";
 
 pub fn all() -> Vec<Exception> {
     vec![
@@ -198,5 +199,18 @@ pub fn all() -> Vec<Exception> {
         ),
         required("delta", "new", STDIN),
         required("detect-waste", "log", STDIN),
+        // ---- vault: one flat MCP parameter object vs per-mode CLI flags ----
+        mcp_only(
+            "vault decrypt",
+            "map",
+            "one flat VaultParams object serves all five modes; decrypt reads encrypted_blob and passphrase only, so the CLI has no inert --map flag",
+        ),
+        required("vault encrypt", "map", STDIN),
+        required("vault encrypt", "passphrase", VAULT_RUNTIME_REQUIRED),
+        required("vault find", "map", STDIN),
+        required("vault find", "query", VAULT_RUNTIME_REQUIRED),
+        required("vault forget", "map", STDIN),
+        required("vault forget", "query", VAULT_RUNTIME_REQUIRED),
+        required("vault inspect", "map", STDIN),
     ]
 }

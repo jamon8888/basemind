@@ -75,7 +75,7 @@ pub struct ResourcesConfig {
     ///
     /// The best-effort backpressure gate
     /// ([`crate::backpressure::FootprintGate`]) samples
-    /// [`crate::sysres::phys_footprint`] at each admit point and parks the
+    /// [`crate::sysres::process_rss`] at each admit point and parks the
     /// worker while the process is over the ceiling, shaving the scan's peak.
     /// It stays best-effort: an unreadable sample or a sustained overshoot
     /// admits anyway to guarantee forward progress, so the ceiling shapes the
