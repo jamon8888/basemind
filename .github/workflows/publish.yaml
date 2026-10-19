@@ -889,7 +889,10 @@ jobs:
           # ldd can never list it (the macOS twin builds the same way). Prove
           # the other side of the chain instead — the binary carries the
           # dlopen target name, and the RUNPATH/ctypes checks below resolve it.
-          strings "$dir/basemind" | grep -q "libonnxruntime" || {
+          # grep -a directly on the file: `strings | grep -q` dies under
+          # `set -o pipefail` (grep -q exits on first match, strings gets
+          # SIGPIPE, pipeline fails even when the match is there).
+          grep -aq "libonnxruntime" "$dir/basemind" || {
             echo "::error::basemind binary has no libonnxruntime runtime reference"; exit 1
           }
           readelf -d "$dir/basemind" | grep -q "RUNPATH.*\$ORIGIN/lib" || {
