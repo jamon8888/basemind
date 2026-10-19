@@ -883,10 +883,14 @@ jobs:
           "$dir/basemind" --version
           test -f "$dir/lib/libonnxruntime.so.1"
           # ponytail: no embedding session here on purpose — that needs a model
-          # download; linkage proof (NEEDED/RPATH/SONAME + real dlopen) is the
-          # deterministic gate that blocks a broken bundle before publish.
-          ldd "$dir/basemind" | grep -q "libonnxruntime" || {
-            echo "::error::basemind does not link the bundled libonnxruntime"; ldd "$dir/basemind"; exit 1
+          # download; linkage proof (dlopen name/RPATH/SONAME + real dlopen) is
+          # the deterministic gate that blocks a broken bundle before publish.
+          # ort-dynamic is load-dynamic: no DT_NEEDED entry exists for ORT, so
+          # ldd can never list it (the macOS twin builds the same way). Prove
+          # the other side of the chain instead — the binary carries the
+          # dlopen target name, and the RUNPATH/ctypes checks below resolve it.
+          strings "$dir/basemind" | grep -q "libonnxruntime" || {
+            echo "::error::basemind binary has no libonnxruntime runtime reference"; exit 1
           }
           readelf -d "$dir/basemind" | grep -q "RUNPATH.*\$ORIGIN/lib" || {
             echo "::error::basemind RUNPATH missing \$ORIGIN/lib"; readelf -d "$dir/basemind"; exit 1
