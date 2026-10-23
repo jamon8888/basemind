@@ -8,7 +8,7 @@ use super::{PiiEntity, RiskLevel};
 /// High legal/financial risk and secrets sit at 0.95; contact identifiers lower.
 /// Unknown categories default to 0.80.
 pub fn confidence_threshold(category: &str) -> f32 {
-    match category {
+    match bare_label(category) {
         "national_id"
         | "national_id_fr"
         | "national_id_nl"
@@ -17,6 +17,7 @@ pub fn confidence_threshold(category: &str) -> f32 {
         | "national_id_ie"
         | "national_id_pt"
         | "national_id_generic"
+        | "tax_id"
         | "iban"
         | "credit_card"
         | "health_data"
@@ -43,6 +44,18 @@ pub fn confidence_threshold(category: &str) -> f32 {
     }
 }
 
+/// The label without the wrapper a custom category carries when it is rendered with `Debug`.
+///
+/// The redaction engine reports a caller-supplied label as `Custom("tax_id")`, and the lineage
+/// keeps that string as the entity's category. The thresholds and the risk table have to look
+/// through the wrapper, or a company identifier would be graded as an unknown label.
+fn bare_label(label: &str) -> &str {
+    label
+        .strip_prefix("custom(\"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+        .unwrap_or(label)
+}
+
 /// Returns true when a detection at `confidence` survives the Layer-4 filter.
 pub fn passes_threshold(category: &str, confidence: f32) -> bool {
     confidence >= confidence_threshold(category)
@@ -64,7 +77,7 @@ pub fn gliner_label_threshold(label: &str) -> f32 {
 /// critical, national/financial identifiers high, infrastructure and contact
 /// identifiers medium or low. Unknown labels default to low.
 pub fn risk_for_label(label: &str) -> RiskLevel {
-    match label {
+    match bare_label(label) {
         "api_key"
         | "aws_access_key"
         | "aws_secret_key"

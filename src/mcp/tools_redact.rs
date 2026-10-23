@@ -43,6 +43,15 @@ pub struct RedactTextParams {
     /// Custom regex patterns to redact. Each entry is `["label", "regex"]`.
     #[serde(default)]
     pub custom_patterns: Vec<Vec<String>>,
+    /// Case dictionary: each entry is `["value", "code_name"]`.
+    ///
+    /// The value is the one that must not reach the agent — the real name of a party, the
+    /// name of the project, an address — and the code name is what stands in for it. Each
+    /// value is replaced by its code name in the redacted text, whether the detection engine
+    /// found it or not; and a code name the engine did redact on its own is put back. The
+    /// rehydration map is left untouched, so the caller keeps a reversible record.
+    #[serde(default)]
+    pub pseudonyms: Vec<Vec<String>>,
     /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
     /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
     /// every entry in `GLI_NER2_PII_LABELS` plus `AI_ACT_NER_LABELS` for
@@ -317,7 +326,34 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .await
         .map_err(|e| McpError::internal_error(format!("xberg redaction failed: {e}"), None))?;
 
-    let findings = doc.redaction_report.map(|report| report.findings).unwrap_or_default();
+    let mut findings = doc.redaction_report.map(|report| report.findings).unwrap_or_default();
+    let mut rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
+
+    // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
+    // phone number. The legal caller acts on the label, so it has to be `tax_id`.
+    crate::pii::relabel_in_text(&mut findings, &original);
+    let mut redacted_text = std::mem::take(&mut doc.content);
+    // …and the token in the text carries that label too: a company identifier is not
+    // `[PHONE_3]`.
+    crate::pii::rename_tokens(&mut redacted_text, &mut rehydration_map, &findings);
+
+    // The case dictionary: the value becomes its code name, whether the engine found it or not.
+    let dictionary: Vec<crate::pii::Pseudonym> = args
+        .pseudonyms
+        .iter()
+        .filter_map(|entry| {
+            if entry.len() == 2 {
+                crate::pii::Pseudonym::new(entry[0].clone(), entry[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !dictionary.is_empty() {
+        let (substituted, _) = crate::pii::apply_pseudonyms(&redacted_text, &rehydration_map, &dictionary);
+        redacted_text = substituted;
+    }
+
     let detections: Vec<serde_json::Value> = findings
         .iter()
         .map(|finding| {
@@ -338,10 +374,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
-    let rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
-
     Ok(CallToolResult::structured(serde_json::json!({
-        "redacted_text": doc.content,
+        "redacted_text": redacted_text,
         "rehydration_map": rehydration_map,
         "detections": detections,
         "ner_ran": ner_ran

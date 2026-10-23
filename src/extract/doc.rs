@@ -682,12 +682,17 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
     // Capture findings for ALL strategies (xberg ran redaction internally for
     // non-TokenReplace strategies, so redaction_report is populated).
     if config.redaction.enabled {
-        let findings = result
+        let mut findings = result
             .redaction_report
             .as_ref()
-            .map(|r| &r.findings)
-            .cloned()
+            .map(|r| r.findings.clone())
             .unwrap_or_default();
+        // A French company identifier (SIREN, SIRET) is a run of digits the engine files as
+        // a phone number. The rehydration map carries the value each token replaced, so the
+        // identifier is recognised even though the text is already redacted.
+        if let Some(map) = pending_rehydration.as_ref() {
+            crate::pii::relabel_by_map(&mut findings, map);
+        }
         redaction_findings = findings
             .into_iter()
             .map(|f| RedactionFinding {

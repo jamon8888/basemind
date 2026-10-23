@@ -469,6 +469,27 @@ impl BasemindServer {
         self.state.lean.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// True when the served workspace is protected — it carries a `safe/` mirror — and this
+    /// process is not the privacy gateway's own.
+    ///
+    /// Read per request rather than cached at construction: the gateway writes the mirror
+    /// after basemind may already be running, and the mirror's presence is what turns the
+    /// boundary on. The check is a single `symlink_metadata` on `<root>/safe`, which is
+    /// cheaper than the tool call it guards.
+    pub(crate) fn workspace_protected(&self) -> bool {
+        !crate::protected::gateway_capable() && crate::protected::is_protected(&self.state.shared.root)
+    }
+
+    /// True when `name` is a tool this server withholds from the agent.
+    ///
+    /// Withheld inside a protected workspace: `redact_text` returns the token→original
+    /// table and every detection in the clear, and `vault` encrypts, decrypts and searches
+    /// that table. Both stay available to the gateway itself (see
+    /// [`crate::protected::GATEWAY_ENV`]) and to every workspace without a mirror.
+    pub(crate) fn withholds_tool(&self, name: &str) -> bool {
+        self.workspace_protected() && crate::protected::is_withheld_tool(name)
+    }
+
     /// Assemble the full tool router (every feature-gated tool group). Pure and argument-free —
     /// its output is invariant for the life of the process, so [`new_with_options`]
     /// (Self::new_with_options) and [`from_shared`](Self::from_shared) never call this directly;

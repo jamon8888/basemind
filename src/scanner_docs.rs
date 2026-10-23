@@ -324,23 +324,20 @@ pub(crate) fn extract_and_persist_doc(
         extract_doc(abs, Some(mime_type), &doc_config).with_context(|| format!("extract document {rel}"))?;
     doc.config_digest.clone_from(&filters.doc_digest);
 
-    // Persist the rehydration map as a content-addressed blob when redaction
-    // captured one. The encrypted blob's hash becomes the rehydration_ref stored
-    // in the doc blob and threaded into LanceDB rows.
-    if let Some(map) = doc.pending_rehydration.take()
-        && !map.is_empty()
-    {
-        let passphrase = derive_rehydration_passphrase(scope);
-        let encrypted =
-            xberg::text::redaction::rehydration::encrypt_map(&map, &passphrase).context("encrypt rehydration map")?;
-        let ref_hash = hashing::hash_bytes(&encrypted);
-        let ref_hex_buf = hashing::hex_buf(&ref_hash);
-        let ref_hex = hashing::hex_str(&ref_hex_buf);
-        store
-            .write_rehydration(ref_hex, &encrypted)
-            .context("write rehydration blob")?;
-        doc.rehydration_ref = Some(ref_hex.to_string());
-    }
+    // The rehydration map captured during extraction is NOT persisted here.
+    //
+    // It used to be encrypted with a passphrase derived from the workspace scope and the data
+    // directory (a 64-bit hash of two values the reader can compute), stored as a
+    // content-addressed blob, and referenced from the index through `rehydration_ref`. Anyone
+    // who knew the scope and the data directory could recompute that key and decrypt the map —
+    // the token→original table of every redacted document in the workspace. In the gateway
+    // (passerelle) architecture the true values belong to the gateway, which keeps its keys in
+    // the system keychain; basemind is the engine and keeps no key at rest.
+    //
+    // The map stays in memory for the length of the extraction (the tax-id relabeling reads it)
+    // and is dropped with the document. `rehydration_ref` therefore stays `None`; the field and
+    // its index column remain for schema stability, and the blob GC reaps the blobs older
+    // workspaces left behind.
 
     // Wire redaction findings into the pii_lineage GDPR Article 30 audit trail.
     if !doc.redaction_findings.is_empty()
@@ -390,25 +387,6 @@ pub(crate) fn extract_and_persist_doc(
 /// never disagree about the requirement — a disagreement is exactly the issue-#44 loop.
 pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedMode, filters: &Filters) -> bool {
     matches!(mode, EmbedMode::Inline) && cfg.embed && filters.doc_embed_allowed(rel)
-}
-
-/// Derive a deterministic passphrase for encrypting rehydration maps.
-///
-/// Mixes the workspace scope with the data-directory path so blobs from
-/// different workspaces or machines cannot be decrypted interchangeably.
-/// The data directory is machine-unique and not derivable from scope alone,
-/// which protects against a copied blob being decrypted on a different
-/// machine with the same scope name.
-// ponytail: scope+data_dir is sufficient for local-only encryption.
-// Upgrade path: vault-managed random key if cross-device portability is needed.
-fn derive_rehydration_passphrase(scope: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    scope.hash(&mut hasher);
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "basemind") {
-        dirs.data_dir().hash(&mut hasher);
-    }
-    format!("basemind-rehydration-{:016x}", hasher.finish())
 }
 
 /// The pure (IO-free) half of the `process_doc` unchanged fast path: does a tracked entry settle the

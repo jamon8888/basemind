@@ -572,13 +572,13 @@ fn process_doc(
                 rehydration_ref: batch.rehydration_ref.clone(),
                 config_digest: filters.doc_digest.clone(),
             };
-            // Deferred persists an entry only to carry a rehydration_ref into the index
-            // for the GC live set (else the rehydration blob could be reaped while the
-            // doc references it). With no rehydration there is nothing the index must
-            // know: leave the doc untracked so a later Inline pass indexes it (bug #32).
+            // A Deferred pass leaves the doc untracked so a later Inline pass indexes it
+            // (bug #32). It used to persist an entry when the document carried a
+            // rehydration_ref, to keep the rehydration blob alive for the GC live set;
+            // basemind no longer persists rehydration maps (the gateway owns that vault),
+            // so the entry is always left out.
             let doc_upsert = match embed {
                 EmbedMode::Inline => Some(doc_entry),
-                EmbedMode::Deferred if doc_entry.rehydration_ref.is_some() => Some(doc_entry),
                 EmbedMode::Deferred => None,
             };
             FileResult {

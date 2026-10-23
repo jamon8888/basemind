@@ -165,6 +165,9 @@ pub(super) async fn lean_call_tool(
             let rows: Vec<Value> = router
                 .list_all()
                 .into_iter()
+                // A withheld tool stays invisible in lean mode too: the wrapper's listing is
+                // how a lean agent discovers the real surface.
+                .filter(|t| !server.withholds_tool(&t.name))
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -177,6 +180,13 @@ pub(super) async fn lean_call_tool(
         TOOL_GET_SCHEMA => {
             let tool_name = required_str(request.arguments.as_ref(), "tool_name")?;
             reject_wrapper_target(&tool_name)?;
+            if server.withholds_tool(&tool_name) {
+                return Err(McpError::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    crate::protected::withheld_message(&tool_name),
+                    None,
+                ));
+            }
             let tool = router
                 .get(&tool_name)
                 .ok_or_else(|| McpError::invalid_params(format!("unknown tool `{tool_name}`"), None))?;
@@ -190,6 +200,13 @@ pub(super) async fn lean_call_tool(
         TOOL_INVOKE => {
             let tool_name = required_str(request.arguments.as_ref(), "tool_name")?;
             reject_wrapper_target(&tool_name)?;
+            if server.withholds_tool(&tool_name) {
+                return Err(McpError::new(
+                    rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                    crate::protected::withheld_message(&tool_name),
+                    None,
+                ));
+            }
             if !router.has_route(&tool_name) {
                 return Err(McpError::invalid_params(format!("unknown tool `{tool_name}`"), None));
             }
