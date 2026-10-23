@@ -243,7 +243,7 @@ mod tests {
                 "[TAX_ID_1]",
             ),
         ];
-        relabel_in_text(&mut findings, &original);
+        relabel_in_text(&mut findings, original);
         let mut text = "Le SIREN [PHONE_1], la TVA [TAX_ID_1].".to_string();
         let mut map = BTreeMap::from([
             ("[PHONE_1]".to_string(), "552100554".to_string()),

@@ -9,7 +9,9 @@ use std::path::Path;
 use std::process::Command;
 
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams, ResourceContents};
+#[cfg(feature = "documents")]
+use rmcp::model::CallToolRequestParams;
+use rmcp::model::{ReadResourceRequestParams, ResourceContents};
 use tempfile::TempDir;
 
 fn git(repo: &Path, args: &[&str]) {
