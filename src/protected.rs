@@ -76,6 +76,40 @@ pub fn is_withheld_tool(name: &str) -> bool {
     WITHHELD_TOOLS.contains(&name)
 }
 
+/// The refusal for a `memory` call whose modes reach the **shared** tier inside a protected
+/// workspace, or `None` when the call may pass.
+///
+/// The shared tier is what the withheld **resource** `basemind://memory/{key}` serves, so the
+/// tool cannot hand out the same content: its default `get`, `list`, `search`, `put`, `delete`
+/// and `audit` modes all address the shared namespace (the visibility selector defaults to
+/// `group`), and `mine`, `proposals`, `accept` and `reject` operate the shared governance
+/// surface. Private `individual` memory (scoped to the calling agent, owner-segmented in the
+/// store) is not exposed through that resource surface, so it stays available.
+///
+/// `mode` and `visibility` are read raw from the call arguments: this gate runs before the
+/// handler parses them, and an unknown mode falls through (`false`) — the handler's own mode
+/// parser rejects it.
+pub fn memory_shared_refusal(args: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let args = args?;
+    let mode = args.get("mode").and_then(serde_json::Value::as_str)?;
+    let visibility = args.get("visibility").and_then(serde_json::Value::as_str);
+    let shared = visibility.is_none_or(|value| !value.trim().eq_ignore_ascii_case("individual"));
+    let refused = match mode.trim().to_ascii_lowercase().as_str() {
+        "documents" => false, // searches the workspace's own (masked) index, not shared memory
+        "mine" | "proposals" | "accept" | "reject" => true,
+        "put" | "get" | "list" | "search" | "delete" | "audit" => shared,
+        _ => false,
+    };
+    refused.then(|| {
+        format!(
+            "`memory` on the shared tier is not available in a protected workspace: this workspace \
+         carries a `{MIRROR_DIR}/` mirror, and the shared memory is not masked by it — the same \
+         content the `basemind://memory/{{key}}` resource is refused for. Scope the call with \
+         `visibility: \"individual\"` for the agent's own private entries.",
+        )
+    })
+}
+
 /// The message an agent gets when it reaches for a withheld tool. It names the reason and
 /// the way out, so a refusal reads as a policy and not as a missing feature.
 pub fn withheld_message(tool: &str) -> String {
@@ -84,6 +118,72 @@ pub fn withheld_message(tool: &str) -> String {
          `{MIRROR_DIR}/` mirror, and the token→original table belongs to the privacy gateway. \
          The agent sees tokens only."
     )
+}
+
+#[cfg(test)]
+mod memory_gate_tests {
+    use super::*;
+
+    fn arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("object").clone()
+    }
+
+    #[test]
+    fn the_default_visibility_is_the_shared_tier() {
+        let refusal = memory_shared_refusal(Some(&arguments(serde_json::json!({
+            "mode": "get", "key": "case/notes",
+        }))));
+        assert!(refusal.is_some());
+    }
+
+    #[test]
+    fn every_mode_touching_shared_memory_is_refused() {
+        for mode in ["put", "list", "search", "delete", "audit"] {
+            let refusal = memory_shared_refusal(Some(&arguments(serde_json::json!({
+                "mode": mode,
+            }))));
+            assert!(refusal.is_some(), "mode `{mode}` must be refused");
+        }
+        for mode in ["mine", "proposals", "accept", "reject"] {
+            let refusal = memory_shared_refusal(Some(&arguments(serde_json::json!({ "mode": mode }))));
+            assert!(refusal.is_some(), "mode `{mode}` must be refused");
+        }
+    }
+
+    #[test]
+    fn a_group_visibility_is_refused_regardless_of_spelling() {
+        for spelling in ["group", "Group", "GROUP"] {
+            let refusal = memory_shared_refusal(Some(&arguments(serde_json::json!({
+                "mode": "search", "query": "show me", "visibility": spelling,
+            }))));
+            assert!(refusal.is_some(), "visibility `{spelling}` is shared");
+        }
+    }
+
+    #[test]
+    fn the_private_tier_passes_and_so_does_the_workspace_index() {
+        for call in [
+            serde_json::json!({ "mode": "get", "key": "mine", "visibility": "individual" }),
+            serde_json::json!({ "mode": "put", "key": "mine", "value": "v", "visibility": "individual" }),
+            serde_json::json!({ "mode": "list", "visibility": "INDIVIDUAL" }),
+            serde_json::json!({ "mode": "search", "query": "q", "visibility": "individual" }),
+            serde_json::json!({ "mode": "delete", "key": "mine", "visibility": "individual" }),
+            serde_json::json!({ "mode": "audit", "visibility": "individual" }),
+            serde_json::json!({ "mode": "documents", "query": "q" }),
+        ] {
+            let refusal = memory_shared_refusal(Some(&arguments(call)));
+            assert!(refusal.is_none());
+        }
+    }
+
+    #[test]
+    fn everything_the_gate_cannot_judge_falls_through() {
+        // No arguments, a missing mode, or an unknown mode: the gate must not guess — the
+        // handler's own parser rejects what it cannot read.
+        assert!(memory_shared_refusal(None).is_none());
+        assert!(memory_shared_refusal(Some(&arguments(serde_json::json!({})))).is_none());
+        assert!(memory_shared_refusal(Some(&arguments(serde_json::json!({ "mode": "bogus" })))).is_none());
+    }
 }
 
 #[cfg(test)]

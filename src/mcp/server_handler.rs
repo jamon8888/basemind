@@ -29,7 +29,8 @@ impl ServerHandler for BasemindServer {
     ///
     /// In a protected workspace (one carrying a `safe/` mirror) the two tools that hand out the
     /// true values — `redact_text` and `vault` — are withheld: they are not advertised, so an
-    /// agent that searches for them never finds them.
+    /// agent that searches for them never finds them. The `memory` tool keeps its private
+    /// tier but loses the shared one (`crate::protected::memory_shared_refusal`).
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -98,6 +99,18 @@ impl ServerHandler for BasemindServer {
                 crate::protected::withheld_message(&request.name),
                 None,
             ));
+        }
+        // The `memory` tool stays callable, but a protected workspace turns off the shared
+        // tier exactly like the withheld resource: the same content the shared tier serves is
+        // what `basemind://memory/{key}` is refused for. Private individual memory passes.
+        if request.name == "memory" {
+            if let Some(message) = crate::protected::memory_shared_refusal(request.arguments.as_ref()) {
+                return Err(rmcp::ErrorData::new(
+                    rmcp::model::ErrorCode::INVALID_PARAMS,
+                    message,
+                    None,
+                ));
+            }
         }
         let admission = self
             .heavy_admission

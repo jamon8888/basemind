@@ -412,6 +412,9 @@ pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedM
 /// The entry must also carry the current `config_digest` (so a changed chunk / extraction knob
 /// re-processes the doc), and `reflush` (the embed policy changed since the last scan) sends every
 /// doc that wants vectors back through the pipeline so its rows are rebuilt from the cached blob.
+/// An entry that still carries a legacy `rehydration_ref` does not settle either: basemind keeps
+/// no key at rest, so the doc is re-processed (an Inline pass clears the reference and rewrites
+/// both blob and entry) instead of staying pinned in the GC's live set forever.
 pub(crate) fn doc_entry_settled(
     existing: &crate::store::DocEntry,
     hash_hex: &str,
@@ -424,6 +427,7 @@ pub(crate) fn doc_entry_settled(
         && existing.embedding_preset == embedding_preset
         && existing.config_digest == config_digest
         && !(embed_requested && reflush)
+        && existing.rehydration_ref.is_none()
         && (existing.embedded || existing.embed_attempted || !embed_requested)
 }
 

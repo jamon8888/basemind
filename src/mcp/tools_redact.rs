@@ -348,8 +348,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             if entry.len() != 2 {
                 return Err(McpError::invalid_params(
                     format!(
-                        "each pseudonym entry is a [value, code_name] pair; got {} \
-                         element(s): {entry:?}",
+                        "each pseudonym entry is a [value, code_name] pair; got {} element(s)",
                         entry.len()
                     ),
                     None,
@@ -357,7 +356,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             }
             crate::pii::Pseudonym::new(entry[0].clone(), entry[1].clone()).ok_or_else(|| {
                 McpError::invalid_params(
-                    format!("a pseudonym's value and code name must both be non-empty; got {entry:?}"),
+                    "a pseudonym's value and code name must both be non-empty".to_string(),
                     None,
                 )
             })

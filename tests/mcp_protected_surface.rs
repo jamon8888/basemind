@@ -1,5 +1,7 @@
 //! The protected surface: a workspace that carries a `safe/` mirror withholds the two tools
 //! that hand out the true values, and the upstream resources that are not masked by the mirror.
+//! The `memory` tool stays callable, but its shared tier is refused the same way: private
+//! `individual` memory passes, and so does the `documents` search over the masked index.
 //!
 //! The mirror is the marker: the privacy gateway writes `safe/` when it writes the redacted
 //! copy, so its presence is what turns the boundary on. Without it, basemind is a plain code
@@ -87,6 +89,116 @@ async fn the_two_tools_are_served_in_an_ordinary_workspace() {
     let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_ref()).collect();
     assert!(names.contains(&"redact_text"), "{names:?}");
     assert!(names.contains(&"vault"), "{names:?}");
+}
+
+/// Call the `memory` tool with the given arguments and return its protocol outcome.
+async fn memory(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: serde_json::Value,
+) -> Result<rmcp::model::CallToolResult, rmcp::ServiceError> {
+    service
+        .call_tool(
+            CallToolRequestParams::new("memory")
+                .with_arguments(arguments.as_object().expect("memory arguments").clone()),
+        )
+        .await
+}
+
+#[cfg(feature = "documents")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_on_the_shared_tier_is_refused_in_a_protected_workspace() {
+    // The shared tier is exactly what the withheld `basemind://memory/{key}` resource
+    // serves: the tool cannot hand out the same unmasked content.
+    let dir = workspace(true);
+    let service = client(dir.path()).await;
+    for call in [
+        serde_json::json!({ "mode": "get", "key": "skill/one" }),
+        serde_json::json!({ "mode": "list" }),
+        serde_json::json!({ "mode": "search", "query": "notes" }),
+        serde_json::json!({ "mode": "put", "key": "skill/one", "value": "v" }),
+        serde_json::json!({ "mode": "audit" }),
+        serde_json::json!({ "mode": "proposals" }),
+    ] {
+        let error = memory(&service, call)
+            .await
+            .expect_err("a shared-tier memory call must be refused");
+        assert!(
+            error.to_string().contains("protected workspace"),
+            "the refusal must name the boundary: {error}"
+        );
+    }
+}
+
+/// The private roundtrip needs the store backend itself: `put` refuses with "requires the
+/// `memory` feature" when the binary carries `documents` without `memory` (the CI legs that
+/// compile this file — `full` — always build both).
+#[cfg(all(feature = "documents", feature = "memory"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_private_memory_tier_stays_available_in_a_protected_workspace() {
+    let dir = workspace(true);
+    let service = client(dir.path()).await;
+    memory(
+        &service,
+        serde_json::json!({
+            "mode": "put",
+            "key": "agent/scratch",
+            "value": "reviser la section 3",
+            "embed": false,
+            "visibility": "individual",
+        }),
+    )
+    .await
+    .expect("an individual put stays available");
+    let result = memory(
+        &service,
+        serde_json::json!({
+            "mode": "get",
+            "key": "agent/scratch",
+            "visibility": "individual",
+        }),
+    )
+    .await
+    .expect("an individual get stays available");
+    let text = result
+        .content
+        .iter()
+        .find_map(|content| match content {
+            rmcp::model::ContentBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        text.contains("reviser la section 3"),
+        "the private note round-trips: {text}"
+    );
+}
+
+#[cfg(feature = "documents")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lean_wrapper_gates_memory_on_the_shared_tier_too() {
+    let dir = workspace(true);
+    let transport = basemind::mcp::serve_in_memory_lean(dir.path(), "working", true)
+        .await
+        .expect("lean in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+    let error = service
+        .call_tool(
+            CallToolRequestParams::new("invoke_tool").with_arguments(
+                serde_json::json!({
+                    "tool_name": "memory",
+                    "tool_input": { "mode": "get", "key": "skill/one" },
+                })
+                .as_object()
+                .expect("invoke arguments")
+                .clone(),
+            ),
+        )
+        .await
+        .expect_err("a lean wrapper cannot carry the call past the gate");
+    assert!(
+        error.to_string().contains("protected workspace"),
+        "the refusal must name the boundary: {error}"
+    );
 }
 
 #[cfg(feature = "documents")]

@@ -162,12 +162,17 @@ pub(super) async fn lean_call_tool(
 ) -> Result<CallToolResponse, McpError> {
     match request.name.as_ref() {
         TOOL_LIST => {
+            // The protected check is hoisted out of the loop: it is a filesystem probe, and
+            // asking it once instead of per tool is the difference between one and N syscalls
+            // per `tools/list` (the non-lean path in `server_handler.rs` does the same).
+            let protected = server.workspace_protected();
             let rows: Vec<Value> = router
                 .list_all()
                 .into_iter()
                 // A withheld tool stays invisible in lean mode too: the wrapper's listing is
-                // how a lean agent discovers the real surface.
-                .filter(|t| !server.withholds_tool(&t.name))
+                // how a lean agent discovers the real surface. `is_withheld_tool` is pure, so
+                // the filesystem probe stays hoisted on `protected`.
+                .filter(|t| !(protected && crate::protected::is_withheld_tool(&t.name)))
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -206,6 +211,19 @@ pub(super) async fn lean_call_tool(
                     crate::protected::withheld_message(&tool_name),
                     None,
                 ));
+            }
+            // A lean wrapper must not carry a `memory` call past the protected-workspace gate:
+            // the shared tier is gated exactly as the direct surface gates it, reading the same
+            // `tool_input` the inner call will use.
+            if tool_name == "memory" && server.workspace_protected() {
+                let input = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get("tool_input"))
+                    .and_then(serde_json::Value::as_object);
+                if let Some(message) = crate::protected::memory_shared_refusal(input) {
+                    return Err(McpError::new(rmcp::model::ErrorCode::INVALID_PARAMS, message, None));
+                }
             }
             if !router.has_route(&tool_name) {
                 return Err(McpError::invalid_params(format!("unknown tool `{tool_name}`"), None));

@@ -104,6 +104,15 @@ pub fn rename_tokens(text: &mut String, map: &mut BTreeMap<String, String>, find
             taken.insert(from);
             continue;
         }
+        // The rewrite sweeps the whole text, so the source token has to unambiguously stand
+        // for this one finding: it must be the rehydration map's key. Only the token-replace
+        // strategy allocates tokens — a `mask` shares `[REDACTED]` across every finding and a
+        // `drop` leaves no token at all, and neither enters the map — so renaming one of
+        // those would rewrite unrelated masked spans (or, on an empty token, every character
+        // boundary) and hand the agent tokens nothing maps back to.
+        if !map.contains_key(&from) {
+            continue;
+        }
         if renames.iter().any(|(existing, _)| *existing == from) {
             continue; // one source, one destination — however many findings share the token
         }
@@ -227,6 +236,36 @@ mod tests {
         let mut map = BTreeMap::from([("[PHONE_1]".to_string(), "552100554".to_string())]);
         assert_eq!(rename_tokens(&mut text, &mut map, &findings), 1);
         assert_eq!(text, "[TAX_ID_1] et [TAX_ID_1].");
+    }
+
+    #[test]
+    fn a_masked_marker_shared_across_findings_is_never_renamed() {
+        // `mask` gives every finding the same `[REDACTED]` replacement and never enters the
+        // rehydration map: renaming one finding's marker would sweep every masked span —
+        // persons, email addresses — into the company identifier's label.
+        let original = "SIREN 552100554";
+        let mut findings = vec![finding_in(original, "552100554", PiiCategory::Phone, "[REDACTED]")];
+        relabel_in_text(&mut findings, original);
+        let mut text = "M. [REDACTED] a appelé depuis [REDACTED].".to_string();
+        let mut map = BTreeMap::new();
+        assert_eq!(rename_tokens(&mut text, &mut map, &findings), 0);
+        assert_eq!(text, "M. [REDACTED] a appelé depuis [REDACTED].");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_span_has_no_token_to_rename() {
+        // `drop` replaces the span with nothing: an empty token would read as a pattern the
+        // sweep inserts at every character boundary. The marker never enters the map, so
+        // nothing is renamed and the text passes through untouched.
+        let original = "SIREN 552100554 papier.";
+        let mut findings = vec![finding_in(original, "552100554", PiiCategory::Phone, "")];
+        relabel_in_text(&mut findings, original);
+        let mut text = "SIREN  papier.".to_string();
+        let mut map = BTreeMap::new();
+        assert_eq!(rename_tokens(&mut text, &mut map, &findings), 0);
+        assert_eq!(text, "SIREN  papier.");
+        assert!(map.is_empty());
     }
 
     #[test]

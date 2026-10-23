@@ -36,9 +36,22 @@ function readMetaLine(meta, lines, index) {
   if (folded) {
     const block = [];
     let i = index;
-    while (i + 1 < lines.length && /^\s+\S/u.test(lines[i + 1])) {
-      block.push(lines[i + 1].trim());
-      i += 1;
+    // A folded block carries its blank lines: swallowing stops at the first nonblank line
+    // that returns to the frontmatter-key indentation level (or the closing `---`), not at
+    // an interior blank, which would silently drop the rest of the description.
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (next.trim() === "" || /^\s+\S/u.test(next)) {
+        block.push(next.trim());
+        i += 1;
+      } else {
+        break;
+      }
+    }
+    // Trailing blanks separate the block from what follows; they are newline runs, not
+    // content, and a folded description ends with them dropped.
+    while (block.length > 0 && block.at(-1) === "") {
+      block.pop();
     }
     meta[key] = inline.startsWith("|") ? block.join("\n") : block.join(" ");
     return i;
