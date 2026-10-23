@@ -243,8 +243,8 @@ pub(crate) fn apply_documents_overrides(
             p.insert("documents.redaction.allowed_categories", source);
         }
     }
-    if let Some(ref strat) = overrides.redaction_strategy {
-        let applied = match strat.to_ascii_lowercase().as_str() {
+    if let Some(ref strategy) = overrides.redaction_strategy {
+        let applied = match strategy.to_ascii_lowercase().as_str() {
             "replace" => {
                 d.redaction.strategy = super::documents::RedactionStrategy::TokenReplace;
                 true
@@ -262,7 +262,7 @@ pub(crate) fn apply_documents_overrides(
                 true
             }
             _ => {
-                tracing::warn!(value = %strat, "unknown redaction_strategy value; ignoring");
+                tracing::warn!(value = %strategy, "unknown redaction_strategy value; ignoring");
                 false
             }
         };

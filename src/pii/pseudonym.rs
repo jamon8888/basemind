@@ -2,7 +2,7 @@
 //!
 //! A case file carries names the parties do not want spelled out. The lawyer picks a code
 //! name for each of them (« Dupont » becomes « Orme ») and adds the terms that belong to the
-//! file alone (« Projet Orion », an address). Two things then have to hold:
+//! file alone (« Dossier Orion », an address). Two things then have to hold:
 //!
 //! 1. **The real value never reaches the agent.** It is replaced by its code name — not by a
 //!    token, because the code name is the name the file is *meant* to carry.
@@ -64,10 +64,16 @@ impl Applied {
 /// `text` the text it produced. The returned text carries the code names; the map is not
 /// modified, so the caller keeps a reversible record of the true values.
 pub fn apply(text: &str, map: &BTreeMap<String, String>, entries: &[Pseudonym]) -> (String, Applied) {
-    let usable: Vec<&Pseudonym> = entries
+    let mut usable: Vec<&Pseudonym> = entries
         .iter()
         .filter(|entry| !entry.value.trim().is_empty() && !entry.code.trim().is_empty())
         .collect();
+    // Longest value first: with (« Jean Dupont », « Orme ») and (« Dupont », « Chêne »)
+    // given the other way round, the shorter value would rewrite the inside of the longer
+    // one (« Jean Chêne »), and the « Jean Dupont » entry would then never match — leaving
+    // part of what the dictionary hides standing in the text. The stable sort keeps the
+    // caller's own order among entries of equal length.
+    usable.sort_by_key(|entry| std::cmp::Reverse(entry.value.chars().count()));
     if usable.is_empty() {
         return (text.to_string(), Applied::default());
     }
@@ -186,12 +192,12 @@ mod tests {
 
     #[test]
     fn a_value_the_model_missed_is_replaced_all_the_same() {
-        let entries = vec![Pseudonym::new("Projet Orion", "Projet Onyx").unwrap()];
-        let (text, applied) = apply("Le Projet Orion avance.", &map(&[]), &entries);
-        assert_eq!(text, "Le Projet Onyx avance.");
+        let entries = vec![Pseudonym::new("Dossier Orion", "Dossier Onyx").unwrap()];
+        let (text, applied) = apply("Le Dossier Orion débute.", &map(&[]), &entries);
+        assert_eq!(text, "Le Dossier Onyx débute.");
         assert_eq!(
             applied.literals,
-            vec![("Projet Orion".to_string(), "Projet Onyx".to_string())]
+            vec![("Dossier Orion".to_string(), "Dossier Onyx".to_string())]
         );
     }
 
@@ -228,6 +234,28 @@ mod tests {
         let entries = vec![Pseudonym::new("Orion", "Onyx").unwrap()];
         let (text, _) = apply("Le [ORION_1] porte le nom Orion.", &map(&[]), &entries);
         assert_eq!(text, "Le [ORION_1] porte le nom Onyx.");
+    }
+
+    #[test]
+    fn a_longer_value_is_replaced_before_a_fragment_of_it() {
+        // « Jean Dupont » must fall to its own code name, not be rewritten inside-out by
+        // the shorter « Dupont » entry that shares the surname.
+        let entries = vec![
+            Pseudonym::new("Jean Dupont", "Orme").unwrap(),
+            Pseudonym::new("Dupont", "Chêne").unwrap(),
+        ];
+        let (text, _) = apply("Jean Dupont et Dupont sont là.", &map(&[]), &entries);
+        assert_eq!(text, "Orme et Chêne sont là.");
+    }
+
+    #[test]
+    fn the_resolution_of_overlapping_values_does_not_depend_on_the_callers_order() {
+        let entries = vec![
+            Pseudonym::new("Dupont", "Chêne").unwrap(),
+            Pseudonym::new("Jean Dupont", "Orme").unwrap(),
+        ];
+        let (text, _) = apply("Jean Dupont et Dupont sont là.", &map(&[]), &entries);
+        assert_eq!(text, "Orme et Chêne sont là.");
     }
 
     #[test]

@@ -23,7 +23,7 @@ Four things in basemind sat across that line.
    content-addressed blob in the store. Anyone who knew the scope and the data directory could
    recompute the key and decrypt the table of every redacted document in the workspace.
 3. **The detection could not be told about the case's own vocabulary.** A lawyer renames the
-   parties (« Dupont » becomes « Orme ») and adds the file's own terms (« Projet Orion », an
+   parties (« Dupont » becomes « Orme ») and adds the file's own terms (« Dossier Orion », an
    address). Nothing could carry that dictionary into the detection.
 4. **A SIREN was classified as a phone number.** The engine files any run of seven to fifteen
    digits as a phone number, and a SIREN is nine digits. The legal caller acts on the label,
@@ -52,6 +52,20 @@ The gateway still needs the engine, so it marks the basemind process it owns wit
 `BASEMIND_GATEWAY_TOKEN`. That is a capability, not a flag: the gateway generates the value
 and keeps it out of the agent's sandbox environment. Without the capability, the two tools
 stay available to every workspace that has no mirror — a plain code index is unaffected.
+
+**The boundary the capability draws (and the one it does not).** The token closes the gap
+between «the tool exists in the engine» and «the agent may reach it» *for a basemind process
+the gateway launches from configuration*. What it cannot stop is a process the agent itself
+launches: an agent able to spawn arbitrary processes runs its own basemind — with or without
+the token, with or without a workspace carrying a mirror — and no environment check can
+distinguish a spawner the gateway chose from one the agent chose, because both carry the
+agent's own OS credentials. Moving to a credential basemind «verifies» changes nothing there:
+anything the gateway can hold, the agent's same-user processes could read equally. Stopping
+that case is the job of the OS sandbox the agent runtime provides (the gateway is what
+provisions it), not of basemind. The capability is the cooperation contract between two
+components the user administers, and it degrades into a symbol when the sandbox fails; that
+residual risk is on record, and the withheld-by-default direction is what keeps the failure
+of one component from exposing every workspace.
 
 ### 2. basemind keeps no key at rest
 

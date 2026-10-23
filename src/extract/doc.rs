@@ -897,12 +897,19 @@ fn prepare_doc_chunk(
     (chunk, dense_input)
 }
 
-/// Deterministic fingerprint of a `RedactionConfig` for cache invalidation.
-/// Two configs that produce identical redaction behaviour hash to the same
-/// value; any field change produces a different fingerprint, forcing
-/// re-extraction of cached doc blobs.
+/// What the redaction fingerprint must cover: the config *and* the post-processing the
+/// extractor applies to the engine's findings on its own motion (currently the tax_id
+/// re-labelling — SIREN/SIRET company identifiers — see [`crate::pii`]). Bumping the tag
+/// makes every redacted document re-extract once, so a cached blob whose findings were
+/// never re-labelled cannot be served alongside re-labelled ones.
+const REDACTION_PIPELINE_TAG: &str = "redaction-pipeline/2";
+
+/// Deterministic fingerprint of a `RedactionConfig` (+ the pipeline tag) for cache
+/// invalidation. Two configs that produce identical redaction behaviour hash to the same
+/// value; any field change produces a different fingerprint, forcing re-extraction of
+/// cached doc blobs.
 pub(crate) fn hash_redaction_config(cfg: &RedactionConfig) -> String {
-    let json = serde_json::to_string(cfg).unwrap_or_default();
+    let json = serde_json::to_string(&(REDACTION_PIPELINE_TAG, cfg)).unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     json.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

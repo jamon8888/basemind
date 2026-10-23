@@ -22,6 +22,14 @@
 //! [`GATEWAY_ENV`]. That is a capability rather than a flag: the value is a secret the
 //! gateway generates, and keeping it out of the agent's sandbox environment is the
 //! gateway's job — an agent that inherits it can call the two tools.
+//!
+//! The capability does what a process-level switch can and nothing more: it separates a
+//! basemind process the gateway launched from configuration from any other. An agent able
+//! to spawn its own processes can launch a basemind without the mirror's protections —
+//! no environment check can tell a spawner the gateway chose from a spawner the agent
+//! chose, because both run under the agent's own OS credentials (anything the gateway can
+//! hold, those processes could read). Halting that case is the agent runtime's sandbox,
+//! which the gateway provisions; ADR-0015 records the residual risk on purpose.
 
 use std::path::Path;
 
@@ -41,9 +49,21 @@ pub const WITHHELD_TOOLS: &[&str] = &["redact_text", "vault"];
 /// True when `root` carries a `safe/` mirror.
 ///
 /// Fails closed: any `safe` entry marks the workspace as protected, including a symlink
-/// (which may point at the originals rather than at a mirror).
+/// (which may point at the originals rather than at a mirror) — and so does an entry the
+/// check cannot look at. A mirror inspection that ends in a permission or I/O error is not
+/// an absence: pretending the workspace were ordinary would hand the agent the two tools
+/// and the upstream resources precisely in the workspace that is carrying them.
 pub fn is_protected(root: &Path) -> bool {
-    std::fs::symlink_metadata(root.join(MIRROR_DIR)).is_ok()
+    mirror_marks_protected(std::fs::symlink_metadata(root.join(MIRROR_DIR)))
+}
+
+/// The decision isomorphic to the inspection result, so both branches carry tests.
+fn mirror_marks_protected(inspection: Result<std::fs::Metadata, std::io::Error>) -> bool {
+    match inspection {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true, // present, but uninspectable: fail closed
+    }
 }
 
 /// True when this process is the gateway's own basemind process.
@@ -74,6 +94,13 @@ mod tests {
     fn a_workspace_without_a_mirror_is_not_protected() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!is_protected(dir.path()));
+    }
+
+    #[test]
+    fn a_mirror_the_check_cannot_look_at_is_still_protected() {
+        // A confirmed absence (`NotFound`) is the only state that keeps the workspace
+        // ordinary; a permission or I/O error turns the boundary on instead of off.
+        assert!(mirror_marks_protected(Err(std::io::Error::from_raw_os_error(13)))); // EACCES
     }
 
     #[test]

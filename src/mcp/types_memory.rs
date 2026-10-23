@@ -143,7 +143,7 @@ pub struct MemoryParams {
     /// `documents`: ingestion scope (default this repo; web pages live under `web:<host>`).
     #[serde(default)]
     pub scope: Option<String>,
-    /// `documents`: case-insensitive substring over NER entity categories (ANDed with `keywords_contains`).
+    /// `documents`: case-insensitive substring over NER entity categories (AND-combined with `keywords_contains`).
     #[serde(default)]
     pub entity_category: Option<String>,
     /// `documents`: case-insensitive substring over document keywords.

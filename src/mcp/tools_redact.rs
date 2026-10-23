@@ -337,18 +337,32 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // `[PHONE_3]`.
     crate::pii::rename_tokens(&mut redacted_text, &mut rehydration_map, &findings);
 
-    // The case dictionary: the value becomes its code name, whether the engine found it or not.
+    // The case dictionary: the value becomes its code name, whether the engine found it or
+    // not. Fail closed: an entry the caller meant to hide must never be silently dropped —
+    // a malformed pair aborts the call rather than leaving the real value standing in the
+    // text the agent receives.
     let dictionary: Vec<crate::pii::Pseudonym> = args
         .pseudonyms
         .iter()
-        .filter_map(|entry| {
-            if entry.len() == 2 {
-                crate::pii::Pseudonym::new(entry[0].clone(), entry[1].clone())
-            } else {
-                None
+        .map(|entry| {
+            if entry.len() != 2 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "each pseudonym entry is a [value, code_name] pair; got {} \
+                         element(s): {entry:?}",
+                        entry.len()
+                    ),
+                    None,
+                ));
             }
+            crate::pii::Pseudonym::new(entry[0].clone(), entry[1].clone()).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("a pseudonym's value and code name must both be non-empty; got {entry:?}"),
+                    None,
+                )
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, McpError>>()?;
     if !dictionary.is_empty() {
         let (substituted, _) = crate::pii::apply_pseudonyms(&redacted_text, &rehydration_map, &dictionary);
         redacted_text = substituted;

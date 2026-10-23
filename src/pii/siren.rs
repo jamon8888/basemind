@@ -77,7 +77,7 @@ fn luhn(digits: &[u32]) -> bool {
         .enumerate()
         .map(|(index, digit)| {
             let mut value = *digit;
-            if index % 2 == 1 {
+            if !index.is_multiple_of(2) {
                 value *= 2;
                 if value > 9 {
                     value -= 9;
@@ -86,7 +86,7 @@ fn luhn(digits: &[u32]) -> bool {
             value
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 #[cfg(test)]

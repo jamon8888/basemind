@@ -306,11 +306,24 @@ pub(crate) fn extract_and_persist_doc(
     if let Some(mut cached) = store.read_doc_by_hex(hash_hex).ok().flatten()
         && cached_doc_is_reusable(&cached, cfg, embed, &filters.doc_digest)
     {
+        // The same pass rewrites whatever the blob still carries from an older regime —
+        // a digest-less blob is stamped with the current one, and a rehydration_ref left
+        // by the dropped rehydration vault is cleared: basemind keeps no key at rest, so
+        // the index must not point at an old token→original blob (which would also keep
+        // it in the GC's live set instead of letting it be reaped).
+        let mut rewrite = false;
         if cached.config_digest.is_empty() {
             cached.config_digest.clone_from(&filters.doc_digest);
+            rewrite = true;
+        }
+        if cached.rehydration_ref.is_some() {
+            cached.rehydration_ref = None;
+            rewrite = true;
+        }
+        if rewrite {
             store
                 .write_doc(hash, &cached)
-                .with_context(|| format!("stamp doc blob for {rel}"))?;
+                .with_context(|| format!("rewrite doc blob for {rel}"))?;
         }
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.

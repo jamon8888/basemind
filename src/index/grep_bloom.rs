@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn unicode_literals_are_matched_on_their_utf8_bytes() {
-        let needle = Needle::compile("caf\u{e9}s").expect("literal");
-        assert!(needle.passes(parse_row(&row_for("two caf\u{e9}s here")).unwrap().bits));
+        let needle = Needle::compile("na\u{ef}ves").expect("literal");
+        assert!(needle.passes(parse_row(&row_for("two na\u{ef}ves here")).unwrap().bits));
     }
 
     #[test]

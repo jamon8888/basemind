@@ -7,7 +7,6 @@ candidate list is sorted before sampling, and the RNG is seeded from `"<head>:<s
 
 from __future__ import annotations
 
-import argparse
 import ast
 import json
 import random
@@ -15,8 +14,12 @@ import re
 import subprocess
 import sys
 import warnings
-from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import argparse
+    from collections.abc import Iterable, Iterator
 
 warnings.simplefilter("ignore")  # old code trips SyntaxWarning (invalid escapes) on parse
 
@@ -74,10 +77,10 @@ def _glob_to_regex(glob: str) -> re.Pattern[str]:
     return re.compile(body)
 
 
-class Excluder:
+class PathExcludes:
     """Matches a path when the glob matches it or any of its parent directories."""
 
-    def __init__(self, globs: Iterable[str]):
+    def __init__(self, globs: Iterable[str]) -> None:
         self._res = [_glob_to_regex(g.strip("/")) for g in globs]
 
     def __call__(self, path: str) -> bool:
@@ -95,10 +98,10 @@ class Repo:
         exclude: Iterable[str] = (),
         exts: str = "",
         max_bytes: int = DEFAULT_MAX_BYTES,
-    ):
+    ) -> None:
         self.root = str(Path(root).resolve())
         self.head = self.git("rev-parse", "HEAD").strip()
-        self.excluded = Excluder(exclude)
+        self.excluded = PathExcludes(exclude)
         self.exts = tuple("." + e.strip().lstrip(".") for e in exts.split(",") if e.strip())
         self.max_bytes = max_bytes
         self._all: list[str] | None = None
@@ -246,7 +249,7 @@ def emit(tasks: list[dict], out: str) -> None:
         sys.stdout.write(lines)
     else:
         Path(out).write_text(lines, encoding="utf-8")
-    print(f"wrote {len(tasks)} tasks", file=sys.stderr)
+    sys.stderr.write(f"wrote {len(tasks)} tasks\n")
 
 
 def sample(rng: random.Random, items: list, n: int) -> list:

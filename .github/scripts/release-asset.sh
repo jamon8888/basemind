@@ -134,7 +134,9 @@ cmd_download() {
 [ $# -ge 1 ] || usage
 case "$1" in
 resolve)
-  [ $# -ge 2 ] && [ $# -le 4 ] || usage
+  if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
+    usage
+  fi
   cmd_resolve "$2" "${3:-true}" "${4:-}"
   ;;
 upload)

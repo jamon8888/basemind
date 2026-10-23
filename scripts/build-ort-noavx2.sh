@@ -82,7 +82,9 @@ git submodule update --init --recursive --depth 1
 pick_python() {
   local cands=() c
   [ -n "${ORT_PYTHON:-}" ] && cands+=("$ORT_PYTHON")
-  while IFS= read -r c; do cands+=("$c"); done < <(ls -d /opt/python/cp3*/bin/python3 2>/dev/null | sort -V -r)
+  while IFS= read -r c; do cands+=("$c"); done < <(
+    find /opt/python -maxdepth 3 \( -type f -o -type l \) -path '/opt/python/cp3*/bin/python3' 2>/dev/null | sort -V -r
+  )
   cands+=(python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3)
   for c in "${cands[@]}"; do
     if { command -v "$c" >/dev/null 2>&1 || [ -x "$c" ]; } &&
@@ -126,4 +128,4 @@ ln -sf "libonnxruntime.so.${ORT_VERSION}" "$PREFIX/lib/libonnxruntime.so.1"
 ln -sf libonnxruntime.so.1 "$PREFIX/lib/libonnxruntime.so"
 
 echo "✓ ONNX Runtime ${ORT_VERSION} (no AVX) installed to $PREFIX/lib"
-ls -la "$PREFIX/lib/" | grep onnxruntime
+find "$PREFIX/lib" -maxdepth 1 -name '*onnxruntime*' -exec ls -la {} +
