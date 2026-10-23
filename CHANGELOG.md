@@ -60,6 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a manifest quay.io has since pruned (`manifest unknown`), which made the required
   `-noavx2` asset missing and left every release as a draft; it now floats on `:latest` like
   the stock legs, whose glibc-floor audit still catches any drift.
+- **`redact_text`'s NER reads — and reports — every character.** GLiNER2's candle backend reads
+  only the encoder's first few hundred tokens (the schema prompt eats into the same budget),
+  so names, companies and addresses past the first roughly 585–898 characters went undetected
+  while the tool answered `ner_ran: true` — worst for `file_path`, whose extracted text the
+  caller never sees. The tool now windows the text internally: word-boundary windows with 100
+  characters of overlap, sized in tokens against the model's own `tokenizer.json` and encoder
+  limit and capped at the caller's 400-character gate; spans shift onto the caller's offsets
+  and merge to their union (over-masking, never a leak). The result declares its coverage —
+  `ner_windows`, `ner_window_chars` and `ner_truncated` — and `require_ner` fails when the
+  text could not be read whole. ([#94])
 
 ## [0.33.1] - 2026-10-10
 
@@ -177,6 +187,7 @@ designed at all; see issues #7–#12.
 [#74]: https://github.com/jamon8888/basemind/pull/74
 [#75]: https://github.com/jamon8888/basemind/pull/75
 [#76]: https://github.com/jamon8888/basemind/pull/76
+[#94]: https://github.com/jamon8888/basemind/pull/94
 
 ## [0.26.0] - 2026-09-01
 
