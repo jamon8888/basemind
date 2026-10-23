@@ -985,6 +985,7 @@ dependencies = [
  "streaming-iterator",
  "tempfile",
  "thiserror 2.0.21",
+ "tokenizers 0.23.2",
  "tokio",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
