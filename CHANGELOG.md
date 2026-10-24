@@ -8,7 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
-## [Unreleased] - 2026-10-23
+## [0.34.1] - 2026-10-24
+
+> **Patch release — the redact_text NER fix.** No index migration: `RELEASE_MINOR` stays 34,
+> so upgrading from 0.34.x does not re-index.
 
 ### Fixed
 
@@ -23,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops extreme bodies honestly. The result declares its coverage — `ner_windows`,
   `ner_window_chars` and `ner_truncated` — and `require_ner` fails when the text could not be
   read whole. ([#94])
+- **cargo-deny's advisories gate is green again.** Lockfile-only semver bumps past
+  RUSTSEC-2026-0385 (ctutils), RUSTSEC-2026-0386 (tokio 1.54.1), RUSTSEC-2026-0382/0383/0381
+  (rustls-webpki, webpki-root-certs, webpki-roots) — no code or building changes.
 
 ## [0.34.0] - 2026-10-18
 
