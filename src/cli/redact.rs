@@ -39,6 +39,11 @@ pub struct RedactArgs {
     #[arg(long = "custom-pattern", value_name = "LABEL,REGEX")]
     pub custom_patterns: Vec<String>,
 
+    /// Case dictionary entry: the value that must not reach the agent, and the code name that
+    /// stands in for it. Format: `--pseudonym value,code-name`. Repeatable.
+    #[arg(long = "pseudonym", value_name = "VALUE,CODE_NAME")]
+    pub pseudonyms: Vec<String>,
+
     /// Local GLiNER2 model directory for person/organization/location NER. A missing dir degrades to pattern-only redaction.
     #[arg(long, value_name = "DIR")]
     pub ner_model_dir: Option<String>,
@@ -76,7 +81,17 @@ fn read_input(args: &RedactArgs) -> Result<(String, Option<String>)> {
 
 /// Runs `basemind redact`: builds `RedactTextParams` from the CLI flags and
 /// calls the same `redact_text` tool method the MCP server exposes.
+///
+/// Refused inside a protected workspace (one carrying a `safe/` mirror): the redaction map
+/// this command returns is the token→original table, which belongs to the privacy gateway
+/// there. The gateway reaches the engine with the capability it holds
+/// (`BASEMIND_GATEWAY_TOKEN`); an agent confined to the mirror does not.
 pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit, out: &mut impl Write) -> Result<()> {
+    if server.workspace_protected() {
+        return Err(crate::cli::exit::CliExit::usage(crate::protected::withheld_message(
+            "redact_text",
+        )));
+    }
     let (text, file_path) = read_input(args)?;
     let params = RedactTextParams {
         text,
@@ -85,6 +100,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         strategy: Some(args.strategy.clone()),
         custom_terms: parse_pairs(args.custom_terms.clone())?,
         custom_patterns: parse_pairs(args.custom_patterns.clone())?,
+        pseudonyms: parse_pairs(args.pseudonyms.clone())?,
         ner_model_dir: args.ner_model_dir.clone(),
         require_ner: false,
     };

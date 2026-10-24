@@ -27,7 +27,7 @@ def main() -> None:
     a = p.parse_args()
 
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
-    where: dict[str, list[tuple[str, int]]] = defaultdict(list)  # name -> [(path, line)]
+    where: dict[str, list[tuple[str, int]]] = defaultdict(list)  # one (path, line) pair per occurrence of the name
     for path, src in repo.blobs(repo.files()):
         tree = c.parse_python(src)
         if tree is not None:
@@ -65,10 +65,7 @@ def main() -> None:
             }
         )
     if len(tasks) < a.n:
-        print(
-            f"only {len(tasks)} of {a.n} requested tasks met the filters",
-            file=sys.stderr,
-        )
+        sys.stderr.write(f"only {len(tasks)} of {a.n} requested tasks met the filters\n")
     c.emit(tasks, a.out)
 
 

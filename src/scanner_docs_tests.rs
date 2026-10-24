@@ -210,6 +210,38 @@ fn doc_entry_settled_backs_off_after_a_failed_embed_attempt() {
     );
 }
 
+#[test]
+fn doc_entry_settled_does_not_settle_a_legacy_rehydration_ref() {
+    use crate::store::DocEntry;
+    let base = DocEntry {
+        config_digest: String::new(),
+        hash_hex: "h".to_string(),
+        rehydration_ref: None,
+        embedding_preset: "balanced".to_string(),
+        size_bytes: 10,
+        mtime: 0,
+        embedded: true,
+        embed_attempted: true,
+    };
+    assert!(doc_entry_settled(&base, "h", "balanced", true, "", false));
+
+    // A reference kept alive by a Literal pass must not let its doc settle forever: basemind
+    // keeps no key at rest, so the next pass re-processes the doc and the Inline pipeline
+    // clears the reference (an entry where GC would otherwise pin the blob indefinitely).
+    let referred = DocEntry {
+        rehydration_ref: Some("blob/deadbeef".to_string()),
+        ..base.clone()
+    };
+    assert!(
+        !doc_entry_settled(&referred, "h", "balanced", true, "", false),
+        "an entry carrying a rehydration_ref re-opens"
+    );
+    assert!(
+        doc_entry_settled(&base, "h", "balanced", false, "", false),
+        "sanity: the reference-free entry settles as before"
+    );
+}
+
 fn filters_for(documents: DocumentsConfig) -> Filters {
     let mut config = crate::config::default_for_root(Path::new("."));
     config.documents = documents;

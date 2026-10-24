@@ -42,7 +42,7 @@ fn vocabulary() -> Vec<String> {
         "spawn_blocking",
         "unspawn",
         "é",
-        "caf\u{e9}",
+        "na\u{ef}ve",
         "日本語",
         "日本",
         "Display",

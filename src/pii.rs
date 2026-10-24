@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 mod patterns;
 mod pipeline;
+mod pseudonym;
+mod siren;
+#[cfg(feature = "documents")]
+mod tax_id;
 mod translation;
 mod validators;
 
@@ -16,6 +20,10 @@ pub use pipeline::{
     DetectedSpan, ERASED_VALUE_HASH, confidence_threshold, dedupe_spans, gliner_label_threshold, is_private_ipv4,
     passes_threshold, risk_for_label, validate_db_connection_string, validate_e164, validate_jwt,
 };
+pub use pseudonym::{Applied, Pseudonym, apply as apply_pseudonyms};
+pub use siren::{TAX_ID_LABEL, is_fr_company_id, validate_fr_siren, validate_fr_siret};
+#[cfg(feature = "documents")]
+pub use tax_id::{is_tax_id, relabel_by_map, relabel_in_text, rename_tokens, tax_id_category};
 pub use validators::{
     validate_at_svnr, validate_be_niss, validate_eu_national_id, validate_fr_nir, validate_iban, validate_ie_pps,
     validate_nl_bsn, validate_pt_nif,
@@ -558,6 +566,14 @@ mod tests {
         assert_eq!(risk_for_label("internal_url"), RiskLevel::Medium);
         assert_eq!(risk_for_label("person_name"), RiskLevel::Low);
         assert_eq!(risk_for_label("something_new"), RiskLevel::Low);
+    }
+    #[test]
+    fn test_a_custom_label_is_graded_through_its_wrapper() {
+        // The lineage keeps the category as the engine renders it: `Custom("tax_id")`.
+        assert_eq!(confidence_threshold("custom(\"tax_id\")"), 0.95);
+        assert_eq!(risk_for_label("custom(\"tax_id\")"), RiskLevel::High);
+        assert_eq!(risk_for_label("custom(\"national_id_fr\")"), RiskLevel::High);
+        assert_eq!(risk_for_label("custom(\"national_id_fr\")"), RiskLevel::High);
     }
     #[test]
     fn test_gliner_label_thresholds_per_spec() {

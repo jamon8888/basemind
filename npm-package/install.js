@@ -9,16 +9,18 @@ const AdmZip = require("adm-zip");
 
 const { version } = require("./package.json");
 
+/// One `sysctl` inquiry; `-n` prints the value of `name`, or "" when it is absent.
+function sysctl(name) {
+  try {
+    return execFileSync("sysctl", ["-n", name], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
+
 function isAppleSilicon() {
   if (os.type() !== "Darwin") return false;
   if (os.arch() === "arm64") return true;
-  const sysctl = (name) => {
-    try {
-      return execFileSync("sysctl", ["-n", name], { encoding: "utf8" }).trim();
-    } catch {
-      return "";
-    }
-  };
   return sysctl("sysctl.proc_translated") === "1" || sysctl("hw.optional.arm64") === "1";
 }
 

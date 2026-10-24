@@ -26,6 +26,11 @@ impl ServerHandler for BasemindServer {
     /// is set, advertise only the three lean wrapper tools instead. The macro detects this
     /// hand-written method and skips generating its own, so the default branch must remain a
     /// faithful copy of the generated body to keep the unset-flag surface byte-for-byte identical.
+    ///
+    /// In a protected workspace (one carrying a `safe/` mirror) the two tools that hand out the
+    /// true values — `redact_text` and `vault` — are withheld: they are not advertised, so an
+    /// agent that searches for them never finds them. The `memory` tool keeps its private
+    /// tier but loses the shared one (`crate::protected::memory_shared_refusal`).
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -34,11 +39,15 @@ impl ServerHandler for BasemindServer {
         if self.lean_enabled() {
             return Ok(lean::lean_list_tools());
         }
-        Ok(
-            rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
-                .with_ttl_ms(LIST_CACHE_TTL_MS)
-                .with_cache_scope(CacheScope::Public),
-        )
+        let mut result = rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
+            .with_ttl_ms(LIST_CACHE_TTL_MS)
+            .with_cache_scope(CacheScope::Public);
+        if self.workspace_protected() {
+            result
+                .tools
+                .retain(|tool| !crate::protected::is_withheld_tool(&tool.name));
+        }
+        Ok(result)
     }
 
     /// `tools/call`. Default: dispatch through the static router exactly as the macro would.
@@ -81,6 +90,28 @@ impl ServerHandler for BasemindServer {
         } else {
             super::admission::WorkClass::Control
         };
+        // A withheld tool is not dispatched at all: inside a protected workspace the
+        // token→original table belongs to the privacy gateway, so the call is refused before
+        // the router sees it. Refused, not silently ignored — the agent gets the reason.
+        if self.withholds_tool(&request.name) {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::METHOD_NOT_FOUND,
+                crate::protected::withheld_message(&request.name),
+                None,
+            ));
+        }
+        // The `memory` tool stays callable, but a protected workspace turns off the shared
+        // tier exactly like the withheld resource: the same content the shared tier serves is
+        // what `basemind://memory/{key}` is refused for. Private individual memory passes.
+        if request.name == "memory"
+            && let Some(message) = crate::protected::memory_shared_refusal(request.arguments.as_ref())
+        {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                message,
+                None,
+            ));
+        }
         let admission = self
             .heavy_admission
             .admit(work_class)
@@ -152,9 +183,14 @@ impl ServerHandler for BasemindServer {
 
     /// `get_tool` introspection. Default mirrors the macro (router lookup); in lean mode it
     /// reports the three wrapper tools so task-support validation matches the advertised surface.
+    /// A withheld tool is invisible to introspection too: an agent that asks for its schema
+    /// gets nothing, exactly as if it had never been registered.
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
         if self.lean_enabled() {
             return lean::lean_get_tool(name);
+        }
+        if self.withholds_tool(name) {
+            return None;
         }
         self.tool_router.get(name).cloned()
     }
@@ -204,18 +240,29 @@ impl ServerHandler for BasemindServer {
     }
 
     /// `resources/templates/list`: the parameterised resources.
+    ///
+    /// In a protected workspace the upstream templates are withheld: they address the index
+    /// (a file outline) and the shared memory, and neither is masked by the `safe/` mirror.
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListResourceTemplatesResult, rmcp::ErrorData> {
-        Ok(self.list_resource_templates_result())
+        let mut result = self.list_resource_templates_result();
+        if self.workspace_protected() {
+            result.resource_templates.clear();
+        }
+        Ok(result)
     }
 
     /// `resources/read`: `basemind://safe/<path>` reads one file under `safe/` as text (every path
     /// that could reach outside it — `..`, absolute, encoded separators, a symlink pointing out —
     /// is refused; see [`safe_resources`]); every other `basemind://` URI delegates to upstream's
     /// outline dispatchers (status, repo map, outline, memory).
+    ///
+    /// In a protected workspace the upstream URIs are refused: what they serve (the index, the
+    /// shared memory) never passes through the mirror's masking, so reading them would hand the
+    /// agent material the `safe/` boundary exists to withhold.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -230,6 +277,16 @@ impl ServerHandler for BasemindServer {
                     rmcp::ErrorData::internal_error(format!("resources/read task failed: {error}"), None)
                 })??;
             return Ok(result.into());
+        }
+        if self.workspace_protected() {
+            return Err(rmcp::ErrorData::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                format!(
+                    "`{uri}` is not available in a protected workspace: this workspace carries a \
+                     `safe/` mirror, and the index and the shared memory are not masked by it."
+                ),
+                None,
+            ));
         }
         Ok(self.read_resource_uri(&uri).await?.into())
     }
