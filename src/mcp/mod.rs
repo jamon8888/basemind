@@ -25,6 +25,7 @@ mod graph_view;
 mod helpers;
 mod helpers_admin;
 mod helpers_archmap;
+
 mod helpers_calls;
 mod helpers_calls_scan;
 mod helpers_code;
@@ -81,6 +82,8 @@ mod memory;
 #[cfg(feature = "memory")]
 pub(crate) mod memory_ops;
 pub mod mode;
+#[cfg(feature = "ner-candle")]
+mod ner_windowing;
 mod notifications;
 mod prompts;
 #[cfg(feature = "memory")]
