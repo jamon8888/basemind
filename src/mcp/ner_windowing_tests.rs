@@ -14,10 +14,8 @@ use super::{NerBudget, SEP_TEXT_TOKEN, WINDOW_CHARS, merge_window_entities, plan
 fn per_char_tokenizer() -> tokenizers::Tokenizer {
     let mut vocab: ahash::AHashMap<String, u32> = ahash::AHashMap::new();
     vocab.insert("[UNK]".to_string(), 0);
-    let mut id = 1u32;
-    for byte in b' '..=b'~' {
+    for (id, byte) in (1u32..).zip(b' '..=b'~') {
         vocab.insert((byte as char).to_string(), id);
-        id += 1;
     }
     let model = tokenizers::models::bpe::BPE::builder()
         .vocab_and_merges(vocab, Vec::new())
@@ -160,7 +158,7 @@ fn a_budget_that_cannot_cover_a_window_stops_with_cut_off() {
 #[test]
 fn a_hopeless_budget_fails_planning() {
     let text = "Alice Smith met Bob Jones in Paris near Acme Corp.";
-    let plan = plan_windows(&text, &budget_with_text_chars(1));
+    let plan = plan_windows(text, &budget_with_text_chars(1));
     assert!(plan.is_err(), "no window can run on a hopeless budget");
 }
 
