@@ -5,7 +5,7 @@
 
 use xberg::types::entity::{Entity, EntityCategory};
 
-use super::{NerBudget, WINDOW_CHARS, merge_window_entities, plan_windows, schema_items};
+use super::{NerBudget, SEP_TEXT_TOKEN, WINDOW_CHARS, merge_window_entities, plan_windows, schema_items};
 
 /// A tokenizer that costs one token per character: a BPE whose vocabulary is
 /// the printable ASCII set with no merges — every word tokenizes to its own
@@ -27,15 +27,17 @@ fn per_char_tokenizer() -> tokenizers::Tokenizer {
     tokenizers::Tokenizer::new(model)
 }
 
-/// Budget builder for a per-character tokenizer: the prompt's cost is its own
-/// character count, and `headroom` is the character budget the text gets.
+/// Budget builder for a per-character tokenizer: the prompt's token cost is
+/// its own character count, and `headroom` is the character budget a
+/// window's text gets — the production relation is `tokens_for_text =
+/// encoder limit − prompt − margin`, so a window must fit inside `headroom`
+/// on its own.
 fn budget_with_text_chars(headroom: usize) -> NerBudget {
     let prompt_items = schema_items(&["person".to_string(), "location".to_string()]);
-    let prompt_chars: usize = prompt_items.iter().map(String::len).sum();
+    let prompt_chars: usize = prompt_items.iter().map(String::len).sum::<usize>() + SEP_TEXT_TOKEN.len();
     NerBudget {
         prompt_tokens: prompt_chars,
-        tokens_for_text: prompt_chars + headroom,
-        prompt_items,
+        tokens_for_text: headroom,
         tokenizer: per_char_tokenizer(),
     }
 }
@@ -167,9 +169,18 @@ fn a_hopeless_budget_fails_planning() {
 #[test]
 fn overlapping_windows_merge_their_duplicates() {
     let entities = vec![
-        entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.62)),
-        entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.97)),
-        entity(EntityCategory::Organization, "Acme Corp", 31, 40, Some(0.9)),
+        (
+            entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.62)),
+            Some(0),
+        ),
+        (
+            entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.97)),
+            Some(1),
+        ),
+        (
+            entity(EntityCategory::Organization, "Acme Corp", 31, 40, Some(0.9)),
+            Some(1),
+        ),
     ];
     let kept = merge_window_entities("Alice Smith met Bob Jones near Acme Corp", entities);
     assert_eq!(kept.len(), 2, "the duplicate collapses into its twin: {kept:?}");
@@ -183,9 +194,12 @@ fn overlapping_windows_merge_their_duplicates() {
 #[test]
 fn rival_labels_keep_the_more_confident_claim() {
     let entities = vec![
-        entity(EntityCategory::Location, "Smith", 6, 11, Some(0.6)),
-        entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.97)),
-        entity(EntityCategory::Organization, "Acme", 31, 35, Some(0.9)),
+        (entity(EntityCategory::Location, "Smith", 6, 11, Some(0.6)), Some(0)),
+        (
+            entity(EntityCategory::Person, "Alice Smith", 0, 11, Some(0.97)),
+            Some(0),
+        ),
+        (entity(EntityCategory::Organization, "Acme", 31, 35, Some(0.9)), Some(0)),
     ];
     let kept = merge_window_entities("Alice Smith met Bob Jones and Acme", entities);
     assert_eq!(kept.len(), 2, "{kept:?}");
@@ -195,13 +209,39 @@ fn rival_labels_keep_the_more_confident_claim() {
     assert_eq!(kept[1].text, "Acme");
 }
 
-/// Same-label neighbours across a boundary union to one mention spanning both,
-/// whose surface covers the whole of it — over-masking, never a leak.
+/// The ticket's leak case, in miniature: the lower-confidence rival sorts
+/// first, but the more confident one wins the clash — and its span extends
+/// over the union, so no overlapping piece is left outside the redaction
+/// ("Acme Corp Jones" under Person; "Jones" can no longer leak).
 #[test]
-fn same_label_neighbours_union_to_a_span_leaking_nothing() {
+fn a_low_confidence_rival_starting_first_extends_the_confident_winner() {
     let entities = vec![
-        entity(EntityCategory::Location, "Rue", 11, 14, Some(0.7)),
-        entity(EntityCategory::Location, "de la Paix", 15, 25, Some(0.8)),
+        (
+            entity(EntityCategory::Organization, "Acme Corp", 0, 9, Some(0.5)),
+            Some(0),
+        ),
+        (entity(EntityCategory::Person, "Corp Jones", 5, 15, Some(0.99)), Some(0)),
+    ];
+    let kept = merge_window_entities("Acme Corp Jones signs", entities);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].start, 0);
+    assert_eq!(kept[0].end, 15);
+    assert_eq!(kept[0].text, "Acme Corp Jones");
+    assert_eq!(kept[0].confidence, Some(0.99), "the more confident rival wins");
+}
+
+/// Same-label pieces the different windows saw separately union to one
+/// mention spanning both: the second window re-read the region between them,
+/// so the join is earned — the windowed saw a split mention, and its pieces
+/// must not leak the characters in between.
+#[test]
+fn same_label_pieces_from_different_windows_union_leaking_nothing() {
+    let entities = vec![
+        (entity(EntityCategory::Location, "Rue", 11, 14, Some(0.7)), Some(0)),
+        (
+            entity(EntityCategory::Location, "de la Paix", 15, 25, Some(0.8)),
+            Some(1),
+        ),
     ];
     let kept = merge_window_entities("date at 12 Rue de la Paix, Paris", entities);
     assert_eq!(kept.len(), 1, "{kept:?}");
@@ -211,13 +251,35 @@ fn same_label_neighbours_union_to_a_span_leaking_nothing() {
     assert_eq!(kept[0].confidence, Some(0.8), "the union carries the best confidence");
 }
 
+/// Inside one window the same gap rule would weld *unrelated* detections
+/// ("Rue" and "de la Paix" are mention pieces only because the windows re-read
+/// the region): one window's neighbours separated only by separator characters
+/// stay separate spans.
+#[test]
+fn same_window_neighbours_keep_their_own_spans() {
+    let entities = vec![
+        (entity(EntityCategory::Location, "Rue", 11, 14, Some(0.7)), Some(0)),
+        (
+            entity(EntityCategory::Location, "de la Paix", 15, 25, Some(0.8)),
+            Some(0),
+        ),
+    ];
+    let kept = merge_window_entities("date at 12 Rue de la Paix, Paris", entities);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0].text, "Rue");
+    assert_eq!(kept[1].text, "de la Paix");
+}
+
 /// A partial-overlap mention from another window extends the kept span to the
 /// union: the tail it claims must be read (and redacted) whole.
 #[test]
 fn partial_ranges_union_over_the_callers_text() {
     let entities = vec![
-        entity(EntityCategory::Person, "Dubreuil", 13, 21, Some(0.7)),
-        entity(EntityCategory::Person, "Hélène Dubreuil Martin", 5, 28, Some(0.9)),
+        (entity(EntityCategory::Person, "Dubreuil", 13, 21, Some(0.7)), Some(0)),
+        (
+            entity(EntityCategory::Person, "Hélène Dubreuil Martin", 5, 28, Some(0.9)),
+            Some(1),
+        ),
     ];
     let kept = merge_window_entities("Pour Hélène Dubreuil Martin, un token", entities);
     assert_eq!(kept.len(), 1, "{kept:?}");

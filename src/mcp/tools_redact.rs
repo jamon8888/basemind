@@ -280,7 +280,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             None,
         ));
     }
-    ner_run.entities = merge_span_windows(&original, std::mem::take(&mut ner_run.entities));
+    ner_run.entities = merge_span_windows(&original, std::mem::take(&mut ner_run.mentions));
     let ner_confidence: std::collections::HashMap<(u32, u32), f32> = ner_run
         .entities
         .iter()
@@ -524,31 +524,23 @@ fn is_regex_word(c: char) -> bool {
 /// What one `redact_text` call's NER produced.
 ///
 /// When the model did not run (`ran: false`), every field is the default: NER
-/// added nothing and nothing may claim coverage. When it did run, the fields
-/// are the #71 coverage contract: `windows` (how many windows the model read),
-/// `window_chars` (largest window, in characters) and `truncated` — true only
-/// when planning had to stop before covering the text, in which case the
-/// caller reports `ner_truncated: true` and `require_ner` fails the call.
+/// `window_chars` (largest window, in characters), `truncated` — true only
+/// when reading had to stop before covering the text: planning that could not
+/// pay for the rest, or the wall-clock budget — in which case the caller
+/// reports `ner_truncated: true` and `require_ner` fails the call.
+///
+/// Until the merge runs, mentions are tagged with the window that found each
+/// (`None` once a merged span crosses windows): the merge needs the
+/// provenance, the caller does not.
+#[derive(Default)]
 struct NerRun {
+    mentions: Vec<(xberg::types::entity::Entity, Option<usize>)>,
     entities: Vec<xberg::types::entity::Entity>,
     ran: bool,
     windows: usize,
     window_chars: usize,
     truncated: bool,
     cut_off: Option<usize>,
-}
-
-impl Default for NerRun {
-    fn default() -> Self {
-        Self {
-            entities: Vec::new(),
-            ran: false,
-            windows: 0,
-            window_chars: 0,
-            truncated: false,
-            cut_off: None,
-        }
-    }
 }
 
 /// Merge mentions across windows into the redaction-claim set: same label to
@@ -558,17 +550,17 @@ impl Default for NerRun {
 #[cfg(feature = "ner-candle")]
 fn merge_span_windows(
     original: &str,
-    entities: Vec<xberg::types::entity::Entity>,
+    mentions: Vec<(xberg::types::entity::Entity, Option<usize>)>,
 ) -> Vec<xberg::types::entity::Entity> {
-    super::ner_windowing::merge_window_entities(original, entities)
+    super::ner_windowing::merge_window_entities(original, mentions)
 }
 
 #[cfg(not(feature = "ner-candle"))]
 fn merge_span_windows(
     _original: &str,
-    entities: Vec<xberg::types::entity::Entity>,
+    entities: Vec<(xberg::types::entity::Entity, Option<usize>)>,
 ) -> Vec<xberg::types::entity::Entity> {
-    entities
+    entities.into_iter().map(|(entity, _)| entity).collect()
 }
 
 /// The labels every call asks GLiNER2 for, in the order the candle backend
@@ -621,8 +613,16 @@ fn ner_categories(labels: &[String]) -> Vec<xberg::types::entity::EntityCategory
 #[cfg(feature = "ner-candle")]
 async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun, String> {
     use crate::mcp::ner_windowing;
+    use std::time::{Duration, Instant};
     use xberg::text::ner::NerBackend;
     use xberg::text::ner::candle::CandleBackend;
+    /// Wall-clock budget for the whole NER pass inside one call. Windows run
+    /// sequentially, so an extremely large input could otherwise hold an MCP
+    /// call for hours (the app measured roughly 4 s per 400-character window
+    /// on a CPU-only i5-7360U; 1 MiB would be thousands). Past the deadline
+    /// the run reports truncation exactly like a budget-stopped plan:
+    /// `require_ner` fails, the pattern pass stands, nothing is cut silently.
+    const NER_TIME_BUDGET: Duration = Duration::from_secs(10 * 60);
     let Some(dir) = model_dir else {
         return Err("no ner_model_dir given".to_string());
     };
@@ -665,7 +665,19 @@ async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun,
         cut_off: plan.cut_off,
         ..Default::default()
     };
-    for window in &plan.windows {
+    let started = Instant::now();
+    let mut read_windows = 0usize;
+    for (index, window) in plan.windows.iter().enumerate() {
+        if started.elapsed() >= NER_TIME_BUDGET {
+            tracing::warn!(
+                after_windows = index,
+                elapsed_s = started.elapsed().as_secs(),
+                remaining = plan.windows.len() - index,
+                "NER window deadline reached; windows remain unrun, reporting truncation",
+            );
+            run.cut_off = Some(run.cut_off.unwrap_or(window.start));
+            break;
+        }
         let Some(slice) = text.get(window.start..window.end) else {
             return Err(format!(
                 "window [{}, {}) does not fall on character boundaries",
@@ -673,12 +685,13 @@ async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun,
             ));
         };
         match backend.detect(slice, &categories).await {
-            Ok(mut entities) => {
-                for entity in &mut entities {
+            Ok(entities) => {
+                let shifted = entities.into_iter().map(|mut entity| {
                     entity.start += window.start as u32;
                     entity.end += window.start as u32;
-                }
-                run.entities.extend(entities);
+                    (entity, Some(index))
+                });
+                run.mentions.extend(shifted);
             }
             Err(error) => {
                 tracing::warn!(%error, "GLiNER2 NER failed; redacting pattern-only");
@@ -686,7 +699,12 @@ async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun,
             }
         }
         run.window_chars = run.window_chars.max(slice.chars().count());
+        read_windows += 1;
     }
+    // `ner_windows` says how many windows were actually read, so a
+    // deadline-stopped run claims fewer than were planned.
+    run.windows = read_windows;
+    run.truncated = run.cut_off.is_some();
     Ok(run)
 }
 

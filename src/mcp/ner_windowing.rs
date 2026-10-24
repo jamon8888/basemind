@@ -74,17 +74,17 @@ pub(crate) struct WindowPlan {
     pub cut_off: Option<usize>,
 }
 
-/// The per-call budget, measured from the model's own artifacts and carrying
-/// the exact prompt sequence and tokenizer the candle path will run, so the
+/// The per-call budget, measured once from the model's own artifacts, so the
 /// planner counts with what the backend counts with.
+///
+/// Relation kept against the encoder: `prompt_tokens + window text + margin ≤
+/// encoder limit` — the prompt and the headroom are both reserved here, once,
+/// so the planner only has to keep a window's *text* under `tokens_for_text`.
 pub(crate) struct NerBudget {
     /// Tokens the schema prompt takes (labels + `[SEP_TEXT]`).
     pub prompt_tokens: usize,
     /// Tokens left for a window's text: encoder limit − prompt − margin.
     pub tokens_for_text: usize,
-    /// The prompt's own word list (`schema_items` + `[SEP_TEXT]`), fed before
-    /// each window's words in the backend's counting.
-    pub prompt_items: Vec<String>,
     /// The model's tokenizer, reloaded here to count with, not re-estimated.
     pub(crate) tokenizer: tokenizers::Tokenizer,
 }
@@ -120,10 +120,9 @@ fn max_position_embeddings(model_dir: &Path) -> Result<usize, String> {
 /// encoded as one sequence — exactly how `encode_pretokenized` feeds the
 /// tokenizer. Per-item counting makes this the same number the encoder sees,
 /// prompt included.
-fn encoded_token_count(tokenizer: &tokenizers::Tokenizer, items: &[String]) -> Result<usize, String> {
-    let words: Vec<&str> = items.iter().map(String::as_str).collect();
+fn encoded_token_count(tokenizer: &tokenizers::Tokenizer, items: &[&str]) -> Result<usize, String> {
     let encoding = tokenizer
-        .encode(words, false)
+        .encode(items, false)
         .map_err(|e| format!("tokenizing the window budget failed: {e}"))?;
     Ok(encoding.get_ids().len())
 }
@@ -151,8 +150,11 @@ pub(crate) fn schema_items(labels: &[String]) -> Vec<String> {
 /// count from the model's own `tokenizer.json` (measured, not estimated), the
 /// encoder's limit from its config. Cached per directory and label list; the
 /// cache is process-wide like the backend itself.
+/// The budget cache: one entry per model dir + label list.
+type BudgetsByLabelsKey = Mutex<HashMap<(PathBuf, u64), Arc<NerBudget>>>;
+
 pub(crate) fn load_budget(model_dir: &str, labels: &[String]) -> Result<Arc<NerBudget>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64), Arc<NerBudget>>>> = OnceLock::new();
+    static CACHE: OnceLock<BudgetsByLabelsKey> = OnceLock::new();
     let dir = Path::new(model_dir);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for label in labels {
@@ -174,7 +176,8 @@ pub(crate) fn load_budget(model_dir: &str, labels: &[String]) -> Result<Arc<NerB
         .map_err(|e| format!("cannot load tokenizer from {}: {e}", tokenizer_path.display()))?;
     let mut prompt_items = schema_items(labels);
     prompt_items.push(SEP_TEXT_TOKEN.to_string());
-    let prompt_tokens = encoded_token_count(&tokenizer, &prompt_items)?;
+    let prompt_refs: Vec<&str> = prompt_items.iter().map(String::as_str).collect();
+    let prompt_tokens = encoded_token_count(&tokenizer, &prompt_refs)?;
     let max_seq = max_position_embeddings(dir)?;
     if max_seq <= prompt_tokens + TOKENS_MARGIN {
         return Err(format!(
@@ -184,7 +187,6 @@ pub(crate) fn load_budget(model_dir: &str, labels: &[String]) -> Result<Arc<NerB
     let budget = Arc::new(NerBudget {
         prompt_tokens,
         tokens_for_text: max_seq - prompt_tokens - TOKENS_MARGIN,
-        prompt_items,
         tokenizer,
     });
     cache
@@ -279,21 +281,16 @@ fn segments(text: &str) -> Vec<Segment> {
     result
 }
 
-/// Tokens the backend would spend on one window: the schema prompt plus the
-/// window's own words, encoded in one call — the counting the candle path
-/// applies right before it truncates. Words come from re-splitting the
-/// lowercased slice, exactly what the backend will do to it.
-fn window_token_count(
-    tokenizer: &tokenizers::Tokenizer,
-    prompt_items: &[String],
-    slice: &str,
-) -> Result<usize, String> {
+/// Tokens the backend would spend on one window's text — lowercased and
+/// re-split into words, exactly how the candle path feeds its window. Per-word
+/// counting is additive, so window text + the prompt (counted once in
+/// `load_budget`) is the sequence the encoder can truncate; the planner
+/// therefore compares this count directly with `tokens_for_text`, the limit
+/// already minus prompt and margin.
+fn window_token_count(tokenizer: &tokenizers::Tokenizer, slice: &str) -> Result<usize, String> {
     let lowered = slice.to_lowercase();
-    let mut items: Vec<String> = prompt_items.to_vec();
-    for hit in word_regex().find_iter(&lowered) {
-        items.push(hit.as_str().to_string());
-    }
-    encoded_token_count(tokenizer, &items)
+    let words: Vec<&str> = word_regex().find_iter(&lowered).map(|hit| hit.as_str()).collect();
+    encoded_token_count(tokenizer, &words)
 }
 
 /// Plan the windows: walk the segments filling each window to the character
@@ -314,10 +311,10 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         }
         // … then to the token budget.
         let slice_at = |end: usize| text.get(pieces[index].b0..pieces[end].b1).unwrap_or("");
-        let mut tokens = window_token_count(&budget.tokenizer, &budget.prompt_items, slice_at(last))?;
+        let mut tokens = window_token_count(&budget.tokenizer, slice_at(last))?;
         while tokens > budget.tokens_for_text && last > index {
             last -= 1;
-            tokens = window_token_count(&budget.tokenizer, &budget.prompt_items, slice_at(last))?;
+            tokens = window_token_count(&budget.tokenizer, slice_at(last))?;
         }
         if tokens > budget.tokens_for_text {
             return if windows.is_empty() {
@@ -349,6 +346,11 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
     Ok(WindowPlan { windows, cut_off: None })
 }
 
+/// One mention together with the index of the window that found it. `None`
+/// once a span merges pieces of more than one window and can no longer be
+/// attributed to one.
+pub(crate) type WindowMention = (Entity, Option<usize>);
+
 /// Merge the mentions every window found. Overlapping windows re-read the
 /// overlap, so the same span arrives once per window that saw it, and rival
 /// labels from different windows can claim one text. Rules, per the ticket:
@@ -356,41 +358,51 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
 /// - same label overlapping (or touching) spans merge to their union — over
 ///   the caller's own text, so the redaction pattern covers the whole mention,
 ///   never a leak — carrying the parts' best confidence;
-/// - rival labels that overlap keep the more confident one, the longer span
-///   on a tie (the first in sort order: earliest start, longest end);
-/// - exact duplicates collapse (one mention redacts once).
-pub(crate) fn merge_window_entities(text: &str, entities: Vec<Entity>) -> Vec<Entity> {
+/// - same-label neighbours whose gap holds no word characters (a mention the
+///   windows saw in pieces) merge too — but only across windows: a different
+///   window re-read the same region and its piece earns the join, while gaps
+///   inside one window are separate detections, not one mention's pieces;
+/// - rival labels that overlap are decided by confidence: the winner keeps its
+///   label and confidence and its span extends to the union of everything
+///   overlapping it, so whichever label loses, no span piece is left outside
+///   the redaction portions.
+pub(crate) fn merge_window_entities(text: &str, mentions: Vec<WindowMention>) -> Vec<Entity> {
     // Union within a label first: windows finding the same or overlapping
     // mentions under one label become one mention each.
-    let mut per_label: HashMap<String, Vec<Entity>> = HashMap::new();
-    for entity in entities {
-        per_label.entry(join_key(&entity.category)).or_default().push(entity);
+    let mut per_label: HashMap<String, Vec<WindowMention>> = HashMap::new();
+    for mention in mentions {
+        per_label
+            .entry(join_key(&mention.0.category))
+            .or_default()
+            .push(mention);
     }
-    let mut merged: Vec<Entity> = Vec::new();
-    for group in per_label.into_values() {
-        let mut sorted = group;
-        sorted.sort_by(|a, b| {
-            a.start
-                .cmp(&b.start)
-                .then(b.end.cmp(&a.end))
-                .then(prefer_confident(a, b))
+    let mut merged: Vec<WindowMention> = Vec::new();
+    for mut group in per_label.into_values() {
+        group.sort_by(|a, b| {
+            a.0.start
+                .cmp(&b.0.start)
+                .then(b.0.end.cmp(&a.0.end))
+                .then(prefer_confident(&a.0, &b.0))
         });
-        let mut simplified: Vec<Entity> = Vec::with_capacity(sorted.len());
-        for entity in sorted {
+        let mut simplified: Vec<WindowMention> = Vec::with_capacity(group.len());
+        for (entity, window) in group {
             match simplified
                 // only the last can touch the new candidate: kept spans are
                 // disjoint and sorted
                 .last_mut()
             {
                 // Same label: union (touching spans merge; so do neighbours
-                // whose gap holds no word characters — a mention the windows
-                // saw in pieces must not leak the pieces between them).
-                Some(kept)
+                // across windows whose gap holds no word characters — a
+                // mention the windows saw in pieces must not leak the pieces
+                // between them).
+                Some((kept, kept_window))
                     if entity.start <= kept.end
-                        || text
-                            .get(kept.end as usize..entity.start as usize)
-                            .is_some_and(|gap| !gap.chars().any(|c| c.is_alphanumeric())) =>
+                        || (kept_window != &window
+                            && text
+                                .get(kept.end as usize..entity.start as usize)
+                                .is_some_and(|gap| !gap.chars().any(|c| c.is_alphanumeric()))) =>
                 {
+                    *kept_window = if *kept_window == window { *kept_window } else { None };
                     if entity.end > kept.end {
                         // Entity offsets are `u32` (xberg's type); the union
                         // surface is read back from the caller's own text.
@@ -407,33 +419,88 @@ pub(crate) fn merge_window_entities(text: &str, entities: Vec<Entity>) -> Vec<En
                         kept.confidence = entity.confidence;
                     }
                 }
-                _ => simplified.push(entity),
+                _ => simplified.push((entity, window)),
             }
         }
         merged.extend(simplified);
     }
-    // Rival labels fight only on real overlap: keep first in sort order —
-    // earliest start, longest end, higher confidence, label for determinism.
+    // Rival labels fight only on real overlap — and by confidence: the winner
+    // states the label and confidence of the most confident span in the clash,
+    // and its span extends over the union so no overlapping piece drops out of
+    // the redaction (sorting earliest start first keeps the union's left edge
+    // decided before a later candidate arrives).
     merged.sort_by(|a, b| {
-        a.start
-            .cmp(&b.start)
-            .then(b.end.cmp(&a.end))
-            .then(prefer_confident(a, b))
-            .then(join_key(&a.category).cmp(&join_key(&b.category)))
+        a.0.start
+            .cmp(&b.0.start)
+            .then(b.0.end.cmp(&a.0.end))
+            .then(prefer_confident(&a.0, &b.0))
+            .then(join_key(&a.0.category).cmp(&join_key(&b.0.category)))
     });
-    let mut kept: Vec<Entity> = Vec::new();
-    for entity in merged {
-        if kept
-            .last()
-            .is_some_and(|last| entity.start < last.end && last.start < entity.end)
-        {
-            // overlaps an earlier kept span: the more confident (earlier,
-            // longer) span already claims it
+    let mut kept: Vec<WindowMention> = Vec::new();
+    for mention in merged {
+        let overlapping: Vec<usize> = kept
+            .iter()
+            .enumerate()
+            .filter(|(_, (span, _))| mention.0.start < span.end && span.start < mention.0.end)
+            .map(|(index, _)| index)
+            .collect();
+        if overlapping.is_empty() {
+            kept.push(mention);
             continue;
         }
-        kept.push(entity);
+        let mut winners: Vec<WindowMention> = Vec::with_capacity(overlapping.len() + 1);
+        let mut survivors: Vec<WindowMention> = Vec::new();
+        for (index, entry) in kept.drain(..).enumerate() {
+            if overlapping.contains(&index) {
+                winners.push(entry);
+            } else {
+                survivors.push(entry);
+            }
+        }
+        winners.push(mention);
+        let (union_start, union_end) = (
+            winners
+                .iter()
+                .map(|(span, _)| span.start)
+                .min()
+                .expect("candidate in the clash"),
+            winners
+                .iter()
+                .map(|(span, _)| span.end)
+                .max()
+                .expect("candidate in the clash"),
+        );
+        let best = winners
+            .iter()
+            .enumerate()
+            .min_by(|a, b| prefer_winner(&a.1.0, &b.1.0))
+            .map(|(index, _)| index)
+            .expect("candidate in the clash");
+        let (mut winner, mut winner_window) = winners.swap_remove(best);
+        winner.start = union_start;
+        winner.end = union_end;
+        if let Some(union_surface) = text.get(union_start as usize..union_end as usize) {
+            let union = union_surface.trim().to_string();
+            if !union.is_empty() {
+                winner.text = union;
+            }
+        }
+        for (piece, window) in winners {
+            winner_window = if winner_window == window { winner_window } else { None };
+            if confidence(&winner) < confidence(&piece) {
+                winner.confidence = piece.confidence;
+            }
+        }
+        survivors.push((winner, winner_window));
+        survivors.sort_by(|a, b| {
+            a.0.start
+                .cmp(&b.0.start)
+                .then(b.0.end.cmp(&a.0.end))
+                .then(prefer_confident(&a.0, &b.0))
+        });
+        kept = survivors;
     }
-    kept
+    kept.into_iter().map(|(entity, _)| entity).collect()
 }
 
 /// Ordering key of a category: names a label group without relying on Debug
@@ -450,6 +517,14 @@ fn prefer_confident(a: &Entity, b: &Entity) -> std::cmp::Ordering {
     b.confidence
         .partial_cmp(&a.confidence)
         .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Which rival wins one overlapping clash: the more confident; longer on a
+/// tie; the label string for determinism when both tie.
+fn prefer_winner(a: &Entity, b: &Entity) -> std::cmp::Ordering {
+    prefer_confident(a, b)
+        .then((b.end - b.start).cmp(&(a.end - a.start)))
+        .then(join_key(&a.category).cmp(&join_key(&b.category)))
 }
 
 fn confidence(entity: &Entity) -> f32 {

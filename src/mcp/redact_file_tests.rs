@@ -511,14 +511,16 @@ async fn ner_windows_read_the_whole_text() {
     let name_offsets = [0usize, 500, 700, 5_000, 19_000];
     for offset in name_offsets {
         let mut text = String::new();
-        while text.chars().count() < offset {
+        while text.chars().count() + filler.chars().count() <= offset {
             text.push_str(filler);
         }
-        let trimmed = text
-            .get(..)
-            .and_then(|me| me.char_indices().nth(offset).map(|(byte, _)| byte))
-            .unwrap_or(text.len());
-        text.truncate(trimmed);
+        // Pad the remainder with spaces: `filler` ends in one itself, so the
+        // planted name starts a fresh word at exactly `offset`, and the
+        // word-based span lands where the assertion looks for it — a mid-word
+        // cut would glue the name to a partial token and shift the span.
+        while text.chars().count() < offset {
+            text.push(' ');
+        }
         text.push_str("Jeanne Vasseur a signé chez Amélie Tissot. ");
         while text.chars().count() < 20_000 {
             text.push_str(filler);
