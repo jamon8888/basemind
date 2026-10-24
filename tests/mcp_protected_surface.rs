@@ -92,6 +92,7 @@ async fn the_two_tools_are_served_in_an_ordinary_workspace() {
 }
 
 /// Call the `memory` tool with the given arguments and return its protocol outcome.
+#[cfg(feature = "documents")]
 async fn memory(
     service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: serde_json::Value,
