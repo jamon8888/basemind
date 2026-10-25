@@ -12,7 +12,7 @@ import ast
 import _common as c
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901 - the gold grammar is a flat chain of filters, split for the linter it hides
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     c.add_common_args(p)
     p.add_argument("--max-gold", type=int, default=60)
@@ -21,7 +21,7 @@ def main() -> None:
     a = p.parse_args()
 
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
-    stmts: dict[str, list[str]] = {}  # path -> import statement texts
+    stmts: dict[str, list[str]] = {}  # keyed by path: the import statement texts
     modules: set[str] = set()
     for path, src in repo.blobs(repo.files()):
         tree = c.parse_python(src)

@@ -33,6 +33,9 @@ pub mod lang_rules;
 pub mod mcp;
 pub mod path;
 pub mod pii;
+/// Protected-workspace detection: the boundary that keeps the true values out of the
+/// agent's reach inside a `safe/` mirror workspace.
+pub mod protected;
 pub mod query;
 pub mod registry;
 pub mod render;

@@ -490,8 +490,19 @@ fn process_doc(
     let hex_buf = hashing::hex_buf(&hash);
     let hash_hex = hashing::hex_str(&hex_buf);
 
-    if let Some(existing) = store.lookup_doc(rel)
-        && crate::scanner_docs::doc_entry_settled(
+    // The store entry as it stands before this pass. A legacy entry (pre-boundary) carries
+    // a `rehydration_ref`: the re-extract below rewrites the blob without one, but a
+    // Deferred pass leaves the entry untracked (bug #32), so the stale reference would
+    // keep the settled gate failing on every scan forever — perpetual re-extraction with
+    // no convergence. Captured here so the Deferred branch can migrate exactly those
+    // entries once.
+    let existing_doc = store.lookup_doc(rel);
+    let legacy_rehydration = existing_doc
+        .as_ref()
+        .is_some_and(|existing| existing.rehydration_ref.is_some());
+
+    if existing_doc.as_ref().is_some_and(|existing| {
+        crate::scanner_docs::doc_entry_settled(
             existing,
             hash_hex,
             &config.documents.embedding_preset,
@@ -499,7 +510,7 @@ fn process_doc(
             &filters.doc_digest,
             filters.reflush_embeds,
         )
-        && store.blob_path_doc_hex(hash_hex).exists()
+    }) && store.blob_path_doc_hex(hash_hex).exists()
     {
         return FileResult::bare(rel.to_string(), FileStatus::DocUnchanged);
     }
@@ -572,13 +583,20 @@ fn process_doc(
                 rehydration_ref: batch.rehydration_ref.clone(),
                 config_digest: filters.doc_digest.clone(),
             };
-            // Deferred persists an entry only to carry a rehydration_ref into the index
-            // for the GC live set (else the rehydration blob could be reaped while the
-            // doc references it). With no rehydration there is nothing the index must
-            // know: leave the doc untracked so a later Inline pass indexes it (bug #32).
+            // A Deferred pass leaves the doc untracked so a later Inline pass indexes it
+            // (bug #32). It used to persist an entry when the document carried a
+            // rehydration_ref, to keep the rehydration blob alive for the GC live set;
+            // basemind no longer persists rehydration maps (the gateway owns that vault),
+            // so the entry is always left out — except for a legacy entry that already
+            // carries one. There the re-extract above has just rewritten the blob without
+            // the reference, but leaving the entry untracked would keep the stale
+            // reference failing the settled gate forever (perpetual re-extraction, no
+            // convergence), so exactly that entry is re-tracked once, with the reference
+            // cleared. The batch-built entry still lies about `embedded` (false for a
+            // Deferred pass), so a later Inline pass keeps extracting vectors as before.
             let doc_upsert = match embed {
                 EmbedMode::Inline => Some(doc_entry),
-                EmbedMode::Deferred if doc_entry.rehydration_ref.is_some() => Some(doc_entry),
+                EmbedMode::Deferred if legacy_rehydration => Some(doc_entry),
                 EmbedMode::Deferred => None,
             };
             FileResult {
@@ -672,7 +690,6 @@ fn read_working_tree(
             return Err(not_regular("not a regular file (symlinks are not followed)"));
         }
         if !rel.starts_with('/') {
-            // A symlinked *directory* on the way (`link -> /etc`, path `link/passwd`) passes the leaf check.
             let inside = match (abs.canonicalize(), root.canonicalize()) {
                 (Ok(abs), Ok(root)) => abs.starts_with(root),
                 _ => false,

@@ -58,7 +58,9 @@ linux)
   for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
     while IFS= read -r line; do
       lib=$(awk '{ for (i=1;i<=NF;i++){ if ($i=="=>" && $(i+1) ~ /^\//){print $(i+1); exit} if ($i ~ /^\// && $i !~ /^\(/){print $i; exit} } }' <<<"$line")
-      [ -n "$lib" ] && [ -f "$lib" ] || continue
+      if [ -z "$lib" ] || [ ! -f "$lib" ]; then
+        continue
+      fi
       base=$(basename "$lib")
       case "$base" in
       libc.so* | libm.so* | libpthread.so* | libdl.so* | librt.so* | libresolv.so* | \
@@ -213,7 +215,9 @@ windows)
     done
   fi
   for ort_path in "C:/Program Files/onnxruntime" "C:/Program Files (x86)/onnxruntime" "${ONNXRUNTIME_ROOT:-}"; do
-    [ -n "$ort_path" ] && [ -d "$ort_path/lib" ] || continue
+    if [ -z "$ort_path" ] || [ ! -d "$ort_path/lib" ]; then
+      continue
+    fi
     for dll in "$ort_path/lib"/*.dll; do
       [ -f "$dll" ] || continue
       base=$(basename "$dll")

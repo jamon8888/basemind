@@ -113,7 +113,10 @@ build_context_line() {
   head_file="${cwd}/.git/HEAD"
   if [[ -f "$head_file" ]]; then
     local ref
-    ref="$(IFS= read -r ref <"$head_file" && printf '%s' "$ref" || true)"
+    ref=""
+    if ! IFS= read -r ref <"$head_file"; then
+      ref=""
+    fi
     [[ "$ref" == ref:\ refs/heads/* ]] && branch="${ref#ref: refs/heads/}"
   fi
 

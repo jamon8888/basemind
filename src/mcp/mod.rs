@@ -472,6 +472,46 @@ impl BasemindServer {
         self.state.lean.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// True when the served workspace is protected — it carries a `safe/` mirror — and this
+    /// process is not the privacy gateway's own.
+    ///
+    /// Read per request rather than cached at construction: the gateway writes the mirror
+    /// after basemind may already be running, and the mirror's presence is what turns the
+    /// boundary on. The check is a single `symlink_metadata` on `<root>/safe`, which is
+    /// cheaper than the tool call it guards.
+    pub(crate) fn workspace_protected(&self) -> bool {
+        !crate::protected::gateway_capable() && crate::protected::is_protected(&self.state.shared.root)
+    }
+
+    /// True when `name` is a tool this server withholds from the agent.
+    ///
+    /// Withheld inside a protected workspace: `redact_text` returns the token→original
+    /// table and every detection in the clear, and `vault` encrypts, decrypts and searches
+    /// that table. Both stay available to the gateway itself (see
+    /// [`crate::protected::GATEWAY_ENV`]) and to every workspace without a mirror.
+    pub(crate) fn withholds_tool(&self, name: &str) -> bool {
+        self.workspace_protected() && crate::protected::is_withheld_tool(name)
+    }
+
+    /// The protected-workspace refusal for a shared-tier `memory` call, `None` when the
+    /// call passes (the workspace is unprotected, or the call is scoped to the agent's
+    /// own individual entries).
+    ///
+    /// The single seam both surfaces gate through — the direct handler
+    /// (`server_handler`) and the lean wrapper (`lean`) — so the rule lives in one place
+    /// and cannot silently diverge between paths (the lean envelope nests the Arguments
+    /// under `tool_input`; the caller does that unpacking and hands only the map in).
+    pub(crate) fn protected_memory_refusal(
+        &self,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        if self.workspace_protected() {
+            crate::protected::memory_shared_refusal(arguments)
+        } else {
+            None
+        }
+    }
+
     /// Assemble the full tool router (every feature-gated tool group). Pure and argument-free —
     /// its output is invariant for the life of the process, so [`new_with_options`]
     /// (Self::new_with_options) and [`from_shared`](Self::from_shared) never call this directly;

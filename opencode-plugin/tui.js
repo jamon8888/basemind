@@ -33,6 +33,15 @@ const command = fs.existsSync(bundledLauncher)
 
 let commsHighWaterMicros = 0;
 
+/// Advance the comms watermark to the freshest message; false when there is nothing to show.
+function announce(messages) {
+  if (messages.length === 0) {
+    return false;
+  }
+  commsHighWaterMicros = Math.max(commsHighWaterMicros, ...messages.map((message) => message.ts_micros ?? 0));
+  return true;
+}
+
 /// Read the agent-comms inbox by re-execing the basemind CLI. Resolves to the
 /// parsed JSON, or `null` when the CLI is unavailable or returns nothing.
 function readCommsInbox(directory, limit) {
@@ -69,14 +78,6 @@ export default Plugin.define({
 
     const surface = (message) => {
       context.ui.toast.show({ title: "basemind", message, variant: "info" });
-    };
-
-    const announce = (messages) => {
-      if (messages.length === 0) {
-        return false;
-      }
-      commsHighWaterMicros = Math.max(commsHighWaterMicros, ...messages.map((message) => message.ts_micros ?? 0));
-      return true;
     };
 
     const onSessionCreated = context.data.on("session.created", async () => {

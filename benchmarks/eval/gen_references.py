@@ -32,7 +32,7 @@ def callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901,PLR0912 - the gold grammar is a flat chain of filters, splitting it hides the shape
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     c.add_common_args(p)
     p.add_argument("--mode", choices=["references", "callers", "both"], default="references")
@@ -42,8 +42,10 @@ def main() -> None:
     a = p.parse_args()
 
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
-    calls: dict[str, list[tuple[str, int, int]]] = defaultdict(list)  # name -> (path, start, func_end)
-    defs: dict[str, list[str]] = defaultdict(list)  # name -> [defining paths] (def/class only)
+    calls: dict[str, list[tuple[str, int, int]]] = defaultdict(
+        list
+    )  # one entry per call site: the file path and the call line numbers (start, callee end)
+    defs: dict[str, list[str]] = defaultdict(list)  # one list of defining paths per name (def/class only)
     for path, src in repo.blobs(repo.files()):
         tree = c.parse_python(src)
         if tree is None:
@@ -110,10 +112,7 @@ def main() -> None:
                     "baseline": baseline,
                 }
             )
-    print(
-        f"cross-check dropped {dropped} ast call sites not confirmed by git grep -w",
-        file=sys.stderr,
-    )
+    sys.stderr.write(f"cross-check dropped {dropped} ast call sites not confirmed by git grep -w\n")
     c.emit(tasks, a.out)
 
 

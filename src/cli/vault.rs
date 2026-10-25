@@ -69,7 +69,18 @@ fn read_map(path: Option<&PathBuf>) -> Result<BTreeMap<String, String>> {
     Ok(map)
 }
 
+/// Runs the `vault` group.
+///
+/// Refused inside a protected workspace (one carrying a `safe/` mirror): the vault holds the
+/// token→original table, which belongs to the privacy gateway there. The gateway reaches the
+/// engine with the capability it holds (`BASEMIND_GATEWAY_TOKEN`); an agent confined to the
+/// mirror does not.
 pub async fn run(server: &BasemindServer, cmd: VaultCmd, _opts: &Emit, _out: &mut impl Write) -> Result<()> {
+    if server.workspace_protected() {
+        return Err(crate::cli::exit::CliExit::usage(crate::protected::withheld_message(
+            "vault",
+        )));
+    }
     let params = match cmd {
         VaultCmd::Encrypt { map, passphrase } => VaultParams {
             mode: VaultMode::Encrypt,

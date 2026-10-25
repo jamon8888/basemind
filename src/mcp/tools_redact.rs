@@ -7,6 +7,8 @@
 //! token map) → return `{redacted_text, rehydration_map, detections}` so the
 //! caller can store the map and send redacted text onward.
 
+use std::collections::HashMap;
+
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -43,6 +45,15 @@ pub struct RedactTextParams {
     /// Custom regex patterns to redact. Each entry is `["label", "regex"]`.
     #[serde(default)]
     pub custom_patterns: Vec<Vec<String>>,
+    /// Case dictionary: each entry is `["value", "code_name"]`.
+    ///
+    /// The value is the one that must not reach the agent — the real name of a party, the
+    /// name of the project, an address — and the code name is what stands in for it. Each
+    /// value is replaced by its code name in the redacted text, whether the detection engine
+    /// found it or not; and a code name the engine did redact on its own is put back. The
+    /// rehydration map is left untouched, so the caller keeps a reversible record.
+    #[serde(default)]
+    pub pseudonyms: Vec<Vec<String>>,
     /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
     /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
     /// every entry in `GLI_NER2_PII_LABELS` plus `AI_ACT_NER_LABELS` for
@@ -104,6 +115,13 @@ const MAX_BYTES: usize = 1 << 20; // 1 MiB
 /// the extracted text; without this, a huge file reaches xberg's PDF/image/OCR
 /// work before the post-extraction check can reject it.
 const MAX_FILE_BYTES: u64 = 64 << 20; // 64 MiB
+/// Case-dictionary bounds. Every entry is compiled into a `Regex` and swept over
+/// the whole (up to MAX_BYTES) document, so an unbounded entry count or an
+/// unbounded value length would make a single call an unbounded CPU sink.
+/// Fail the call outright — a value the caller meant to hide must never be
+/// partially handled.
+const MAX_PSEUDONYM_ENTRIES: usize = 64;
+const MAX_PSEUDONYM_VALUE_CHARS: usize = 512;
 
 fn oversized_err(len: usize) -> McpError {
     McpError::internal_error(
@@ -333,7 +351,83 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .await
         .map_err(|e| McpError::internal_error(format!("xberg redaction failed: {e}"), None))?;
 
-    let findings = doc.redaction_report.map(|report| report.findings).unwrap_or_default();
+    let mut findings = doc.redaction_report.map(|report| report.findings).unwrap_or_default();
+    let mut rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
+
+    // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
+    // phone number. The legal caller acts on the label, so it has to be `tax_id`.
+    crate::pii::relabel_in_text(&mut findings, &original);
+    let mut redacted_text = std::mem::take(&mut doc.content);
+    // …and the token in the text carries that label too: a company identifier is not
+    // `[PHONE_3]`.
+    crate::pii::rename_tokens(&mut redacted_text, &mut rehydration_map, &findings);
+
+    // The case dictionary: the value becomes its code name, whether the engine found it or
+    // not. Fail closed: an entry the caller meant to hide must never be silently dropped —
+    // a malformed pair aborts the call rather than leaving the real value standing in the
+    // text the agent receives.
+    let mut pseudonyms_applied: Option<serde_json::Value> = None;
+    // The bounds: beyond them the call is refused, not truncated — a value the caller
+    // meant to hide must never be partially handled.
+    if args.pseudonyms.len() > MAX_PSEUDONYM_ENTRIES {
+        return Err(McpError::invalid_params(
+            format!(
+                "too many pseudonyms: {} entries (max {MAX_PSEUDONYM_ENTRIES})",
+                args.pseudonyms.len()
+            ),
+            None,
+        ));
+    }
+    let dictionary: Vec<crate::pii::Pseudonym> = args
+        .pseudonyms
+        .iter()
+        .map(|entry| {
+            if entry.len() != 2 {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "each pseudonym entry is a [value, code_name] pair; got {} element(s)",
+                        entry.len()
+                    ),
+                    None,
+                ));
+            }
+            for element in [&entry[0], &entry[1]] {
+                if element.chars().count() > MAX_PSEUDONYM_VALUE_CHARS {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "pseudonym entry too long: {} characters (max {MAX_PSEUDONYM_VALUE_CHARS})",
+                            element.chars().count()
+                        ),
+                        None,
+                    ));
+                }
+            }
+            crate::pii::Pseudonym::new(entry[0].clone(), entry[1].clone()).ok_or_else(|| {
+                McpError::invalid_params(
+                    "a pseudonym's value and code name must both be non-empty".to_string(),
+                    None,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, McpError>>()?;
+    if !dictionary.is_empty() {
+        // How many occurrences the engine produced per token: the bound the dictionary
+        // sweep replaces under, so token notation the document itself quotes ("then
+        // read [PERSON_1] here") is not silently rewritten into a code name.
+        let mut token_counts: HashMap<String, usize> = HashMap::new();
+        for finding in &findings {
+            *token_counts.entry(finding.replacement_token.clone()).or_default() += 1;
+        }
+        let (substituted, applied) =
+            crate::pii::apply_pseudonyms_with_counts(&redacted_text, &rehydration_map, &dictionary, &token_counts);
+        redacted_text = substituted;
+        // recorded in the payload below, beside the NER coverage fields
+        pseudonyms_applied = Some(serde_json::json!({
+            "tokens": applied.tokens,
+            "literals": applied.literals,
+        }));
+    }
+
     let detections: Vec<serde_json::Value> = findings
         .iter()
         .map(|finding| {
@@ -354,10 +448,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         })
         .collect();
 
-    let rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
-
     let mut payload = serde_json::json!({
-        "redacted_text": doc.content,
+        "redacted_text": redacted_text,
         "rehydration_map": rehydration_map,
         "detections": detections,
         "ner_ran": ner_run.ran,
@@ -370,6 +462,13 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         payload["ner_windows"] = serde_json::json!(ner_run.windows);
         payload["ner_window_chars"] = serde_json::json!(ner_run.window_chars);
         payload["ner_truncated"] = serde_json::json!(ner_run.truncated);
+    }
+    // The dictionary substitutions, when any: engine redaction (a token,
+    // rehydrated through `rehydration_map`) is told apart from dictionary
+    // substitution (the lawyer's code name), so a dispute over what the agent
+    // was shown has an auditable record.
+    if let Some(applied) = pseudonyms_applied {
+        payload["pseudonyms_applied"] = applied;
     }
     Ok(CallToolResult::structured(payload))
 }

@@ -190,8 +190,6 @@ Phases 0 and 2 of ADR-0012 plus the compile unblock. Phases 1 (RRF fusion), 3 (`
 lanes) and 4 (facets) are designed and unimplemented. Rehydration of PII at query time is not
 designed at all; see issues #7–#12.
 
-[#7]: https://github.com/jamon8888/basemind/issues/7
-[#12]: https://github.com/jamon8888/basemind/issues/12
 [#55]: https://github.com/jamon8888/basemind/pull/55
 [#65]: https://github.com/jamon8888/basemind/pull/65
 [#66]: https://github.com/jamon8888/basemind/pull/66

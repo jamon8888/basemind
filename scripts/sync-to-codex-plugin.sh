@@ -178,7 +178,10 @@ UPSTREAM_BRANCH="$(cd "$UPSTREAM" && git branch --show-current)"
 UPSTREAM_SHA="$(cd "$UPSTREAM" && git rev-parse HEAD)"
 UPSTREAM_SHORT="$(cd "$UPSTREAM" && git rev-parse --short HEAD)"
 
-UPSTREAM_REMOTE_RAW="$(cd "$UPSTREAM" && git remote get-url origin 2>/dev/null || true)"
+UPSTREAM_REMOTE_RAW=""
+if ! UPSTREAM_REMOTE_RAW="$(cd "$UPSTREAM" && git remote get-url origin 2>/dev/null)"; then
+  UPSTREAM_REMOTE_RAW=""
+fi
 case "$UPSTREAM_REMOTE_RAW" in
 git@github.com:*) UPSTREAM_URL="https://github.com/${UPSTREAM_REMOTE_RAW#git@github.com:}" ;;
 ssh://git@github.com/*) UPSTREAM_URL="https://github.com/${UPSTREAM_REMOTE_RAW#ssh://git@github.com/}" ;;

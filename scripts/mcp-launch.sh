@@ -240,11 +240,19 @@ fi
 mkdir -p "$PARENT"
 LOCK="$PARENT/.lock-$VERSION"
 STAGING=""
-release_lock() { [ -n "${LOCK_HELD:-}" ] && rmdir "$LOCK" 2>/dev/null || true; }
+release_lock() {
+  if [ -n "${LOCK_HELD:-}" ]; then
+    rmdir "$LOCK" 2>/dev/null || true
+  fi
+}
 cleanup() {
   release_lock
-  [ -n "${TMP:-}" ] && rm -rf "$TMP" 2>/dev/null || true
-  [ -n "$STAGING" ] && rm -rf "$STAGING" 2>/dev/null || true
+  if [ -n "${TMP:-}" ]; then
+    rm -rf "$TMP" 2>/dev/null || true
+  fi
+  if [ -n "$STAGING" ]; then
+    rm -rf "$STAGING" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -332,7 +340,8 @@ fallback_or_die() {
       log "v${VERSION} is not installable; running basemind ${cand} instead — Claude Code will auto-update to v${VERSION} once its release completes"
       release_lock
       LOCK_HELD=""
-      exec env BASEMIND_FORCE_VERSION="$cand" "$0" "${ARGS[@]}"
+      env BASEMIND_FORCE_VERSION="$cand" "$0" "${ARGS[@]}"
+      exit "$?"
     done
   fi
   fb="$(newest_compatible_cached)"

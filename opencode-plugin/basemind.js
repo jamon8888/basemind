@@ -24,6 +24,42 @@ const bundledSkillsDir = path.join(__dirname, "skills");
 const repoSkillsDir = path.join(__dirname, "..", "skills");
 const skillsDir = fs.existsSync(bundledSkillsDir) ? bundledSkillsDir : repoSkillsDir;
 
+/// Read one frontmatter line into `meta`; folded (`>`/`|`) values swallow the
+/// indented lines that follow, and the returned index is where the scan resumes.
+function readMetaLine(meta, lines, index) {
+  const match = /^([A-Za-z0-9_-]+):\s*(.*)$/u.exec(lines[index]);
+  if (!match) {
+    return index;
+  }
+  const [, key, inline] = match;
+  const folded = inline === ">" || inline === ">-" || inline === "|" || inline === "|-";
+  if (folded) {
+    const block = [];
+    let i = index;
+    // A folded block carries its blank lines: swallowing stops at the first nonblank line
+    // that returns to the frontmatter-key indentation level (or the closing `---`), not at
+    // an interior blank, which would silently drop the rest of the description.
+    while (i + 1 < lines.length) {
+      const next = lines[i + 1];
+      if (next.trim() === "" || /^\s+\S/u.test(next)) {
+        block.push(next.trim());
+        i += 1;
+      } else {
+        break;
+      }
+    }
+    // Trailing blanks separate the block from what follows; they are newline runs, not
+    // content, and a folded description ends with them dropped.
+    while (block.length > 0 && block.at(-1) === "") {
+      block.pop();
+    }
+    meta[key] = inline.startsWith("|") ? block.join("\n") : block.join(" ");
+    return i;
+  }
+  meta[key] = inline.replaceAll(/^["']|["']$/gu, "");
+  return index;
+}
+
 /// Strip a leading YAML frontmatter block, returning its fields and the body.
 /// The skills use plain scalar keys plus folded (`>-`) descriptions; a tiny
 /// parser is enough and avoids pulling a YAML dependency into the plugin.
@@ -33,26 +69,11 @@ function parseSkill(text, fallbackId) {
   if (text.startsWith("---")) {
     const end = text.indexOf("\n---", 3);
     if (end !== -1) {
-      const raw = text.slice(3, end);
-      const lines = raw.split("\n");
+      const lines = text.slice(3, end).split("\n");
       for (let i = 0; i < lines.length; i += 1) {
-        const match = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i]);
-        if (!match) {
-          continue;
-        }
-        const [, key, inline] = match;
-        if (inline === ">" || inline === ">-" || inline === "|" || inline === "|-") {
-          const block = [];
-          while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) {
-            block.push(lines[i + 1].trim());
-            i += 1;
-          }
-          meta[key] = inline.startsWith("|") ? block.join("\n") : block.join(" ");
-        } else {
-          meta[key] = inline.replace(/^["']|["']$/g, "");
-        }
+        i = readMetaLine(meta, lines, i);
       }
-      body = text.slice(end + 4).replace(/^\s*\n/, "");
+      body = text.slice(end + 4).replace(/^\s*\n/u, "");
     }
   }
   return {

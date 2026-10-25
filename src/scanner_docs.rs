@@ -306,11 +306,24 @@ pub(crate) fn extract_and_persist_doc(
     if let Some(mut cached) = store.read_doc_by_hex(hash_hex).ok().flatten()
         && cached_doc_is_reusable(&cached, cfg, embed, &filters.doc_digest)
     {
+        // The same pass rewrites whatever the blob still carries from an older regime —
+        // a digest-less blob is stamped with the current one, and a rehydration_ref left
+        // by the dropped rehydration vault is cleared: basemind keeps no key at rest, so
+        // the index must not point at an old token→original blob (which would also keep
+        // it in the GC's live set instead of letting it be reaped).
+        let mut rewrite = false;
         if cached.config_digest.is_empty() {
             cached.config_digest.clone_from(&filters.doc_digest);
+            rewrite = true;
+        }
+        if cached.rehydration_ref.is_some() {
+            cached.rehydration_ref = None;
+            rewrite = true;
+        }
+        if rewrite {
             store
                 .write_doc(hash, &cached)
-                .with_context(|| format!("stamp doc blob for {rel}"))?;
+                .with_context(|| format!("rewrite doc blob for {rel}"))?;
         }
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
@@ -324,23 +337,20 @@ pub(crate) fn extract_and_persist_doc(
         extract_doc(abs, Some(mime_type), &doc_config).with_context(|| format!("extract document {rel}"))?;
     doc.config_digest.clone_from(&filters.doc_digest);
 
-    // Persist the rehydration map as a content-addressed blob when redaction
-    // captured one. The encrypted blob's hash becomes the rehydration_ref stored
-    // in the doc blob and threaded into LanceDB rows.
-    if let Some(map) = doc.pending_rehydration.take()
-        && !map.is_empty()
-    {
-        let passphrase = derive_rehydration_passphrase(scope);
-        let encrypted =
-            xberg::text::redaction::rehydration::encrypt_map(&map, &passphrase).context("encrypt rehydration map")?;
-        let ref_hash = hashing::hash_bytes(&encrypted);
-        let ref_hex_buf = hashing::hex_buf(&ref_hash);
-        let ref_hex = hashing::hex_str(&ref_hex_buf);
-        store
-            .write_rehydration(ref_hex, &encrypted)
-            .context("write rehydration blob")?;
-        doc.rehydration_ref = Some(ref_hex.to_string());
-    }
+    // The rehydration map captured during extraction is NOT persisted here.
+    //
+    // It used to be encrypted with a passphrase derived from the workspace scope and the data
+    // directory (a 64-bit hash of two values the reader can compute), stored as a
+    // content-addressed blob, and referenced from the index through `rehydration_ref`. Anyone
+    // who knew the scope and the data directory could recompute that key and decrypt the map —
+    // the token→original table of every redacted document in the workspace. In the gateway
+    // (passerelle) architecture the true values belong to the gateway, which keeps its keys in
+    // the system keychain; basemind is the engine and keeps no key at rest.
+    //
+    // The map stays in memory for the length of the extraction (the tax-id relabeling reads it)
+    // and is dropped with the document. `rehydration_ref` therefore stays `None`; the field and
+    // its index column remain for schema stability, and the blob GC reaps the blobs older
+    // workspaces left behind.
 
     // Wire redaction findings into the pii_lineage GDPR Article 30 audit trail.
     if !doc.redaction_findings.is_empty()
@@ -392,25 +402,6 @@ pub(crate) fn doc_embed_requested(rel: &str, cfg: &DocumentsConfig, mode: EmbedM
     matches!(mode, EmbedMode::Inline) && cfg.embed && filters.doc_embed_allowed(rel)
 }
 
-/// Derive a deterministic passphrase for encrypting rehydration maps.
-///
-/// Mixes the workspace scope with the data-directory path so blobs from
-/// different workspaces or machines cannot be decrypted interchangeably.
-/// The data directory is machine-unique and not derivable from scope alone,
-/// which protects against a copied blob being decrypted on a different
-/// machine with the same scope name.
-// ponytail: scope+data_dir is sufficient for local-only encryption.
-// Upgrade path: vault-managed random key if cross-device portability is needed.
-fn derive_rehydration_passphrase(scope: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    scope.hash(&mut hasher);
-    if let Some(dirs) = directories::ProjectDirs::from("", "", "basemind") {
-        dirs.data_dir().hash(&mut hasher);
-    }
-    format!("basemind-rehydration-{:016x}", hasher.finish())
-}
-
 /// The pure (IO-free) half of the `process_doc` unchanged fast path: does a tracked entry settle the
 /// current pass without re-processing? True when the content hash and preset both match AND either
 /// the doc is embedded, a prior pass already attempted embedding (issue #44 follow-up — a failed
@@ -421,6 +412,9 @@ fn derive_rehydration_passphrase(scope: &str) -> String {
 /// The entry must also carry the current `config_digest` (so a changed chunk / extraction knob
 /// re-processes the doc), and `reflush` (the embed policy changed since the last scan) sends every
 /// doc that wants vectors back through the pipeline so its rows are rebuilt from the cached blob.
+/// An entry that still carries a legacy `rehydration_ref` does not settle either: basemind keeps
+/// no key at rest, so the doc is re-processed (an Inline pass clears the reference and rewrites
+/// both blob and entry) instead of staying pinned in the GC's live set forever.
 pub(crate) fn doc_entry_settled(
     existing: &crate::store::DocEntry,
     hash_hex: &str,
@@ -433,6 +427,7 @@ pub(crate) fn doc_entry_settled(
         && existing.embedding_preset == embedding_preset
         && existing.config_digest == config_digest
         && !(embed_requested && reflush)
+        && existing.rehydration_ref.is_none()
         && (existing.embedded || existing.embed_attempted || !embed_requested)
 }
 

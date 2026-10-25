@@ -26,6 +26,7 @@ fn text_params(text: &str) -> RedactTextParams {
         strategy: None,
         custom_terms: vec![],
         custom_patterns: vec![],
+        pseudonyms: vec![],
         ner_model_dir: None,
         require_ner: false,
     }
@@ -137,6 +138,7 @@ async fn file_path_redacts_extracted_text() {
         strategy: None,
         custom_terms: vec![],
         custom_patterns: vec![],
+        pseudonyms: vec![],
         ner_model_dir: None,
         require_ner: false,
     })
@@ -159,6 +161,7 @@ async fn file_path_missing_file_errors() {
         strategy: None,
         custom_terms: vec![],
         custom_patterns: vec![],
+        pseudonyms: vec![],
         ner_model_dir: None,
         require_ner: false,
     })
@@ -176,6 +179,7 @@ async fn text_and_file_path_together_rejected() {
         strategy: None,
         custom_terms: vec![],
         custom_patterns: vec![],
+        pseudonyms: vec![],
         ner_model_dir: None,
         require_ner: false,
     })
@@ -197,6 +201,7 @@ async fn oversized_extracted_content_errors() {
         strategy: None,
         custom_terms: vec![],
         custom_patterns: vec![],
+        pseudonyms: vec![],
         ner_model_dir: None,
         require_ner: false,
     })
