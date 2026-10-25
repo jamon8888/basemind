@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [0.34.1] - 2026-10-24
+
+> **Patch release — the redact_text NER fix.** No index migration: `RELEASE_MINOR` stays 34,
+> so upgrading from 0.34.x does not re-index.
+
+### Fixed
+
+- **`redact_text`'s NER reads — and reports — every character.** GLiNER2's candle backend reads
+  only the encoder's first few hundred tokens (the schema prompt eats into the same budget),
+  so names, companies and addresses past the first roughly 585–898 characters went undetected
+  while the tool answered `ner_ran: true` — worst for `file_path`, whose extracted text the
+  caller never sees. The tool now windows the text internally: word-boundary windows with 100
+  characters of overlap, sized in tokens against the model's own `tokenizer.json` and encoder
+  limit and capped at the caller's 400-character gate; spans shift onto the caller's offsets
+  and merge by confidence to the union (over-masking, never a leak), and a wall-clock budget
+  stops extreme bodies honestly. The result declares its coverage — `ner_windows`,
+  `ner_window_chars` and `ner_truncated` — and `require_ner` fails when the text could not be
+  read whole. ([#94])
+- **cargo-deny's advisories gate is green again.** Lockfile-only semver bumps past
+  RUSTSEC-2026-0385 (ctutils), RUSTSEC-2026-0386 (tokio 1.54.1), RUSTSEC-2026-0382/0383/0381
+  (rustls-webpki, webpki-root-certs, webpki-roots) — no code or building changes.
+
 ## [0.34.0] - 2026-10-18
 
 > **Minor release — an upstream sync, the self-scoped scan gate, and release-pipeline
@@ -175,6 +197,7 @@ designed at all; see issues #7–#12.
 [#74]: https://github.com/jamon8888/basemind/pull/74
 [#75]: https://github.com/jamon8888/basemind/pull/75
 [#76]: https://github.com/jamon8888/basemind/pull/76
+[#94]: https://github.com/jamon8888/basemind/pull/94
 
 ## [0.26.0] - 2026-09-01
 

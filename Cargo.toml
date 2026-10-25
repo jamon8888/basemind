@@ -33,7 +33,7 @@ include = [
   "!/src/index/writer_tests.rs",
 ]
 name = "basemind"
-version = "0.34.0"
+version = "0.34.1"
 authors = ["Na'aman Hirschfeld <nhirschfeld@gmail.com>"]
 edition = "2024"
 description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, on-demand web crawl, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
@@ -132,7 +132,9 @@ code-intel = ["code-intel-js", "code-intel-stack"]
 # GLiNER2 candle NER backend for redact_text person/organization/location (#37).
 # Degrades to pattern-only redaction when the model dir is missing or the tool
 # is called without `ner_model_dir`.
-ner-candle = ["documents", "xberg/ner-candle-backend"]
+# tokenizers: #71 windowing must count tokens exactly as the backend will, so
+# the planner loads the model's own `tokenizer.json` with the same crate.
+ner-candle = ["documents", "xberg/ner-candle-backend", "dep:tokenizers"]
 
 full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search", "ner-candle"]
 
@@ -248,6 +250,10 @@ tree-sitter-language-pack = "1.22.1"
 tree-sitter-stack-graphs = { package = "basemind-tree-sitter-stack-graphs", version = "0.10.1", path = "crates/tree-sitter-stack-graphs", optional = true }
 url = { version = "2", features = ["serde"], optional = true }
 xberg = { version = "1.3.9", default-features = false, features = ["tokio-runtime", "simd-utf8"], optional = true }
+# #71: same crate as `xberg-gliner`'s candle path, so the window planner's token
+# counts are the backend's counts, not an estimate. Same feature set to avoid a
+# divergent feature resolution.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 zstd = "0.14.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -258,6 +264,10 @@ basemind = { path = ".", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 form_urlencoded = "1"
 insta = "1"
+# #71: the windowing unit tests build a tokenizer that costs one token per
+# word; `tokenizers` names its vocab map with `ahash`, so the tests can spell
+# the type the builder asks for.
+ahash = "0.8"
 proptest = "1"
 rmcp = { version = "3.5", features = ["client", "transport-async-rw", "transport-child-process"] }
 tempfile = "3"

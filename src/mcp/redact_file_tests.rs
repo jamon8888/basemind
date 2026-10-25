@@ -86,6 +86,27 @@ async fn require_ner_fails_instead_of_degrading() {
     }
 }
 
+/// The #71 coverage fields (`ner_windows`, `ner_window_chars`,
+/// `ner_truncated`) appear only when NER ran — an unavailable model claims
+/// nothing about windows it never read.
+#[tokio::test]
+async fn coverage_fields_appear_only_when_ner_ran() {
+    let result = run_redact(RedactTextParams {
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Reach me at alice@example.com today")
+    })
+    .await
+    .expect("degrades to pattern-only by default");
+    let payload = json_of(&result);
+    assert_eq!(payload["ner_ran"], Value::Bool(false));
+    for field in ["ner_windows", "ner_window_chars", "ner_truncated"] {
+        assert!(
+            payload.get(field).is_none(),
+            "{field} must not claim coverage when NER never ran: {payload}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn text_param_still_redacts() {
     let result = run_redact(text_params("Reach me at alice@example.com today"))
@@ -247,41 +268,6 @@ async fn custom_term_labels_surface_in_detections() {
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(redacted.contains("[PERSON_1]"), "person token missing: {redacted}");
     assert!(redacted.contains("[LOCATION_1]"), "location token missing: {redacted}");
-}
-
-/// Overlapping NER spans collapse to the earliest, longest mention — one
-/// custom term, one redaction token, even when categories disagree.
-#[test]
-fn overlapping_ner_spans_dedup_to_one_mention() {
-    use xberg::types::entity::{Entity, EntityCategory};
-    let entities = vec![
-        Entity {
-            category: EntityCategory::Person,
-            text: "Alice Smith".to_string(),
-            start: 5,
-            end: 16,
-            confidence: Some(0.97),
-        },
-        Entity {
-            category: EntityCategory::Location,
-            text: "Smith".to_string(),
-            start: 11,
-            end: 16,
-            confidence: Some(0.6),
-        },
-        Entity {
-            category: EntityCategory::Organization,
-            text: "Acme".to_string(),
-            start: 20,
-            end: 24,
-            confidence: Some(0.9),
-        },
-    ];
-    let kept = super::dedup_overlapping(entities);
-    assert_eq!(kept.len(), 2, "overlapping span must be dropped");
-    assert_eq!(kept[0].text, "Alice Smith");
-    assert_eq!(kept[0].confidence, Some(0.97));
-    assert_eq!(kept[1].text, "Acme");
 }
 
 /// NER spans redact whole words only: a short span like "US" must never
@@ -510,4 +496,112 @@ async fn redacted_text_keeps_the_surrounding_text_verbatim() {
     assert!(redacted.starts_with("  Intro\r\n\r\n\r\nContact: "), "{redacted:?}");
     assert!(redacted.ends_with(" merci\n\n"), "{redacted:?}");
     assert!(!redacted.contains("jane.roe@exemple.fr"), "{redacted:?}");
+}
+
+// #71 acceptance: the model reads the whole text, says so, and the result
+// carries the offset coverage a caller needs to prove it. Ignored like the
+// other real-model test: set BASEMIND_NER_MODEL_DIR to the staged GLiNER2
+// directory. The multi-thread runtime is required because the candle backend
+// calls `tokio::task::block_in_place` during inference.
+
+/// A 20 000-character body (a plausible extracted file) with a person name
+/// planted near the ticket's cutoff offsets — 0, 500, 700, 5 000 and 19 000 —
+/// detected at every offset, through `text`: NER windows internally and
+/// reports the coverage contract.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn ner_windows_read_the_whole_text() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let filler = "le rapport continue avec des mots sans aucune personne dedans. ";
+    let name_offsets = [0usize, 500, 700, 5_000, 19_000];
+    for offset in name_offsets {
+        let mut text = String::new();
+        while text.chars().count() + filler.chars().count() <= offset {
+            text.push_str(filler);
+        }
+        // Pad the remainder with spaces: `filler` ends in one itself, so the
+        // planted name starts a fresh word at exactly `offset`, and the
+        // word-based span lands where the assertion looks for it — a mid-word
+        // cut would glue the name to a partial token and shift the span.
+        while text.chars().count() < offset {
+            text.push(' ');
+        }
+        text.push_str("Jeanne Vasseur a signé chez Amélie Tissot. ");
+        while text.chars().count() < 20_000 {
+            text.push_str(filler);
+        }
+        let result = run_redact(RedactTextParams {
+            text: text.clone(),
+            ner_model_dir: Some(dir.clone()),
+            ..text_params(&text)
+        })
+        .await
+        .expect("redact_text succeeds with a real model over 20k characters");
+        let payload = json_of(&result);
+        assert_eq!(payload["ner_ran"], Value::Bool(true));
+        assert_eq!(
+            payload["ner_truncated"],
+            Value::Bool(false),
+            "no truncation at offset {offset}"
+        );
+        let windows = payload["ner_windows"].as_u64().expect("ner_windows");
+        let window_chars = payload["ner_window_chars"].as_u64().expect("ner_window_chars");
+        // The caller's gate: window sizes at most the window size it uses
+        // itself (400), and more than one window for a 20 000-character body.
+        assert!(
+            window_chars <= 400,
+            "`ner_window_chars` {window_chars} past the caller's gate"
+        );
+        assert!(windows > 1, "a 20 000-character body is {windows} windows");
+        // The planted name must surface, at the exact offsets it was sent at.
+        let start = find_char_byte(&text, offset).expect("offset within the text");
+        let detections = payload["detections"].as_array().expect("detections");
+        let name = detections.iter().find(|detection| {
+            detection["start"].as_u64() == Some(start as u64)
+                && detection["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Jeanne") || t.contains("Vasseur"))
+        });
+        let detection = name.unwrap_or_else(|| panic!("no detection at {start} for offset {offset}: {detections:?}"));
+        assert!(
+            detection["confidence"].as_f64().is_some(),
+            "an NER span carries its confidence: {detection:?}"
+        );
+    }
+}
+
+/// Text dense in tokens — digit runs, e-mail addresses, identifiers — must
+/// plan without truncation: the token budget shrinks windows before the char
+/// cap would misread anything.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn dense_text_reports_no_truncation() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let filler = format!(
+        "dossier 0123456789 expéditeur {} iban FR76 3000 4028 3700 0102 7654 319 réf 2026-04-2/1187. ",
+        "alice@exemple.fr"
+    );
+    let text = filler.repeat(500);
+    let result = run_redact(RedactTextParams {
+        text: text.clone(),
+        ner_model_dir: Some(dir),
+        ..text_params(&text)
+    })
+    .await
+    .expect("dense text redacts with a real model");
+    let payload = json_of(&result);
+    assert_eq!(
+        payload["ner_truncated"],
+        Value::Bool(false),
+        "dense text must not truncate: {payload}"
+    );
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    let windows = payload["ner_windows"].as_u64().expect("ner_windows");
+    assert!(windows > 1, "a dense body windows out: {payload}");
+}
+
+/// Byte offset of the `index`th character — placement helper mirroring the
+/// ticket's character-tallied offsets.
+fn find_char_byte(text: &str, index: usize) -> Option<usize> {
+    text.char_indices().nth(index).map(|(byte, _)| byte)
 }
