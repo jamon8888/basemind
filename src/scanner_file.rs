@@ -501,7 +501,7 @@ fn process_doc(
         .as_ref()
         .is_some_and(|existing| existing.rehydration_ref.is_some());
 
-    if let Some(existing) = existing_doc.as_ref().filter(|existing| {
+    if existing_doc.as_ref().is_some_and(|existing| {
         crate::scanner_docs::doc_entry_settled(
             existing,
             hash_hex,
