@@ -8,6 +8,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [0.35.0] - 2026-10-25
+
+> **Minor release — the privacy gateway boundary (ADR-0015).** `RELEASE_MINOR` goes 34 → 35,
+> so the first scan after upgrading pays one full re-index (durable, not destructive — see
+> `src/version.rs`).
+
+### Added
+
+- **A `safe/` mirror makes the workspace protected — the boundary the gateway owns.**
+  `redact_text` and `vault` leave the agent's surface (`tools/list`, `get_tool`, `tools/call`
+  and the lean pass) and the CLI refuses `basemind redact` / `vault` with exit 2; the gateway
+  marks its own basemind process with `BASEMIND_GATEWAY_TOKEN` to reopen them `([#93])`.
+- **The upstream resources refuse in a protected workspace**: status, repo/map, outline and
+  memory are refused and their templates cleared — what they serve is not masked by the mirror.
+- **`redact_text` gains a case dictionary** (`pseudonyms`, `[value, code_name]` pairs, CLI
+  `--pseudonym`): detected or not, a dictionary value becomes its code name, and a code name
+  the engine redacted is put back; the rehydration map is untouched. The result carries the
+  substitutions (`pseudonyms_applied`) so engine redaction stays auditable apart from
+  dictionary renaming `([#93])`.
+
+### Changed
+
+- **A SIREN/SIRET passing the Luhn check is re-labelled `tax_id`, not `phone`**, the label the
+  caller may act on — the token is renamed `[TAX_ID_n]` in text and map on the tool path.
+- **The scan path stops persisting the rehydration map**: no blob is written,
+  `rehydration_ref` stays `None` (the schema keeps the field); the gateway owns the true
+  values and reaches them through the `redact_text` result `([#93])`.
+
+### Fixed
+
+- Token sweeps stop rewriting notation the document itself quotes: the dictionary's token
+  replacement and the tax-id retagging are bounded to the occurrences the engine produced,
+  so an authored "[PERSON_1]" or "[PHONE_3]" keeps standing as the bare token, beyond the
+  rehydration's reach. A phone finding whose value cannot be recovered is warned, not
+  silently skipped in the company-id re-label, and the custom-label grade key is built by
+  matching the enum variant rather than stringifying `Debug` output back.
+- A legacy store entry carrying a `rehydration_ref` no longer defeats convergence in
+  Deferred-only workspaces: the one-time migration re-tracks it with the reference cleared
+  after the blob rewrite `([#93])`.
+
 ## [0.34.1] - 2026-10-24
 
 > **Patch release — the redact_text NER fix.** No index migration: `RELEASE_MINOR` stays 34,
@@ -198,6 +238,7 @@ designed at all; see issues #7–#12.
 [#75]: https://github.com/jamon8888/basemind/pull/75
 [#76]: https://github.com/jamon8888/basemind/pull/76
 [#94]: https://github.com/jamon8888/basemind/pull/94
+[#93]: https://github.com/jamon8888/basemind/pull/93
 
 ## [0.26.0] - 2026-09-01
 
