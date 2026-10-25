@@ -698,7 +698,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
             .map(|f| RedactionFinding {
                 start: f.start,
                 end: f.end,
-                category: format!("{:?}", f.category).to_lowercase(),
+                category: crate::pii::category_string(&f.category),
                 replacement_token: f.replacement_token,
             })
             .collect();

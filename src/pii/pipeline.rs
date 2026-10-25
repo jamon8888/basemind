@@ -1,6 +1,8 @@
 //! Layer-4+ pipeline helpers: confidence thresholds, span dedup, erasure.
 
 use super::{PiiEntity, RiskLevel};
+#[cfg(feature = "documents")]
+use xberg::types::redaction::PiiCategory;
 
 // ─── Pipeline helpers: thresholds, span dedup, format validators, erasure ───
 
@@ -54,6 +56,23 @@ fn bare_label(label: &str) -> &str {
         .strip_prefix("custom(\"")
         .and_then(|rest| rest.strip_suffix("\")"))
         .unwrap_or(label)
+}
+
+/// The category key a redaction finding is graded by: the engine label lowercased, a
+/// caller-supplied label riding the `custom("…")` wrapper [`bare_label`][self::bare_label]
+/// looks through.
+///
+/// Built by matching the enum variant, not by reading `Debug` output back: the doc
+/// extraction seam used to render the `PiiCategory` with `format!("{:?}")` and lowercase
+/// it, so a changed `Debug` rendering (quoting, field names, spacing) would silently flow
+/// into the graders and demote a high-sensitivity label to the unknown default. Render
+/// and parse hold the same wrapper shape, and hold it here.
+#[cfg(feature = "documents")]
+pub fn category_string(category: &PiiCategory) -> String {
+    match category {
+        PiiCategory::Custom(label) => format!("custom(\"{label}\")"),
+        other => format!("{other:?}").to_lowercase(),
+    }
 }
 
 /// Returns true when a detection at `confidence` survives the Layer-4 filter.

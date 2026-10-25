@@ -493,6 +493,25 @@ impl BasemindServer {
         self.workspace_protected() && crate::protected::is_withheld_tool(name)
     }
 
+    /// The protected-workspace refusal for a shared-tier `memory` call, `None` when the
+    /// call passes (the workspace is unprotected, or the call is scoped to the agent's
+    /// own individual entries).
+    ///
+    /// The single seam both surfaces gate through — the direct handler
+    /// (`server_handler`) and the lean wrapper (`lean`) — so the rule lives in one place
+    /// and cannot silently diverge between paths (the lean envelope nests the Arguments
+    /// under `tool_input`; the caller does that unpacking and hands only the map in).
+    pub(crate) fn protected_memory_refusal(
+        &self,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        if self.workspace_protected() {
+            crate::protected::memory_shared_refusal(arguments)
+        } else {
+            None
+        }
+    }
+
     /// Assemble the full tool router (every feature-gated tool group). Pure and argument-free —
     /// its output is invariant for the life of the process, so [`new_with_options`]
     /// (Self::new_with_options) and [`from_shared`](Self::from_shared) never call this directly;

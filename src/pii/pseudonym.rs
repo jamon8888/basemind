@@ -64,6 +64,23 @@ impl Applied {
 /// `text` the text it produced. The returned text carries the code names; the map is not
 /// modified, so the caller keeps a reversible record of the true values.
 pub fn apply(text: &str, map: &BTreeMap<String, String>, entries: &[Pseudonym]) -> (String, Applied) {
+    apply_with_counts(text, map, entries, &HashMap::new())
+}
+
+/// [`apply`], bounded: `token_counts` carries, per engine token, how many findings
+/// produced it. The token sweep replaces exactly that many occurrences — in reading
+/// order — rather than every occurrence in the text. A document that quotes the token
+/// notation itself ("then read [PERSON_1] again") carries occurrences the engine did
+/// not write; an unbounded sweep would rewrite that authored text into the code name
+/// with no detection behind it. An authored extra is left as the bare token: still
+/// masked, and rehydrated through the map exactly like every occurrence of it. A token
+/// absent from `token_counts` sweeps unbounded, as before.
+pub fn apply_with_counts(
+    text: &str,
+    map: &BTreeMap<String, String>,
+    entries: &[Pseudonym],
+    token_counts: &HashMap<String, usize>,
+) -> (String, Applied) {
     let mut usable: Vec<&Pseudonym> = entries
         .iter()
         .filter(|entry| !entry.value.trim().is_empty() && !entry.code.trim().is_empty())
@@ -110,7 +127,13 @@ pub fn apply(text: &str, map: &BTreeMap<String, String>, entries: &[Pseudonym]) 
         if !is_bracketed_token(token) {
             continue;
         }
-        out = out.replace(token.as_str(), code);
+        // The bounded sweep (see [`apply_with_counts`]): only the occurrences the
+        // engine produced carry the code name.
+        let expected = token_counts
+            .get(token.as_str())
+            .copied()
+            .map_or(usize::MAX, |count| count.max(1));
+        out = out.replacen(token.as_str(), code, expected);
         applied.tokens.push((token.clone(), code.clone()));
     }
 

@@ -213,17 +213,18 @@ pub(super) async fn lean_call_tool(
                 ));
             }
             // A lean wrapper must not carry a `memory` call past the protected-workspace gate:
-            // the shared tier is gated exactly as the direct surface gates it, reading the same
-            // `tool_input` the inner call will use.
-            if tool_name == "memory" && server.workspace_protected() {
-                let input = request
-                    .arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.get("tool_input"))
-                    .and_then(serde_json::Value::as_object);
-                if let Some(message) = crate::protected::memory_shared_refusal(input) {
-                    return Err(McpError::new(rmcp::model::ErrorCode::INVALID_PARAMS, message, None));
-                }
+            // the shared tier is gated through the same helper the direct surface uses — one
+            // rule, one place — reading the same `tool_input` the inner call will use.
+            if tool_name == "memory"
+                && let Some(message) = server.protected_memory_refusal(
+                    request
+                        .arguments
+                        .as_ref()
+                        .and_then(|arguments| arguments.get("tool_input"))
+                        .and_then(serde_json::Value::as_object),
+                )
+            {
+                return Err(McpError::new(rmcp::model::ErrorCode::INVALID_PARAMS, message, None));
             }
             if !router.has_route(&tool_name) {
                 return Err(McpError::invalid_params(format!("unknown tool `{tool_name}`"), None));

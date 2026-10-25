@@ -103,10 +103,10 @@ impl ServerHandler for BasemindServer {
         // The `memory` tool stays callable, but in a protected workspace the shared tier is
         // turned off exactly like the withheld resource: the same content the shared tier
         // serves is what `basemind://memory/{key}` is refused for. Private individual memory
-        // passes.
-        if self.workspace_protected()
-            && request.name == "memory"
-            && let Some(message) = crate::protected::memory_shared_refusal(request.arguments.as_ref())
+        // passes. The cheap name check runs first — `workspace_protected()` is a
+        // `symlink_metadata` syscall that the non-memory calls must not pay.
+        if request.name == "memory"
+            && let Some(message) = self.protected_memory_refusal(request.arguments.as_ref())
         {
             return Err(rmcp::ErrorData::new(
                 rmcp::model::ErrorCode::INVALID_PARAMS,

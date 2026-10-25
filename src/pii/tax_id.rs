@@ -62,6 +62,14 @@ fn relabel_with(findings: &mut [RedactionFinding], value_of: impl Fn(&RedactionF
             continue;
         }
         let Some(value) = value_of(finding) else {
+            // Surfaced, not skipped in silence: a phone finding whose value resolves to
+            // nothing (offsets off the text or a char boundary; the token missing from
+            // the map) is exactly the case the re-label exists for. Failing it quietly
+            // would leave a company identifier filed as a phone number with no trace.
+            tracing::warn!(
+                token = %finding.replacement_token,
+                "company-id re-label skipped: the phone finding's value could not be recovered"
+            );
             continue;
         };
         if !is_fr_company_id(&value) {
@@ -83,9 +91,11 @@ fn relabel_with(findings: &mut [RedactionFinding], value_of: impl Fn(&RedactionF
 /// already claimed — by a map key, by a source token, by a token the engine issued under
 /// the tax-id label (a custom-pattern finding carries `[TAX_ID_n]` on its own — renaming
 /// it would only renumber the fleet — but its number stays taken), or by an occurrence in
-/// the redacted text. Claiming makes the rewrite safe as a plain sweep: a destination is
+/// the redacted text. Claiming makes the rewrite safe as a bounded sweep: a destination is
 /// never a source (so a later replacement cannot rewrite an earlier destination) and never
-/// merges two different values in the map.
+/// merges two different values in the map, and only the occurrences the engine wrote (the
+/// findings sharing the token) are renamed — token notation the document itself quotes is
+/// left alone.
 ///
 /// Returns how many tokens were renamed.
 pub fn rename_tokens(text: &mut String, map: &mut BTreeMap<String, String>, findings: &[RedactionFinding]) -> usize {
@@ -127,7 +137,19 @@ pub fn rename_tokens(text: &mut String, map: &mut BTreeMap<String, String>, find
         renames.push((from, to));
     }
     for (from, to) in &renames {
-        *text = text.replace(from.as_str(), to);
+        // The sweep is bounded to the occurrences the engine produced: how many findings
+        // share the source token is how many times the engine wrote it. A document that
+        // quotes the token notation itself ("[PHONE_3] stands for the identifier")
+        // carries authored occurrences; renaming those would hand notation the author
+        // wrote a meaning it never had. The authored extras stay bare tokens — safe,
+        // because the map entry is removed rather than left re-keyed under the old
+        // token, so an authored extra cannot rehydrate to the true value.
+        let produced = findings
+            .iter()
+            .filter(|finding| finding.replacement_token == *from)
+            .count()
+            .max(1);
+        *text = text.replacen(from.as_str(), to, produced);
         if let Some(value) = map.remove(from) {
             map.insert(to.clone(), value);
         }
