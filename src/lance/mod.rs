@@ -20,6 +20,9 @@ mod documents_unit_tests;
 /// Lexical index build and query, out of line by the line cap.
 #[cfg(feature = "documents")]
 pub mod fts;
+/// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
+#[cfg(feature = "graphrag")]
+pub mod graphrag;
 pub mod schema;
 /// Unit tests; out of line by the line cap (`tests/max_lines.rs`).
 #[cfg(test)]
@@ -34,6 +37,13 @@ pub use batch::{BATCH_MAX_DOCS, BATCH_MAX_ROWS, PendingBatch, SCAN_RETENTION};
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;
+
+#[cfg(feature = "graphrag")]
+pub use graphrag::{
+    build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, delete_graph_for_scope,
+    execute_cypher, GraphragConfig, DocEntitySidecar, GraphEntityRow, GraphEdgeRow,
+    normalize_literal, CypherResult, GraphRagHit,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +61,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
+#[cfg(feature = "graphrag")]
+use schema::{graph_entities_schema, graph_edges_schema, GRAPH_ENTITIES_TABLE, GRAPH_EDGES_TABLE};
 
 /// On-disk metadata for the lance store. Tracks the vector dim, the
 /// embedding-model identifier, and the Arrow table schema version; a mismatch on
@@ -236,6 +248,11 @@ impl LanceStore {
             ensure_table(&connection, schema::CODE_CHUNKS_TABLE, schema::code_chunks_schema(dim)).await?;
             #[cfg(feature = "documents")]
             ensure_table(&connection, schema::DOC_LINKS_TABLE, schema::doc_links_schema()).await?;
+            #[cfg(feature = "graphrag")]
+            {
+                ensure_table(&connection, GRAPH_ENTITIES_TABLE, graph_entities_schema()).await?;
+                ensure_table(&connection, GRAPH_EDGES_TABLE, graph_edges_schema()).await?;
+            }
             anyhow::Ok(())
         })?;
 

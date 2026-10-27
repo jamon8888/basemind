@@ -138,6 +138,83 @@ pub fn doc_links_schema() -> SchemaRef {
     ]))
 }
 
+/// Identity key source for entity nodes — mirrors spec 0016 §7.2.
+///
+/// Under `token_replace` the graph cannot join across documents by the literal
+/// (e.g. `[EMAIL_1]` appears in many documents). The key source distinguishes:
+/// - `TokenOfDocument`: (scope, label, literal, document_path) — document-scoped
+/// - `ClearLiteral`: (scope, label, normalized_literal) — global within scope
+#[cfg(feature = "graphrag")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKeySource {
+    TokenOfDocument,
+    ClearLiteral,
+}
+
+/// Build the schema for the `graph_entities` table — entity nodes over the documents corpus.
+///
+/// One row per unique entity key (scope × label × key_source × normalized_literal/document).
+/// Columns:
+/// - `scope`            UTF-8     ingestion scope (repo identity)
+/// - `label`            UTF-8     GLiNER label (`person`, `organization`, `location`, `custom:*`)
+/// - `key_source`       UInt8     0 = TokenOfDocument, 1 = ClearLiteral (EntityKeySource discriminant)
+/// - `normalized_literal` UTF-8  normalized literal (case-fold + ascii-fold + whitespace collapse)
+/// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty for ClearLiteral)
+/// - `mention_count`    UInt32    number of mentions aggregated into this node
+/// - `first_seen_chunk` UInt32    chunk_idx of first mention (for ordering)
+/// - `last_seen_chunk`  UInt32    chunk_idx of last mention
+/// - `doc_path`         UTF-8     document path of the representative mention
+/// - `doc_chunk_idx`    UInt32    chunk index of the representative mention
+#[cfg(feature = "graphrag")]
+pub fn graph_entities_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("key_source", DataType::UInt8, false),
+        Field::new("normalized_literal", DataType::Utf8, false),
+        Field::new("document_path", DataType::Utf8, false),
+        Field::new("mention_count", DataType::UInt32, false),
+        Field::new("first_seen_chunk", DataType::UInt32, false),
+        Field::new("last_seen_chunk", DataType::UInt32, false),
+        Field::new("doc_path", DataType::Utf8, false),
+        Field::new("doc_chunk_idx", DataType::UInt32, false),
+    ]))
+}
+
+/// Build the schema for the `graph_edges` table — co-occurrence edges within chunks.
+///
+/// One row per unique (source_entity_key, target_entity_key, chunk) triple.
+/// Columns:
+/// - `scope`           UTF-8    ingestion scope (repo identity)
+/// - `src_key_source`  UInt8    source EntityKeySource discriminant
+/// - `src_normalized_literal` UTF-8  source normalized literal
+/// - `src_document_path` UTF-8    source document path (for TokenOfDocument)
+/// - `src_label`       UTF-8    source entity label
+/// - `dst_key_source`  UInt8    target EntityKeySource discriminant
+/// - `dst_normalized_literal` UTF-8  target normalized literal
+/// - `dst_document_path` UTF-8    target document path (for TokenOfDocument)
+/// - `dst_label`       UTF-8    target entity label
+/// - `chunk_idx`       UInt32   chunk index where co-occurrence was observed
+/// - `doc_path`        UTF-8    document path of the chunk
+/// - `weight`          UInt32   number of times this edge was observed (always 1 per chunk, can accumulate across rebuilds)
+#[cfg(feature = "graphrag")]
+pub fn graph_edges_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("src_key_source", DataType::UInt8, false),
+        Field::new("src_normalized_literal", DataType::Utf8, false),
+        Field::new("src_document_path", DataType::Utf8, false),
+        Field::new("src_label", DataType::Utf8, false),
+        Field::new("dst_key_source", DataType::UInt8, false),
+        Field::new("dst_normalized_literal", DataType::Utf8, false),
+        Field::new("dst_document_path", DataType::Utf8, false),
+        Field::new("dst_label", DataType::Utf8, false),
+        Field::new("chunk_idx", DataType::UInt32, false),
+        Field::new("doc_path", DataType::Utf8, false),
+        Field::new("weight", DataType::UInt32, false),
+    ]))
+}
+
 /// Table names — small constants in one place so the `LanceStore` impl and any
 /// future migration code agree on what's where.
 pub const DOCUMENTS_TABLE: &str = "documents";
@@ -146,3 +223,7 @@ pub const MEMORY_TABLE: &str = "memory";
 pub const CODE_CHUNKS_TABLE: &str = "code_chunks";
 #[cfg(feature = "documents")]
 pub const DOC_LINKS_TABLE: &str = "doc_links";
+#[cfg(feature = "graphrag")]
+pub const GRAPH_ENTITIES_TABLE: &str = "graph_entities";
+#[cfg(feature = "graphrag")]
+pub const GRAPH_EDGES_TABLE: &str = "graph_edges";
