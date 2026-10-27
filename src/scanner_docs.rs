@@ -328,6 +328,41 @@ pub(crate) fn extract_and_persist_doc(
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
         store.touch_doc_blob(hash_hex);
+
+        // Build GraphRAG entity graph from cached doc's NER sidecar (spec 0016).
+        if cfg.graphrag.enabled {
+            if let Some(lance) = store.lance.as_ref() {
+                use crate::lance::graphrag::{build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, GraphragConfig, DocEntitySidecar};
+                
+                let doc_entities: Vec<DocEntitySidecar> = cached.entities.iter().map(|e| {
+                    let is_token = e.category.starts_with('[') && e.category.ends_with(']');
+                    DocEntitySidecar {
+                        label: e.category.clone(),
+                        literal: e.text.clone(),
+                        is_token,
+                        chunk_idx: 0,
+                        doc_path: rel.to_string(),
+                    }
+                }).collect();
+                
+                let graphrag_cfg = GraphragConfig {
+                    enabled: true,
+                    labels: cfg.graphrag.labels.clone(),
+                    max_rows: cfg.graphrag.max_rows,
+                    hops: cfg.graphrag.hops,
+                };
+                
+                if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
+                    if !entity_rows.is_empty() {
+                        let _ = crate::lance::graphrag::upsert_graph_entities(&store.lance.as_ref().unwrap().inner.connection, &store.lance.as_ref().unwrap().inner.runtime, &entity_rows);
+                    }
+                    if !edge_rows.is_empty() {
+                        let _ = crate::lance::graphrag::upsert_graph_edges(&store.lance.as_ref().unwrap().inner.connection, &store.lance.as_ref().unwrap().inner.runtime, &edge_rows);
+                    }
+                }
+            }
+        }
+
         return Ok(Some(pending_from_doc(&cached, rel, hash_hex, scope, cfg, embed, true)));
     }
 
@@ -386,6 +421,44 @@ pub(crate) fn extract_and_persist_doc(
             }
         }
     }
+    }
+
+    // Build GraphRAG entity graph from NER sidecar (spec 0016).
+    // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
+    if cfg.graphrag.enabled {
+        if let Some(lance) = store.lance.as_ref() {
+            use crate::lance::graphrag::{build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, GraphragConfig, DocEntitySidecar};
+            
+            // Convert FileMapDoc entities to DocEntitySidecar format
+            let doc_entities: Vec<DocEntitySidecar> = doc.entities.iter().map(|e| {
+                let is_token = e.category.starts_with('[') && e.category.ends_with(']'); // token_replace markers like [EMAIL_1]
+                DocEntitySidecar {
+                    label: e.category.clone(),
+                    literal: e.text.clone(),
+                    is_token,
+                    chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
+                    doc_path: rel.to_string(),
+                }
+            }).collect();
+            
+            let graphrag_cfg = GraphragConfig {
+                enabled: true,
+                labels: cfg.graphrag.labels.clone(),
+                max_rows: cfg.graphrag.max_rows,
+                hops: cfg.graphrag.hops,
+            };
+            
+            if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
+                if !entity_rows.is_empty() {
+                    let _ = crate::lance::graphrag::upsert_graph_entities(&lance.inner.connection, &lance.inner.runtime, &entity_rows);
+                }
+                if !edge_rows.is_empty() {
+                    let _ = crate::lance::graphrag::upsert_graph_edges(&lance.inner.connection, &lance.inner.runtime, &edge_rows);
+                }
+            }
+        }
+    }
+
     store
         .write_doc(hash, &doc)
         .with_context(|| format!("write doc blob for {rel}"))?;
@@ -586,6 +659,14 @@ pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::
                 paths = paths.len(),
                 ?error,
                 "doc links stale purge failed; doc↔code edges may be stale"
+            );
+        }
+        // Drop the removed docs' graph entities/edges (spec 0016).
+        if let Err(error) = lance.delete_graph_for_scope(doc_scope) {
+            tracing::warn!(
+                paths = paths.len(),
+                ?error,
+                "graph entities/edges stale purge failed; graph may have stale nodes"
             );
         }
     }

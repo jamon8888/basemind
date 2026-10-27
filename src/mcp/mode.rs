@@ -273,6 +273,8 @@ define_mode! {
         Export => "export", "render the graph as node-link JSON, DOT, Mermaid, GraphML, Cypher or HTML";
         Display => "display", "open a rendered view in a human's desktop viewer";
         Open => "open", "return a live browsable URL for the interactive graph page";
+        Entities => "entities", "read-only Cypher query over the entity graph (GLiNER mentions + co-occurrence)";
+        Rag => "rag", "GraphRAG: embedding seeds → entity expansion → fused retrieval";
     }
 }
 

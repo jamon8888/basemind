@@ -197,6 +197,53 @@ pub struct CallGraphParams {
     pub max_nodes: Option<u32>,
 }
 
+// Graph entities mode: read-only Cypher query over the entity graph.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GraphEntitiesParams {
+    /// Cypher query string (read-only: MATCH, RETURN, WHERE, LIMIT, ORDER BY, WITH, UNION only).
+    #[serde(alias = "query", alias = "q")]
+    pub cypher: String,
+    /// Maximum rows to return (server-side budget, default from config).
+    #[serde(default)]
+    pub max_rows: Option<u32>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphEntitiesResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub truncated: bool,
+}
+
+/// Graph rag mode: hybrid retrieval via entity graph expansion.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GraphRagParams {
+    /// Natural language query to embed and expand.
+    #[serde(alias = "query", alias = "q")]
+    pub query: String,
+    /// Number of hops for entity expansion (default from config, max 2).
+    #[serde(default)]
+    pub hops: Option<u8>,
+    /// Maximum fused candidates to return.
+    #[serde(default)]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphRagResponse {
+    pub hits: Vec<GraphRagHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphRagHit {
+    pub path: String,
+    pub chunk_idx: u32,
+    pub text: String,
+    pub distance: f32,
+    pub graph_path: Vec<String>,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct CallGraphResponse {
     /// Echo of the requested root name.
