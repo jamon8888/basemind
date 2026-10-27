@@ -376,6 +376,24 @@ async fn international_and_french_phone_formats_redact() {
     }
 }
 
+/// The exact French pattern keeps every way of writing the nine digits that the
+/// generic pattern used to catch.
+#[tokio::test]
+async fn french_phone_formats_beyond_digit_pairs_redact() {
+    for phone in [
+        "+33 06 12 34 56 78",
+        "+33 (6) 12 34 56 78",
+        "+33 612 345 678",
+        "+33 1 4268 5300",
+    ] {
+        let text = format!("Appelez le {phone} demain");
+        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let payload = json_of(&result);
+        let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+        assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
+    }
+}
+
 /// A French number stops at its nine digits: the street number of an address that
 /// follows on the same line is not part of it (#114).
 #[tokio::test]
