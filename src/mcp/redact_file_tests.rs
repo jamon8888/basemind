@@ -376,6 +376,24 @@ async fn international_and_french_phone_formats_redact() {
     }
 }
 
+/// A French number stops at its nine digits: the street number of an address that
+/// follows on the same line is not part of it (#114).
+#[tokio::test]
+async fn french_phone_does_not_swallow_a_following_street_number() {
+    let text = "Tél. +33 6 39 98 21 47 11 rue Ferdinand Quéniart, 82000 Montauban";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let map = payload["rehydration_map"].as_object().expect("map");
+    assert!(
+        map.values().any(|v| v.as_str() == Some("+33 6 39 98 21 47")),
+        "the phone must be exactly its nine digits: {map:?}"
+    );
+    assert!(
+        !map.values().any(|v| v.as_str().is_some_and(|v| v.contains("47 11"))),
+        "no value may run into the street number: {map:?}"
+    );
+}
+
 /// The phone patterns must not swallow dates, amounts or short numbers.
 #[tokio::test]
 async fn phone_patterns_leave_dates_and_amounts_alone() {
