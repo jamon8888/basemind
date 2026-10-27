@@ -147,6 +147,7 @@ full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-s
 #   only exists in a build with this feature.
 # Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
 hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
+graphrag = ["documents", "dep:lance-graph"]
 test-support = ["dep:tempfile"]
 
 ort-dynamic = ["xberg?/ort-dynamic"]
@@ -192,6 +193,7 @@ jsonschema = "0.58"
 # ~keep gates `Error::Http` behind `#[cfg(feature = "remote")]` while `job.rs` uses it unconditionally.
 # ~keep It pulls tonic/arrow-flight/reqwest in but nothing is invoked; drop it once upstream fixes the gate.
 lancedb = { version = "0.40.0", features = ["remote"], optional = true }
+lance-graph = { version = "0.5.4", optional = true }
 libc = "0.2"
 # ~keep `extended` exposes `mi_option_set`, used by `alloc_tag` to retag the heap off `VM_MEMORY_IOACCELERATOR`.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
