@@ -662,6 +662,9 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         ExtractError::Document(message)
     })?;
 
+    // #95: measured on the OCR text itself, before redaction and fallible embedding work.
+    let ocr_empty_chars = ocr_signal::check(path, mime_type, &config.document_models, &result.content);
+
     // Run redaction ourselves to capture the rehydration map.
     let mut redaction_findings: Vec<RedactionFinding> = Vec::new();
     let mut pending_rehydration = None;
@@ -779,23 +782,8 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
 
     let mut metadata = metadata_pairs(&result.metadata);
 
-    // #95: an image whose OCR comes back empty (or near-empty) is a silent
-    // failure. Surface it as a warning and a metadata note instead of storing
-    // a near-blank document with no explanation.
-    if ocr_output_near_empty(mime_type, &result.content) {
-        let ocr_chars = result.content.chars().filter(|c| !c.is_whitespace()).count();
-        tracing::warn!(
-            path = %path.display(),
-            mime = mime_type.unwrap_or(""),
-            ocr_chars,
-            "OCR of an image returned no (or very little) text; the page may be blank, low-resolution, or unreadable by the OCR engine"
-        );
-        metadata.push((
-            "ocr_empty".to_string(),
-            format!(
-                "OCR returned {ocr_chars} non-whitespace characters from an image; the page may be blank, low-resolution, or unreadable by the OCR engine"
-            ),
-        ));
+    if let Some(ocr_chars) = ocr_empty_chars {
+        metadata.push(ocr_signal::note(ocr_chars));
     }
 
     let keywords: Vec<DocKeyword> = result
@@ -995,18 +983,8 @@ fn metadata_pairs(metadata: &xberg::types::Metadata) -> Vec<(String, String)> {
     }
 }
 
-/// #95: true when an image's OCR output is empty or near-empty — a silent
-/// failure seen with images carrying an alpha channel (decoded without being
-/// composited onto white) and with pages whose lines the OCR dictionary filter
-/// discards. Kept as a pure predicate so it is unit-testable without the xberg
-/// extraction runtime; `extract_doc` uses it to turn a would-be-silent blank
-/// into a visible warning.
-pub(crate) fn ocr_output_near_empty(mime_type: Option<&str>, content: &str) -> bool {
-    /// Fewer non-whitespace characters than this on an image OCR is "near-empty".
-    const NEAR_EMPTY_OCR_CHARS: usize = 20;
-    mime_type.is_some_and(|m| m.starts_with("image/"))
-        && content.chars().filter(|c| !c.is_whitespace()).count() < NEAR_EMPTY_OCR_CHARS
-}
+/// The near-empty-OCR signal (#95) lives in a submodule by the 1000-line module cap.
+mod ocr_signal;
 
 /// `heading_path` tests live in a subdirectory by the 1000-line module cap
 /// (`tests/max_lines.rs`), the same shape `scanner_docs` uses for its tests.
