@@ -354,10 +354,10 @@ pub(crate) fn extract_and_persist_doc(
                 
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_entities(&store.lance.as_ref().unwrap().inner.connection, &store.lance.as_ref().unwrap().inner.runtime, &entity_rows);
+                        let _ = crate::lance::graphrag::upsert_graph_entities(&lance.inner.connection, &lance.inner.runtime, &entity_rows);
                     }
                     if !edge_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_edges(&store.lance.as_ref().unwrap().inner.connection, &store.lance.as_ref().unwrap().inner.runtime, &edge_rows);
+                        let _ = crate::lance::graphrag::upsert_graph_edges(&lance.inner.connection, &lance.inner.runtime, &edge_rows);
                     }
                 }
             }
