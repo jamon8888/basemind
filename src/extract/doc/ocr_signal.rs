@@ -20,7 +20,12 @@ pub(super) fn ocr_output_near_empty(mime_type: Option<&str>, content: &str) -> b
 
 /// The non-whitespace character count of a near-empty image OCR, logged as a warning; `None`
 /// when the profile ran no OCR (`CodeOnly`, `None_`) or the OCR read enough text.
-pub(super) fn check(path: &Path, mime_type: Option<&str>, profile: &DocumentModelProfile, content: &str) -> Option<usize> {
+pub(super) fn check(
+    path: &Path,
+    mime_type: Option<&str>,
+    profile: &DocumentModelProfile,
+    content: &str,
+) -> Option<usize> {
     let ocr_ran = !matches!(profile, DocumentModelProfile::CodeOnly | DocumentModelProfile::None_);
     if !(ocr_ran && ocr_output_near_empty(mime_type, content)) {
         return None;

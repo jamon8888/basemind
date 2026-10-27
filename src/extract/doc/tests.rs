@@ -193,8 +193,20 @@ fn ocr_near_empty_signal_is_image_scoped_and_thresholded() {
 #[test]
 fn ocr_near_empty_signal_is_silent_when_the_profile_ran_no_ocr() {
     let png = std::path::Path::new("scan.png");
-    assert_eq!(ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, " a "), Some(1));
-    assert_eq!(ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::CodeOnly, ""), None);
-    assert_eq!(ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::None_, ""), None);
-    assert_eq!(ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, &"a ".repeat(20)), None);
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, " a "),
+        Some(1)
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::CodeOnly, ""),
+        None
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::None_, ""),
+        None
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, &"a ".repeat(20)),
+        None
+    );
 }
