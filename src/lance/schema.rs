@@ -144,11 +144,13 @@ pub fn doc_links_schema() -> SchemaRef {
 /// (e.g. `[EMAIL_1]` appears in many documents). The key source distinguishes:
 /// - `TokenOfDocument`: (scope, label, literal, document_path) — document-scoped
 /// - `ClearLiteral`: (scope, label, normalized_literal) — global within scope
+/// - `GatewayToken`: (scope, label, gateway_token) — stable token from passerelle gaze, cross-document
 #[cfg(feature = "graphrag")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityKeySource {
     TokenOfDocument,
     ClearLiteral,
+    GatewayToken,
 }
 
 /// Build the schema for the `graph_entities` table — entity nodes over the documents corpus.
@@ -157,9 +159,10 @@ pub enum EntityKeySource {
 /// Columns:
 /// - `scope`            UTF-8     ingestion scope (repo identity)
 /// - `label`            UTF-8     GLiNER label (`person`, `organization`, `location`, `custom:*`)
-/// - `key_source`       UInt8     0 = TokenOfDocument, 1 = ClearLiteral (EntityKeySource discriminant)
-/// - `normalized_literal` UTF-8  normalized literal (case-fold + ascii-fold + whitespace collapse)
-/// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty for ClearLiteral)
+/// - `key_source`       UInt8     0 = TokenOfDocument, 1 = ClearLiteral, 2 = GatewayToken (EntityKeySource discriminant)
+/// - `normalized_literal` UTF-8  normalized literal (case-fold + ascii-fold + whitespace collapse) — for ClearLiteral
+/// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty otherwise)
+/// - `gateway_token`    UTF-8     stable gateway token from passerelle (only for GatewayToken; empty otherwise)
 /// - `mention_count`    UInt32    number of mentions aggregated into this node
 /// - `first_seen_chunk` UInt32    chunk_idx of first mention (for ordering)
 /// - `last_seen_chunk`  UInt32    chunk_idx of last mention
@@ -173,6 +176,7 @@ pub fn graph_entities_schema() -> SchemaRef {
         Field::new("key_source", DataType::UInt8, false),
         Field::new("normalized_literal", DataType::Utf8, false),
         Field::new("document_path", DataType::Utf8, false),
+        Field::new("gateway_token", DataType::Utf8, false),
         Field::new("mention_count", DataType::UInt32, false),
         Field::new("first_seen_chunk", DataType::UInt32, false),
         Field::new("last_seen_chunk", DataType::UInt32, false),

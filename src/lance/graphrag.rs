@@ -78,6 +78,7 @@ pub fn normalize_literal(s: &str) -> String {
 pub enum EntityNodeKey {
     TokenOfDocument { label: String, literal: String, doc_path: String },
     ClearLiteral { label: String, normalized: String },
+    GatewayToken { label: String, gateway_token: String },
 }
 
 /// Key for deduplicating edges.
@@ -94,9 +95,10 @@ pub struct EdgeKey {
 pub struct GraphEntityRow {
     pub scope: String,
     pub label: String,
-    pub key_source: u8, // 0 = TokenOfDocument, 1 = ClearLiteral
+    pub key_source: u8, // 0 = TokenOfDocument, 1 = ClearLiteral, 2 = GatewayToken
     pub normalized_literal: String,
     pub document_path: String,
+    pub gateway_token: String,
     pub mention_count: u32,
     pub first_seen_chunk: u32,
     pub last_seen_chunk: u32,
@@ -141,12 +143,15 @@ pub fn build_graph_from_entities(
 
         // Determine key source based on redaction strategy.
         // Under token_replace, the literal is a token like [EMAIL_1] — document-scoped.
+        // For gaze gateway tokens (stable cross-document tokens like <deadbeef:Email_1>), use GatewayToken.
         // Otherwise (mask/hash/drop/none), the literal is the original value — global.
-        let (key_source, normalized_literal, document_path) = if ent.is_token {
-            (0u8, ent.literal.clone(), ent.doc_path.clone()) // TokenOfDocument
+        let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
+            (2u8, String::new(), String::new(), ent.gateway_token.clone().unwrap_or_default()) // GatewayToken
+        } else if ent.is_token {
+            (0u8, ent.literal.clone(), ent.doc_path.clone(), String::new()) // TokenOfDocument
         } else {
             let norm = normalize_literal(&ent.literal);
-            (1u8, norm, String::new()) // ClearLiteral
+            (1u8, norm, String::new(), String::new()) // ClearLiteral
         };
 
         let node_key = match key_source {
@@ -155,9 +160,13 @@ pub fn build_graph_from_entities(
                 literal: ent.literal.clone(),
                 doc_path: ent.doc_path.clone(),
             },
-            _ => EntityNodeKey::ClearLiteral {
+            1 => EntityNodeKey::ClearLiteral {
                 label: ent.label.clone(),
                 normalized: normalized_literal.clone(),
+            },
+            _ => EntityNodeKey::GatewayToken {
+                label: ent.label.clone(),
+                gateway_token: gateway_token.clone(),
             },
         };
 
@@ -170,6 +179,7 @@ pub fn build_graph_from_entities(
                 key_source,
                 normalized_literal: normalized_literal.clone(),
                 document_path: document_path.clone(),
+                gateway_token: gateway_token.clone(),
                 mention_count: 0,
                 first_seen_chunk: ent.chunk_idx,
                 last_seen_chunk: ent.chunk_idx,
@@ -194,10 +204,12 @@ pub fn build_graph_from_entities(
         if !allowed.contains(&ent.label) {
             continue;
         }
-        let (key_source, normalized_literal, document_path) = if ent.is_token {
-            (0u8, ent.literal.clone(), ent.doc_path.clone())
+        let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
+            (2u8, String::new(), String::new(), ent.gateway_token.clone().unwrap_or_default())
+        } else if ent.is_token {
+            (0u8, ent.literal.clone(), ent.doc_path.clone(), String::new())
         } else {
-            (1u8, normalize_literal(&ent.literal), String::new())
+            (1u8, normalize_literal(&ent.literal), String::new(), String::new())
         };
         let node_key = match key_source {
             0 => EntityNodeKey::TokenOfDocument {
@@ -205,9 +217,13 @@ pub fn build_graph_from_entities(
                 literal: ent.literal.clone(),
                 doc_path: ent.doc_path.clone(),
             },
-            _ => EntityNodeKey::ClearLiteral {
+            1 => EntityNodeKey::ClearLiteral {
                 label: ent.label.clone(),
                 normalized: normalized_literal,
+            },
+            _ => EntityNodeKey::GatewayToken {
+                label: ent.label.clone(),
+                gateway_token,
             },
         };
         chunk_entities
@@ -231,18 +247,22 @@ pub fn build_graph_from_entities(
                 let src_label = match src {
                     EntityNodeKey::TokenOfDocument { label, .. } => label.clone(),
                     EntityNodeKey::ClearLiteral { label, .. } => label.clone(),
+                    EntityNodeKey::GatewayToken { label, .. } => label.clone(),
                 };
                 let dst_label = match dst {
                     EntityNodeKey::TokenOfDocument { label, .. } => label.clone(),
                     EntityNodeKey::ClearLiteral { label, .. } => label.clone(),
+                    EntityNodeKey::GatewayToken { label, .. } => label.clone(),
                 };
                 let (src_ks, src_norm, src_doc) = match src {
                     EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => (0u8, literal.clone(), doc_path.clone()),
                     EntityNodeKey::ClearLiteral { normalized, .. } => (1u8, normalized.clone(), String::new()),
+                    EntityNodeKey::GatewayToken { gateway_token, .. } => (2u8, gateway_token.clone(), String::new()),
                 };
                 let (dst_ks, dst_norm, dst_doc) = match dst {
                     EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => (0u8, literal.clone(), doc_path.clone()),
                     EntityNodeKey::ClearLiteral { normalized, .. } => (1u8, normalized.clone(), String::new()),
+                    EntityNodeKey::GatewayToken { gateway_token, .. } => (2u8, gateway_token.clone(), String::new()),
                 };
                 let edge_row = edge_map
                     .entry(edge_key)
@@ -278,6 +298,8 @@ pub struct DocEntitySidecar {
     pub label: String,
     pub literal: String,
     pub is_token: bool, // true when literal is a token_replace marker like [EMAIL_1]
+    pub is_gateway_token: bool, // true when literal is a gaze gateway token like <deadbeef:Email_1>
+    pub gateway_token: Option<String>, // the gaze token (e.g., <deadbeef:Email_1>) when is_gateway_token
     pub chunk_idx: u32,
     pub doc_path: String,
 }
@@ -304,6 +326,7 @@ pub fn upsert_graph_entities(
         let mut key_source = arrow_array::builder::UInt8Builder::new();
         let mut normalized_literal = arrow_array::builder::StringBuilder::new();
         let mut document_path = arrow_array::builder::StringBuilder::new();
+        let mut gateway_token = arrow_array::builder::StringBuilder::new();
         let mut mention_count = arrow_array::builder::UInt32Builder::new();
         let mut first_seen_chunk = arrow_array::builder::UInt32Builder::new();
         let mut last_seen_chunk = arrow_array::builder::UInt32Builder::new();
@@ -316,6 +339,7 @@ pub fn upsert_graph_entities(
             key_source.append_value(r.key_source);
             normalized_literal.append_value(&r.normalized_literal);
             document_path.append_value(&r.document_path);
+            gateway_token.append_value(&r.gateway_token);
             mention_count.append_value(r.mention_count);
             first_seen_chunk.append_value(r.first_seen_chunk);
             last_seen_chunk.append_value(r.last_seen_chunk);
@@ -332,6 +356,7 @@ pub fn upsert_graph_entities(
                 Arc::new(key_source.finish()),
                 Arc::new(normalized_literal.finish()),
                 Arc::new(document_path.finish()),
+                Arc::new(gateway_token.finish()),
                 Arc::new(mention_count.finish()),
                 Arc::new(first_seen_chunk.finish()),
                 Arc::new(last_seen_chunk.finish()),
@@ -341,17 +366,26 @@ pub fn upsert_graph_entities(
         )
         .context("assemble graph_entities batch")?;
 
-        // Delete-then-insert for upsert semantics (key = scope+label+key_source+normalized_literal+document_path)
+        // Delete-then-insert for upsert semantics (key = scope+label+key_source+normalized_literal+document_path+gateway_token)
         // We build a predicate per row — acceptable since entity count per scan is modest.
         for r in rows {
-            let predicate = format!(
-                "scope = '{}' AND label = '{}' AND key_source = {} AND normalized_literal = '{}' AND document_path = '{}'",
-                escape_sql_literal(&r.scope),
-                escape_sql_literal(&r.label),
-                r.key_source,
-                escape_sql_literal(&r.normalized_literal),
-                escape_sql_literal(&r.document_path),
-            );
+            let predicate = match r.key_source {
+                2 => format!( // GatewayToken: key is scope+label+key_source+gateway_token
+                    "scope = '{}' AND label = '{}' AND key_source = {} AND gateway_token = '{}'",
+                    escape_sql_literal(&r.scope),
+                    escape_sql_literal(&r.label),
+                    r.key_source,
+                    escape_sql_literal(&r.gateway_token),
+                ),
+                _ => format!( // TokenOfDocument or ClearLiteral
+                    "scope = '{}' AND label = '{}' AND key_source = {} AND normalized_literal = '{}' AND document_path = '{}'",
+                    escape_sql_literal(&r.scope),
+                    escape_sql_literal(&r.label),
+                    r.key_source,
+                    escape_sql_literal(&r.normalized_literal),
+                    escape_sql_literal(&r.document_path),
+                ),
+            };
             table.delete(&predicate).await.context("delete existing entity")?;
         }
 

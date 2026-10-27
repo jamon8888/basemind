@@ -336,10 +336,16 @@ pub(crate) fn extract_and_persist_doc(
                 
                 let doc_entities: Vec<DocEntitySidecar> = cached.entities.iter().map(|e| {
                     let is_token = e.category.starts_with('[') && e.category.ends_with(']');
+                    // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                    let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                        || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                    let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
                     DocEntitySidecar {
                         label: e.category.clone(),
                         literal: e.text.clone(),
                         is_token,
+                        is_gateway_token,
+                        gateway_token,
                         chunk_idx: 0,
                         doc_path: rel.to_string(),
                     }
@@ -432,10 +438,16 @@ pub(crate) fn extract_and_persist_doc(
             // Convert FileMapDoc entities to DocEntitySidecar format
             let doc_entities: Vec<DocEntitySidecar> = doc.entities.iter().map(|e| {
                 let is_token = e.category.starts_with('[') && e.category.ends_with(']'); // token_replace markers like [EMAIL_1]
+                // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                    || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
                 DocEntitySidecar {
                     label: e.category.clone(),
                     literal: e.text.clone(),
                     is_token,
+                    is_gateway_token,
+                    gateway_token,
                     chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
                     doc_path: rel.to_string(),
                 }
