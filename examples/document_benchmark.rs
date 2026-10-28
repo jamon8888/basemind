@@ -253,7 +253,13 @@ fn mutate_synthetic_incremental(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_path: &Path) -> Result<Value> {
+fn quality_report(
+    root: &Path,
+    store: &mut Store,
+    config: &ConfigV1,
+    manifest_path: &Path,
+    baseline_path: Option<&Path>,
+) -> Result<Value> {
     let cases = read_quality_manifest(manifest_path)?;
     let embedder = SharedEmbedder::load_with_provider(
         &config.documents.embedding_preset,
@@ -376,7 +382,7 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
                 / retrieval.len() as f64,
         )
     };
-    Ok(json!({
+    let mut report = json!({
         "manifest": manifest_path,
         "retrieval": {
             "cases": retrieval.len(),
@@ -396,11 +402,32 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
                 1.0
             },
         },
-    }))
+    });
+    if let Some(path) = baseline_path {
+        let baseline_text = fs::read_to_string(path).map_err(|error| anyhow!("read quality baseline: {error}"))?;
+        let baseline: Value =
+            serde_json::from_str(&baseline_text).map_err(|error| anyhow!("parse quality baseline: {error}"))?;
+        let baseline_quality = baseline.get("quality").unwrap_or(&baseline);
+        let delta = |current: Option<f64>, key: &str| {
+            current.and_then(|value| {
+                baseline_quality
+                    .pointer(key)
+                    .and_then(Value::as_f64)
+                    .map(|base| value - base)
+            })
+        };
+        report["baseline_comparison"] = json!({
+            "path": path,
+            "recall_delta": delta(report["retrieval"]["mean_recall"].as_f64(), "/retrieval/mean_recall"),
+            "ndcg_delta": delta(report["retrieval"]["mean_ndcg"].as_f64(), "/retrieval/mean_ndcg"),
+            "ner_coverage_delta": delta(report["ner"]["coverage"].as_f64(), "/ner/coverage"),
+        });
+    }
+    Ok(report)
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -409,6 +436,7 @@ fn main() -> Result<()> {
     let mut manifest_path = None;
     let mut synthetic_manifest_path = None;
     let mut quality_manifest_path = None;
+    let mut quality_baseline_path = None;
     let mut incremental_file = None;
     let mut mutate_incremental = false;
     let mut mode = Mode::All;
@@ -426,6 +454,10 @@ fn main() -> Result<()> {
             "--quality-manifest" => {
                 i += 1;
                 quality_manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
+            }
+            "--quality-baseline" => {
+                i += 1;
+                quality_baseline_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
             }
             "--incremental-file" => {
                 i += 1;
@@ -591,7 +623,7 @@ fn main() -> Result<()> {
     }
     let quality = quality_manifest_path
         .as_deref()
-        .map(|path| quality_report(&root, &mut store, &config, path))
+        .map(|path| quality_report(&root, &mut store, &config, path, quality_baseline_path.as_deref()))
         .transpose()?;
     println!(
         "{}",
