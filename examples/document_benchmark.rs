@@ -156,6 +156,7 @@ fn json_report(
         "manifest_bytes": manifest_bytes,
         "cancelled": report.cancelled,
         "first_result_ms": first_result_ms,
+        "first_searchable_result_ms": first_result_ms,
         "rss_before_bytes": rss_before,
         "rss_after_bytes": rss_after,
         "peak_rss_bytes": basemind::sysres::sample().peak_bytes,
