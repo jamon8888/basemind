@@ -4,6 +4,8 @@
 //! newline-separated list of relative paths; blank lines and `#` comments are
 //! ignored. The same command can measure a cold scan, a warm scan, and an
 //! incremental scan over selected manifest paths.
+//! Pass `--synthetic-manifest` to add a checked-in/generated fixture set (PDF,
+//! DOCX, PPTX, XLSX, and representative text files) to the private corpus.
 //!
 //! ```text
 //! cargo run --release --features documents --example document_benchmark -- \
@@ -158,13 +160,14 @@ fn json_report(
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = args.first().map(PathBuf::from).ok_or_else(|| anyhow!("{}", usage()))?;
     let mut manifest_path = None;
+    let mut synthetic_manifest_path = None;
     let mut mode = Mode::All;
     let mut i = 1;
     while i < args.len() {
@@ -172,6 +175,10 @@ fn main() -> Result<()> {
             "--manifest" => {
                 i += 1;
                 manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
+            }
+            "--synthetic-manifest" => {
+                i += 1;
+                synthetic_manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
             }
             "--mode" => {
                 i += 1;
@@ -186,7 +193,12 @@ fn main() -> Result<()> {
         return Err(anyhow!("root is not a directory: {}", root.display()));
     }
     basemind::store::init_isolated_cache();
-    let manifest_files = manifest(&root, manifest_path.as_deref())?;
+    let mut manifest_files = manifest(&root, manifest_path.as_deref())?;
+    let private_manifest_files = manifest_files.len();
+    let synthetic_manifest_files = manifest(&root, synthetic_manifest_path.as_deref())?;
+    manifest_files.extend(synthetic_manifest_files);
+    manifest_files.sort();
+    manifest_files.dedup();
     let manifest_bytes: u64 = manifest_files
         .iter()
         .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
@@ -296,6 +308,8 @@ fn main() -> Result<()> {
         serde_json::to_string_pretty(&json!({
             "root": root,
             "manifest_files": manifest_files.len(),
+            "private_manifest_files": private_manifest_files,
+            "synthetic_manifest_files": manifest_files.len().saturating_sub(private_manifest_files),
             "runs": runs,
             "configuration": {
                 "embedding_preset": config.documents.embedding_preset,
