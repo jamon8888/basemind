@@ -929,16 +929,10 @@ fn candidates_for_source(
 fn derive_scope(root: &Path, source: &ScanSource<'_>) -> String {
     match source {
         ScanSource::Staged(repo) | ScanSource::Rev { repo, .. } => crate::git::scope_key(repo),
-        ScanSource::WorkingTree => match Repo::discover(root) {
-            Ok(repo) => crate::git::scope_key(&repo),
-            Err(_) => format!("path:{}", root.display()),
-        },
+        ScanSource::WorkingTree => crate::scanner_scope::working_tree_scope(root),
     }
 }
 
-/// Return the scope used by a working-tree scan. Benchmark and compatibility tooling can use this
-/// to query the exact rows written by [`scan_with_observer`], without duplicating git/fallback
-/// scope derivation.
 /// Compact fragments and prune old table versions of the LanceDB store once this scan's writes are
 /// done (#76). No-op when the scan never opened the store or wrote nothing.
 fn maintain_lance_if_open(store: &Store) {

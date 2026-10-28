@@ -580,18 +580,7 @@ fn run_guarded(
     })
 }
 
-/// Run xberg against `path` and translate the result into a `FileMapDoc`.
-///
-/// `mime_type` may be supplied by the caller (e.g. from `lang::detect`); when
-/// `None`, xberg sniffs the file content.
-///
-/// When redaction is enabled with `TokenReplace` strategy, xberg's built-in
-/// redaction is disabled and `redact_capturing_rehydration_map` is called
-/// separately so the rehydration map (token → original) is captured alongside
-/// the rewritten content.
-pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> Result<FileMapDoc, ExtractError> {
-    extract_doc_with_metrics(path, mime_type, config, None)
-}
+pub use super::doc_metrics::extract_doc;
 
 /// [`extract_doc`] with optional per-scan stage accounting. The plain wrapper remains the stable
 /// API for callers and tests that do not need benchmark telemetry.
