@@ -217,7 +217,7 @@ fn process_file(
 ) -> FileResult {
     #[cfg(not(feature = "documents"))]
     {
-        let _ = (config, scope);
+        let _ = (config, scope, metrics);
     }
     #[cfg(not(any(feature = "documents", feature = "code-search")))]
     {
