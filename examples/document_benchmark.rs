@@ -55,6 +55,10 @@ struct NerExpectation {
     required_categories: Vec<String>,
     #[serde(default)]
     required_texts: Vec<String>,
+    #[serde(default)]
+    forbidden_categories: Vec<String>,
+    #[serde(default)]
+    forbidden_texts: Vec<String>,
 }
 
 struct FirstResultObserver {
@@ -268,6 +272,8 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
     let mut retrieval = Vec::new();
     let mut ner_required = 0usize;
     let mut ner_matched = 0usize;
+    let mut ner_forbidden_hits = 0usize;
+    let mut ner_invalid_spans = 0usize;
     for case in cases {
         if let Some(query) = case.query.as_deref()
             && !case.expected_paths.is_empty()
@@ -329,6 +335,23 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
                 .iter()
                 .filter(|text| texts.contains(&text.to_lowercase()))
                 .count();
+            ner_forbidden_hits += expectation
+                .forbidden_categories
+                .iter()
+                .filter(|category| categories.contains(&category.to_lowercase()))
+                .count();
+            ner_forbidden_hits += expectation
+                .forbidden_texts
+                .iter()
+                .filter(|text| texts.contains(&text.to_lowercase()))
+                .count();
+            ner_invalid_spans += doc
+                .entities
+                .iter()
+                .filter(|entity| {
+                    entity.start >= entity.end || usize::try_from(entity.end).unwrap_or(usize::MAX) > doc.content.len()
+                })
+                .count();
         }
     }
     let mean_recall = if retrieval.is_empty() {
@@ -365,6 +388,13 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
             "required_checks": ner_required,
             "matched_checks": ner_matched,
             "coverage": if ner_required > 0 { ner_matched as f64 / ner_required as f64 } else { 1.0 },
+            "forbidden_hits": ner_forbidden_hits,
+            "invalid_spans": ner_invalid_spans,
+            "precision_proxy": if ner_matched + ner_forbidden_hits > 0 {
+                ner_matched as f64 / (ner_matched + ner_forbidden_hits) as f64
+            } else {
+                1.0
+            },
         },
     }))
 }
