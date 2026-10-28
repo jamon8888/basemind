@@ -7,7 +7,7 @@ use basemind::scanner::{EmbedMode, ScanSource, scan};
 use basemind::store::{Store, VIEW_WORKING};
 
 #[test]
-fn full_scan_reports_nonzero_phase_and_total_timings() {
+fn full_scan_reports_ordered_phase_and_total_timings() {
     basemind::store::init_isolated_cache();
     let root = tempfile::tempdir().expect("tempdir");
     fs::write(root.path().join("module.py"), "def answer():\n    return 42\n").expect("write fixture");
