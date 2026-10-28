@@ -40,6 +40,7 @@ pub mod query;
 pub mod registry;
 pub mod render;
 pub mod scan_evidence;
+pub mod scan_metrics;
 pub mod scanner;
 pub(crate) mod scanner_candidates;
 #[cfg(feature = "code-search")]

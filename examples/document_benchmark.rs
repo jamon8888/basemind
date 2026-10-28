@@ -15,6 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::{Result, anyhow};
 use basemind::config::ConfigV1;
 use basemind::scanner::{
     EmbedMode, FileResult, ScanCancel, ScanObserver, ScanReport, ScanSource, scan_paths_with_observer,
@@ -54,24 +55,24 @@ impl ScanObserver for FirstResultObserver {
 }
 
 impl Mode {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn parse(value: &str) -> Result<Self> {
         match value {
             "cold" => Ok(Self::Cold),
             "warm" => Ok(Self::Warm),
             "incremental" => Ok(Self::Incremental),
             "all" => Ok(Self::All),
-            other => Err(format!(
+            other => Err(anyhow!(
                 "unknown mode {other}; expected cold, warm, incremental, or all"
             )),
         }
     }
 }
 
-fn manifest(root: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+fn manifest(root: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>> {
     let Some(path) = path else {
         return Ok(Vec::new());
     };
-    let text = fs::read_to_string(path).map_err(|error| format!("read manifest: {error}"))?;
+    let text = fs::read_to_string(path).map_err(|error| anyhow!("read manifest: {error}"))?;
     let mut files = Vec::new();
     for (line, raw) in text.lines().enumerate() {
         let item = raw.trim();
@@ -81,7 +82,7 @@ fn manifest(root: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
         let relative = PathBuf::from(item);
         let absolute = root.join(&relative);
         if !absolute.is_file() {
-            return Err(format!(
+            return Err(anyhow!(
                 "manifest line {} is not a file: {}",
                 line + 1,
                 relative.display()
@@ -132,9 +133,9 @@ fn usage() -> &'static str {
     "usage: document_benchmark <root> [--manifest FILE] [--mode cold|warm|incremental|all]"
 }
 
-fn main() -> Result<(), String> {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let root = args.first().map(PathBuf::from).ok_or_else(|| usage().to_string())?;
+    let root = args.first().map(PathBuf::from).ok_or_else(|| anyhow!("{}", usage()))?;
     let mut manifest_path = None;
     let mut mode = Mode::All;
     let mut i = 1;
@@ -142,28 +143,28 @@ fn main() -> Result<(), String> {
         match args[i].as_str() {
             "--manifest" => {
                 i += 1;
-                manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| usage().to_string())?));
+                manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
             }
             "--mode" => {
                 i += 1;
-                mode = Mode::parse(args.get(i).ok_or_else(|| usage().to_string())?)?;
+                mode = Mode::parse(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?)?;
             }
-            other => return Err(format!("unknown argument {other}\n{}", usage())),
+            other => return Err(anyhow!("unknown argument {other}\n{}", usage())),
         }
         i += 1;
     }
 
     if !root.is_dir() {
-        return Err(format!("root is not a directory: {}", root.display()));
+        return Err(anyhow!("root is not a directory: {}", root.display()));
     }
     basemind::store::init_isolated_cache();
     let manifest_files = manifest(&root, manifest_path.as_deref())?;
     let mut config = ConfigV1::with_defaults();
     config.documents.enabled = true;
-    let mut store = Store::open(&root, VIEW_WORKING).map_err(|error| format!("open store: {error}"))?;
+    let mut store = Store::open(&root, VIEW_WORKING).map_err(|error| anyhow!("open store: {error}"))?;
     let mut runs = Vec::new();
 
-    let mut full_scan = |label: &str, store: &mut Store| -> Result<(), String> {
+    let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
         let started = Instant::now();
         let mut observer = FirstResultObserver::new(started);
         let result = scan_with_observer(
@@ -175,7 +176,7 @@ fn main() -> Result<(), String> {
             &ScanCancel::new(),
             &mut observer,
         )
-        .map_err(|error| format!("{label} scan: {error}"))?;
+        .map_err(|error| anyhow!("{label} scan: {error}"))?;
         let mut value = report(label, &result, manifest_files.len(), observer.first_result_ms);
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         runs.push(value);
@@ -189,7 +190,7 @@ fn main() -> Result<(), String> {
         }
         Mode::Incremental => {
             let changed = if manifest_files.is_empty() {
-                return Err("incremental mode requires --manifest with at least one file".to_string());
+                return Err(anyhow!("incremental mode requires --manifest with at least one file"));
             } else {
                 manifest_files.clone()
             };
@@ -204,7 +205,7 @@ fn main() -> Result<(), String> {
                 &ScanCancel::new(),
                 &mut observer,
             )
-            .map_err(|error| format!("incremental scan: {error}"))?;
+            .map_err(|error| anyhow!("incremental scan: {error}"))?;
             let mut value = report("incremental", &result, manifest_files.len(), observer.first_result_ms);
             value["wall_clock_ms"] = json!(started.elapsed().as_millis());
             runs.push(value);
@@ -224,7 +225,7 @@ fn main() -> Result<(), String> {
                     &ScanCancel::new(),
                     &mut observer,
                 )
-                .map_err(|error| format!("incremental scan: {error}"))?;
+                .map_err(|error| anyhow!("incremental scan: {error}"))?;
                 let mut value = report("incremental", &result, manifest_files.len(), observer.first_result_ms);
                 value["wall_clock_ms"] = json!(started.elapsed().as_millis());
                 runs.push(value);
@@ -246,7 +247,7 @@ fn main() -> Result<(), String> {
                 "max_concurrent_documents": config.resources.max_concurrent_documents,
             },
         }))
-        .map_err(|error| format!("serialize benchmark: {error}"))?
+        .map_err(|error| anyhow!("serialize benchmark: {error}"))?
     );
     Ok(())
 }

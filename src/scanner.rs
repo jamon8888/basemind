@@ -12,6 +12,7 @@ use crate::path::RelPath;
 use crate::scan_evidence::{
     PHASE_CANDIDATES, PHASE_EXTRACT, PHASE_FLUSH, PHASE_LANES, PHASE_PURGE, PHASE_RESOLVE, ScanBreadcrumb,
 };
+pub use crate::scan_metrics::ScanTimings;
 use crate::scanner_candidates::walk_candidates;
 #[cfg(feature = "code-search")]
 use crate::scanner_code::PendingCodeBatch;
@@ -321,31 +322,12 @@ pub enum FileStatus {
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
     pub stats: ScanStats,
-    /// Wall-clock timings for the major scan phases, in milliseconds. These are
-    /// diagnostic measurements for benchmark and operator tooling; they do not
-    /// alter scheduling or admission decisions.
     pub timings: ScanTimings,
     /// True when the scan was interrupted by a [`ScanCancel`] token. The per-file work that
     /// completed before the trip is committed (blobs, fjall batches, `index.msgpack`); everything
     /// else — remaining candidates, the stale purge, the resolve/doc lanes — was skipped, so the
     /// caller must not treat the report as a complete pass.
     pub cancelled: bool,
-}
-
-/// Wall-clock timings for one full scan invocation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScanTimings {
-    pub candidates_ms: u128,
-    pub extraction_ms: u128,
-    pub purge_ms: u128,
-    pub flush_ms: u128,
-    pub resolve_ms: u128,
-    pub lanes_ms: u128,
-    pub total_ms: u128,
-}
-
-fn elapsed_ms(started: Instant) -> u128 {
-    started.elapsed().as_millis()
 }
 
 /// Cooperative cancellation token for a scan.
@@ -477,10 +459,9 @@ pub fn scan_with_observer(
     let candidates = candidates_for_source(root, config, &filters, &source, cancel)?;
     debug!(count = candidates.len(), kind = source.label(), "scan candidates");
     advance(&mut breadcrumb, PHASE_EXTRACT, Some(candidates.len()));
-
     let scope = derive_scope(root, &source);
     let mut report = ScanReport::default();
-    report.timings.candidates_ms = elapsed_ms(candidates_started);
+    report.timings.candidates_ms = crate::scan_metrics::elapsed_ms(candidates_started);
     let drive = ScanDrive {
         root,
         filters: &filters,
@@ -491,8 +472,7 @@ pub fn scan_with_observer(
         cancel,
     };
     let driven = drive_scan(&drive, &candidates, store, &mut report.stats, observer);
-    report.timings.extraction_ms = elapsed_ms(candidates_started) - report.timings.candidates_ms;
-
+    report.timings.extraction_ms = crate::scan_metrics::elapsed_ms(candidates_started) - report.timings.candidates_ms;
     // Cancelled mid-pass: commit what completed and return BEFORE the stale purge. The purge below ~keep
     // treats every indexed file absent from `driven.seen` as deleted — on a partial pass that would ~keep
     // wipe the entry of every candidate the cancellation skipped. The batch flushes still run: ~keep
@@ -501,7 +481,7 @@ pub fn scan_with_observer(
     // rows come from already-persisted blobs (no model inference), so this stays bounded. ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
-        report.timings.total_ms = elapsed_ms(scan_started);
+        report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         flush_code_map(store)?;
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, driven.doc_batches);
@@ -514,7 +494,6 @@ pub fn scan_with_observer(
 
     advance(&mut breadcrumb, PHASE_PURGE, None);
     let purge_started = Instant::now();
-
     // Derived AFTER the drive rather than before it: the entries the drive upserted are all in ~keep
     // `seen`, so they are excluded either way, and reading the file map here keeps the whole ~keep
     // derivation out of the per-file results' lifetime. ~keep
@@ -584,19 +563,18 @@ pub fn scan_with_observer(
         }
     }
 
-    report.timings.purge_ms = elapsed_ms(purge_started);
+    report.timings.purge_ms = crate::scan_metrics::elapsed_ms(purge_started);
     advance(&mut breadcrumb, PHASE_FLUSH, None);
     let flush_started = Instant::now();
     flush_code_map(store)?;
-    report.timings.flush_ms = elapsed_ms(flush_started);
-
+    report.timings.flush_ms = crate::scan_metrics::elapsed_ms(flush_started);
     // A token tripped after the last per-file check still stops the pass here, once the code map ~keep
     // is durable but before the resolve pass (which can run for minutes on a large repo). The ~keep
     // batch flushes still run — the completed files' entries are already recorded, and dropping ~keep
     // their rows would leave them tracked-but-rowless (blob-sourced, no inference; bounded). ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
-        report.timings.total_ms = elapsed_ms(scan_started);
+        report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, doc_batches);
         });
@@ -616,8 +594,7 @@ pub fn scan_with_observer(
             });
         });
     }
-    report.timings.resolve_ms = elapsed_ms(resolve_started);
-
+    report.timings.resolve_ms = crate::scan_metrics::elapsed_ms(resolve_started);
     advance(&mut breadcrumb, PHASE_LANES, None);
     let lanes_started = Instant::now();
     run_optional_lane(LANE_DOC_BATCHES, || {
@@ -640,11 +617,10 @@ pub fn scan_with_observer(
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
         maintain_lance_if_open(store)
     });
-    report.timings.lanes_ms = elapsed_ms(lanes_started);
-    report.timings.total_ms = elapsed_ms(scan_started);
+    report.timings.lanes_ms = crate::scan_metrics::elapsed_ms(lanes_started);
+    report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
     Ok(report)
 }
-
 /// Move the pass's breadcrumb to `phase`, if one could be written at all. Folding the `Option` in
 /// here keeps every phase boundary a single line and keeps "no breadcrumb" from being a condition
 /// the scan branches on: evidence is never a precondition for the work.
@@ -778,7 +754,7 @@ pub fn scan_paths_with_observer(
     let nothing_removed = removed.is_empty();
     if rels.is_empty() && nothing_removed {
         let mut report = ScanReport::default();
-        report.timings.total_ms = elapsed_ms(scan_started);
+        report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         return Ok(report);
     }
 
@@ -800,7 +776,7 @@ pub fn scan_paths_with_observer(
         #[cfg(feature = "documents")]
         doc_seen,
     } = drive_scan(&drive, &rels, store, &mut report.stats, observer);
-    report.timings.extraction_ms = elapsed_ms(scan_started);
+    report.timings.extraction_ms = crate::scan_metrics::elapsed_ms(scan_started);
 
     // A path that still exists but ended up neither kept as code nor as a document (its language
     // was disabled, it grew past the size cap, turned binary, ...) is dropped exactly as a full
@@ -860,7 +836,7 @@ pub fn scan_paths_with_observer(
     // would leave them tracked-but-rowless (blob-sourced, no inference; bounded). ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
-        report.timings.total_ms = elapsed_ms(scan_started);
+        report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, doc_batches);
         });
@@ -903,7 +879,7 @@ pub fn scan_paths_with_observer(
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
         maintain_lance_if_open(store)
     });
-    report.timings.total_ms = elapsed_ms(scan_started);
+    report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
     Ok(report)
 }
 
