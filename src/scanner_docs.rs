@@ -427,8 +427,6 @@ pub(crate) fn extract_and_persist_doc(
             }
         }
     }
-    }
-
     // Build GraphRAG entity graph from NER sidecar (spec 0016).
     // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
     if cfg.graphrag.enabled {

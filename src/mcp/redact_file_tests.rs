@@ -28,8 +28,54 @@ fn text_params(text: &str) -> RedactTextParams {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     }
+}
+
+#[tokio::test]
+async fn unknown_ner_profile_is_rejected() {
+    let error = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@99".to_string()),
+        ..text_params("Alice Smith")
+    })
+    .await
+    .expect_err("unknown NER profiles must fail closed");
+    assert!(error.message.contains("unknown NER profile"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn ner_profile_metadata_reports_effective_labels_without_model() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@1".to_string()),
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Alice Smith works at Acme Corp.")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], "legal-fr@1");
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth"
+        ])
+    );
 }
 
 /// A `ner_model_dir` pointing at nothing must never fail the call:
