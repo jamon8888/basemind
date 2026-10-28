@@ -168,8 +168,12 @@ fn json_report(
         },
         "configuration": {
             "embedding_preset": config.documents.embedding_preset,
+            "embedding_model": config.documents.embedding_preset,
             "onnx_provider": config.resources.onnx_provider,
             "precision": "fp32",
+            "ner_enabled": config.documents.ner.enabled,
+            "ner_backend": format!("{:?}", config.documents.ner.backend),
+            "ner_model": config.documents.ner.model,
             "scan_threads": config.resources.scan_threads,
             "embed_threads": config.resources.embed_threads,
             "embed_batch_size": config.resources.embed_batch_size,
@@ -509,11 +513,15 @@ fn main() -> Result<()> {
             "runs": runs,
             "configuration": {
                 "embedding_preset": config.documents.embedding_preset,
+                "embedding_model": config.documents.embedding_preset,
                 "onnx_provider": config.resources.onnx_provider,
                 "scan_threads": config.resources.scan_threads,
                 "embed_threads": config.resources.embed_threads,
                 "embed_batch_size": config.resources.embed_batch_size,
                 "max_concurrent_documents": config.resources.max_concurrent_documents,
+                "ner_enabled": config.documents.ner.enabled,
+                "ner_backend": format!("{:?}", config.documents.ner.backend),
+                "ner_model": config.documents.ner.model,
             },
             "quality": quality,
         }))
