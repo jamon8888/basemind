@@ -259,6 +259,7 @@ fn quality_report(
     config: &ConfigV1,
     manifest_path: &Path,
     baseline_path: Option<&Path>,
+    quality_tolerance: f64,
 ) -> Result<Value> {
     let cases = read_quality_manifest(manifest_path)?;
     let embedder = SharedEmbedder::load_with_provider(
@@ -416,18 +417,33 @@ fn quality_report(
                     .map(|base| value - base)
             })
         };
+        let recall_delta = delta(report["retrieval"]["mean_recall"].as_f64(), "/retrieval/mean_recall");
+        let ndcg_delta = delta(report["retrieval"]["mean_ndcg"].as_f64(), "/retrieval/mean_ndcg");
+        let ner_coverage_delta = delta(report["ner"]["coverage"].as_f64(), "/ner/coverage");
+        let within_tolerance = [recall_delta, ndcg_delta, ner_coverage_delta]
+            .into_iter()
+            .flatten()
+            .all(|value| value >= -quality_tolerance);
         report["baseline_comparison"] = json!({
             "path": path,
-            "recall_delta": delta(report["retrieval"]["mean_recall"].as_f64(), "/retrieval/mean_recall"),
-            "ndcg_delta": delta(report["retrieval"]["mean_ndcg"].as_f64(), "/retrieval/mean_ndcg"),
-            "ner_coverage_delta": delta(report["ner"]["coverage"].as_f64(), "/ner/coverage"),
+            "tolerance": quality_tolerance,
+            "within_tolerance": within_tolerance,
+            "recall_delta": recall_delta,
+            "ndcg_delta": ndcg_delta,
+            "ner_coverage_delta": ner_coverage_delta,
         });
+        if !within_tolerance {
+            return Err(anyhow!(
+                "quality regression exceeds tolerance ({quality_tolerance:.4}) compared with {}",
+                path.display()
+            ));
+        }
     }
     Ok(report)
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -437,6 +453,7 @@ fn main() -> Result<()> {
     let mut synthetic_manifest_path = None;
     let mut quality_manifest_path = None;
     let mut quality_baseline_path = None;
+    let mut quality_tolerance = 0.01_f64;
     let mut incremental_file = None;
     let mut mutate_incremental = false;
     let mut mode = Mode::All;
@@ -458,6 +475,17 @@ fn main() -> Result<()> {
             "--quality-baseline" => {
                 i += 1;
                 quality_baseline_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
+            }
+            "--quality-tolerance" => {
+                i += 1;
+                quality_tolerance = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("{}", usage()))?
+                    .parse::<f64>()
+                    .map_err(|error| anyhow!("invalid quality tolerance: {error}"))?;
+                if !quality_tolerance.is_finite() || quality_tolerance < 0.0 {
+                    return Err(anyhow!("quality tolerance must be a finite non-negative fraction"));
+                }
             }
             "--incremental-file" => {
                 i += 1;
@@ -623,7 +651,16 @@ fn main() -> Result<()> {
     }
     let quality = quality_manifest_path
         .as_deref()
-        .map(|path| quality_report(&root, &mut store, &config, path, quality_baseline_path.as_deref()))
+        .map(|path| {
+            quality_report(
+                &root,
+                &mut store,
+                &config,
+                path,
+                quality_baseline_path.as_deref(),
+                quality_tolerance,
+            )
+        })
         .transpose()?;
     println!(
         "{}",
