@@ -24,6 +24,9 @@ The harness also auto-discovers `fixtures/synthetic-manifest.txt` (or a root
 stage timings, first persisted-searchable-result time, processed bytes/tokens/
 chunks throughput, RSS, configuration, and skip/failure counters. The optional
 quality manifest reports embedding recall/nDCG and NER category/text coverage.
+When supplied, `--quality-baseline` adds recall, nDCG, and NER coverage deltas
+against a prior JSON report (either the full benchmark output or its `quality`
+object).
 Fixtures are intentionally small; use the private manifest for throughput and
 memory thresholds.
 
