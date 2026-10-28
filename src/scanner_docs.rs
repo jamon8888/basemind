@@ -30,7 +30,7 @@ use anyhow::Context as _;
 use xberg::core::mime;
 
 use crate::config::{DocumentsConfig, LlmConfig, ResourcesConfig};
-use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc};
+use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc_with_metrics};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
 use crate::lance::{DocumentRow, PendingBatch};
@@ -62,6 +62,10 @@ pub(crate) struct PendingDocBatch {
     /// Number of chunks indexed (zero is valid — xberg may yield no chunks
     /// when the file body is empty or below the chunk threshold).
     pub chunk_count: usize,
+    /// Approximate whitespace-delimited token count used for benchmark throughput.
+    pub token_count: usize,
+    /// UTF-8 bytes in the extracted content, used as processed-work throughput.
+    pub content_bytes: usize,
     /// Length of each chunk's embedding vector. Zero when embeddings are off.
     pub embedding_dim: u16,
     /// Whether this file should emit LanceDB rows at flush time. False for the no-embed, empty, and
@@ -298,6 +302,7 @@ pub(crate) fn extract_and_persist_doc(
     filters: &Filters,
     scope: &str,
     mode: EmbedMode,
+    metrics: &crate::scan_metrics::ScanStageMetrics,
 ) -> Result<Option<PendingDocBatch>, anyhow::Error> {
     let embed = doc_embed_requested(rel, cfg, mode, filters);
     let hex_buf = hashing::hex_buf(hash);
@@ -374,8 +379,8 @@ pub(crate) fn extract_and_persist_doc(
 
     let mut doc_config = doc_config_from(cfg, llm, resources, embed);
     doc_config.phase = Some(Arc::clone(&filters.doc_phase));
-    let mut doc: FileMapDoc =
-        extract_doc(abs, Some(mime_type), &doc_config).with_context(|| format!("extract document {rel}"))?;
+    let mut doc: FileMapDoc = extract_doc_with_metrics(abs, Some(mime_type), &doc_config, Some(metrics))
+        .with_context(|| format!("extract document {rel}"))?;
     doc.config_digest.clone_from(&filters.doc_digest);
 
     // The rehydration map captured during extraction is NOT persisted here.
@@ -469,9 +474,11 @@ pub(crate) fn extract_and_persist_doc(
         }
     }
 
+    let persistence_started = std::time::Instant::now();
     store
         .write_doc(hash, &doc)
         .with_context(|| format!("write doc blob for {rel}"))?;
+    metrics.add_persistence(persistence_started.elapsed());
 
     Ok(Some(pending_from_doc(&doc, rel, hash_hex, scope, cfg, embed, false)))
 }
@@ -565,6 +572,8 @@ fn pending_from_doc(
     reused: bool,
 ) -> PendingDocBatch {
     let chunk_count = doc.chunks.len();
+    let token_count = doc.content.split_whitespace().count();
+    let content_bytes = doc.content.len();
     let embedding_dim = doc.embedding_dim;
     let over_cap = chunk_count > cfg.max_chunks_per_document;
     if over_cap {
@@ -587,6 +596,8 @@ fn pending_from_doc(
         blob_hash: blob_hash.to_string(),
         doc_scope: scope.to_string(),
         chunk_count,
+        token_count,
+        content_bytes,
         embedding_dim,
         emit_rows,
         embedded: !embed || embedding_dim > 0 || chunk_count == 0,
