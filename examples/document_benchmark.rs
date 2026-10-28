@@ -147,6 +147,7 @@ fn json_report(
     config: &ConfigV1,
     rss_before: Option<u64>,
     rss_after: Option<u64>,
+    peak_rss_before: Option<u64>,
 ) -> Value {
     let stats = report.stats;
     let total_seconds = report.timings.total_ms as f64 / 1_000.0;
@@ -160,6 +161,11 @@ fn json_report(
         "rss_before_bytes": rss_before,
         "rss_after_bytes": rss_after,
         "peak_rss_bytes": basemind::sysres::sample().peak_bytes,
+        "peak_rss_before_bytes": peak_rss_before,
+        "peak_rss_delta_bytes": basemind::sysres::sample()
+            .peak_bytes
+            .zip(peak_rss_before)
+            .map(|(after, before)| after.saturating_sub(before)),
         "throughput": {
             "documents_per_second": if total_seconds > 0.0 { stats.docs_indexed as f64 / total_seconds } else { 0.0 },
             "bytes_per_second": if total_seconds > 0.0 { stats.docs_bytes as f64 / total_seconds } else { 0.0 },
@@ -413,6 +419,7 @@ fn main() -> Result<()> {
     let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
+        let peak_rss_before = basemind::sysres::sample().peak_bytes;
         let mut observer = FirstResultObserver::new(started);
         let result = if manifest_files.is_empty() {
             scan_with_observer(
@@ -445,6 +452,7 @@ fn main() -> Result<()> {
             &config,
             rss_before,
             basemind::sysres::sample().current_bytes,
+            peak_rss_before,
         );
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         value["cache_before_run"] = json!(cache_before);
@@ -455,6 +463,7 @@ fn main() -> Result<()> {
     let mut incremental_scan = |paths: &[PathBuf], store: &mut Store| -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
+        let peak_rss_before = basemind::sysres::sample().peak_bytes;
         let mut observer = FirstResultObserver::new(started);
         let result = scan_paths_with_observer(
             &root,
@@ -479,6 +488,7 @@ fn main() -> Result<()> {
             &config,
             rss_before,
             basemind::sysres::sample().current_bytes,
+            peak_rss_before,
         );
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         value["cache_before_run"] = json!(cache_before);
