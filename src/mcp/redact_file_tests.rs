@@ -396,6 +396,34 @@ async fn ner_model_dir_detects_entities_with_confidence() {
     assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
 }
 
+/// Download-gated (#97): the selected legal profile must reach the real NER
+/// backend, while the response records the exact ordered labels used for the
+/// coverage contract. This is intentionally ignored unless a model is staged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn legal_profile_runs_ner_with_effective_labels() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@1".to_string()),
+        ner_model_dir: Some(dir),
+        ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
+    })
+    .await
+    .expect("legal profile NER succeeds");
+    let payload = json_of(&result);
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    assert_eq!(payload["ner_profile"]["name"], "legal-fr@1");
+    assert_eq!(payload["ner_profile"]["labels"].as_array().map(Vec::len), Some(16));
+    assert_eq!(payload["ner_truncated"], Value::Bool(false));
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+    assert!(
+        !payload["redacted_text"]
+            .as_str()
+            .expect("redacted_text")
+            .contains("Alice Smith")
+    );
+}
+
 /// xberg's built-in phone pattern misses these formats (a `+` after a space
 /// defeats its leading `\b`; French numbers are written in digit pairs).
 #[tokio::test]
