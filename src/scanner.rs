@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use thiserror::Error;
 use tracing::debug;
@@ -320,11 +321,31 @@ pub enum FileStatus {
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
     pub stats: ScanStats,
+    /// Wall-clock timings for the major scan phases, in milliseconds. These are
+    /// diagnostic measurements for benchmark and operator tooling; they do not
+    /// alter scheduling or admission decisions.
+    pub timings: ScanTimings,
     /// True when the scan was interrupted by a [`ScanCancel`] token. The per-file work that
     /// completed before the trip is committed (blobs, fjall batches, `index.msgpack`); everything
     /// else — remaining candidates, the stale purge, the resolve/doc lanes — was skipped, so the
     /// caller must not treat the report as a complete pass.
     pub cancelled: bool,
+}
+
+/// Wall-clock timings for one full scan invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanTimings {
+    pub candidates_ms: u128,
+    pub extraction_ms: u128,
+    pub purge_ms: u128,
+    pub flush_ms: u128,
+    pub resolve_ms: u128,
+    pub lanes_ms: u128,
+    pub total_ms: u128,
+}
+
+fn elapsed_ms(started: Instant) -> u128 {
+    started.elapsed().as_millis()
 }
 
 /// Cooperative cancellation token for a scan.
@@ -434,6 +455,7 @@ pub fn scan_with_observer(
     cancel: &ScanCancel,
     observer: &mut dyn ScanObserver,
 ) -> Result<ScanReport, ScanError> {
+    let scan_started = Instant::now();
     // Held for the whole pass and dropped on every exit — the two cancellation returns, the `?` on ~keep
     // a walk that hit the candidate ceiling, an unwinding panic. That is what makes a surviving ~keep
     // record mean "this process never ran a destructor", i.e. a hard kill (issue #62). Only the ~keep
@@ -451,12 +473,14 @@ pub fn scan_with_observer(
         .filter(|p| matches!(embed, EmbedMode::Inline) && p.changed);
     filters.reflush_embeds = policy.as_ref().is_some_and(|p| p.reflush);
     advance(&mut breadcrumb, PHASE_CANDIDATES, None);
+    let candidates_started = Instant::now();
     let candidates = candidates_for_source(root, config, &filters, &source, cancel)?;
     debug!(count = candidates.len(), kind = source.label(), "scan candidates");
     advance(&mut breadcrumb, PHASE_EXTRACT, Some(candidates.len()));
 
     let scope = derive_scope(root, &source);
     let mut report = ScanReport::default();
+    report.timings.candidates_ms = elapsed_ms(candidates_started);
     let drive = ScanDrive {
         root,
         filters: &filters,
@@ -467,6 +491,7 @@ pub fn scan_with_observer(
         cancel,
     };
     let driven = drive_scan(&drive, &candidates, store, &mut report.stats, observer);
+    report.timings.extraction_ms = elapsed_ms(candidates_started) - report.timings.candidates_ms;
 
     // Cancelled mid-pass: commit what completed and return BEFORE the stale purge. The purge below ~keep
     // treats every indexed file absent from `driven.seen` as deleted — on a partial pass that would ~keep
@@ -476,6 +501,7 @@ pub fn scan_with_observer(
     // rows come from already-persisted blobs (no model inference), so this stays bounded. ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
+        report.timings.total_ms = elapsed_ms(scan_started);
         flush_code_map(store)?;
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, driven.doc_batches);
@@ -487,6 +513,7 @@ pub fn scan_with_observer(
     }
 
     advance(&mut breadcrumb, PHASE_PURGE, None);
+    let purge_started = Instant::now();
 
     // Derived AFTER the drive rather than before it: the entries the drive upserted are all in ~keep
     // `seen`, so they are excluded either way, and reading the file map here keeps the whole ~keep
@@ -557,8 +584,11 @@ pub fn scan_with_observer(
         }
     }
 
+    report.timings.purge_ms = elapsed_ms(purge_started);
     advance(&mut breadcrumb, PHASE_FLUSH, None);
+    let flush_started = Instant::now();
     flush_code_map(store)?;
+    report.timings.flush_ms = elapsed_ms(flush_started);
 
     // A token tripped after the last per-file check still stops the pass here, once the code map ~keep
     // is durable but before the resolve pass (which can run for minutes on a large repo). The ~keep
@@ -566,6 +596,7 @@ pub fn scan_with_observer(
     // their rows would leave them tracked-but-rowless (blob-sourced, no inference; bounded). ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
+        report.timings.total_ms = elapsed_ms(scan_started);
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, doc_batches);
         });
@@ -575,6 +606,7 @@ pub fn scan_with_observer(
         return Ok(report);
     }
 
+    let resolve_started = Instant::now();
     if matches!(source, ScanSource::WorkingTree) {
         advance(&mut breadcrumb, PHASE_RESOLVE, None);
         let precise = config.code_intel.precise_resolution;
@@ -584,8 +616,10 @@ pub fn scan_with_observer(
             });
         });
     }
+    report.timings.resolve_ms = elapsed_ms(resolve_started);
 
     advance(&mut breadcrumb, PHASE_LANES, None);
+    let lanes_started = Instant::now();
     run_optional_lane(LANE_DOC_BATCHES, || {
         flush_doc_batches_if_any(store, config, doc_batches);
     });
@@ -606,6 +640,8 @@ pub fn scan_with_observer(
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
         maintain_lance_if_open(store)
     });
+    report.timings.lanes_ms = elapsed_ms(lanes_started);
+    report.timings.total_ms = elapsed_ms(scan_started);
     Ok(report)
 }
 
@@ -682,6 +718,7 @@ pub fn scan_paths_with_observer(
     cancel: &ScanCancel,
     observer: &mut dyn ScanObserver,
 ) -> Result<ScanReport, ScanError> {
+    let scan_started = Instant::now();
     let source = ScanSource::WorkingTree;
     let filter = IndexFilter::new(root, config)?;
 
@@ -740,7 +777,9 @@ pub fn scan_paths_with_observer(
     #[cfg(not(feature = "documents"))]
     let nothing_removed = removed.is_empty();
     if rels.is_empty() && nothing_removed {
-        return Ok(ScanReport::default());
+        let mut report = ScanReport::default();
+        report.timings.total_ms = elapsed_ms(scan_started);
+        return Ok(report);
     }
 
     let scope = derive_scope(root, &source);
@@ -761,6 +800,7 @@ pub fn scan_paths_with_observer(
         #[cfg(feature = "documents")]
         doc_seen,
     } = drive_scan(&drive, &rels, store, &mut report.stats, observer);
+    report.timings.extraction_ms = elapsed_ms(scan_started);
 
     // A path that still exists but ended up neither kept as code nor as a document (its language
     // was disabled, it grew past the size cap, turned binary, ...) is dropped exactly as a full
@@ -820,6 +860,7 @@ pub fn scan_paths_with_observer(
     // would leave them tracked-but-rowless (blob-sourced, no inference; bounded). ~keep
     if cancel.is_cancelled() {
         report.cancelled = true;
+        report.timings.total_ms = elapsed_ms(scan_started);
         run_optional_lane(LANE_DOC_BATCHES, || {
             flush_doc_batches_if_any(store, config, doc_batches);
         });
@@ -862,6 +903,7 @@ pub fn scan_paths_with_observer(
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
         maintain_lance_if_open(store)
     });
+    report.timings.total_ms = elapsed_ms(scan_started);
     Ok(report)
 }
 
