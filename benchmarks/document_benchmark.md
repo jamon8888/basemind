@@ -27,3 +27,7 @@ memory thresholds.
 For a proportional update benchmark, edit one manifest file between separate
 `--mode warm` and `--mode incremental` invocations, or select it explicitly
 with `--incremental-file path/to/file.docx`.
+
+The generated `synthetic-incremental.txt` is selected automatically and is
+updated in `all`/`incremental` runs. Use `--mutate-incremental` to opt into the
+same deterministic append for a selected text fixture.

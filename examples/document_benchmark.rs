@@ -233,6 +233,22 @@ fn read_quality_manifest(path: &Path) -> Result<Vec<QualityCase>> {
         .collect()
 }
 
+fn mutate_synthetic_incremental(path: &Path) -> Result<()> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
+        return Err(anyhow!(
+            "--mutate-incremental requires a .txt fixture; edit {} between runs instead",
+            path.display()
+        ));
+    }
+    let mut bytes = fs::read(path).map_err(|error| anyhow!("read incremental fixture: {error}"))?;
+    let marker = b"Basemind synthetic incremental update\n";
+    if !bytes.ends_with(marker) {
+        bytes.extend_from_slice(marker);
+        fs::write(path, bytes).map_err(|error| anyhow!("write incremental fixture: {error}"))?;
+    }
+    Ok(())
+}
+
 fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_path: &Path) -> Result<Value> {
     let cases = read_quality_manifest(manifest_path)?;
     let embedder = SharedEmbedder::load_with_provider(
@@ -354,7 +370,7 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--quality-manifest FILE] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -364,6 +380,7 @@ fn main() -> Result<()> {
     let mut synthetic_manifest_path = None;
     let mut quality_manifest_path = None;
     let mut incremental_file = None;
+    let mut mutate_incremental = false;
     let mut mode = Mode::All;
     let mut i = 1;
     while i < args.len() {
@@ -384,6 +401,7 @@ fn main() -> Result<()> {
                 i += 1;
                 incremental_file = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
             }
+            "--mutate-incremental" => mutate_incremental = true,
             "--mode" => {
                 i += 1;
                 mode = Mode::parse(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?)?;
@@ -414,7 +432,18 @@ fn main() -> Result<()> {
     let mut runs = Vec::new();
     let changed_file = incremental_file
         .map(|path| root.join(path))
+        .or_else(|| {
+            manifest_files
+                .iter()
+                .find(|path| path.file_name().is_some_and(|name| name == "synthetic-incremental.txt"))
+                .cloned()
+        })
         .or_else(|| manifest_files.first().cloned());
+
+    let should_mutate = mutate_incremental
+        || changed_file
+            .as_ref()
+            .is_some_and(|path| path.file_name().is_some_and(|name| name == "synthetic-incremental.txt"));
 
     let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
         let started = Instant::now();
@@ -506,12 +535,18 @@ fn main() -> Result<()> {
                 .clone()
                 .map(|path| vec![path])
                 .ok_or_else(|| anyhow!("incremental mode requires --manifest or --incremental-file"))?;
+            if should_mutate {
+                mutate_synthetic_incremental(&changed[0])?;
+            }
             incremental_scan(&changed, &mut store)?;
         }
         Mode::All => {
             full_scan("cold", &mut store)?;
             full_scan("warm", &mut store)?;
             if let Some(path) = changed_file {
+                if should_mutate {
+                    mutate_synthetic_incremental(&path)?;
+                }
                 incremental_scan(&[path], &mut store)?;
             }
         }

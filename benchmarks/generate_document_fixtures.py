@@ -43,6 +43,7 @@ def write_pdf(path: Path) -> None:
 def generate(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     write_pdf(root / "synthetic.pdf")
+    (root / "synthetic-incremental.txt").write_text("Basemind synthetic incremental fixture Alice Paris\n")
     write_zip(
         root / "synthetic.docx",
         {
@@ -74,7 +75,10 @@ def generate(root: Path) -> Path:
         },
     )
     manifest = root / "synthetic-manifest.txt"
-    manifest.write_text("\n".join(path.name for path in sorted(root.iterdir()) if path.suffix in {".pdf", ".docx", ".pptx", ".xlsx"}) + "\n")
+    manifest.write_text(
+        "\n".join(path.name for path in sorted(root.iterdir()) if path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"})
+        + "\n"
+    )
     return manifest
 
 
