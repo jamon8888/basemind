@@ -95,13 +95,41 @@ fn manifest(root: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn report(mode: &str, report: &ScanReport, manifest_files: usize, first_result_ms: Option<u128>) -> Value {
+fn json_report(
+    mode: &str,
+    report: &ScanReport,
+    manifest_files: usize,
+    manifest_bytes: u64,
+    first_result_ms: Option<u128>,
+    config: &ConfigV1,
+    rss_before: Option<u64>,
+    rss_after: Option<u64>,
+) -> Value {
     let stats = report.stats;
+    let total_seconds = report.timings.total_ms as f64 / 1_000.0;
     json!({
         "mode": mode,
         "manifest_files": manifest_files,
+        "manifest_bytes": manifest_bytes,
         "cancelled": report.cancelled,
         "first_result_ms": first_result_ms,
+        "rss_before_bytes": rss_before,
+        "rss_after_bytes": rss_after,
+        "peak_rss_bytes": basemind::sysres::sample().peak_bytes,
+        "throughput": {
+            "documents_per_second": if total_seconds > 0.0 { stats.docs_indexed as f64 / total_seconds } else { 0.0 },
+            "bytes_per_second": if total_seconds > 0.0 { manifest_bytes as f64 / total_seconds } else { 0.0 },
+            "chunks_per_second": if total_seconds > 0.0 { stats.docs_chunks as f64 / total_seconds } else { 0.0 },
+        },
+        "configuration": {
+            "embedding_preset": config.documents.embedding_preset,
+            "onnx_provider": config.resources.onnx_provider,
+            "precision": "fp32",
+            "scan_threads": config.resources.scan_threads,
+            "embed_threads": config.resources.embed_threads,
+            "embed_batch_size": config.resources.embed_batch_size,
+            "max_concurrent_documents": config.resources.max_concurrent_documents,
+        },
         "timings_ms": {
             "candidates": report.timings.candidates_ms,
             "extraction": report.timings.extraction_ms,
@@ -159,6 +187,10 @@ fn main() -> Result<()> {
     }
     basemind::store::init_isolated_cache();
     let manifest_files = manifest(&root, manifest_path.as_deref())?;
+    let manifest_bytes: u64 = manifest_files
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum();
     let mut config = ConfigV1::with_defaults();
     config.documents.enabled = true;
     let mut store = Store::open(&root, VIEW_WORKING).map_err(|error| anyhow!("open store: {error}"))?;
@@ -166,18 +198,73 @@ fn main() -> Result<()> {
 
     let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
         let started = Instant::now();
+        let rss_before = basemind::sysres::sample().current_bytes;
         let mut observer = FirstResultObserver::new(started);
-        let result = scan_with_observer(
+        let result = if manifest_files.is_empty() {
+            scan_with_observer(
+                &root,
+                store,
+                &config,
+                ScanSource::WorkingTree,
+                EmbedMode::Inline,
+                &ScanCancel::new(),
+                &mut observer,
+            )
+        } else {
+            scan_paths_with_observer(
+                &root,
+                store,
+                &config,
+                &manifest_files,
+                EmbedMode::Inline,
+                &ScanCancel::new(),
+                &mut observer,
+            )
+        }
+        .map_err(|error| anyhow!("{label} scan: {error}"))?;
+        let mut value = json_report(
+            label,
+            &result,
+            manifest_files.len(),
+            manifest_bytes,
+            observer.first_result_ms,
+            &config,
+            rss_before,
+            basemind::sysres::sample().current_bytes,
+        );
+        value["wall_clock_ms"] = json!(started.elapsed().as_millis());
+        runs.push(value);
+        Ok(())
+    };
+
+    let mut incremental_scan = |paths: &[PathBuf], store: &mut Store| -> Result<()> {
+        let started = Instant::now();
+        let rss_before = basemind::sysres::sample().current_bytes;
+        let mut observer = FirstResultObserver::new(started);
+        let result = scan_paths_with_observer(
             &root,
             store,
             &config,
-            ScanSource::WorkingTree,
+            paths,
             EmbedMode::Inline,
             &ScanCancel::new(),
             &mut observer,
         )
-        .map_err(|error| anyhow!("{label} scan: {error}"))?;
-        let mut value = report(label, &result, manifest_files.len(), observer.first_result_ms);
+        .map_err(|error| anyhow!("incremental scan: {error}"))?;
+        let selected_bytes: u64 = paths
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+            .sum();
+        let mut value = json_report(
+            "incremental",
+            &result,
+            paths.len(),
+            selected_bytes,
+            observer.first_result_ms,
+            &config,
+            rss_before,
+            basemind::sysres::sample().current_bytes,
+        );
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         runs.push(value);
         Ok(())
@@ -192,43 +279,15 @@ fn main() -> Result<()> {
             let changed = if manifest_files.is_empty() {
                 return Err(anyhow!("incremental mode requires --manifest with at least one file"));
             } else {
-                manifest_files.clone()
+                vec![manifest_files[0].clone()]
             };
-            let started = Instant::now();
-            let mut observer = FirstResultObserver::new(started);
-            let result = scan_paths_with_observer(
-                &root,
-                &mut store,
-                &config,
-                &changed,
-                EmbedMode::Inline,
-                &ScanCancel::new(),
-                &mut observer,
-            )
-            .map_err(|error| anyhow!("incremental scan: {error}"))?;
-            let mut value = report("incremental", &result, manifest_files.len(), observer.first_result_ms);
-            value["wall_clock_ms"] = json!(started.elapsed().as_millis());
-            runs.push(value);
+            incremental_scan(&changed, &mut store)?;
         }
         Mode::All => {
             full_scan("cold", &mut store)?;
             full_scan("warm", &mut store)?;
             if !manifest_files.is_empty() {
-                let started = Instant::now();
-                let mut observer = FirstResultObserver::new(started);
-                let result = scan_paths_with_observer(
-                    &root,
-                    &mut store,
-                    &config,
-                    &manifest_files,
-                    EmbedMode::Inline,
-                    &ScanCancel::new(),
-                    &mut observer,
-                )
-                .map_err(|error| anyhow!("incremental scan: {error}"))?;
-                let mut value = report("incremental", &result, manifest_files.len(), observer.first_result_ms);
-                value["wall_clock_ms"] = json!(started.elapsed().as_millis());
-                runs.push(value);
+                incremental_scan(&[manifest_files[0].clone()], &mut store)?;
             }
         }
     }

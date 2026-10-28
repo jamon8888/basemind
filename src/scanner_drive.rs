@@ -399,12 +399,14 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
             }
             #[cfg(feature = "documents")]
             FileStatus::DocIndexed {
+                chunk_count,
                 reused,
                 degraded,
                 text_fallback,
                 ..
             } => {
                 ctx.stats.docs_indexed += 1;
+                ctx.stats.docs_chunks += *chunk_count;
                 if *reused {
                     ctx.stats.reused_doc_extraction += 1;
                 }

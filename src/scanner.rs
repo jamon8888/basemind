@@ -157,6 +157,7 @@ pub struct ScanStats {
     /// were configured) pushed to LanceDB. Always present in `ScanStats` so callers that don't
     /// compile the `documents` feature still get a stable struct shape; stays `0` in that mode.
     pub docs_indexed: usize,
+    pub docs_chunks: usize,
     /// Subset of `docs_indexed` served from an already-persisted `.doc.msgpack` blob instead of a
     /// fresh xberg extraction (+ embedding). Mirrors `reused_extraction` for the doc tier: rename /
     /// rewrite churn should show up here, never as fresh extraction work (issue #44).
@@ -200,7 +201,6 @@ impl ScanStats {
         self.tier_migrated > 0 || self.refreshed_extraction > 0
     }
 }
-
 /// Per-file result. Every file the scanner *considered* shows up here.
 /// SkippedNoLang is included so callers can render or hide it via verbosity.
 #[derive(Debug, Clone)]
