@@ -348,7 +348,7 @@ fn quality_report(root: &Path, store: &mut Store, config: &ConfigV1, manifest_pa
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--quality-manifest FILE] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--quality-manifest FILE] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -357,6 +357,7 @@ fn main() -> Result<()> {
     let mut manifest_path = None;
     let mut synthetic_manifest_path = None;
     let mut quality_manifest_path = None;
+    let mut incremental_file = None;
     let mut mode = Mode::All;
     let mut i = 1;
     while i < args.len() {
@@ -372,6 +373,10 @@ fn main() -> Result<()> {
             "--quality-manifest" => {
                 i += 1;
                 quality_manifest_path = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
+            }
+            "--incremental-file" => {
+                i += 1;
+                incremental_file = Some(PathBuf::from(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?));
             }
             "--mode" => {
                 i += 1;
@@ -401,6 +406,9 @@ fn main() -> Result<()> {
     let cache_before = root.join(".basemind/views/working/index.msgpack").is_file();
     let mut store = Store::open(&root, VIEW_WORKING).map_err(|error| anyhow!("open store: {error}"))?;
     let mut runs = Vec::new();
+    let changed_file = incremental_file
+        .map(|path| root.join(path))
+        .or_else(|| manifest_files.first().cloned());
 
     let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
         let started = Instant::now();
@@ -484,18 +492,17 @@ fn main() -> Result<()> {
             full_scan("warm", &mut store)?;
         }
         Mode::Incremental => {
-            let changed = if manifest_files.is_empty() {
-                return Err(anyhow!("incremental mode requires --manifest with at least one file"));
-            } else {
-                vec![manifest_files[0].clone()]
-            };
+            let changed = changed_file
+                .clone()
+                .map(|path| vec![path])
+                .ok_or_else(|| anyhow!("incremental mode requires --manifest or --incremental-file"))?;
             incremental_scan(&changed, &mut store)?;
         }
         Mode::All => {
             full_scan("cold", &mut store)?;
             full_scan("warm", &mut store)?;
-            if !manifest_files.is_empty() {
-                incremental_scan(&[manifest_files[0].clone()], &mut store)?;
+            if let Some(path) = changed_file {
+                incremental_scan(&[path], &mut store)?;
             }
         }
     }

@@ -23,3 +23,7 @@ chunks throughput, RSS, configuration, and skip/failure counters. The optional
 quality manifest reports embedding recall/nDCG and NER category/text coverage.
 Fixtures are intentionally small; use the private manifest for throughput and
 memory thresholds.
+
+For a proportional update benchmark, edit one manifest file between separate
+`--mode warm` and `--mode incremental` invocations, or select it explicitly
+with `--incremental-file path/to/file.docx`.
