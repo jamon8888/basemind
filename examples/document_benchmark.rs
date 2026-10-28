@@ -417,7 +417,15 @@ fn main() -> Result<()> {
     basemind::store::init_isolated_cache();
     let mut manifest_files = manifest(&root, manifest_path.as_deref())?;
     let private_manifest_files = manifest_files.len();
-    let synthetic_manifest_files = manifest(&root, synthetic_manifest_path.as_deref())?;
+    let discovered_synthetic = synthetic_manifest_path.or_else(|| {
+        [
+            root.join("fixtures/synthetic-manifest.txt"),
+            root.join("synthetic-manifest.txt"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    });
+    let synthetic_manifest_files = manifest(&root, discovered_synthetic.as_deref())?;
     manifest_files.extend(synthetic_manifest_files);
     manifest_files.sort();
     manifest_files.dedup();

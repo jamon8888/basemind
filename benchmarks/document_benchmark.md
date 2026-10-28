@@ -17,6 +17,9 @@ cargo run --release --features documents --example document_benchmark -- \
   --mode all
 ```
 
+The harness also auto-discovers `fixtures/synthetic-manifest.txt` (or a root
+`synthetic-manifest.txt`) when `--synthetic-manifest` is omitted.
+
 `all` executes cold, warm, and a one-file incremental pass. Each run reports
 stage timings, first persisted-searchable-result time, processed bytes/tokens/
 chunks throughput, RSS, configuration, and skip/failure counters. The optional
