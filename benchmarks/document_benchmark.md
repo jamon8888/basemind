@@ -26,7 +26,9 @@ chunks throughput, RSS, configuration, and skip/failure counters. The optional
 quality manifest reports embedding recall/nDCG and NER category/text coverage.
 When supplied, `--quality-baseline` adds recall, nDCG, and NER coverage deltas
 against a prior JSON report (either the full benchmark output or its `quality`
-object).
+object). The default allowed regression is `0.01` (one percentage point); set
+`--quality-tolerance` to change that fraction. A regression beyond the limit
+fails the benchmark command.
 Fixtures are intentionally small; use the private manifest for throughput and
 memory thresholds.
 
