@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [Unreleased]
+
+### Added
+
+- **Versioned `redact_text` NER profiles.** Callers can select the historical
+  `full@1` label set or the reduced `legal-fr@1` profile; responses expose the
+  resolved profile and ordered labels for reproducible coverage checks.
+
 ## [0.34.1] - 2026-10-24
 
 > **Patch release — the redact_text NER fix.** No index migration: `RELEASE_MINOR` stays 34,
