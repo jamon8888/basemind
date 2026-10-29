@@ -11,11 +11,24 @@ use super::RedactionCustomPattern;
 /// national `06 12 34 56 78` is detected. Kept tight to avoid dates/amounts:
 /// the international form needs a `+` and at least two further 2–4 digit
 /// groups; the national form is exactly `0X` plus four digit pairs.
+///
+/// A French number (`+33`) has exactly nine digits after the country code (any
+/// grouping, an optional trunk `0` or `(0)`, the first digit possibly in
+/// parentheses), so it gets its own exact pattern and the generic one never starts at `+33`: the
+/// generic form accepts up to five groups and would swallow the street number of
+/// an address that follows on the same line (`+33 6 12 34 56 78 11 rue …`), whose
+/// overlapping address detection is then dropped (#114).
 pub fn phone_patterns() -> Vec<RedactionCustomPattern> {
     vec![
         RedactionCustomPattern {
             label: "phone".into(),
-            pattern: r"\+\d{1,3}[ .\-]?(?:\(0\)[ .\-]?)?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,5}\b".into(),
+            pattern: r"\+33[ .\-]?(?:\(0\)[ .\-]?|0[ .\-]?)?\(?[1-9]\)?(?:[ .\-]?\d){8}\b".into(),
+            case_sensitive: false,
+        },
+        RedactionCustomPattern {
+            label: "phone".into(),
+            pattern: r"\+(?:[124-9]\d{0,2}|3[0-24-9]\d?)[ .\-]?(?:\(0\)[ .\-]?)?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,5}\b"
+                .into(),
             case_sensitive: false,
         },
         RedactionCustomPattern {
