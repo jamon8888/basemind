@@ -984,7 +984,7 @@ fn metadata_pairs(metadata: &xberg::types::Metadata) -> Vec<(String, String)> {
 }
 
 /// The near-empty-OCR signal (#95) lives in a submodule by the 1000-line module cap.
-mod ocr_signal;
+pub(crate) mod ocr_signal;
 
 /// `heading_path` tests live in a subdirectory by the 1000-line module cap
 /// (`tests/max_lines.rs`), the same shape `scanner_docs` uses for its tests.

@@ -20,7 +20,7 @@ pub(super) fn ocr_output_near_empty(mime_type: Option<&str>, content: &str) -> b
 
 /// The non-whitespace character count of a near-empty image OCR, logged as a warning; `None`
 /// when the profile ran no OCR (`CodeOnly`, `None_`) or the OCR read enough text.
-pub(super) fn check(
+pub(crate) fn check(
     path: &Path,
     mime_type: Option<&str>,
     profile: &DocumentModelProfile,
@@ -31,8 +31,9 @@ pub(super) fn check(
         return None;
     }
     let ocr_chars = non_whitespace_chars(content);
+    let safe_path = sanitize_path_for_log(path);
     tracing::warn!(
-        path = %path.display(),
+        path = %safe_path,
         mime = mime_type.unwrap_or(""),
         ocr_chars,
         "OCR of an image returned no (or very little) text; the page may be blank, low-resolution, or unreadable by the OCR engine"
@@ -41,7 +42,7 @@ pub(super) fn check(
 }
 
 /// The `ocr_empty` metadata note carried by the document.
-pub(super) fn note(ocr_chars: usize) -> (String, String) {
+pub(crate) fn note(ocr_chars: usize) -> (String, String) {
     (
         "ocr_empty".to_string(),
         format!(
@@ -52,4 +53,31 @@ pub(super) fn note(ocr_chars: usize) -> (String, String) {
 
 fn non_whitespace_chars(content: &str) -> usize {
     content.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+fn sanitize_path_for_log(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_path_for_log;
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_path_for_log_removes_control_characters() {
+        assert_eq!(
+            sanitize_path_for_log(Path::new("docs/evil\n\r\tname.pdf")),
+            "docs/evilname.pdf"
+        );
+    }
+
+    #[test]
+    fn log_path_drops_terminal_control_characters() {
+        let safe = sanitize_path_for_log(Path::new("scan\u{1b}[2J\ncontract.png"));
+        assert_eq!(safe, "scan[2Jcontract.png");
+    }
 }

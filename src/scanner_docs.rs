@@ -30,6 +30,7 @@ use anyhow::Context as _;
 use xberg::core::mime;
 
 use crate::config::{DocumentsConfig, LlmConfig, ResourcesConfig};
+use crate::extract::doc::ocr_signal;
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
@@ -312,6 +313,20 @@ pub(crate) fn extract_and_persist_doc(
         // the index must not point at an old token→original blob (which would also keep
         // it in the GC's live set instead of letting it be reaped).
         let mut rewrite = false;
+        // Cached blobs predate the OCR signal or may have been created before the
+        // signal was enabled. Re-evaluate the cached OCR text under the current
+        // profile so reusable images receive the same warning and metadata note
+        // as freshly extracted images.
+        if let Some(ocr_chars) = ocr_signal::check(
+            abs,
+            Some(&cached.mime_type),
+            &resources.document_models,
+            &cached.content,
+        ) && !cached.metadata.iter().any(|(key, _)| key == "ocr_empty")
+        {
+            cached.metadata.push(ocr_signal::note(ocr_chars));
+            rewrite = true;
+        }
         if cached.config_digest.is_empty() {
             cached.config_digest.clone_from(&filters.doc_digest);
             rewrite = true;
