@@ -352,7 +352,7 @@ pub(super) async fn run_graph(state: &super::ServerState, params: GraphParams) -
             &cache,
             &basemind_dir,
             super::types_graph::GraphEntitiesParams {
-                cypher: require_field(mode, "cypher", None)?,
+                cypher: require_field(mode, "cypher", cypher)?,
                 max_rows,
             },
             notice,
@@ -969,6 +969,14 @@ pub(super) async fn run_graph_rag(
     notice: Option<super::types::LifecycleNotice>,
     started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
+    #[cfg(not(feature = "graphrag"))]
+    {
+        return Err(McpError::invalid_params(
+            "graph rag mode requires the graphrag feature",
+            None,
+        ));
+    }
+
     // This is a placeholder implementation - full GraphRAG would:
     // 1. Embed the query using the configured embedder
     // 2. Find seed entities in top-k chunks
@@ -976,8 +984,11 @@ pub(super) async fn run_graph_rag(
     // 4. Fuse with vector/keyword lanes
     // For now, return empty with notice
 
-    json_result(&super::types_graph::GraphRagResponse {
-        hits: Vec::new(),
-        truncated: false,
-    })
+    #[cfg(feature = "graphrag")]
+    {
+        json_result(&super::types_graph::GraphRagResponse {
+            hits: Vec::new(),
+            truncated: false,
+        })
+    }
 }
