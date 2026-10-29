@@ -34,14 +34,7 @@ pub struct GraphParams {
     pub mode: GraphMode,
     /// `calls` / `neighbors` / `subgraph`. Root symbol name, matched exactly (not a substring).
     /// Every definition site of the name is a root; pin one with `path`. Required by those modes.
-    #[serde(
-        default,
-        alias = "needle",
-        alias = "query",
-        alias = "symbol",
-        alias = "function",
-        alias = "q"
-    )]
+    #[serde(default, alias = "needle", alias = "symbol", alias = "function", alias = "q")]
     pub name: Option<String>,
     /// `calls` / `neighbors` / `subgraph`. Repo-relative path that disambiguates `name` when
     /// several definitions share it.
@@ -137,6 +130,21 @@ pub struct GraphParams {
     /// `display`/`open`: launch the viewer (default true); false only renders and returns the path or URL.
     #[serde(default)]
     pub open: Option<bool>,
+    /// `entities`: read-only Cypher query over the entity graph.
+    #[serde(default)]
+    pub cypher: Option<String>,
+    /// `entities`: maximum rows to return.
+    #[serde(default)]
+    pub max_rows: Option<u32>,
+    /// `rag`: natural-language query for GraphRAG retrieval.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// `rag`: entity expansion hop count.
+    #[serde(default)]
+    pub hops: Option<u32>,
+    /// `rag`: maximum results to return.
+    #[serde(default)]
+    pub max_results: Option<u32>,
 }
 
 impl GraphParams {
@@ -171,6 +179,11 @@ impl GraphParams {
             format: None,
             write: None,
             open: None,
+            cypher: None,
+            max_rows: None,
+            query: None,
+            hops: None,
+            max_results: None,
         }
     }
 }

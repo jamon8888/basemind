@@ -40,9 +40,9 @@ pub use doc_links::DocLinkRow;
 
 #[cfg(feature = "graphrag")]
 pub use graphrag::{
-    build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, delete_graph_for_scope,
-    execute_cypher, GraphragConfig, DocEntitySidecar, GraphEntityRow, GraphEdgeRow,
-    normalize_literal, CypherResult, GraphRagHit,
+    CypherResult, DocEntitySidecar, GraphEdgeRow, GraphEntityRow, GraphRagHit, GraphragConfig,
+    build_graph_from_entities, delete_graph_for_scope, execute_cypher, normalize_literal, upsert_graph_edges,
+    upsert_graph_entities,
 };
 
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ use tokio::runtime::Runtime;
 
 use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
 #[cfg(feature = "graphrag")]
-use schema::{graph_entities_schema, graph_edges_schema, GRAPH_ENTITIES_TABLE, GRAPH_EDGES_TABLE};
+use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
 /// On-disk metadata for the lance store. Tracks the vector dim, the
 /// embedding-model identifier, and the Arrow table schema version; a mismatch on
@@ -522,6 +522,11 @@ impl LanceStore {
     #[cfg(feature = "documents")]
     pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
+    }
+
+    #[cfg(feature = "graphrag")]
+    pub fn delete_graph_for_scope(&self, scope: &str) -> Result<()> {
+        graphrag::delete_graph_for_scope(&self.inner.connection, self.inner.rt(), scope)
     }
 
     pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {

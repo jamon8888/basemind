@@ -186,6 +186,7 @@ async fn file_path_redacts_extracted_text() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -209,6 +210,7 @@ async fn file_path_missing_file_errors() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -227,6 +229,7 @@ async fn text_and_file_path_together_rejected() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -249,6 +252,7 @@ async fn oversized_extracted_content_errors() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await

@@ -7,17 +7,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt8Array};
+use arrow_array::{Array, RecordBatch, StringArray, UInt8Array, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use futures::TryStreamExt;
-use lancedb::query::ExecutableQuery;
 use lancedb::Connection;
+use lancedb::query::ExecutableQuery;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use super::schema::{
-    graph_entities_schema, graph_edges_schema, GRAPH_ENTITIES_TABLE, GRAPH_EDGES_TABLE,
-    EntityKeySource,
+    EntityKeySource, GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema,
 };
 use super::{escape_sql_literal, now_micros};
 
@@ -76,9 +75,19 @@ pub fn normalize_literal(s: &str) -> String {
 /// Key for deduplicating entity mentions into nodes.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum EntityNodeKey {
-    TokenOfDocument { label: String, literal: String, doc_path: String },
-    ClearLiteral { label: String, normalized: String },
-    GatewayToken { label: String, gateway_token: String },
+    TokenOfDocument {
+        label: String,
+        literal: String,
+        doc_path: String,
+    },
+    ClearLiteral {
+        label: String,
+        normalized: String,
+    },
+    GatewayToken {
+        label: String,
+        gateway_token: String,
+    },
 }
 
 /// Key for deduplicating edges.
@@ -146,7 +155,12 @@ pub fn build_graph_from_entities(
         // For gaze gateway tokens (stable cross-document tokens like <deadbeef:Email_1>), use GatewayToken.
         // Otherwise (mask/hash/drop/none), the literal is the original value — global.
         let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
-            (2u8, String::new(), String::new(), ent.gateway_token.clone().unwrap_or_default()) // GatewayToken
+            (
+                2u8,
+                String::new(),
+                String::new(),
+                ent.gateway_token.clone().unwrap_or_default(),
+            ) // GatewayToken
         } else if ent.is_token {
             (0u8, ent.literal.clone(), ent.doc_path.clone(), String::new()) // TokenOfDocument
         } else {
@@ -171,21 +185,19 @@ pub fn build_graph_from_entities(
         };
 
         // Upsert entity node
-        let entity_row = entity_map
-            .entry(node_key.clone())
-            .or_insert_with(|| GraphEntityRow {
-                scope: scope.to_string(),
-                label: ent.label.clone(),
-                key_source,
-                normalized_literal: normalized_literal.clone(),
-                document_path: document_path.clone(),
-                gateway_token: gateway_token.clone(),
-                mention_count: 0,
-                first_seen_chunk: ent.chunk_idx,
-                last_seen_chunk: ent.chunk_idx,
-                doc_path: ent.doc_path.clone(),
-                doc_chunk_idx: ent.chunk_idx,
-            });
+        let entity_row = entity_map.entry(node_key.clone()).or_insert_with(|| GraphEntityRow {
+            scope: scope.to_string(),
+            label: ent.label.clone(),
+            key_source,
+            normalized_literal: normalized_literal.clone(),
+            document_path: document_path.clone(),
+            gateway_token: gateway_token.clone(),
+            mention_count: 0,
+            first_seen_chunk: ent.chunk_idx,
+            last_seen_chunk: ent.chunk_idx,
+            doc_path: ent.doc_path.clone(),
+            doc_chunk_idx: ent.chunk_idx,
+        });
         entity_row.mention_count += 1;
         entity_row.last_seen_chunk = ent.chunk_idx.max(entity_row.last_seen_chunk);
         if ent.chunk_idx < entity_row.first_seen_chunk {
@@ -205,7 +217,12 @@ pub fn build_graph_from_entities(
             continue;
         }
         let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
-            (2u8, String::new(), String::new(), ent.gateway_token.clone().unwrap_or_default())
+            (
+                2u8,
+                String::new(),
+                String::new(),
+                ent.gateway_token.clone().unwrap_or_default(),
+            )
         } else if ent.is_token {
             (0u8, ent.literal.clone(), ent.doc_path.clone(), String::new())
         } else {
@@ -255,31 +272,33 @@ pub fn build_graph_from_entities(
                     EntityNodeKey::GatewayToken { label, .. } => label.clone(),
                 };
                 let (src_ks, src_norm, src_doc) = match src {
-                    EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => (0u8, literal.clone(), doc_path.clone()),
+                    EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => {
+                        (0u8, literal.clone(), doc_path.clone())
+                    }
                     EntityNodeKey::ClearLiteral { normalized, .. } => (1u8, normalized.clone(), String::new()),
                     EntityNodeKey::GatewayToken { gateway_token, .. } => (2u8, gateway_token.clone(), String::new()),
                 };
                 let (dst_ks, dst_norm, dst_doc) = match dst {
-                    EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => (0u8, literal.clone(), doc_path.clone()),
+                    EntityNodeKey::TokenOfDocument { literal, doc_path, .. } => {
+                        (0u8, literal.clone(), doc_path.clone())
+                    }
                     EntityNodeKey::ClearLiteral { normalized, .. } => (1u8, normalized.clone(), String::new()),
                     EntityNodeKey::GatewayToken { gateway_token, .. } => (2u8, gateway_token.clone(), String::new()),
                 };
-                let edge_row = edge_map
-                    .entry(edge_key)
-                    .or_insert_with(|| GraphEdgeRow {
-                        scope: scope.to_string(),
-                        src_key_source: src_ks,
-                        src_normalized_literal: src_norm,
-                        src_document_path: src_doc,
-                        src_label,
-                        dst_key_source: dst_ks,
-                        dst_normalized_literal: dst_norm,
-                        dst_document_path: dst_doc,
-                        dst_label,
-                        chunk_idx,
-                        doc_path: doc_path.clone(),
-                        weight: 0,
-                    });
+                let edge_row = edge_map.entry(edge_key).or_insert_with(|| GraphEdgeRow {
+                    scope: scope.to_string(),
+                    src_key_source: src_ks,
+                    src_normalized_literal: src_norm,
+                    src_document_path: src_doc,
+                    src_label,
+                    dst_key_source: dst_ks,
+                    dst_normalized_literal: dst_norm,
+                    dst_document_path: dst_doc,
+                    dst_label,
+                    chunk_idx,
+                    doc_path: doc_path.clone(),
+                    weight: 0,
+                });
                 edge_row.weight += 1;
             }
         }
@@ -297,19 +316,15 @@ pub fn build_graph_from_entities(
 pub struct DocEntitySidecar {
     pub label: String,
     pub literal: String,
-    pub is_token: bool, // true when literal is a token_replace marker like [EMAIL_1]
-    pub is_gateway_token: bool, // true when literal is a gaze gateway token like <deadbeef:Email_1>
+    pub is_token: bool,                // true when literal is a token_replace marker like [EMAIL_1]
+    pub is_gateway_token: bool,        // true when literal is a gaze gateway token like <deadbeef:Email_1>
     pub gateway_token: Option<String>, // the gaze token (e.g., <deadbeef:Email_1>) when is_gateway_token
     pub chunk_idx: u32,
     pub doc_path: String,
 }
 
 /// Insert graph entity rows into the graph_entities table (upsert by unique key).
-pub fn upsert_graph_entities(
-    connection: &Connection,
-    runtime: &Runtime,
-    rows: &[GraphEntityRow],
-) -> Result<()> {
+pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &[GraphEntityRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -400,11 +415,7 @@ pub fn upsert_graph_entities(
 }
 
 /// Insert graph edge rows into the graph_edges table (upsert by unique key).
-pub fn upsert_graph_edges(
-    connection: &Connection,
-    runtime: &Runtime,
-    rows: &[GraphEdgeRow],
-) -> Result<()> {
+pub fn upsert_graph_edges(connection: &Connection, runtime: &Runtime, rows: &[GraphEdgeRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -488,22 +499,14 @@ pub fn upsert_graph_edges(
             table.delete(&predicate).await.context("delete existing edges")?;
         }
 
-        table
-            .add(batch)
-            .execute()
-            .await
-            .context("insert graph_edges batch")?;
+        table.add(batch).execute().await.context("insert graph_edges batch")?;
 
         anyhow::Ok(())
     })
 }
 
 /// Delete all graph entities/edges for a scope (used by gc / wipe).
-pub fn delete_graph_for_scope(
-    connection: &Connection,
-    runtime: &Runtime,
-    scope: &str,
-) -> Result<()> {
+pub fn delete_graph_for_scope(connection: &Connection, runtime: &Runtime, scope: &str) -> Result<()> {
     runtime.block_on(async {
         let table = connection
             .open_table(GRAPH_ENTITIES_TABLE)
@@ -550,7 +553,7 @@ pub fn execute_cypher(
 
     // Use lance-graph to execute Cypher over the batches
     // lance-graph API: GraphConfig -> CypherQuery.execute(tables)
-    use lance_graph::{GraphConfig, CypherQuery};
+    use lance_graph::{CypherQuery, GraphConfig};
 
     let config = GraphConfig::builder()
         .with_node_label("Entity", "scope") // nodes are in graph_entities
@@ -563,12 +566,7 @@ pub fn execute_cypher(
         ("CO_OCCURS".to_string(), edges_batch),
     ];
 
-    let result = runtime.block_on(async {
-        CypherQuery::new(cypher)
-            .with_config(config)
-            .execute(tables)
-            .await
-    })?;
+    let result = runtime.block_on(async { CypherQuery::new(cypher).with_config(config).execute(tables).await })?;
 
     // Convert lance-graph result to our format
     let columns = result.schema().fields().iter().map(|f| f.name().clone()).collect();
@@ -603,11 +601,7 @@ pub fn execute_cypher(
     Ok(CypherResult { columns, rows })
 }
 
-async fn load_graph_entities_batch(
-    connection: &Connection,
-    runtime: &Runtime,
-    scope: &str,
-) -> Result<RecordBatch> {
+async fn load_graph_entities_batch(connection: &Connection, runtime: &Runtime, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_ENTITIES_TABLE)
         .execute()
@@ -631,11 +625,7 @@ async fn load_graph_entities_batch(
     arrow::compute::concat_batches(&batches[0].schema(), &batches).context("concat graph_entities batches")
 }
 
-async fn load_graph_edges_batch(
-    connection: &Connection,
-    runtime: &Runtime,
-    scope: &str,
-) -> Result<RecordBatch> {
+async fn load_graph_edges_batch(connection: &Connection, runtime: &Runtime, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_EDGES_TABLE)
         .execute()
@@ -697,8 +687,14 @@ mod tests {
     #[test]
     fn test_entity_key_dedup() {
         let mut map = HashMap::new();
-        let k1 = EntityNodeKey::ClearLiteral { label: "person".into(), normalized: "john smith".into() };
-        let k2 = EntityNodeKey::ClearLiteral { label: "person".into(), normalized: "john smith".into() };
+        let k1 = EntityNodeKey::ClearLiteral {
+            label: "person".into(),
+            normalized: "john smith".into(),
+        };
+        let k2 = EntityNodeKey::ClearLiteral {
+            label: "person".into(),
+            normalized: "john smith".into(),
+        };
         map.insert(k1, 1);
         map.insert(k2, 2);
         assert_eq!(map.len(), 1);

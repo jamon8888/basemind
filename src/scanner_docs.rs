@@ -335,40 +335,56 @@ pub(crate) fn extract_and_persist_doc(
         store.touch_doc_blob(hash_hex);
 
         // Build GraphRAG entity graph from cached doc's NER sidecar (spec 0016).
+        #[cfg(feature = "graphrag")]
         if cfg.graphrag.enabled {
             if let Some(lance) = store.lance.as_ref() {
-                use crate::lance::graphrag::{build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, GraphragConfig, DocEntitySidecar};
-                
-                let doc_entities: Vec<DocEntitySidecar> = cached.entities.iter().map(|e| {
-                    let is_token = e.category.starts_with('[') && e.category.ends_with(']');
-                    // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
-                    let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
-                        || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
-                    let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
-                    DocEntitySidecar {
-                        label: e.category.clone(),
-                        literal: e.text.clone(),
-                        is_token,
-                        is_gateway_token,
-                        gateway_token,
-                        chunk_idx: 0,
-                        doc_path: rel.to_string(),
-                    }
-                }).collect();
-                
+                use crate::lance::graphrag::{
+                    DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
+                    upsert_graph_entities,
+                };
+
+                let doc_entities: Vec<DocEntitySidecar> = cached
+                    .entities
+                    .iter()
+                    .map(|e| {
+                        let is_token = e.category.starts_with('[') && e.category.ends_with(']');
+                        // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                        let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                            || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                        let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
+                        DocEntitySidecar {
+                            label: e.category.clone(),
+                            literal: e.text.clone(),
+                            is_token,
+                            is_gateway_token,
+                            gateway_token,
+                            chunk_idx: 0,
+                            doc_path: rel.to_string(),
+                        }
+                    })
+                    .collect();
+
                 let graphrag_cfg = GraphragConfig {
                     enabled: true,
                     labels: cfg.graphrag.labels.clone(),
                     max_rows: cfg.graphrag.max_rows,
                     hops: cfg.graphrag.hops,
                 };
-                
+
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_entities(&lance.inner.connection, &lance.inner.runtime, &entity_rows);
+                        let _ = crate::lance::graphrag::upsert_graph_entities(
+                            &lance.inner.connection,
+                            &lance.inner.runtime,
+                            &entity_rows,
+                        );
                     }
                     if !edge_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_edges(&lance.inner.connection, &lance.inner.runtime, &edge_rows);
+                        let _ = crate::lance::graphrag::upsert_graph_edges(
+                            &lance.inner.connection,
+                            &lance.inner.runtime,
+                            &edge_rows,
+                        );
                     }
                 }
             }
@@ -434,41 +450,56 @@ pub(crate) fn extract_and_persist_doc(
     }
     // Build GraphRAG entity graph from NER sidecar (spec 0016).
     // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
+    #[cfg(feature = "graphrag")]
     if cfg.graphrag.enabled {
         if let Some(lance) = store.lance.as_ref() {
-            use crate::lance::graphrag::{build_graph_from_entities, upsert_graph_entities, upsert_graph_edges, GraphragConfig, DocEntitySidecar};
-            
+            use crate::lance::graphrag::{
+                DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,
+            };
+
             // Convert FileMapDoc entities to DocEntitySidecar format
-            let doc_entities: Vec<DocEntitySidecar> = doc.entities.iter().map(|e| {
-                let is_token = e.category.starts_with('[') && e.category.ends_with(']'); // token_replace markers like [EMAIL_1]
-                // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
-                let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
-                    || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
-                let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
-                DocEntitySidecar {
-                    label: e.category.clone(),
-                    literal: e.text.clone(),
-                    is_token,
-                    is_gateway_token,
-                    gateway_token,
-                    chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
-                    doc_path: rel.to_string(),
-                }
-            }).collect();
-            
+            let doc_entities: Vec<DocEntitySidecar> = doc
+                .entities
+                .iter()
+                .map(|e| {
+                    let is_token = e.category.starts_with('[') && e.category.ends_with(']'); // token_replace markers like [EMAIL_1]
+                    // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                    let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                        || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                    let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
+                    DocEntitySidecar {
+                        label: e.category.clone(),
+                        literal: e.text.clone(),
+                        is_token,
+                        is_gateway_token,
+                        gateway_token,
+                        chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
+                        doc_path: rel.to_string(),
+                    }
+                })
+                .collect();
+
             let graphrag_cfg = GraphragConfig {
                 enabled: true,
                 labels: cfg.graphrag.labels.clone(),
                 max_rows: cfg.graphrag.max_rows,
                 hops: cfg.graphrag.hops,
             };
-            
+
             if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                 if !entity_rows.is_empty() {
-                    let _ = crate::lance::graphrag::upsert_graph_entities(&lance.inner.connection, &lance.inner.runtime, &entity_rows);
+                    let _ = crate::lance::graphrag::upsert_graph_entities(
+                        &lance.inner.connection,
+                        &lance.inner.runtime,
+                        &entity_rows,
+                    );
                 }
                 if !edge_rows.is_empty() {
-                    let _ = crate::lance::graphrag::upsert_graph_edges(&lance.inner.connection, &lance.inner.runtime, &edge_rows);
+                    let _ = crate::lance::graphrag::upsert_graph_edges(
+                        &lance.inner.connection,
+                        &lance.inner.runtime,
+                        &edge_rows,
+                    );
                 }
             }
         }
@@ -683,6 +714,7 @@ pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::
             );
         }
         // Drop the removed docs' graph entities/edges (spec 0016).
+        #[cfg(feature = "graphrag")]
         if let Err(error) = lance.delete_graph_for_scope(doc_scope) {
             tracing::warn!(
                 paths = paths.len(),
