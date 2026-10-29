@@ -44,9 +44,13 @@ pub struct RedactArgs {
     #[arg(long = "pseudonym", value_name = "VALUE,CODE_NAME")]
     pub pseudonyms: Vec<String>,
 
-    /// Local GLiNER2 model directory for person/organization/location NER. A missing dir degrades to pattern-only redaction.
+    /// Local GLiNER2 model directory. A missing dir degrades to pattern-only redaction.
     #[arg(long, value_name = "DIR")]
     pub ner_model_dir: Option<String>,
+
+    /// Named, versioned NER label profile (full@1 or legal-fr@1).
+    #[arg(long, value_name = "PROFILE")]
+    pub ner_profile: Option<String>,
 
     /// Output machine-readable JSON regardless of TTY.
     #[arg(long)]
@@ -102,6 +106,7 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         custom_patterns: parse_pairs(args.custom_patterns.clone())?,
         pseudonyms: parse_pairs(args.pseudonyms.clone())?,
         ner_model_dir: args.ner_model_dir.clone(),
+        ner_profile: args.ner_profile.clone(),
         require_ner: false,
     };
 

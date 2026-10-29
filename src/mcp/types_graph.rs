@@ -34,14 +34,7 @@ pub struct GraphParams {
     pub mode: GraphMode,
     /// `calls` / `neighbors` / `subgraph`. Root symbol name, matched exactly (not a substring).
     /// Every definition site of the name is a root; pin one with `path`. Required by those modes.
-    #[serde(
-        default,
-        alias = "needle",
-        alias = "query",
-        alias = "symbol",
-        alias = "function",
-        alias = "q"
-    )]
+    #[serde(default, alias = "needle", alias = "symbol", alias = "function", alias = "q")]
     pub name: Option<String>,
     /// `calls` / `neighbors` / `subgraph`. Repo-relative path that disambiguates `name` when
     /// several definitions share it.
@@ -137,6 +130,21 @@ pub struct GraphParams {
     /// `display`/`open`: launch the viewer (default true); false only renders and returns the path or URL.
     #[serde(default)]
     pub open: Option<bool>,
+    /// `entities`: read-only Cypher query over the entity graph.
+    #[serde(default)]
+    pub cypher: Option<String>,
+    /// `entities`: maximum rows to return.
+    #[serde(default)]
+    pub max_rows: Option<u32>,
+    /// `rag`: natural-language query for GraphRAG retrieval.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// `rag`: entity expansion hop count.
+    #[serde(default)]
+    pub hops: Option<u32>,
+    /// `rag`: maximum results to return.
+    #[serde(default)]
+    pub max_results: Option<u32>,
 }
 
 impl GraphParams {
@@ -171,6 +179,11 @@ impl GraphParams {
             format: None,
             write: None,
             open: None,
+            cypher: None,
+            max_rows: None,
+            query: None,
+            hops: None,
+            max_results: None,
         }
     }
 }
@@ -195,6 +208,53 @@ pub struct CallGraphParams {
     /// When hit, response is marked truncated.
     #[serde(default)]
     pub max_nodes: Option<u32>,
+}
+
+// Graph entities mode: read-only Cypher query over the entity graph.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GraphEntitiesParams {
+    /// Cypher query string (read-only: MATCH, RETURN, WHERE, LIMIT, ORDER BY, WITH, UNION only).
+    #[serde(alias = "query", alias = "q")]
+    pub cypher: String,
+    /// Maximum rows to return (server-side budget, default from config).
+    #[serde(default)]
+    pub max_rows: Option<u32>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphEntitiesResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub truncated: bool,
+}
+
+/// Graph rag mode: hybrid retrieval via entity graph expansion.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct GraphRagParams {
+    /// Natural language query to embed and expand.
+    #[serde(alias = "query", alias = "q")]
+    pub query: String,
+    /// Number of hops for entity expansion (default from config, max 2).
+    #[serde(default)]
+    pub hops: Option<u8>,
+    /// Maximum fused candidates to return.
+    #[serde(default)]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphRagResponse {
+    pub hits: Vec<GraphRagHit>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct GraphRagHit {
+    pub path: String,
+    pub chunk_idx: u32,
+    pub text: String,
+    pub distance: f32,
+    pub graph_path: Vec<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]

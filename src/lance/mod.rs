@@ -20,6 +20,9 @@ mod documents_unit_tests;
 /// Lexical index build and query, out of line by the line cap.
 #[cfg(feature = "documents")]
 pub mod fts;
+/// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
+#[cfg(feature = "graphrag")]
+pub mod graphrag;
 pub mod schema;
 /// Unit tests; out of line by the line cap (`tests/max_lines.rs`).
 #[cfg(test)]
@@ -34,6 +37,13 @@ pub use batch::{BATCH_MAX_DOCS, BATCH_MAX_ROWS, PendingBatch, SCAN_RETENTION};
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;
+
+#[cfg(feature = "graphrag")]
+pub use graphrag::{
+    CypherResult, DocEntitySidecar, GraphEdgeRow, GraphEntityRow, GraphRagHit, GraphragConfig,
+    build_graph_from_entities, delete_graph_for_scope, execute_cypher, normalize_literal, upsert_graph_edges,
+    upsert_graph_entities,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +61,8 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
+#[cfg(feature = "graphrag")]
+use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
 /// On-disk metadata for the lance store. Tracks the vector dim, the
 /// embedding-model identifier, and the Arrow table schema version; a mismatch on
@@ -236,6 +248,11 @@ impl LanceStore {
             ensure_table(&connection, schema::CODE_CHUNKS_TABLE, schema::code_chunks_schema(dim)).await?;
             #[cfg(feature = "documents")]
             ensure_table(&connection, schema::DOC_LINKS_TABLE, schema::doc_links_schema()).await?;
+            #[cfg(feature = "graphrag")]
+            {
+                ensure_table(&connection, GRAPH_ENTITIES_TABLE, graph_entities_schema()).await?;
+                ensure_table(&connection, GRAPH_EDGES_TABLE, graph_edges_schema()).await?;
+            }
             anyhow::Ok(())
         })?;
 
@@ -505,6 +522,11 @@ impl LanceStore {
     #[cfg(feature = "documents")]
     pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
+    }
+
+    #[cfg(feature = "graphrag")]
+    pub fn delete_graph_for_scope(&self, scope: &str) -> Result<()> {
+        graphrag::delete_graph_for_scope(&self.inner.connection, self.inner.rt(), scope)
     }
 
     pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {

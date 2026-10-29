@@ -178,6 +178,9 @@ pub struct DocumentsConfig {
     /// Tokenizer settings for the lexical index (`[documents.fts]`).
     #[serde(default)]
     pub fts: FtsConfig,
+    /// GraphRAG entity graph (`[graphrag]`).
+    #[serde(default)]
+    pub graphrag: GraphragConfig,
     /// Identifier extraction for the exact lane (`[documents.citations]`).
     #[serde(default)]
     pub citations: CitationsConfig,
@@ -278,6 +281,7 @@ impl Default for DocumentsConfig {
             fusion: FusionConfig::default(),
             fts: FtsConfig::default(),
             citations: CitationsConfig::default(),
+            graphrag: GraphragConfig::default(),
             embed_max_threads: 0,
         }
     }
@@ -373,6 +377,40 @@ pub struct NerConfig {
     /// labels surface as `EntityCategory::Custom(_)` in the entity stream.
     #[serde(default)]
     pub custom_labels: Vec<String>,
+}
+
+/// GraphRAG entity graph configuration (spec 0016).
+///
+/// When `enabled = true` (and the `graphrag` feature is compiled), the scanner
+/// builds `graph_entities` and `graph_edges` Lance tables from the NER sidecar
+/// at scan time. The `graph entities` and `graph rag` tool modes become available.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphragConfig {
+    /// Master switch — off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Labels to project as graph nodes. Default: person, organization, location + custom_labels.
+    /// Numeric/secret labels (email, phone, iban, swift_bic, ip_address, api_key, password,
+    /// ssn, credit_card, date_of_birth) are excluded by default.
+    #[serde(default = "default_graphrag_labels")]
+    pub labels: Vec<String>,
+    /// Max rows returned by Cypher queries (server-side budget).
+    #[serde(default = "default_graphrag_max_rows")]
+    pub max_rows: usize,
+    /// Hop depth for graph rag expansion (1 or 2).
+    #[serde(default = "default_graphrag_hops")]
+    pub hops: u8,
+}
+
+fn default_graphrag_labels() -> Vec<String> {
+    vec!["person".into(), "organization".into(), "location".into()]
+}
+fn default_graphrag_max_rows() -> usize {
+    200
+}
+fn default_graphrag_hops() -> u8 {
+    2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]

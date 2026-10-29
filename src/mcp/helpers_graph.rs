@@ -42,7 +42,10 @@ use super::mode::{GraphMode, reject_unsupported};
 use super::shared_state::SharedReadStack;
 use super::types_archmap::ArchitectureMapParams;
 use super::types_community::CommunitiesParams;
-use super::types_graph::{CallGraphNode, CallGraphParams, CallGraphResponse, CallGraphSite, GraphParams};
+use super::types_graph::{
+    CallGraphNode, CallGraphParams, CallGraphResponse, CallGraphSite, GraphEntitiesParams, GraphEntitiesResponse,
+    GraphParams, GraphRagParams, GraphRagResponse,
+};
 use super::types_graphview::{DisplayParams, GraphExportParams, UiParams};
 use super::types_traverse::{NeighborsParams, PathParams, SubgraphParams};
 use crate::extract::SymbolKind;
@@ -113,6 +116,11 @@ pub(super) async fn run_graph(state: &super::ServerState, params: GraphParams) -
         format,
         write,
         open,
+        cypher,
+        max_rows,
+        query,
+        hops,
+        max_results,
     } = params;
     let present = [
         ("name", name.is_some()),
@@ -140,6 +148,11 @@ pub(super) async fn run_graph(state: &super::ServerState, params: GraphParams) -
         ("format", format.is_some()),
         ("write", write.is_some()),
         ("open", open.is_some()),
+        ("cypher", cypher.is_some()),
+        ("max_rows", max_rows.is_some()),
+        ("query", query.is_some()),
+        ("hops", hops.is_some()),
+        ("max_results", max_results.is_some()),
     ];
     reject_foreign_fields(mode, &present, allowed_fields(mode))?;
 
@@ -333,6 +346,34 @@ pub(super) async fn run_graph(state: &super::ServerState, params: GraphParams) -
             )
             .await
         }
+        GraphMode::Entities => run_graph_entities(
+            shared,
+            idx,
+            &cache,
+            &basemind_dir,
+            super::types_graph::GraphEntitiesParams {
+                cypher: require_field(mode, "cypher", cypher)?,
+                max_rows,
+            },
+            notice,
+            started,
+        ),
+        GraphMode::Rag => {
+            run_graph_rag(
+                shared,
+                idx,
+                &cache,
+                &basemind_dir,
+                super::types_graph::GraphRagParams {
+                    query: require_field(mode, "query", query)?,
+                    hops: hops.map(|value| value.min(u8::MAX as u32) as u8),
+                    max_results,
+                },
+                notice,
+                started,
+            )
+            .await
+        }
     }
 }
 
@@ -398,6 +439,8 @@ fn allowed_fields(mode: GraphMode) -> &'static [&'static str] {
             "max_edges",
             "open",
         ],
+        GraphMode::Entities => &["cypher", "max_rows"],
+        GraphMode::Rag => &["query", "hops", "max_results"],
     }
 }
 
@@ -847,4 +890,105 @@ fn sorted_adjacency(map: AHashMap<String, AHashSet<String>>) -> AHashMap<String,
             (key, names)
         })
         .collect()
+}
+
+/// Handle `graph` mode `entities` — read-only Cypher query over the entity graph.
+#[cfg(feature = "graphrag")]
+pub(super) fn run_graph_entities(
+    shared: &SharedReadStack,
+    idx: Option<&crate::index::IndexDb>,
+    cache: &MapCache,
+    basemind_dir: &std::path::Path,
+    params: super::types_graph::GraphEntitiesParams,
+    notice: Option<super::types::LifecycleNotice>,
+    started: std::time::Instant,
+) -> Result<CallToolResult, McpError> {
+    use crate::lance::execute_cypher;
+
+    let store = match shared.store.try_read() {
+        Ok(s) => s,
+        Err(_) => return Err(McpError::internal_error("store locked", None)),
+    };
+    let lance_store = match &store.lance {
+        Some(ls) => ls,
+        None => {
+            return Err(McpError::invalid_params(
+                "graphrag feature not enabled or lance store not available",
+                None,
+            ));
+        }
+    };
+
+    let scope = shared.scope.clone();
+    let max_rows = params.max_rows.unwrap_or(200).min(1000) as usize;
+
+    let cypher_result = execute_cypher(
+        &lance_store.inner.connection,
+        &lance_store.inner.runtime,
+        &scope,
+        &params.cypher,
+        max_rows,
+    )
+    .map_err(|e| McpError::internal_error(format!("Cypher execution failed: {e}"), None))?;
+
+    let elapsed = started.elapsed().as_micros() as u64;
+    json_result(
+        super::types_graph::GraphEntitiesResponse {
+            columns: cypher_result.columns,
+            rows: cypher_result.rows,
+            truncated: cypher_result.rows.len() >= max_rows,
+        },
+        notice,
+        elapsed,
+    )
+}
+
+#[cfg(not(feature = "graphrag"))]
+pub(super) fn run_graph_entities(
+    _shared: &SharedReadStack,
+    _idx: Option<&crate::index::IndexDb>,
+    _cache: &MapCache,
+    _basemind_dir: &std::path::Path,
+    _params: super::types_graph::GraphEntitiesParams,
+    _notice: Option<super::types::LifecycleNotice>,
+    _started: std::time::Instant,
+) -> Result<CallToolResult, McpError> {
+    Err(McpError::invalid_params(
+        "graph entities mode requires the graphrag feature",
+        None,
+    ))
+}
+
+/// Handle `graph` mode `rag` — GraphRAG hybrid retrieval.
+pub(super) async fn run_graph_rag(
+    shared: &SharedReadStack,
+    idx: Option<&crate::index::IndexDb>,
+    cache: &MapCache,
+    basemind_dir: &std::path::Path,
+    params: super::types_graph::GraphRagParams,
+    notice: Option<super::types::LifecycleNotice>,
+    started: std::time::Instant,
+) -> Result<CallToolResult, McpError> {
+    #[cfg(not(feature = "graphrag"))]
+    {
+        return Err(McpError::invalid_params(
+            "graph rag mode requires the graphrag feature",
+            None,
+        ));
+    }
+
+    // This is a placeholder implementation - full GraphRAG would:
+    // 1. Embed the query using the configured embedder
+    // 2. Find seed entities in top-k chunks
+    // 3. Expand via Cypher 1-2 hops
+    // 4. Fuse with vector/keyword lanes
+    // For now, return empty with notice
+
+    #[cfg(feature = "graphrag")]
+    {
+        json_result(&super::types_graph::GraphRagResponse {
+            hits: Vec::new(),
+            truncated: false,
+        })
+    }
 }

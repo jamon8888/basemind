@@ -28,8 +28,54 @@ fn text_params(text: &str) -> RedactTextParams {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     }
+}
+
+#[tokio::test]
+async fn unknown_ner_profile_is_rejected() {
+    let error = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@99".to_string()),
+        ..text_params("Alice Smith")
+    })
+    .await
+    .expect_err("unknown NER profiles must fail closed");
+    assert!(error.message.contains("unknown NER profile"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn ner_profile_metadata_reports_effective_labels_without_model() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@1".to_string()),
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Alice Smith works at Acme Corp.")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], "legal-fr@1");
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth"
+        ])
+    );
 }
 
 /// A `ner_model_dir` pointing at nothing must never fail the call:
@@ -140,6 +186,7 @@ async fn file_path_redacts_extracted_text() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -163,6 +210,7 @@ async fn file_path_missing_file_errors() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -181,6 +229,7 @@ async fn text_and_file_path_together_rejected() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -203,6 +252,7 @@ async fn oversized_extracted_content_errors() {
         custom_patterns: vec![],
         pseudonyms: vec![],
         ner_model_dir: None,
+        ner_profile: None,
         require_ner: false,
     })
     .await
@@ -348,6 +398,34 @@ async fn ner_model_dir_detects_entities_with_confidence() {
     assert_eq!(payload["ner_ran"], Value::Bool(true));
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
+}
+
+/// Download-gated (#97): the selected legal profile must reach the real NER
+/// backend, while the response records the exact ordered labels used for the
+/// coverage contract. This is intentionally ignored unless a model is staged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn legal_profile_runs_ner_with_effective_labels() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@1".to_string()),
+        ner_model_dir: Some(dir),
+        ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
+    })
+    .await
+    .expect("legal profile NER succeeds");
+    let payload = json_of(&result);
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    assert_eq!(payload["ner_profile"]["name"], "legal-fr@1");
+    assert_eq!(payload["ner_profile"]["labels"].as_array().map(Vec::len), Some(16));
+    assert_eq!(payload["ner_truncated"], Value::Bool(false));
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+    assert!(
+        !payload["redacted_text"]
+            .as_str()
+            .expect("redacted_text")
+            .contains("Alice Smith")
+    );
 }
 
 /// xberg's built-in phone pattern misses these formats (a `+` after a space

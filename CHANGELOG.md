@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [Unreleased]
+
+### Added
+
+- **Versioned `redact_text` NER profiles.** Callers can select the historical
+  `full@1` label set or the reduced `legal-fr@1` profile; responses expose the
+  resolved profile and ordered labels for reproducible coverage checks.
+
 ## [0.35.0] - 2026-10-25
 
 > **Minor release — the privacy gateway boundary (ADR-0015).** `RELEASE_MINOR` goes 34 → 35,
