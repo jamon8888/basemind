@@ -31,7 +31,7 @@ use xberg::core::mime;
 
 use crate::config::{DocumentsConfig, LlmConfig, ResourcesConfig};
 use crate::extract::doc::ocr_signal;
-use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc};
+use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc_with_metrics};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
 use crate::lance::{DocumentRow, PendingBatch};
@@ -63,6 +63,10 @@ pub(crate) struct PendingDocBatch {
     /// Number of chunks indexed (zero is valid — xberg may yield no chunks
     /// when the file body is empty or below the chunk threshold).
     pub chunk_count: usize,
+    /// Approximate whitespace-delimited token count used for benchmark throughput.
+    pub token_count: usize,
+    /// UTF-8 bytes in the extracted content, used as processed-work throughput.
+    pub content_bytes: usize,
     /// Length of each chunk's embedding vector. Zero when embeddings are off.
     pub embedding_dim: u16,
     /// Whether this file should emit LanceDB rows at flush time. False for the no-embed, empty, and
@@ -299,6 +303,7 @@ pub(crate) fn extract_and_persist_doc(
     filters: &Filters,
     scope: &str,
     mode: EmbedMode,
+    metrics: &crate::scan_metrics::ScanStageMetrics,
 ) -> Result<Option<PendingDocBatch>, anyhow::Error> {
     let embed = doc_embed_requested(rel, cfg, mode, filters);
     let hex_buf = hashing::hex_buf(hash);
@@ -343,13 +348,70 @@ pub(crate) fn extract_and_persist_doc(
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
         store.touch_doc_blob(hash_hex);
+
+        // Build GraphRAG entity graph from cached doc's NER sidecar (spec 0016).
+        #[cfg(feature = "graphrag")]
+        if cfg.graphrag.enabled {
+            if let Some(lance) = store.lance.as_ref() {
+                use crate::lance::graphrag::{
+                    DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
+                    upsert_graph_entities,
+                };
+
+                let doc_entities: Vec<DocEntitySidecar> = cached
+                    .entities
+                    .iter()
+                    .map(|e| {
+                        let is_token = e.category.starts_with('[') && e.category.ends_with(']');
+                        // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                        let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                            || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                        let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
+                        DocEntitySidecar {
+                            label: e.category.clone(),
+                            literal: e.text.clone(),
+                            is_token,
+                            is_gateway_token,
+                            gateway_token,
+                            chunk_idx: 0,
+                            doc_path: rel.to_string(),
+                        }
+                    })
+                    .collect();
+
+                let graphrag_cfg = GraphragConfig {
+                    enabled: true,
+                    labels: cfg.graphrag.labels.clone(),
+                    max_rows: cfg.graphrag.max_rows,
+                    hops: cfg.graphrag.hops,
+                };
+
+                if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
+                    if !entity_rows.is_empty() {
+                        let _ = crate::lance::graphrag::upsert_graph_entities(
+                            &lance.inner.connection,
+                            &lance.inner.runtime,
+                            &entity_rows,
+                        );
+                    }
+                    if !edge_rows.is_empty() {
+                        let _ = crate::lance::graphrag::upsert_graph_edges(
+                            &lance.inner.connection,
+                            &lance.inner.runtime,
+                            &edge_rows,
+                        );
+                    }
+                }
+            }
+        }
+
         return Ok(Some(pending_from_doc(&cached, rel, hash_hex, scope, cfg, embed, true)));
     }
 
     let mut doc_config = doc_config_from(cfg, llm, resources, embed);
     doc_config.phase = Some(Arc::clone(&filters.doc_phase));
-    let mut doc: FileMapDoc =
-        extract_doc(abs, Some(mime_type), &doc_config).with_context(|| format!("extract document {rel}"))?;
+    let mut doc: FileMapDoc = extract_doc_with_metrics(abs, Some(mime_type), &doc_config, Some(metrics))
+        .with_context(|| format!("extract document {rel}"))?;
     doc.config_digest.clone_from(&filters.doc_digest);
 
     // The rehydration map captured during extraction is NOT persisted here.
@@ -401,9 +463,68 @@ pub(crate) fn extract_and_persist_doc(
             }
         }
     }
+    // Build GraphRAG entity graph from NER sidecar (spec 0016).
+    // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
+    #[cfg(feature = "graphrag")]
+    if cfg.graphrag.enabled {
+        if let Some(lance) = store.lance.as_ref() {
+            use crate::lance::graphrag::{
+                DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,
+            };
+
+            // Convert FileMapDoc entities to DocEntitySidecar format
+            let doc_entities: Vec<DocEntitySidecar> = doc
+                .entities
+                .iter()
+                .map(|e| {
+                    let is_token = e.category.starts_with('[') && e.category.ends_with(']'); // token_replace markers like [EMAIL_1]
+                    // Detect gaze gateway tokens: <anchor:Class_N> or anchor.Class_N formats
+                    let is_gateway_token = e.text.starts_with('<') && e.text.contains(':') && e.text.ends_with('>')
+                        || e.text.contains('.') && e.text.contains('@') && e.text.contains("gaze-fake.invalid");
+                    let gateway_token = if is_gateway_token { Some(e.text.clone()) } else { None };
+                    DocEntitySidecar {
+                        label: e.category.clone(),
+                        literal: e.text.clone(),
+                        is_token,
+                        is_gateway_token,
+                        gateway_token,
+                        chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
+                        doc_path: rel.to_string(),
+                    }
+                })
+                .collect();
+
+            let graphrag_cfg = GraphragConfig {
+                enabled: true,
+                labels: cfg.graphrag.labels.clone(),
+                max_rows: cfg.graphrag.max_rows,
+                hops: cfg.graphrag.hops,
+            };
+
+            if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
+                if !entity_rows.is_empty() {
+                    let _ = crate::lance::graphrag::upsert_graph_entities(
+                        &lance.inner.connection,
+                        &lance.inner.runtime,
+                        &entity_rows,
+                    );
+                }
+                if !edge_rows.is_empty() {
+                    let _ = crate::lance::graphrag::upsert_graph_edges(
+                        &lance.inner.connection,
+                        &lance.inner.runtime,
+                        &edge_rows,
+                    );
+                }
+            }
+        }
+    }
+
+    let persistence_started = std::time::Instant::now();
     store
         .write_doc(hash, &doc)
         .with_context(|| format!("write doc blob for {rel}"))?;
+    metrics.add_persistence(persistence_started.elapsed());
 
     Ok(Some(pending_from_doc(&doc, rel, hash_hex, scope, cfg, embed, false)))
 }
@@ -497,6 +618,8 @@ fn pending_from_doc(
     reused: bool,
 ) -> PendingDocBatch {
     let chunk_count = doc.chunks.len();
+    let token_count = doc.content.split_whitespace().count();
+    let content_bytes = doc.content.len();
     let embedding_dim = doc.embedding_dim;
     let over_cap = chunk_count > cfg.max_chunks_per_document;
     if over_cap {
@@ -519,6 +642,8 @@ fn pending_from_doc(
         blob_hash: blob_hash.to_string(),
         doc_scope: scope.to_string(),
         chunk_count,
+        token_count,
+        content_bytes,
         embedding_dim,
         emit_rows,
         embedded: !embed || embedding_dim > 0 || chunk_count == 0,
@@ -601,6 +726,15 @@ pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::
                 paths = paths.len(),
                 ?error,
                 "doc links stale purge failed; doc↔code edges may be stale"
+            );
+        }
+        // Drop the removed docs' graph entities/edges (spec 0016).
+        #[cfg(feature = "graphrag")]
+        if let Err(error) = lance.delete_graph_for_scope(doc_scope) {
+            tracing::warn!(
+                paths = paths.len(),
+                ?error,
+                "graph entities/edges stale purge failed; graph may have stale nodes"
             );
         }
     }

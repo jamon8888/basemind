@@ -76,6 +76,8 @@ fn pending_doc_batch_is_metadata_only() {
         blob_hash: "deadbeef".to_string(),
         doc_scope: "repo:origin".to_string(),
         chunk_count: 3,
+        token_count: 12,
+        content_bytes: 64,
         embedding_dim: 768,
         emit_rows: true,
         embedded: true,

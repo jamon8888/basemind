@@ -1,0 +1,4 @@
+# Retrieval cases use paths exactly as they appear in the scan manifest.
+{"query":"Alice Paris","expected_paths":["synthetic.pdf","synthetic.docx","synthetic.pptx","synthetic.xlsx"],"k":10}
+# NER checks are additive to retrieval cases and can appear without a query.
+{"ner":[{"path":"synthetic.docx","required_categories":["person","location"],"required_texts":["Alice","Paris"]}]}

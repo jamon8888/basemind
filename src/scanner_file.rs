@@ -87,6 +87,7 @@ pub(crate) fn run_candidates(
     embed: EmbedMode,
     cancel: &ScanCancel,
     max_workers: usize,
+    metrics: &crate::scan_metrics::ScanStageMetrics,
 ) -> Vec<FileResult> {
     let min_len = if max_workers == 0 {
         1
@@ -106,7 +107,9 @@ pub(crate) fn run_candidates(
                     if cancel.is_cancelled() {
                         return batch;
                     }
-                    let result = process_file(root, rel, filters, store, source, config, scope, &mut batch, embed);
+                    let result = process_file(
+                        root, rel, filters, store, source, config, scope, &mut batch, embed, metrics,
+                    );
                     batch.push_result(result);
                     batch
                 },
@@ -210,10 +213,11 @@ fn process_file(
     scope: &str,
     index_batch: &mut WorkerIndexBatch<'_>,
     embed: EmbedMode,
+    metrics: &crate::scan_metrics::ScanStageMetrics,
 ) -> FileResult {
     #[cfg(not(feature = "documents"))]
     {
-        let _ = (config, scope);
+        let _ = (config, scope, metrics);
     }
     #[cfg(not(any(feature = "documents", feature = "code-search")))]
     {
@@ -233,7 +237,7 @@ fn process_file(
             #[cfg(feature = "documents")]
             {
                 if matches!(source, ScanSource::WorkingTree) {
-                    return process_doc(root, rel, filters, store, config, scope, embed);
+                    return process_doc(root, rel, filters, store, config, scope, embed, metrics);
                 }
             }
             return FileResult::bare(rel.to_string(), FileStatus::SkippedNoLang);
@@ -471,6 +475,7 @@ fn process_doc(
     config: &Config,
     scope: &str,
     embed: EmbedMode,
+    metrics: &crate::scan_metrics::ScanStageMetrics,
 ) -> FileResult {
     let abs = root.join(rel);
     let effective_scope = crate::scanner_docs::doc_scope_for(rel, scope, config);
@@ -561,6 +566,7 @@ fn process_doc(
         filters,
         scope,
         embed,
+        metrics,
     ) {
         Ok(Some(batch)) => {
             let status = FileStatus::DocIndexed {

@@ -23,9 +23,9 @@ pub use code::CodeSearchConfig;
 pub use comms::CommsConfig;
 pub use documents::{
     ApiKey, CitationsConfig, CustomRerankerModel, DocLanguageConfig, DocumentsConfig, FtsConfig, FusionConfig,
-    KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig, NerRedactionConfig, OcrBackend, OcrConfig,
-    OutputConfig, OutputFormat, RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy,
-    RerankerConfig, ResolvedRerankerModel, SecretString, SummarizationConfig, SummarizationStrategy,
+    GraphragConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig, NerRedactionConfig, OcrBackend,
+    OcrConfig, OutputConfig, OutputFormat, RedactionConfig, RedactionCustomPattern, RedactionCustomTerm,
+    RedactionStrategy, RerankerConfig, ResolvedRerankerModel, SecretString, SummarizationConfig, SummarizationStrategy,
 };
 pub use layered::{ConfigLayers, LoadedConfig, defaults_only, merge_layers};
 pub use overrides::DocumentsCliOverrides;

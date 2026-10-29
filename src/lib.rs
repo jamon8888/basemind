@@ -40,10 +40,12 @@ pub mod query;
 pub mod registry;
 pub mod render;
 pub mod scan_evidence;
+pub mod scan_metrics;
 pub mod scanner;
 pub(crate) mod scanner_candidates;
 #[cfg(feature = "code-search")]
 pub mod scanner_code;
+pub(crate) mod scanner_doc_lane;
 #[cfg(feature = "documents")]
 pub mod scanner_doc_links;
 #[cfg(feature = "documents")]
@@ -54,6 +56,7 @@ pub(crate) mod scanner_filter;
 pub(crate) mod scanner_index_batch;
 pub mod scanner_lanes;
 pub(crate) mod scanner_policy;
+pub(crate) mod scanner_scope;
 pub mod search;
 #[cfg(all(feature = "shells", any(unix, windows)))]
 pub mod shells;

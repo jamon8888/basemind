@@ -580,16 +580,16 @@ fn run_guarded(
     })
 }
 
-/// Run xberg against `path` and translate the result into a `FileMapDoc`.
-///
-/// `mime_type` may be supplied by the caller (e.g. from `lang::detect`); when
-/// `None`, xberg sniffs the file content.
-///
-/// When redaction is enabled with `TokenReplace` strategy, xberg's built-in
-/// redaction is disabled and `redact_capturing_rehydration_map` is called
-/// separately so the rehydration map (token → original) is captured alongside
-/// the rewritten content.
-pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> Result<FileMapDoc, ExtractError> {
+pub use super::doc_metrics::extract_doc;
+
+/// [`extract_doc`] with optional per-scan stage accounting. The plain wrapper remains the stable
+/// API for callers and tests that do not need benchmark telemetry.
+pub(crate) fn extract_doc_with_metrics(
+    path: &Path,
+    mime_type: Option<&str>,
+    config: &DocConfig,
+    metrics: Option<&crate::scan_metrics::ScanStageMetrics>,
+) -> Result<FileMapDoc, ExtractError> {
     let mut krz_config = config.to_xberg();
 
     // When redaction is enabled with TokenReplace, we need to capture the
@@ -626,6 +626,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
             ))
         })?;
     }
+    let extraction_started = std::time::Instant::now();
     let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
     let mut text_fallback = false;
     if let Err(error) = &outcome
@@ -649,6 +650,9 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
                 "text/plain retry also failed; reporting the original error"
             ),
         }
+    }
+    if let Some(metrics) = metrics {
+        metrics.add_extraction(extraction_started.elapsed(), config.ner.enabled);
     }
     let linear = linear || text_fallback;
     let mut extraction = outcome.map_err(|e| ExtractError::Document(e.to_string()))?;
@@ -707,6 +711,7 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
             .collect();
     }
 
+    let chunking_started = std::time::Instant::now();
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
@@ -747,8 +752,12 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         );
         dense_inputs.clear();
     }
+    if let Some(metrics) = metrics {
+        metrics.add_chunking(chunking_started.elapsed());
+    }
     let mut embedding_dim = 0;
     if embed_requested && !dense_inputs.is_empty() {
+        let embedding_started = std::time::Instant::now();
         let preset = config.embedding_preset.as_deref().unwrap_or("balanced");
         let embedder = crate::embeddings::SharedEmbedder::load_with_provider(
             preset,
@@ -771,6 +780,9 @@ pub fn extract_doc(path: &Path, mime_type: Option<&str>, config: &DocConfig) -> 
         embedding_dim = embedder.dim();
         for (chunk, vector) in chunks.iter_mut().zip(vectors) {
             chunk.embedding = vector;
+        }
+        if let Some(metrics) = metrics {
+            metrics.add_embedding(embedding_started.elapsed());
         }
     }
 

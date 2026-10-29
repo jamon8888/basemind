@@ -68,6 +68,9 @@ pub trait ScanObserver {
     /// One file's outcome.
     fn on_file(&mut self, result: FileResult);
 
+    /// Called after the first persisted search row becomes queryable for this scan.
+    fn on_searchable(&mut self) {}
+
     /// End of one drive chunk; `live_results` is how many [`FileResult`]s that chunk held live at
     /// once. The bound this module exists to enforce is observable through exactly this hook.
     fn on_batch(&mut self, live_results: usize) {
@@ -238,6 +241,7 @@ pub(crate) struct ScanDrive<'a> {
     pub(crate) scope: &'a str,
     pub(crate) embed: crate::scanner::EmbedMode,
     pub(crate) cancel: &'a ScanCancel,
+    pub(crate) metrics: &'a crate::scan_metrics::ScanStageMetrics,
 }
 
 /// What the drive loop hands back: the deferred batch descriptors, plus the path sets the stale
@@ -337,6 +341,7 @@ pub(crate) fn drive_scan(
                 drive.embed,
                 drive.cancel,
                 max_workers,
+                drive.metrics,
             )
         },
         |ctx: &mut DriveCtx<'_>, produced| apply_outcomes(ctx, produced),
@@ -399,12 +404,16 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
             }
             #[cfg(feature = "documents")]
             FileStatus::DocIndexed {
+                chunk_count,
                 reused,
                 degraded,
                 text_fallback,
                 ..
             } => {
                 ctx.stats.docs_indexed += 1;
+                ctx.stats.docs_chunks += *chunk_count;
+                ctx.stats.docs_tokens += o.doc_batch.as_ref().map_or(0, |batch| batch.token_count);
+                ctx.stats.docs_bytes += o.doc_batch.as_ref().map_or(0, |batch| batch.content_bytes);
                 if *reused {
                     ctx.stats.reused_doc_extraction += 1;
                 }

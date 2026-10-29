@@ -61,6 +61,12 @@ pub struct RedactTextParams {
     /// redaction instead of failing.
     #[serde(default)]
     pub ner_model_dir: Option<String>,
+    /// Named, versioned NER label profile. `full@1` preserves the historical
+    /// label set; `legal-fr@1` sends only the labels needed by the French legal
+    /// gateway. The resolved profile and ordered labels are returned in the
+    /// response so callers can reproduce coverage and latency measurements.
+    #[serde(default)]
+    pub ner_profile: Option<String>,
     /// Fail with an error when NER did not run (no `ner_model_dir`, model
     /// missing or unloadable, inference error, build without `ner-candle`)
     /// instead of degrading to pattern-only redaction. For callers that must
@@ -73,7 +79,7 @@ pub struct RedactTextParams {
 impl BasemindServer {
     #[tool(
         title = "Redact text",
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), and ner_ran (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -147,6 +153,8 @@ enum Source {
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
 async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
+    let ner_profile =
+        resolve_ner_profile(args.ner_profile.as_deref()).map_err(|reason| McpError::invalid_params(reason, None))?;
     let source = match args.file_path.as_deref() {
         Some(path) => {
             if !args.text.is_empty() {
@@ -277,7 +285,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // #71: the backend reads only the encoder's first few hundred tokens, so
     // `run_ner_windowed` hands it the text in windows and reports exactly what
     // ran: window count, largest window and whether planning had to stop.
-    let mut ner_run = match run_ner_windowed(args.ner_model_dir.as_deref(), &original).await {
+    let mut ner_run = match run_ner_windowed(args.ner_model_dir.as_deref(), &original, &ner_profile).await {
         Ok(run) => run,
         Err(reason) if args.require_ner => {
             return Err(McpError::internal_error(
@@ -453,6 +461,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "rehydration_map": rehydration_map,
         "detections": detections,
         "ner_ran": ner_run.ran,
+        "ner_profile": {
+            "name": ner_profile.name,
+            "labels": ner_profile.labels,
+        },
     });
     // #71 coverage contract: a result that carries `ner_windows` and
     // `ner_window_chars` vouches that the model read (only) those windows — with
@@ -511,7 +523,6 @@ fn ner_label(category: &xberg::types::entity::EntityCategory) -> Option<String> 
 /// (7 languages: en, fr, es, de, it, pt, nl). GLiNER2 conditions on the label
 /// list given at inference time, so this list — not the model — decides what
 /// NER can find.
-#[cfg(feature = "ner-candle")]
 const GLI_NER2_PII_LABELS: &[&str] = &[
     // person / names
     "person",
@@ -571,7 +582,6 @@ const GLI_NER2_PII_LABELS: &[&str] = &[
 /// ("provider of the high-risk AI system"), which is why these read as
 /// `ai_act_<thing>` rather than a bare role word that would fire on every
 /// "cloud provider" in sight.
-#[cfg(feature = "ner-candle")]
 const AI_ACT_NER_LABELS: &[&str] = &[
     // actor roles
     "ai_act_provider",
@@ -603,6 +613,55 @@ const AI_ACT_CITATION_REGEX: &str = r"\b2024/1689\b";
 /// NER spans shorter than this are dropped: even whole-word, case-insensitive
 /// hits on 1-2 char spans ("us", "go") are noise that would shred the mirror.
 const MIN_NER_SPAN_CHARS: usize = 3;
+
+/// The labels sent to GLiNER2 are part of the coverage contract: changing
+/// them changes both what the model can detect and the window token budget.
+/// Keep profiles named and versioned so a gateway can pin one and reproduce a
+/// result instead of relying on an implicit process default.
+#[derive(Debug, Clone)]
+struct NerProfile {
+    name: String,
+    labels: Vec<String>,
+}
+
+const LEGAL_FR_LABELS: &[&str] = &[
+    "full_name",
+    "first_name",
+    "last_name",
+    "person",
+    "organization",
+    "address",
+    "street_address",
+    "city",
+    "postal_code",
+    "email",
+    "phone_number",
+    "iban",
+    "bank_account",
+    "tax_id",
+    "national_id_number",
+    "date_of_birth",
+];
+
+fn resolve_ner_profile(requested: Option<&str>) -> Result<NerProfile, String> {
+    let name = requested.unwrap_or("full@1");
+    let labels = match name {
+        "full@1" => {
+            let mut labels = vec!["organization".to_string(), "location".to_string()];
+            labels.extend(GLI_NER2_PII_LABELS.iter().map(|label| (*label).to_string()));
+            labels.extend(AI_ACT_NER_LABELS.iter().map(|label| (*label).to_string()));
+            labels
+        }
+        "legal-fr@1" => LEGAL_FR_LABELS.iter().map(|label| (*label).to_string()).collect(),
+        other => {
+            return Err(format!("unknown NER profile {other}; expected full@1 or legal-fr@1"));
+        }
+    };
+    Ok(NerProfile {
+        name: name.to_string(),
+        labels,
+    })
+}
 
 /// Boundary-aware escaped pattern for a NER span, so matches stay whole-word.
 /// `\b` is emitted only at edges that start/end a word char — a span ending
@@ -662,24 +721,6 @@ fn merge_span_windows(
     entities.into_iter().map(|(entity, _)| entity).collect()
 }
 
-/// The labels every call asks GLiNER2 for, in the order the candle backend
-/// will build its schema prompt from — `organization`/`location` as extra
-/// zero-shot labels so the three categories redaction claimed before #37 keep
-/// working (neither is among the 42), then the 42 PII labels and the AI Act
-/// labels. The same list gates the window planner's budget (#71), so the
-/// prompt the backend runs with is the prompt the budget was measured for.
-#[cfg(feature = "ner-candle")]
-fn ner_labels() -> Vec<String> {
-    let mut labels = vec!["organization".to_string(), "location".to_string()];
-    labels.extend(
-        GLI_NER2_PII_LABELS
-            .iter()
-            .chain(AI_ACT_NER_LABELS.iter())
-            .map(|label| (*label).to_string()),
-    );
-    labels
-}
-
 /// The same labels as the categories the candle backend receives. Named
 /// variants keep their round-trip labels (`person`, `organization`, …);
 /// everything else is a zero-shot `Custom` label.
@@ -710,7 +751,7 @@ fn ner_categories(labels: &[String]) -> Vec<xberg::types::entity::EntityCategory
 /// inference failure (the mention set is then all-or-nothing; a mid-window
 /// failure cannot vouch for the windows before it, so none is kept).
 #[cfg(feature = "ner-candle")]
-async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun, String> {
+async fn run_ner_windowed(model_dir: Option<&str>, text: &str, profile: &NerProfile) -> Result<NerRun, String> {
     use crate::mcp::ner_windowing;
     use std::time::{Duration, Instant};
     use xberg::text::ner::NerBackend;
@@ -725,7 +766,7 @@ async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun,
     let Some(dir) = model_dir else {
         return Err("no ner_model_dir given".to_string());
     };
-    let labels = ner_labels();
+    let labels = profile.labels.clone();
     let categories = ner_categories(&labels);
     let backend = match CandleBackend::get_or_init(std::path::Path::new(dir), None) {
         Ok(backend) => backend,
@@ -810,7 +851,7 @@ async fn run_ner_windowed(model_dir: Option<&str>, text: &str) -> Result<NerRun,
 /// Stand-in for builds without `ner-candle`: NER never runs, so this always
 /// returns `Err` and the caller degrades or refuses per `require_ner`.
 #[cfg(not(feature = "ner-candle"))]
-async fn run_ner_windowed(model_dir: Option<&str>, _text: &str) -> Result<NerRun, String> {
+async fn run_ner_windowed(model_dir: Option<&str>, _text: &str, _profile: &NerProfile) -> Result<NerRun, String> {
     if let Some(dir) = model_dir {
         tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
     }
