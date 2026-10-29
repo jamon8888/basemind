@@ -156,3 +156,57 @@ fn language_confidences_are_persisted_without_xberg_types() {
         }]
     );
 }
+
+/// #95: the near-empty-OCR signal fires only for an image whose OCR came back
+/// empty (or near-empty) — never for a non-image format, and never for an image
+/// that produced real text.
+#[test]
+fn ocr_near_empty_signal_is_image_scoped_and_thresholded() {
+    // A non-image format is never flagged, even when blank.
+    assert!(!ocr_signal::ocr_output_near_empty(Some("application/pdf"), ""));
+    assert!(!ocr_signal::ocr_output_near_empty(Some("text/plain"), "   "));
+
+    // An image with real OCR output is not flagged.
+    assert!(!ocr_signal::ocr_output_near_empty(
+        Some("image/png"),
+        "contrat de prestation de services conclu entre deux parties"
+    ));
+
+    // An image whose OCR is empty, whitespace-only, or a near-empty fragment is.
+    assert!(ocr_signal::ocr_output_near_empty(Some("image/png"), ""));
+    assert!(ocr_signal::ocr_output_near_empty(Some("image/jpeg"), "   \n\n  \t"));
+    assert!(ocr_signal::ocr_output_near_empty(Some("image/png"), "Le  "));
+
+    // SVG is text markup, not OCR output.
+    assert!(!ocr_signal::ocr_output_near_empty(Some("image/svg+xml"), ""));
+
+    // No mime type (defensive) is not treated as an image.
+    assert!(!ocr_signal::ocr_output_near_empty(None, ""));
+
+    // The floor counts non-whitespace characters: 19 is near-empty, 20 is not.
+    assert!(ocr_signal::ocr_output_near_empty(Some("image/png"), &"a ".repeat(19)));
+    assert!(!ocr_signal::ocr_output_near_empty(Some("image/png"), &"a ".repeat(20)));
+}
+
+/// #95: the signal follows the profile — no OCR ran under `CodeOnly` / `None_`, so a blank
+/// image is not reported as an OCR failure there.
+#[test]
+fn ocr_near_empty_signal_is_silent_when_the_profile_ran_no_ocr() {
+    let png = std::path::Path::new("scan.png");
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, " a "),
+        Some(1)
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::CodeOnly, ""),
+        None
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::None_, ""),
+        None
+    );
+    assert_eq!(
+        ocr_signal::check(png, Some("image/png"), &DocumentModelProfile::Full, &"a ".repeat(20)),
+        None
+    );
+}

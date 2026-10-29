@@ -666,6 +666,9 @@ pub(crate) fn extract_doc_with_metrics(
         ExtractError::Document(message)
     })?;
 
+    // #95: measured on the OCR text itself, before redaction and fallible embedding work.
+    let ocr_empty_chars = ocr_signal::check(path, mime_type, &config.document_models, &result.content);
+
     // Run redaction ourselves to capture the rehydration map.
     let mut redaction_findings: Vec<RedactionFinding> = Vec::new();
     let mut pending_rehydration = None;
@@ -789,7 +792,11 @@ pub(crate) fn extract_doc_with_metrics(
         String::new()
     };
 
-    let metadata = metadata_pairs(&result.metadata);
+    let mut metadata = metadata_pairs(&result.metadata);
+
+    if let Some(ocr_chars) = ocr_empty_chars {
+        metadata.push(ocr_signal::note(ocr_chars));
+    }
 
     let keywords: Vec<DocKeyword> = result
         .extracted_keywords
@@ -987,6 +994,9 @@ fn metadata_pairs(metadata: &xberg::types::Metadata) -> Vec<(String, String)> {
         _ => Vec::new(),
     }
 }
+
+/// The near-empty-OCR signal (#95) lives in a submodule by the 1000-line module cap.
+pub(crate) mod ocr_signal;
 
 /// `heading_path` tests live in a subdirectory by the 1000-line module cap
 /// (`tests/max_lines.rs`), the same shape `scanner_docs` uses for its tests.
