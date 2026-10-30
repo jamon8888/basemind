@@ -286,6 +286,63 @@ fn matches_mime(entry: &str, mime_type: &str) -> bool {
     false
 }
 
+/// Reconcile NER spans with gaze gateway tokens (spec 0016 §15-Q5 / #111).
+///
+/// xberg's NER returns the matched span (`Name_1`, or even the bare anchor
+/// `4b31c7ee`), not the full gateway token `<4b31c7ee:Name_1>` that gaze wrote
+/// into the document. Any entity whose text sits inside a gateway-token
+/// occurrence in the document body is re-attributed to that token, so the graph
+/// keys on the stable cross-document token identity
+/// (`EntityKeySource::GatewayToken`) instead of a document-local span literal.
+/// Matching is normalization-tolerant (lowercase, alphanumerics only) because
+/// the span text and the token interior are normalized differently.
+fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
+    static TOKEN_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TOKEN_RE.get_or_init(|| {
+        // gaze token shape: <anchor:Class_N> with an 8-hex anchor (the
+        // workspace_stability_probe contract, #107).
+        regex::Regex::new(r"<([0-9a-fA-F]{8}):([A-Za-z]+)_(\d+)>").expect("gateway token regex")
+    });
+
+    // (normalized key, full token) per occurrence — inner and bare anchor.
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for m in re.captures_iter(content) {
+        let full = m.get(0).map(|t| t.as_str()).unwrap_or_default().to_string();
+        candidates.push((format!("{}{}", m[2].to_lowercase(), m[3]), full.clone()));
+        candidates.push((m[1].to_lowercase(), full));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+
+    for ent in entities.iter_mut() {
+        if ent.is_gateway_token || ent.gateway_token.is_some() {
+            continue;
+        }
+        let needle = norm(&ent.text);
+        if needle.len() < 3 {
+            continue;
+        }
+        // Exact needle match wins over containment.
+        let hit = candidates
+            .iter()
+            .find(|(k, _)| *k == needle)
+            .or_else(|| candidates.iter().find(|(k, _)| k.contains(&needle)));
+        if let Some((_, full)) = hit {
+            ent.is_gateway_token = true;
+            ent.gateway_token = Some(full.clone());
+            ent.literal = full.clone();
+        }
+    }
+}
+
 /// Run xberg against `abs`, write the document blob to the content-addressed
 /// store, and assemble a [`PendingDocBatch`] for the apply pass. Returns
 /// `Ok(None)` when extraction succeeded but produced no embeddings (we still
@@ -392,6 +449,7 @@ pub(crate) fn extract_and_persist_doc(
                         }
                     })
                     .collect();
+                reconcile_gateway_tokens(&mut doc_entities, &cached.content);
 
                 let graphrag_cfg = GraphragConfig {
                     enabled: true,
@@ -514,6 +572,7 @@ pub(crate) fn extract_and_persist_doc(
                     }
                 })
                 .collect();
+            reconcile_gateway_tokens(&mut doc_entities, &doc.content);
 
             let graphrag_cfg = GraphragConfig {
                 enabled: true,
