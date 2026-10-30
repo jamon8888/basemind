@@ -41,12 +41,6 @@ fn xberg_11_removes_the_vulnerable_quick_xml_line() {
 
     // The vulnerable quick-xml 0.37 line must be absent, whether it is referenced as a bare name or
     // as the `name version` form Cargo.lock uses when several versions coexist.
-    let vulnerable: Vec<_> = packages(&lock)
-        .iter()
-        .filter(|package| package["name"].as_str() == Some("quick-xml"))
-        .filter_map(|package| package["version"].as_str())
-        .filter(|version| version.starts_with("0.37."))
-        .collect();
     // reqsign still pins quick-xml 0.37 transitively; ensure the vulnerable line is
     // not reintroduced through xberg itself (the original invariant this test protects).
     let vulnerable_dependents: Vec<String> = packages(&lock)
