@@ -426,6 +426,43 @@ impl LanceStore {
         })
     }
 
+    /// Fetch document chunks for specific paths (plain scan, no vector search).
+    ///
+    /// Used by the GraphRAG `rag` mode to pull the chunk text of graph-expanded
+    /// documents that the vector lane did not surface on its own.
+    pub fn document_chunks_for_paths(&self, scope: &str, paths: &[String], limit: usize) -> Result<Vec<DocumentHit>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(DOCUMENTS_TABLE)
+                .execute()
+                .await
+                .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+            let path_list = paths
+                .iter()
+                .map(|p| format!("'{}'", escape_sql_literal(p)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let predicate = format!("scope = '{}' AND path IN ({path_list})", escape_sql_literal(scope));
+            let mut stream = table
+                .query()
+                .only_if(predicate)
+                .limit(limit)
+                .execute()
+                .await
+                .context("fetch document chunks")?;
+            let mut hits = Vec::new();
+            while let Some(batch) = stream.try_next().await.context("stream next batch")? {
+                decode_document_hits(&batch, &mut hits)?;
+            }
+            anyhow::Ok(hits)
+        })
+    }
+
     /// KNN over the memory table for one `(scope, visibility, agent_id)` namespace.
     ///
     /// The `visibility` + `agent_id` predicate is mandatory so an individual search never

@@ -25,16 +25,23 @@ use crate::extract::doc::{DocEntity, DocKeyword, DocSummary};
 
 #[cfg(feature = "intelligence")]
 pub(super) async fn embed_query(state: &ServerState, text: &str) -> Result<Vec<f32>, McpError> {
-    let preset = state.shared.config.documents.embedding_preset.clone();
-    let max_embed_threads = state
-        .shared
+    embed_query_shared(&state.shared, text).await
+}
+
+/// Embed one query text through the workspace's shared embedder (lazy-loaded once).
+#[cfg(feature = "intelligence")]
+pub(super) async fn embed_query_shared(
+    shared: &crate::mcp::shared_state::SharedReadStack,
+    text: &str,
+) -> Result<Vec<f32>, McpError> {
+    let preset = shared.config.documents.embedding_preset.clone();
+    let max_embed_threads = shared
         .config
         .resources
-        .effective_embed_threads(state.shared.config.documents.embed_max_threads);
-    let embed_batch_size = state.shared.config.resources.embed_batch_size;
-    let provider = state.shared.config.resources.onnx_provider;
-    let embedder = state
-        .shared
+        .effective_embed_threads(shared.config.documents.embed_max_threads);
+    let embed_batch_size = shared.config.resources.embed_batch_size;
+    let provider = shared.config.resources.onnx_provider;
+    let embedder = shared
         .embedder
         .get_or_try_init(|| async {
             crate::embeddings::SharedEmbedder::load_with_provider(

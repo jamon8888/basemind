@@ -252,6 +252,10 @@ pub struct GraphRagParams {
 pub struct GraphRagResponse {
     pub hits: Vec<GraphRagHit>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<super::types::LifecycleNotice>,
+    #[serde(default)]
+    pub elapsed_us: u64,
 }
 
 #[cfg(feature = "graphrag")]
