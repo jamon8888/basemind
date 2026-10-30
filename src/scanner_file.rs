@@ -467,7 +467,6 @@ fn process_file(
 /// route through xberg. Always returns a `FileResult` — falls back to `SkippedNoLang`
 /// when documents are disabled or the MIME type is filtered out.
 #[cfg(feature = "documents")]
-#[allow(clippy::too_many_arguments)]
 fn process_doc(
     root: &Path,
     rel: &str,
