@@ -115,6 +115,18 @@ pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
     u16::try_from(dimensions).with_context(|| format!("preset {name} dimensions {dimensions} exceeds u16"))
 }
 
+#[cfg(feature = "graphrag")]
+fn lance_or_open_fallback(store: &Store, preset: &str) -> Option<Arc<crate::lance::LanceStore>> {
+    store.lance.clone().or_else(|| {
+        preset_dim(preset).ok().and_then(|dim| {
+            let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
+            crate::lance::LanceStore::open(&dir, dim, preset)
+                .map_err(|error| tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build"))
+                .ok()
+        })
+    })
+}
+
 /// Translate the project-level `[documents]` config into the xberg-facing
 /// [`DocConfig`] the extractor expects. Pulled out so the wiring in
 /// `process_file` stays a single call.
@@ -431,16 +443,7 @@ pub(crate) fn extract_and_persist_doc(
             // `&Store` (immutable) so `lance_or_open` is out of reach — open a standalone
             // handle against the same `.basemind/lance/` dir instead; LanceDB connections
             // to one store are independent and safe to hold in parallel.
-            let lance = store.lance.clone().or_else(|| {
-                preset_dim(&cfg.embedding_preset).ok().and_then(|dim| {
-                    let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
-                    crate::lance::LanceStore::open(&dir, dim, &cfg.embedding_preset)
-                        .map_err(|error| {
-                            tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build")
-                        })
-                        .ok()
-                })
-            });
+            let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
             if let Some(lance) = lance {
                 use crate::lance::graphrag::{
                     DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
@@ -558,14 +561,7 @@ pub(crate) fn extract_and_persist_doc(
     if cfg.graphrag.enabled {
         // Same standalone-open rationale as the cached-doc path above: `&Store` is
         // immutable here, and the graph must survive `embed = false` on a fresh workspace.
-        let lance = store.lance.clone().or_else(|| {
-            preset_dim(&cfg.embedding_preset).ok().and_then(|dim| {
-                let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
-                crate::lance::LanceStore::open(&dir, dim, &cfg.embedding_preset)
-                    .map_err(|error| tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build"))
-                    .ok()
-            })
-        });
+        let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
         if let Some(lance) = lance {
             use crate::lance::graphrag::{
                 DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,

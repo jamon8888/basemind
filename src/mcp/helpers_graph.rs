@@ -930,7 +930,7 @@ pub(super) async fn run_graph_entities(
     };
 
     let scope = shared.scope.clone();
-    let configured_max_rows = shared.config.documents.graphrag.max_rows;
+    let configured_max_rows = shared.config.documents.graphrag.max_rows as u32;
     let max_rows = params.max_rows.unwrap_or(configured_max_rows).min(configured_max_rows) as usize;
     let cypher = params.cypher.clone();
 
@@ -976,35 +976,171 @@ pub(super) async fn run_graph_entities(
 }
 
 /// Handle `graph` mode `rag` — GraphRAG hybrid retrieval.
+///
+/// Pipeline: embed the query → vector top-k over the documents table → seed the
+/// entity graph with the entities of those documents → expand over the co-occurrence
+/// edges (`hops`, capped at 2) → pull the chunks of graph-reachable documents the
+/// vector lane missed → fuse both lanes (see [`crate::lance::graphrag::fuse_results`]).
 pub(super) async fn run_graph_rag(
-    _shared: &SharedReadStack,
+    shared: &SharedReadStack,
     _idx: Option<&crate::index::IndexDb>,
     _cache: &MapCache,
-    _basemind_dir: &std::path::Path,
-    _params: super::types_graph::GraphRagParams,
-    _notice: Option<super::types::LifecycleNotice>,
-    _started: std::time::Instant,
+    basemind_dir: &std::path::Path,
+    params: super::types_graph::GraphRagParams,
+    notice: Option<super::types::LifecycleNotice>,
+    started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
     #[cfg(not(feature = "graphrag"))]
     {
+        let _ = (shared, basemind_dir, params, notice, started);
         Err(McpError::invalid_params(
             "graph rag mode requires the graphrag feature",
             None,
         ))
     }
 
-    // This is a placeholder implementation - full GraphRAG would:
-    // 1. Embed the query using the configured embedder
-    // 2. Find seed entities in top-k chunks
-    // 3. Expand via Cypher 1-2 hops
-    // 4. Fuse with vector/keyword lanes
-    // For now, return empty with notice
-
     #[cfg(feature = "graphrag")]
     {
+        use crate::lance::graphrag::{expand_entity_graph, fuse_results, load_edge_endpoints, load_entity_refs};
+
+        let max_results = params.max_results.unwrap_or(50).clamp(1, 200) as usize;
+        let hops = params.hops.unwrap_or(2).min(2);
+        let scope = shared.scope.clone();
+
+        // 1. Embed the query (shared embedder, lazy-loaded).
+        let query_vec = super::memory::embed_query_shared(shared, &params.query).await?;
+
+        // 2. Lance store — same read-path fallback as the `entities` mode.
+        let store = match shared.store.try_read() {
+            Ok(s) => s,
+            Err(_) => return Err(McpError::internal_error("store locked", None)),
+        };
+        let lance_store = match &store.lance {
+            Some(ls) => ls.clone(),
+            None => {
+                let dir = basemind_dir.join(crate::store_layout::LANCE_DIR);
+                tokio::task::spawn_blocking(move || crate::lance::open_existing(&dir))
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("lance open task: {e}"), None))?
+                    .map_err(|e| McpError::internal_error(format!("open lance store: {e}"), None))?
+                    .ok_or_else(|| {
+                        McpError::invalid_params("graphrag feature not enabled or lance store not available", None)
+                    })?
+            }
+        };
+        drop(store);
+
+        // 3-6. Vector seeds, graph expansion, chunk fetch and fusion — all off the
+        // async workers: every LanceStore call block_ons its own runtime.
+        let dim_ok = query_vec.len() == usize::from(lance_store.dim());
+        if !dim_ok {
+            return Err(McpError::internal_error(
+                format!(
+                    "query vector dim {} does not match store dim {}",
+                    query_vec.len(),
+                    lance_store.dim()
+                ),
+                None,
+            ));
+        }
+        let k = max_results.min(50);
+        let rag = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<(Vec<crate::lance::graphrag::GraphRagHit>, bool)> {
+                // 3. Vector lane: top-k document chunks.
+                let vector_hits = lance_store.search_documents(&scope, query_vec, k, None)?;
+
+                // 4. Load the graph batches once; seeds = entities of the vector-hit docs.
+                let connection = lance_store.connection();
+                let runtime = lance_store.runtime();
+                let entities_batch = runtime
+                    .block_on(crate::lance::graphrag::load_graph_entities_batch(connection, &scope))
+                    .map_err(|e| anyhow::anyhow!("load graph_entities: {e}"))?;
+                let edges_batch = runtime
+                    .block_on(crate::lance::graphrag::load_graph_edges_batch(connection, &scope))
+                    .map_err(|e| anyhow::anyhow!("load graph_edges: {e}"))?;
+                let entities = load_entity_refs(&entities_batch)?;
+                let (edge_src, edge_dst) = load_edge_endpoints(&edges_batch)?;
+
+                let hit_paths: std::collections::HashSet<String> = vector_hits.iter().map(|h| h.path.clone()).collect();
+                let mut seeds: Vec<String> = Vec::new();
+                let mut seed_seen = std::collections::HashSet::new();
+                for entity in &entities {
+                    if hit_paths.contains(&entity.document_path) && seed_seen.insert(entity.entity_id.clone()) {
+                        seeds.push(entity.entity_id.clone());
+                    }
+                }
+
+                // 5. Expand over the co-occurrence edges (bounded).
+                let expanded = expand_entity_graph(&edge_src, &edge_dst, &seeds, hops, 200);
+                let expanded_ids: std::collections::HashSet<&str> =
+                    expanded.iter().map(|e| e.entity_id.as_str()).collect();
+                let hop_of: std::collections::HashMap<&str, u8> =
+                    expanded.iter().map(|e| (e.entity_id.as_str(), e.hop)).collect();
+                let chain_of: std::collections::HashMap<&str, Vec<String>> = expanded
+                    .iter()
+                    .map(|e| (e.entity_id.as_str(), e.chain.clone()))
+                    .collect();
+
+                // 6a. Documents reachable through the graph but absent from the vector lane.
+                let mut graph_doc_hop: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+                for entity in &entities {
+                    if !expanded_ids.contains(entity.entity_id.as_str()) {
+                        continue;
+                    }
+                    let hop = hop_of.get(entity.entity_id.as_str()).copied().unwrap_or(0);
+                    let entry = graph_doc_hop.entry(entity.document_path.clone()).or_insert(hop);
+                    if hop < *entry {
+                        *entry = hop;
+                    }
+                }
+                let fresh_paths: Vec<String> = graph_doc_hop
+                    .keys()
+                    .filter(|p| !hit_paths.contains(*p))
+                    .cloned()
+                    .collect();
+                let fresh_chunks = if fresh_paths.is_empty() {
+                    Vec::new()
+                } else {
+                    lance_store.document_chunks_for_paths(&scope, &fresh_paths, 40)?
+                };
+
+                // 6b. Fuse.
+                let graph_chunks: Vec<(crate::lance::DocumentHit, u8, Vec<String>)> = fresh_chunks
+                    .into_iter()
+                    .map(|hit| {
+                        let hop = graph_doc_hop.get(&hit.path).copied().unwrap_or(1).max(1);
+                        let chain = entities
+                            .iter()
+                            .find(|e| e.document_path == hit.path)
+                            .and_then(|e| chain_of.get(e.entity_id.as_str()))
+                            .cloned()
+                            .unwrap_or_default();
+                        (hit, hop, chain)
+                    })
+                    .collect();
+                Ok(fuse_results(vector_hits, graph_chunks, max_results))
+            },
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("rag task: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("GraphRAG retrieval failed: {e}"), None))?;
+
+        let (hits, truncated) = rag;
+        let hits = hits
+            .into_iter()
+            .map(|h| super::types_graph::GraphRagHit {
+                path: h.path,
+                chunk_idx: h.chunk_idx,
+                text: h.text,
+                distance: h.distance,
+                graph_path: h.graph_path,
+            })
+            .collect();
         json_result(&super::types_graph::GraphRagResponse {
-            hits: Vec::new(),
-            truncated: false,
+            hits,
+            truncated,
+            notice,
+            elapsed_us: elapsed_us(started),
         })
     }
 }

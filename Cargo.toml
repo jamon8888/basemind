@@ -169,7 +169,7 @@ arrow-select = { version = "=58", optional = true }
 # arrow 58. The graph bridge crosses the boundary with an in-memory IPC roundtrip
 # (writer on 58, reader on 56) — see `batch_to_v56` in lance/graphrag.rs.
 arrow-ipc = { version = "=58", optional = true }
-arrow56 = { package = "arrow", version = "56.2", default-features = false, features = ["ipc"], optional = true }
+arrow56 = { package = "arrow", version = "=56.2", default-features = false, features = ["ipc"], optional = true }
 base64 = "0.23"
 blake3 = "1"
 bstr = { version = "1", features = ["serde"] }

@@ -139,19 +139,22 @@ pub struct GraphEdgeRow {
 /// Derive the stable node id from an [`EntityNodeKey`]. The same derivation must be
 /// used for entity rows and edge endpoints, or Cypher joins silently come up empty.
 pub fn entity_node_id(key: &EntityNodeKey) -> String {
+    fn escape(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('|', "\\|")
+    }
     match key {
         EntityNodeKey::TokenOfDocument {
             label,
             literal,
             doc_path,
         } => {
-            format!("ks0|{label}|{doc_path}|{literal}")
+            format!("ks0|{}|{}|{}", escape(label), escape(doc_path), escape(literal))
         }
         EntityNodeKey::ClearLiteral { label, normalized } => {
-            format!("ks1|{label}|{normalized}")
+            format!("ks1|{}|{}", escape(label), escape(normalized))
         }
         EntityNodeKey::GatewayToken { label, gateway_token } => {
-            format!("ks2|{label}|{gateway_token}")
+            format!("ks2|{}|{}", escape(label), escape(gateway_token))
         }
     }
 }
@@ -662,7 +665,7 @@ fn batch_to_v56(batch: &RecordBatch) -> Result<arrow56::record_batch::RecordBatc
     out.ok_or_else(|| anyhow!("empty ipc stream across the arrow 58->56 bridge"))
 }
 
-async fn load_graph_entities_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
+pub(crate) async fn load_graph_entities_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_ENTITIES_TABLE)
         .execute()
@@ -686,7 +689,7 @@ async fn load_graph_entities_batch(connection: &Connection, scope: &str) -> Resu
     arrow_select::concat::concat_batches(&batches[0].schema(), &batches).context("concat graph_entities batches")
 }
 
-async fn load_graph_edges_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
+pub(crate) async fn load_graph_edges_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_EDGES_TABLE)
         .execute()
@@ -709,19 +712,200 @@ async fn load_graph_edges_batch(connection: &Connection, scope: &str) -> Result<
     arrow_select::concat::concat_batches(&batches[0].schema(), &batches).context("concat graph_edges batches")
 }
 
-/// Graph RAG retrieval: embedding seeds → entity expansion → fused candidates.
-pub async fn graph_rag_retrieve(
-    connection: &Connection,
-    runtime: &Runtime,
-    scope: &str,
-    seed_embeddings: Vec<Vec<f32>>,
-    config: &GraphragConfig,
-    fusion_limit: usize,
-) -> Result<Vec<GraphRagHit>> {
-    // 1. Find seed entities: chunks containing these embeddings' top entities
-    // This would query the documents table for top-k by vector, then get their entities
-    // For now, placeholder - the full implementation integrates with the fusion pipeline
-    Ok(Vec::new())
+/// One entity row projected out of the `graph_entities` batch for retrieval.
+#[derive(Debug, Clone)]
+pub struct EntityRef {
+    pub entity_id: String,
+    pub label: String,
+    pub normalized_literal: String,
+    pub document_path: String,
+}
+
+/// Project the retrieval-relevant columns out of a `graph_entities` batch.
+pub fn load_entity_refs(batch: &RecordBatch) -> Result<Vec<EntityRef>> {
+    use arrow_array::{StringArray, UInt32Array};
+    let entity_id = batch
+        .column_by_name("entity_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`entity_id` column missing"))?;
+    let label = batch
+        .column_by_name("label")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`label` column missing"))?;
+    let literal = batch
+        .column_by_name("normalized_literal")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`normalized_literal` column missing"))?;
+    let doc_path = batch
+        .column_by_name("document_path")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`document_path` column missing"))?;
+    let mention = batch
+        .column_by_name("mention_count")
+        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(EntityRef {
+            entity_id: entity_id.value(i).to_string(),
+            label: label.value(i).to_string(),
+            normalized_literal: literal.value(i).to_string(),
+            document_path: doc_path.value(i).to_string(),
+        });
+    }
+    let _ = mention;
+    Ok(out)
+}
+
+/// One expanded entity: how far it sits from a seed and the chain that reached it.
+#[derive(Debug, Clone)]
+pub struct ExpandedEntity {
+    pub entity_id: String,
+    /// 0 for the seed itself, 1..=hops for the expansion ring.
+    pub hop: u8,
+    /// Entity ids from the seed to this entity, inclusive.
+    pub chain: Vec<String>,
+}
+
+/// Breadth-first expansion over the co-occurrence edge list, in memory.
+///
+/// The graph tables are small (one row per entity-document and per edge-chunk triple),
+/// so an in-memory BFS over the projected `src_id`/`dst_id` columns beats a Cypher
+/// round-trip per hop and reuses the same batches `execute_cypher` loads.
+pub fn expand_entity_graph(
+    edges_src: &[String],
+    edges_dst: &[String],
+    seeds: &[String],
+    hops: u8,
+    max_expand: usize,
+) -> Vec<ExpandedEntity> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (src, dst) in edges_src.iter().zip(edges_dst.iter()) {
+        adjacency.entry(src.as_str()).or_default().push(dst.as_str());
+        adjacency.entry(dst.as_str()).or_default().push(src.as_str());
+    }
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<(String, u8, Vec<String>)> = VecDeque::new();
+    for seed in seeds {
+        if seen.insert(seed.as_str()) {
+            queue.push_back((seed.clone(), 0, vec![seed.clone()]));
+        }
+    }
+
+    while let Some((entity_id, hop, chain)) = queue.pop_front() {
+        out.push(ExpandedEntity {
+            entity_id: entity_id.clone(),
+            hop,
+            chain,
+        });
+        if out.len() >= max_expand || hop >= hops {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(entity_id.as_str()) {
+            for next in neighbors {
+                if seen.insert(next) {
+                    let mut next_chain = chain.clone();
+                    next_chain.push((*next).to_string());
+                    queue.push_back(((*next).to_string(), hop + 1, next_chain));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Project the `src_id` / `dst_id` columns out of a `graph_edges` batch.
+pub fn load_edge_endpoints(batch: &RecordBatch) -> Result<(Vec<String>, Vec<String>)> {
+    use arrow_array::StringArray;
+    let src = batch
+        .column_by_name("src_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`src_id` column missing"))?;
+    let dst = batch
+        .column_by_name("dst_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`dst_id` column missing"))?;
+    let mut srcs = Vec::with_capacity(batch.num_rows());
+    let mut dsts = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        srcs.push(src.value(i).to_string());
+        dsts.push(dst.value(i).to_string());
+    }
+    Ok((srcs, dsts))
+}
+
+/// Fuse vector-lane and graph-lane candidates into one ranked hit list.
+///
+/// Vector hits score `1 / (1 + distance)`; a chunk pulled in only through the graph
+/// scores `0.3 / hop` (hop 1 → 0.6, hop 2 → 0.3). A chunk present in both lanes gets
+/// the sum, so graph agreement boosts genuine vector hits. `distance` on the way out
+/// is `1 / score - 1`, keeping "lower is closer" consistent across lanes.
+pub fn fuse_results(
+    vector_hits: Vec<crate::lance::DocumentHit>,
+    graph_chunks: Vec<(crate::lance::DocumentHit, u8, Vec<String>)>,
+    max_results: usize,
+) -> (Vec<GraphRagHit>, bool) {
+    use std::collections::HashMap;
+
+    // entity chains per (path, chunk): keep the shortest chain per chunk.
+    let mut graph_meta: HashMap<(String, u32), (u8, Vec<String>)> = HashMap::new();
+    for (hit, hop, chain) in &graph_chunks {
+        let key = (hit.path.clone(), hit.chunk_idx);
+        let entry = graph_meta.entry(key).or_insert((*hop, chain.clone()));
+        if *hop < entry.0 {
+            *entry = (*hop, chain.clone());
+        }
+    }
+
+    let mut scored: Vec<(f32, GraphRagHit)> = Vec::new();
+    for hit in vector_hits {
+        let vector_score = 1.0 / (1.0 + hit.distance.max(0.0));
+        let graph_bonus = graph_meta
+            .get(&(hit.path.clone(), hit.chunk_idx))
+            .map(|(hop, _)| 0.3 / f32::from(*hop).max(1.0))
+            .unwrap_or(0.0);
+        let score = vector_score + graph_bonus;
+        let chain = graph_meta
+            .get(&(hit.path.clone(), hit.chunk_idx))
+            .map(|(_, chain)| chain.clone())
+            .unwrap_or_default();
+        scored.push((
+            score,
+            GraphRagHit {
+                path: hit.path,
+                chunk_idx: hit.chunk_idx,
+                text: hit.text,
+                distance: 1.0 / score - 1.0,
+                graph_path: chain,
+            },
+        ));
+    }
+    for (hit, hop, chain) in graph_chunks {
+        let key = (hit.path.clone(), hit.chunk_idx);
+        if scored.iter().any(|(_, h)| (h.path.clone(), h.chunk_idx) == key) {
+            continue;
+        }
+        let score = 0.3 / f32::from(hop).max(1.0);
+        scored.push((
+            score,
+            GraphRagHit {
+                path: hit.path,
+                chunk_idx: hit.chunk_idx,
+                text: hit.text,
+                distance: 1.0 / score - 1.0,
+                graph_path: chain,
+            },
+        ));
+    }
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let truncated = scored.len() > max_results;
+    scored.truncate(max_results);
+    (scored.into_iter().map(|(_, hit)| hit).collect(), truncated)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
