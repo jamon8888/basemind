@@ -259,9 +259,5 @@ pub fn table() -> Vec<Row> {
             "file/stdin redaction driver over the same engine as the `redact_text` MCP tool; the tool takes inline text and carries no mode enum, so there is no (tool, mode) pair to point at",
         ),
     ]);
-    rows.extend([
-        mcp_only("graph", "entities", "GraphRAG entity lookup is currently MCP-only"),
-        mcp_only("graph", "rag", "GraphRAG retrieval is currently MCP-only"),
-    ]);
     rows
 }
