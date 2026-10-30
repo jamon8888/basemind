@@ -7,11 +7,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use arrow_array::{Array, RecordBatch, StringArray, UInt8Array, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_array::{Array, RecordBatch};
 use futures::TryStreamExt;
 use lancedb::Connection;
-use lancedb::query::ExecutableQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
@@ -108,6 +107,8 @@ pub struct GraphEntityRow {
     pub normalized_literal: String,
     pub document_path: String,
     pub gateway_token: String,
+    /// Stable node id for lance-graph's Cypher joins (`ks<discriminant>|<label>|<key part>`).
+    pub entity_id: String,
     pub mention_count: u32,
     pub first_seen_chunk: u32,
     pub last_seen_chunk: u32,
@@ -127,9 +128,35 @@ pub struct GraphEdgeRow {
     pub dst_normalized_literal: String,
     pub dst_document_path: String,
     pub dst_label: String,
+    /// Source/target node ids — join columns for lance-graph (`graph_entities.entity_id`).
+    pub src_id: String,
+    pub dst_id: String,
     pub chunk_idx: u32,
     pub doc_path: String,
     pub weight: u32,
+}
+
+/// Derive the stable node id from an [`EntityNodeKey`]. The same derivation must be
+/// used for entity rows and edge endpoints, or Cypher joins silently come up empty.
+pub fn entity_node_id(key: &EntityNodeKey) -> String {
+    fn escape(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('|', "\\|")
+    }
+    match key {
+        EntityNodeKey::TokenOfDocument {
+            label,
+            literal,
+            doc_path,
+        } => {
+            format!("ks0|{}|{}|{}", escape(label), escape(doc_path), escape(literal))
+        }
+        EntityNodeKey::ClearLiteral { label, normalized } => {
+            format!("ks1|{}|{}", escape(label), escape(normalized))
+        }
+        EntityNodeKey::GatewayToken { label, gateway_token } => {
+            format!("ks2|{}|{}", escape(label), escape(gateway_token))
+        }
+    }
 }
 
 /// Build the entity graph from DocEntity sidecar records produced by the scanner.
@@ -192,6 +219,7 @@ pub fn build_graph_from_entities(
             normalized_literal: normalized_literal.clone(),
             document_path: document_path.clone(),
             gateway_token: gateway_token.clone(),
+            entity_id: entity_node_id(&node_key),
             mention_count: 0,
             first_seen_chunk: ent.chunk_idx,
             last_seen_chunk: ent.chunk_idx,
@@ -295,6 +323,8 @@ pub fn build_graph_from_entities(
                     dst_normalized_literal: dst_norm,
                     dst_document_path: dst_doc,
                     dst_label,
+                    src_id: entity_node_id(src),
+                    dst_id: entity_node_id(dst),
                     chunk_idx,
                     doc_path: doc_path.clone(),
                     weight: 0,
@@ -319,6 +349,8 @@ pub struct DocEntitySidecar {
     pub is_token: bool,                // true when literal is a token_replace marker like [EMAIL_1]
     pub is_gateway_token: bool,        // true when literal is a gaze gateway token like <deadbeef:Email_1>
     pub gateway_token: Option<String>, // the gaze token (e.g., <deadbeef:Email_1>) when is_gateway_token
+    pub start: u32,
+    pub end: u32,
     pub chunk_idx: u32,
     pub doc_path: String,
 }
@@ -342,6 +374,7 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
         let mut normalized_literal = arrow_array::builder::StringBuilder::new();
         let mut document_path = arrow_array::builder::StringBuilder::new();
         let mut gateway_token = arrow_array::builder::StringBuilder::new();
+        let mut entity_id = arrow_array::builder::StringBuilder::new();
         let mut mention_count = arrow_array::builder::UInt32Builder::new();
         let mut first_seen_chunk = arrow_array::builder::UInt32Builder::new();
         let mut last_seen_chunk = arrow_array::builder::UInt32Builder::new();
@@ -355,6 +388,7 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
             normalized_literal.append_value(&r.normalized_literal);
             document_path.append_value(&r.document_path);
             gateway_token.append_value(&r.gateway_token);
+            entity_id.append_value(&r.entity_id);
             mention_count.append_value(r.mention_count);
             first_seen_chunk.append_value(r.first_seen_chunk);
             last_seen_chunk.append_value(r.last_seen_chunk);
@@ -372,6 +406,7 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
                 Arc::new(normalized_literal.finish()),
                 Arc::new(document_path.finish()),
                 Arc::new(gateway_token.finish()),
+                Arc::new(entity_id.finish()),
                 Arc::new(mention_count.finish()),
                 Arc::new(first_seen_chunk.finish()),
                 Arc::new(last_seen_chunk.finish()),
@@ -435,6 +470,8 @@ pub fn upsert_graph_edges(connection: &Connection, runtime: &Runtime, rows: &[Gr
         let mut dst_normalized_literal = arrow_array::builder::StringBuilder::new();
         let mut dst_document_path = arrow_array::builder::StringBuilder::new();
         let mut dst_label = arrow_array::builder::StringBuilder::new();
+        let mut src_id = arrow_array::builder::StringBuilder::new();
+        let mut dst_id = arrow_array::builder::StringBuilder::new();
         let mut chunk_idx = arrow_array::builder::UInt32Builder::new();
         let mut doc_path = arrow_array::builder::StringBuilder::new();
         let mut weight = arrow_array::builder::UInt32Builder::new();
@@ -449,6 +486,8 @@ pub fn upsert_graph_edges(connection: &Connection, runtime: &Runtime, rows: &[Gr
             dst_normalized_literal.append_value(&r.dst_normalized_literal);
             dst_document_path.append_value(&r.dst_document_path);
             dst_label.append_value(&r.dst_label);
+            src_id.append_value(&r.src_id);
+            dst_id.append_value(&r.dst_id);
             chunk_idx.append_value(r.chunk_idx);
             doc_path.append_value(&r.doc_path);
             weight.append_value(r.weight);
@@ -467,6 +506,8 @@ pub fn upsert_graph_edges(connection: &Connection, runtime: &Runtime, rows: &[Gr
                 Arc::new(dst_normalized_literal.finish()),
                 Arc::new(dst_document_path.finish()),
                 Arc::new(dst_label.finish()),
+                Arc::new(src_id.finish()),
+                Arc::new(dst_id.finish()),
                 Arc::new(chunk_idx.finish()),
                 Arc::new(doc_path.finish()),
                 Arc::new(weight.finish()),
@@ -547,61 +588,84 @@ pub fn execute_cypher(
     cypher: &str,
     max_rows: usize,
 ) -> Result<CypherResult> {
-    // Load graph tables as Arrow batches
-    let entities_batch = load_graph_entities_batch(connection, runtime, scope).await?;
-    let edges_batch = load_graph_edges_batch(connection, runtime, scope).await?;
-
-    // Use lance-graph to execute Cypher over the batches
-    // lance-graph API: GraphConfig -> CypherQuery.execute(tables)
     use lance_graph::{CypherQuery, GraphConfig};
 
+    // Load graph tables as Arrow batches (block_on around the async loaders —
+    // the MCP dispatch is sync here, and the store runtime owns the reactor).
+    let entities_batch = runtime.block_on(load_graph_entities_batch(connection, scope))?;
+    let edges_batch = runtime.block_on(load_graph_edges_batch(connection, scope))?;
+
+    // lance-graph maps label names onto id/join columns of the batches:
+    // nodes join on `entity_id`, relationships on `src_id`/`dst_id` (schema.rs).
     let config = GraphConfig::builder()
-        .with_node_label("Entity", "scope") // nodes are in graph_entities
-        .with_edge_label("CO_OCCURS", "scope") // edges are in graph_edges
+        .with_node_label("Entity", "entity_id")
+        .with_relationship("CO_OCCURS", "src_id", "dst_id")
         .build()
         .context("build GraphConfig")?;
 
-    let tables = vec![
-        ("Entity".to_string(), entities_batch),
-        ("CO_OCCURS".to_string(), edges_batch),
-    ];
+    let mut datasets = std::collections::HashMap::new();
+    datasets.insert("Entity".to_string(), batch_to_v56(&entities_batch)?);
+    datasets.insert("CO_OCCURS".to_string(), batch_to_v56(&edges_batch)?);
 
-    let result = runtime.block_on(async { CypherQuery::new(cypher).with_config(config).execute(tables).await })?;
+    // `CypherQuery::new` parses (Result), `execute` runs async and yields ONE
+    // RecordBatch holding the projected columns.
+    let result = runtime
+        .block_on(async {
+            CypherQuery::new(cypher)?
+                .with_config(config)
+                .execute(datasets, None)
+                .await
+        })
+        .context("execute cypher")?;
 
-    // Convert lance-graph result to our format
-    let columns = result.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let columns: Vec<String> = result.schema().fields().iter().map(|f| f.name().clone()).collect();
     let mut rows = Vec::new();
-    for batch in result {
-        for i in 0..batch.num_rows() {
-            let mut row = Vec::new();
-            for col in batch.columns() {
-                let arr = col.as_any();
-                let val = if let Some(s) = arr.downcast_ref::<StringArray>() {
-                    s.value(i).to_string()
-                } else if let Some(u) = arr.downcast_ref::<arrow_array::Int64Array>() {
-                    u.value(i).to_string()
-                } else if let Some(u) = arr.downcast_ref::<arrow_array::UInt64Array>() {
-                    u.value(i).to_string()
-                } else if let Some(f) = arr.downcast_ref::<arrow_array::Float64Array>() {
-                    f.value(i).to_string()
-                } else if let Some(b) = arr.downcast_ref::<arrow_array::BooleanArray>() {
-                    b.value(i).to_string()
-                } else {
-                    "?".to_string()
-                };
-                row.push(val);
-            }
-            rows.push(row);
-            if rows.len() >= max_rows {
-                break;
-            }
+    'outer: for i in 0..result.num_rows() {
+        let mut row = Vec::with_capacity(result.num_columns());
+        for col in result.columns() {
+            // lance-graph runs on arrow 56 — downcast through its array types.
+            let val = if col.is_null(i) {
+                "<null>".to_string()
+            } else {
+                arrow56::util::display::array_value_to_string(col.as_ref(), i).unwrap_or_else(|_| "?".to_string())
+            };
+            row.push(val);
+        }
+        rows.push(row);
+        if rows.len() >= max_rows {
+            break 'outer;
         }
     }
 
     Ok(CypherResult { columns, rows })
 }
 
-async fn load_graph_entities_batch(connection: &Connection, runtime: &Runtime, scope: &str) -> Result<RecordBatch> {
+/// Cross the arrow 58 -> 56 version boundary (lancedb 0.40 vs lance-graph 0.5.4) via an
+/// in-memory IPC roundtrip. Both sides speak Apache Arrow IPC, so this is a pure
+/// re-serialization — no data reinterpretation, schema preserved verbatim.
+fn batch_to_v56(batch: &RecordBatch) -> Result<arrow56::record_batch::RecordBatch> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+            .context("ipc writer (arrow 58)")?;
+        writer.write(batch).context("ipc write batch")?;
+        writer.finish().context("ipc finish")?;
+    }
+    let mut reader = arrow56::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None)
+        .context("ipc reader (arrow 56)")?;
+    let mut out: Option<arrow56::record_batch::RecordBatch> = None;
+    while let Some(b) = reader.next().transpose().context("ipc read batch")? {
+        out = match out {
+            None => Some(b),
+            Some(prev) => {
+                Some(arrow56::compute::concat_batches(&prev.schema(), &[prev, b]).context("ipc concat batches")?)
+            }
+        };
+    }
+    out.ok_or_else(|| anyhow!("empty ipc stream across the arrow 58->56 bridge"))
+}
+
+pub(crate) async fn load_graph_entities_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_ENTITIES_TABLE)
         .execute()
@@ -622,10 +686,10 @@ async fn load_graph_entities_batch(connection: &Connection, runtime: &Runtime, s
         // Return empty batch with correct schema
         return Ok(RecordBatch::new_empty(graph_entities_schema()));
     }
-    arrow::compute::concat_batches(&batches[0].schema(), &batches).context("concat graph_entities batches")
+    arrow_select::concat::concat_batches(&batches[0].schema(), &batches).context("concat graph_entities batches")
 }
 
-async fn load_graph_edges_batch(connection: &Connection, runtime: &Runtime, scope: &str) -> Result<RecordBatch> {
+pub(crate) async fn load_graph_edges_batch(connection: &Connection, scope: &str) -> Result<RecordBatch> {
     let table = connection
         .open_table(GRAPH_EDGES_TABLE)
         .execute()
@@ -645,22 +709,203 @@ async fn load_graph_edges_batch(connection: &Connection, runtime: &Runtime, scop
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(graph_edges_schema()));
     }
-    arrow::compute::concat_batches(&batches[0].schema(), &batches).context("concat graph_edges batches")
+    arrow_select::concat::concat_batches(&batches[0].schema(), &batches).context("concat graph_edges batches")
 }
 
-/// Graph RAG retrieval: embedding seeds → entity expansion → fused candidates.
-pub async fn graph_rag_retrieve(
-    connection: &Connection,
-    runtime: &Runtime,
-    scope: &str,
-    seed_embeddings: Vec<Vec<f32>>,
-    config: &GraphragConfig,
-    fusion_limit: usize,
-) -> Result<Vec<GraphRagHit>> {
-    // 1. Find seed entities: chunks containing these embeddings' top entities
-    // This would query the documents table for top-k by vector, then get their entities
-    // For now, placeholder - the full implementation integrates with the fusion pipeline
-    Ok(Vec::new())
+/// One entity row projected out of the `graph_entities` batch for retrieval.
+#[derive(Debug, Clone)]
+pub struct EntityRef {
+    pub entity_id: String,
+    pub label: String,
+    pub normalized_literal: String,
+    pub document_path: String,
+}
+
+/// Project the retrieval-relevant columns out of a `graph_entities` batch.
+pub fn load_entity_refs(batch: &RecordBatch) -> Result<Vec<EntityRef>> {
+    use arrow_array::{StringArray, UInt32Array};
+    let entity_id = batch
+        .column_by_name("entity_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`entity_id` column missing"))?;
+    let label = batch
+        .column_by_name("label")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`label` column missing"))?;
+    let literal = batch
+        .column_by_name("normalized_literal")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`normalized_literal` column missing"))?;
+    let doc_path = batch
+        .column_by_name("document_path")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`document_path` column missing"))?;
+    let mention = batch
+        .column_by_name("mention_count")
+        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(EntityRef {
+            entity_id: entity_id.value(i).to_string(),
+            label: label.value(i).to_string(),
+            normalized_literal: literal.value(i).to_string(),
+            document_path: doc_path.value(i).to_string(),
+        });
+    }
+    let _ = mention;
+    Ok(out)
+}
+
+/// One expanded entity: how far it sits from a seed and the chain that reached it.
+#[derive(Debug, Clone)]
+pub struct ExpandedEntity {
+    pub entity_id: String,
+    /// 0 for the seed itself, 1..=hops for the expansion ring.
+    pub hop: u8,
+    /// Entity ids from the seed to this entity, inclusive.
+    pub chain: Vec<String>,
+}
+
+/// Breadth-first expansion over the co-occurrence edge list, in memory.
+///
+/// The graph tables are small (one row per entity-document and per edge-chunk triple),
+/// so an in-memory BFS over the projected `src_id`/`dst_id` columns beats a Cypher
+/// round-trip per hop and reuses the same batches `execute_cypher` loads.
+pub fn expand_entity_graph(
+    edges_src: &[String],
+    edges_dst: &[String],
+    seeds: &[String],
+    hops: u8,
+    max_expand: usize,
+) -> Vec<ExpandedEntity> {
+    use std::collections::{HashMap, VecDeque};
+
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (src, dst) in edges_src.iter().zip(edges_dst.iter()) {
+        adjacency.entry(src.as_str()).or_default().push(dst.as_str());
+        adjacency.entry(dst.as_str()).or_default().push(src.as_str());
+    }
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<(String, u8, Vec<String>)> = VecDeque::new();
+    for seed in seeds {
+        if seen.insert(seed.as_str()) {
+            queue.push_back((seed.clone(), 0, vec![seed.clone()]));
+        }
+    }
+
+    while let Some((entity_id, hop, chain)) = queue.pop_front() {
+        out.push(ExpandedEntity {
+            entity_id: entity_id.clone(),
+            hop,
+            chain,
+        });
+        if out.len() >= max_expand || hop >= hops {
+            continue;
+        }
+        if let Some(neighbors) = adjacency.get(entity_id.as_str()) {
+            for next in neighbors {
+                if seen.insert(next) {
+                    let mut next_chain = chain.clone();
+                    next_chain.push((*next).to_string());
+                    queue.push_back(((*next).to_string(), hop + 1, next_chain));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Project the `src_id` / `dst_id` columns out of a `graph_edges` batch.
+pub fn load_edge_endpoints(batch: &RecordBatch) -> Result<(Vec<String>, Vec<String>)> {
+    use arrow_array::StringArray;
+    let src = batch
+        .column_by_name("src_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`src_id` column missing"))?;
+    let dst = batch
+        .column_by_name("dst_id")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`dst_id` column missing"))?;
+    let mut srcs = Vec::with_capacity(batch.num_rows());
+    let mut dsts = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        srcs.push(src.value(i).to_string());
+        dsts.push(dst.value(i).to_string());
+    }
+    Ok((srcs, dsts))
+}
+
+/// Fuse vector-lane and graph-lane candidates into one ranked hit list.
+///
+/// Vector hits score `1 / (1 + distance)`; a chunk pulled in only through the graph
+/// scores `0.3 / hop` (hop 1 → 0.6, hop 2 → 0.3). A chunk present in both lanes gets
+/// the sum, so graph agreement boosts genuine vector hits. `distance` on the way out
+/// is `1 / score - 1`, keeping "lower is closer" consistent across lanes.
+pub fn fuse_results(
+    vector_hits: Vec<crate::lance::DocumentHit>,
+    graph_chunks: Vec<(crate::lance::DocumentHit, u8, Vec<String>)>,
+    max_results: usize,
+) -> (Vec<GraphRagHit>, bool) {
+    use std::collections::HashMap;
+
+    // entity chains per (path, chunk): keep the shortest chain per chunk.
+    let mut graph_meta: HashMap<(String, u32), (u8, Vec<String>)> = HashMap::new();
+    for (hit, hop, chain) in &graph_chunks {
+        let key = (hit.path.clone(), hit.chunk_idx);
+        let entry = graph_meta.entry(key).or_insert((*hop, chain.clone()));
+        if *hop < entry.0 {
+            *entry = (*hop, chain.clone());
+        }
+    }
+
+    let mut scored: Vec<(f32, GraphRagHit)> = Vec::new();
+    for hit in vector_hits {
+        let vector_score = 1.0 / (1.0 + hit.distance.max(0.0));
+        let graph_bonus = graph_meta
+            .get(&(hit.path.clone(), hit.chunk_idx))
+            .map(|(hop, _)| 0.3 / f32::from(*hop).max(1.0))
+            .unwrap_or(0.0);
+        let score = vector_score + graph_bonus;
+        let chain = graph_meta
+            .get(&(hit.path.clone(), hit.chunk_idx))
+            .map(|(_, chain)| chain.clone())
+            .unwrap_or_default();
+        scored.push((
+            score,
+            GraphRagHit {
+                path: hit.path,
+                chunk_idx: hit.chunk_idx,
+                text: hit.text,
+                distance: 1.0 / score - 1.0,
+                graph_path: chain,
+            },
+        ));
+    }
+    for (hit, hop, chain) in graph_chunks {
+        let key = (hit.path.clone(), hit.chunk_idx);
+        if scored.iter().any(|(_, h)| (h.path.clone(), h.chunk_idx) == key) {
+            continue;
+        }
+        let score = 0.3 / f32::from(hop).max(1.0);
+        scored.push((
+            score,
+            GraphRagHit {
+                path: hit.path,
+                chunk_idx: hit.chunk_idx,
+                text: hit.text,
+                distance: 1.0 / score - 1.0,
+                graph_path: chain,
+            },
+        ));
+    }
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let truncated = scored.len() > max_results;
+    scored.truncate(max_results);
+    (scored.into_iter().map(|(_, hit)| hit).collect(), truncated)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

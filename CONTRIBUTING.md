@@ -5,6 +5,10 @@ small surface area and a sharp commit-quality bar.
 
 ## Quickstart
 
+For Claude Code, Codex, or a first codebase tour, start with the
+[shared agent guide](docs/agents/README.md). It maps features and source ownership
+to architecture, tests, and integration workflows.
+
 ```sh
 git clone https://github.com/Goldziher/basemind && cd basemind
 task setup     # cargo fetch + poly hook install (one-time)

@@ -163,6 +163,8 @@ pub enum EntityKeySource {
 /// - `normalized_literal` UTF-8  normalized literal (case-fold + ascii-fold + whitespace collapse) — for ClearLiteral
 /// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty otherwise)
 /// - `gateway_token`    UTF-8     stable gateway token from passerelle (only for GatewayToken; empty otherwise)
+/// - `entity_id`        UTF-8     stable node id handed to lance-graph's Cypher engine (`ks<discriminant>|<label>|<key part>`);
+///                                edges join on this column, so it must stay derivation-stable across rebuilds
 /// - `mention_count`    UInt32    number of mentions aggregated into this node
 /// - `first_seen_chunk` UInt32    chunk_idx of first mention (for ordering)
 /// - `last_seen_chunk`  UInt32    chunk_idx of last mention
@@ -177,6 +179,7 @@ pub fn graph_entities_schema() -> SchemaRef {
         Field::new("normalized_literal", DataType::Utf8, false),
         Field::new("document_path", DataType::Utf8, false),
         Field::new("gateway_token", DataType::Utf8, false),
+        Field::new("entity_id", DataType::Utf8, false),
         Field::new("mention_count", DataType::UInt32, false),
         Field::new("first_seen_chunk", DataType::UInt32, false),
         Field::new("last_seen_chunk", DataType::UInt32, false),
@@ -198,6 +201,8 @@ pub fn graph_entities_schema() -> SchemaRef {
 /// - `dst_normalized_literal` UTF-8  target normalized literal
 /// - `dst_document_path` UTF-8    target document path (for TokenOfDocument)
 /// - `dst_label`       UTF-8    target entity label
+/// - `src_id`           UTF-8    source node `entity_id` (joins `graph_entities.entity_id` in Cypher)
+/// - `dst_id`           UTF-8    target node `entity_id`
 /// - `chunk_idx`       UInt32   chunk index where co-occurrence was observed
 /// - `doc_path`        UTF-8    document path of the chunk
 /// - `weight`          UInt32   number of times this edge was observed (always 1 per chunk, can accumulate across rebuilds)
@@ -213,6 +218,8 @@ pub fn graph_edges_schema() -> SchemaRef {
         Field::new("dst_normalized_literal", DataType::Utf8, false),
         Field::new("dst_document_path", DataType::Utf8, false),
         Field::new("dst_label", DataType::Utf8, false),
+        Field::new("src_id", DataType::Utf8, false),
+        Field::new("dst_id", DataType::Utf8, false),
         Field::new("chunk_idx", DataType::UInt32, false),
         Field::new("doc_path", DataType::Utf8, false),
         Field::new("weight", DataType::UInt32, false),

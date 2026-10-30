@@ -54,10 +54,19 @@ them.
 | [0010](0010-branch-integration-release-strategy.md) | Branch, integration & release strategy | Accepted |
 | [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign | Accepted |
 | [0012](0012-multi-lane-document-retrieval.md) | Multi-lane document retrieval — multi-lane, embeddings optional | Accepted |
+| [0012: grep](0012-grep-content-prefilter.md) | Per-file trigram bloom prefilter for code grep | Accepted |
 | [0013](0013-encryption-at-rest-comes-from-the-volume.md) | Encryption at rest comes from the volume, enforced as a deployment requirement | Accepted |
+| [0013: comms](0013-comms-robustness-idempotency-replay.md) | Correlated requests, bounded waits, idempotent posts and relay replay | Accepted |
 | [0014](0014-tier-routing-is-declared-by-the-caller.md) | Tier routing is declared by the caller, not inferred by basemind | Proposed |
+| [0014: parity](0014-cli-mcp-parity-guard.md) | Executable CLI/MCP parity guard | Accepted |
+| [0015: extraction](0015-bounded-document-extraction.md) | Bound document extraction with a thread cap, tombstones and a phase budget | Proposed |
+| [0015: privacy](0015-privacy-gateway-boundary.md) | Privacy gateway boundary | Accepted |
 
-Implementation specs live in [`../specs/`](../specs/). ADR-0012's spec is
-[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). ADR-0013
-constrains that spec's §14.0 rather than adding a new one. ADR-0014 governs which tier a path is
-indexed in, which is the question the spec's `documents` tier assumes rather than answers.
+Some existing ADRs share a numeric prefix. Link by full filename and title when
+referring to those decisions; the number alone is ambiguous. Status here mirrors
+the ADR text, while the [feature catalog](../agents/features.md) describes current
+implementation and limitations.
+
+Implementation specs live in [`../specs/`](../specs/). [ADR-0012: Multi-lane document retrieval](0012-multi-lane-document-retrieval.md)'s spec is
+[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). [ADR-0013: Encryption at rest comes from the volume](0013-encryption-at-rest-comes-from-the-volume.md)
+constrains that spec's §14.0 rather than adding a new one. [ADR-0014: Tier routing is declared by the caller](0014-tier-routing-is-declared-by-the-caller.md) governs which tier a path is indexed in, which is the question the spec's `documents` tier assumes rather than answers.
