@@ -94,8 +94,7 @@ pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
         return Ok(None);
     }
     let body = std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
-    let meta: LanceMeta =
-        serde_json::from_slice(&body).with_context(|| format!("parse {}", meta_path.display()))?;
+    let meta: LanceMeta = serde_json::from_slice(&body).with_context(|| format!("parse {}", meta_path.display()))?;
     LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
 }
 

@@ -924,10 +924,7 @@ pub(super) async fn run_graph_entities(
                 .map_err(|e| McpError::internal_error(format!("lance open task: {e}"), None))?
                 .map_err(|e| McpError::internal_error(format!("open lance store: {e}"), None))?
                 .ok_or_else(|| {
-                    McpError::invalid_params(
-                        "graphrag feature not enabled or lance store not available",
-                        None,
-                    )
+                    McpError::invalid_params("graphrag feature not enabled or lance store not available", None)
                 })?
         }
     };
