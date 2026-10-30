@@ -34,6 +34,8 @@ use crate::extract::doc::ocr_signal;
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc_with_metrics};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
+#[cfg(feature = "graphrag")]
+use crate::lance::DocEntitySidecar;
 use crate::lance::{DocumentRow, PendingBatch};
 use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
@@ -111,6 +113,28 @@ pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
     let dimensions = crate::embeddings::resolve_embedding_dims(name)
         .with_context(|| format!("unknown xberg embedding preset: {name}"))?;
     u16::try_from(dimensions).with_context(|| format!("preset {name} dimensions {dimensions} exceeds u16"))
+}
+
+#[cfg(feature = "graphrag")]
+fn lance_or_open_fallback(store: &Store, preset: &str) -> Option<Arc<crate::lance::LanceStore>> {
+    if let Some(lance) = &store.lance {
+        return Some(lance.clone());
+    }
+    let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
+    match crate::lance::open_existing(&dir) {
+        Ok(Some(lance)) => Some(Arc::new(lance)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "graphrag: open existing LanceStore failed; skipping graph build"
+            );
+            if let Err(error) = preset_dim(preset) {
+                tracing::warn!(?error, "graphrag: unknown embedding preset; graph build skipped");
+            }
+            None
+        }
+    }
 }
 
 /// Translate the project-level `[documents]` config into the xberg-facing
@@ -286,6 +310,79 @@ fn matches_mime(entry: &str, mime_type: &str) -> bool {
     false
 }
 
+/// Reconcile NER spans with gaze gateway tokens (spec 0016 §15-Q5 / #111).
+///
+/// xberg's NER returns the matched span (`Name_1`, or even the bare anchor
+/// `4b31c7ee`), not the full gateway token `<4b31c7ee:Name_1>` that gaze wrote
+/// into the document. Any entity whose text sits inside a gateway-token
+/// occurrence in the document body is re-attributed to that token, so the graph
+/// keys on the stable cross-document token identity
+/// (`EntityKeySource::GatewayToken`) instead of a document-local span literal.
+/// Matching is normalization-tolerant (lowercase, alphanumerics only) because
+/// the span text and the token interior are normalized differently.
+#[cfg(feature = "graphrag")]
+fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
+    static TOKEN_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TOKEN_RE.get_or_init(|| {
+        // gaze token shape: <anchor:Class_N> with an 8-hex anchor (the
+        // workspace_stability_probe contract, #107).
+        regex::Regex::new(r"<([0-9a-fA-F]{8}):([A-Za-z]+)_(\d+)>").expect("gateway token regex")
+    });
+
+    // (normalized key, full token) per occurrence — inner and bare anchor.
+    let mut candidates: Vec<(usize, usize, String, String)> = Vec::new();
+    for m in re.captures_iter(content) {
+        let full = m.get(0).map(|t| t.as_str()).unwrap_or_default().to_string();
+        let class = m.get(2).map(|value| value.as_str()).unwrap_or_default();
+        let ordinal = m.get(3).map(|value| value.as_str()).unwrap_or_default();
+        let anchor = m.get(1).map(|value| value.as_str()).unwrap_or_default();
+        let span = m.get(0).expect("regex match");
+        candidates.push((
+            span.start(),
+            span.end(),
+            format!("{}{}", class.to_lowercase(), ordinal),
+            full.clone(),
+        ));
+        candidates.push((span.start(), span.end(), anchor.to_lowercase(), full));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    };
+
+    for ent in entities.iter_mut() {
+        if ent.is_gateway_token || ent.gateway_token.is_some() {
+            continue;
+        }
+        let needle = norm(&ent.literal);
+        if needle.len() < 3 {
+            continue;
+        }
+        // Exact needle match wins over containment.
+        let hit = candidates
+            .iter()
+            .filter(|(start, end, _, _)| ent.start as usize >= *start && ent.end as usize <= *end)
+            .find(|(_, _, k, _)| *k == needle)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|(start, end, _, _)| ent.start as usize >= *start && ent.end as usize <= *end)
+                    .find(|(_, _, k, _)| k.contains(&needle))
+            });
+        if let Some((_, _, _, full)) = hit {
+            ent.is_gateway_token = true;
+            ent.gateway_token = Some(full.clone());
+            ent.literal = full.clone();
+        }
+    }
+}
+
 /// Run xberg against `abs`, write the document blob to the content-addressed
 /// store, and assemble a [`PendingDocBatch`] for the apply pass. Returns
 /// `Ok(None)` when extraction succeeded but produced no embeddings (we still
@@ -352,13 +449,18 @@ pub(crate) fn extract_and_persist_doc(
         // Build GraphRAG entity graph from cached doc's NER sidecar (spec 0016).
         #[cfg(feature = "graphrag")]
         if cfg.graphrag.enabled {
-            if let Some(lance) = store.lance.as_ref() {
+            // The entity graph lives in lance even when `embed = false`. This path holds
+            // `&Store` (immutable) so `lance_or_open` is out of reach — open a standalone
+            // handle against the same `.basemind/lance/` dir instead; LanceDB connections
+            // to one store are independent and safe to hold in parallel.
+            let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
+            if let Some(lance) = lance {
                 use crate::lance::graphrag::{
                     DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
                     upsert_graph_entities,
                 };
 
-                let doc_entities: Vec<DocEntitySidecar> = cached
+                let mut doc_entities: Vec<DocEntitySidecar> = cached
                     .entities
                     .iter()
                     .map(|e| {
@@ -373,11 +475,14 @@ pub(crate) fn extract_and_persist_doc(
                             is_token,
                             is_gateway_token,
                             gateway_token,
+                            start: e.start,
+                            end: e.end,
                             chunk_idx: 0,
                             doc_path: rel.to_string(),
                         }
                     })
                     .collect();
+                reconcile_gateway_tokens(&mut doc_entities, &cached.content);
 
                 let graphrag_cfg = GraphragConfig {
                     enabled: true,
@@ -389,17 +494,14 @@ pub(crate) fn extract_and_persist_doc(
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
                         let _ = crate::lance::graphrag::upsert_graph_entities(
-                            &lance.inner.connection,
-                            &lance.inner.runtime,
+                            lance.connection(),
+                            lance.runtime(),
                             &entity_rows,
                         );
                     }
                     if !edge_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_edges(
-                            &lance.inner.connection,
-                            &lance.inner.runtime,
-                            &edge_rows,
-                        );
+                        let _ =
+                            crate::lance::graphrag::upsert_graph_edges(lance.connection(), lance.runtime(), &edge_rows);
                     }
                 }
             }
@@ -467,13 +569,16 @@ pub(crate) fn extract_and_persist_doc(
     // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
     #[cfg(feature = "graphrag")]
     if cfg.graphrag.enabled {
-        if let Some(lance) = store.lance.as_ref() {
+        // Same standalone-open rationale as the cached-doc path above: `&Store` is
+        // immutable here, and the graph must survive `embed = false` on a fresh workspace.
+        let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
+        if let Some(lance) = lance {
             use crate::lance::graphrag::{
                 DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,
             };
 
             // Convert FileMapDoc entities to DocEntitySidecar format
-            let doc_entities: Vec<DocEntitySidecar> = doc
+            let mut doc_entities: Vec<DocEntitySidecar> = doc
                 .entities
                 .iter()
                 .map(|e| {
@@ -488,11 +593,14 @@ pub(crate) fn extract_and_persist_doc(
                         is_token,
                         is_gateway_token,
                         gateway_token,
+                        start: e.start,
+                        end: e.end,
                         chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
                         doc_path: rel.to_string(),
                     }
                 })
                 .collect();
+            reconcile_gateway_tokens(&mut doc_entities, &doc.content);
 
             let graphrag_cfg = GraphragConfig {
                 enabled: true,
@@ -504,17 +612,13 @@ pub(crate) fn extract_and_persist_doc(
             if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                 if !entity_rows.is_empty() {
                     let _ = crate::lance::graphrag::upsert_graph_entities(
-                        &lance.inner.connection,
-                        &lance.inner.runtime,
+                        lance.connection(),
+                        lance.runtime(),
                         &entity_rows,
                     );
                 }
                 if !edge_rows.is_empty() {
-                    let _ = crate::lance::graphrag::upsert_graph_edges(
-                        &lance.inner.connection,
-                        &lance.inner.runtime,
-                        &edge_rows,
-                    );
+                    let _ = crate::lance::graphrag::upsert_graph_edges(lance.connection(), lance.runtime(), &edge_rows);
                 }
             }
         }

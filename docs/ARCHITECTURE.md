@@ -1,15 +1,22 @@
 # Architecture
 
 basemind is a single Rust crate that builds one binary (`basemind`) and exposes
-its internals as a library. The binary serves three roles: `basemind scan` indexes
-a workspace, the daemon (`basemind comms daemon`, auto-spawned; singleton per user) is the sole
-writer managing a machine-global cache and hosts the MCP router over one shared read stack per
-workspace, and `basemind serve` is a thin stdio relay that ensures the daemon and pumps bytes to it
-(HTTP-native clients dial the daemon directly). `serve` needs the `comms` feature; the one-shot CLI
-(`basemind code …`, `git …`) opens the store itself and does not.
+its internals as a library. `basemind scan` indexes a workspace under an exclusive
+writer lock. The daemon (`basemind comms daemon`, auto-spawned; singleton per user)
+owns its active workspace writers and hosts the MCP router over shared read
+stacks. `basemind serve` is a thin stdio relay that ensures the daemon and pumps
+bytes to it; HTTP-native clients can dial its opt-in HTTP frontend directly.
+`serve` requires `comms`. One-shot query commands use the same helpers through
+`cli/context.rs`: local reads when possible, or index/memory forwarding when the
+daemon owns the store. `rescan` forwards to a running daemon; `scan` reports a
+writer collision rather than silently opening a second writer.
+
+For task-oriented navigation, see the [agent guide](agents/README.md),
+[complete source ownership map](agents/codebase-map.md), and
+[feature/build catalog](agents/features.md).
 
 The Cargo workspace also vendors four crates under `crates/` — `stack-graphs`,
-`tree-sitter-graph`, `tree-sitter-stack-graphs`, `lsp-positions` — a tree-sitter-0.26 fork of
+`tree-sitter-graph`, `tree-sitter-stack-graphs`, `lsp-positions` — compatibility forks of
 the upstream stack-graphs project, maintained in-tree because upstream targets an older
 tree-sitter. The fork root-caused and fixed two upstream panics and drops the C-FFI, serde,
 sqlite, and visualization modules basemind doesn't use. It backs the Python/Java half of the
@@ -18,40 +25,27 @@ code-intelligence tier (see [Code intelligence](#code-intelligence-precise-resol
 > This document describes the system as-built. For *why* a given decision was made and which
 > alternatives were rejected, see the Architecture Decision Records in [`adr/`](adr/README.md).
 
-```text
-                    ┌─────────────┐
-                    │ basemind    │
-                    │ scan        │
-                    └─────┬───────┘
-                          │ extraction results over IPC (UDS)
-                          ▼
-        ┌──────────────────────────────────────┐
-        │  basemind daemon (singleton)         │
-        │                                      │
-        │  ┌─────────┐ ┌─────────────┐         │
-        │  │ Fjall   │ │ LanceDB     │         │
-        │  │ writer  │ │ writer      │         │
-        │  └─────────┘ └─────────────┘         │
-        │  sole writer per machine; hosts the  │
-        │  MCP router + one shared read stack  │
-        │  per workspace                       │
-        └────┬─────────────────────────┬───────┘
-             │ <cache>/cache/          │ streamable HTTP (opt-in)
-             │ workspaces/<key>/       │ and the stdio relay
-   ┌─────────▼──────┐                  │
-   │ Content-addr   │                  │
-   │ msgpack blobs  │       ┌──────────┴───────────────┐
-   │ (cache/blobs,  │       │ basemind serve           │
-   │ machine-wide,  │       │ (stdio relay, one per    │
-   │ deduped)       │       │ client session)          │
-   └────────────────┘       └──────────┬───────────────┘
-                                       │ MCP stdio
-                                       ▼
-                            ┌──────────────────────┐
-                            │ AI coding agents     │
-                            │ (Claude Code, etc.)  │
-                            └──────────────────────┘
+```mermaid
+flowchart TD
+  Agent["Agent MCP client"] --> Relay["basemind serve: stdio relay"]
+  Relay --> Daemon["Daemon: MCP router and workspace pool"]
+  Agent --> HTTP["Opt-in authenticated HTTP frontend"]
+  HTTP --> Daemon
+  CLI["One-shot CLI"] --> Helpers["Shared query helpers"]
+  Helpers -->|daemon owns index| Daemon
+  Helpers -->|local read| Cache["Workspace views and indexes"]
+  Rescan["rescan"] -->|daemon running| Daemon
+  Rescan -->|no daemon| Cache
+  Scan["Local scan/watch: exclusive writer lock"] --> Cache
+  Daemon --> Cache
+  Cache --> Blobs["Machine-global content-addressed blobs"]
+  Cache --> Fjall["Fjall secondary indexes and metadata"]
+  Cache --> Lance["Optional LanceDB tables"]
 ```
+
+The local writer and daemon writer are alternative ownership paths, not two
+concurrent writers to the same workspace. See `main.rs`, `cli/context.rs`,
+`store_lock.rs`, and `comms/workspace_pool.rs` for admission and forwarding.
 
 ## Source layout
 
@@ -111,7 +105,7 @@ src/
 │   │                         refs_by_path (code-intelligence reverse index)
 │   ├── keys.rs             — length-prefixed composite key encodings
 │   ├── grep_bloom.rs       — per-file trigram bloom rows: the `code grep` candidate prefilter
-│   │                         (ADR-0012)
+│   │                         ([ADR-0012: Grep content prefilter](adr/0012-grep-content-prefilter.md))
 │   ├── name_dict.rs        — resident dictionary of distinct callee / trait names behind
 │   │                         `references` / `callers` / `implementations`
 │   └── writer.rs           — atomic read-before-write upsert; per-file commit;
@@ -161,9 +155,8 @@ src/
 │   ├── overrides.rs        — DocumentsCliOverrides — backs the clap flags
 │   ├── layered.rs          — merge_layers (Mcp > Cli > Env > File > Default)
 │   └── source.rs           — ConfigSource + ProvenanceMap ledger
-├── mcp/                    — MCP server: nine domain tools (code, graph, git, memory, web,
-│                             agents, workspace, shell, admin), each one #[tool] dispatching
-│                             on a required `mode` — see "MCP surface" below
+├── mcp/                    — MCP server: domain tools plus feature-gated privacy tools;
+│                             see "MCP surface" below for registration and restrictions
 │   ├── mod.rs, state.rs    — server bootstrap; shared ServerState
 │   ├── mode.rs             — define_mode!: the mode enums, wire spellings, telemetry_key(),
 │   │                         and domain_modes() (what tests/cli_parity/ walks)
@@ -234,7 +227,7 @@ src/
 ├── queries/<pack-name>.scm — hand-written extraction queries (override TSLP tags.scm)
 ├── render.rs, hashing.rs, watcher.rs                   — supporting modules
 
-crates/                    — vendored tree-sitter-0.26 stack-graphs fork (workspace members):
+crates/                    — vendored stack-graph compatibility forks (workspace members):
                              stack-graphs, tree-sitter-graph, tree-sitter-stack-graphs,
                              lsp-positions
 ```
@@ -254,10 +247,9 @@ Walker (gitignore-aware)
         Store::write_l1               — content-addressed msgpack blob
         Store::write_l2 (if eager)
         grep bloom row (working tree) — built from the bytes already in hand
-  → collect FileResult { rel, l1_hash, l2_hash?, … }
-  → Forward to daemon via IPC (UDS)
-        IndexWriter::upsert_file(...) — Fjall secondary index
-        per-file commit               — atomic batch (daemon-side)
+        IndexWriter::upsert_file(...) — stage each file's atomic replacement
+        WorkerIndexBatch              — commit on file/byte/shared staging bounds
+  → absorb one bounded chunk of FileResult values, then release it
   → apply_outcomes:
         write Index meta
         prune deleted files via IndexWriter::remove_file
@@ -271,13 +263,18 @@ Walker (gitignore-aware)
         LANE_BM25_STATS     — recompute corpus-global BM25 N / avgdl
 ```
 
-The daemon is the sole writer to Fjall and LanceDB. Scan processes forward their extraction
-results to the daemon, which applies index updates atomically.
+The pipeline runs against the store owned by its caller: a local scan holds the
+workspace writer lock, while daemon rescans run through the workspace pool. A
+forwarded rescan asks the daemon to run the scan; it is not a per-file extraction
+result stream from a separate CLI process.
 
 Key invariants:
 
-- **Per-file commit** — every `process_file` commits its Fjall batch before
-  returning. Fjall handles cross-thread locking; the scanner does not.
+- **Bounded index commits** — each file stages its replacement atomically, while
+  `scanner_index_batch.rs` groups files into worker batches. File count, per-worker
+  staged bytes and a shared staged-byte ledger trigger commits; worker completion
+  flushes the remainder. Atomic per-file replacement does not imply one commit
+  per file.
 - **Atomic upsert** — `IndexWriter::upsert_file` is read-before-write: read
   existing primary entries first to derive secondary-index keys for deletion,
   then stage all deletes + inserts in one batch. No torn state on re-scan.
@@ -286,8 +283,10 @@ Key invariants:
   lane. Everything after the barrier — resolved-reference stitching, LanceDB
   document/code embedding batches, BM25 corpus stats — is enrichment: each lane
   runs inside `scanner_lanes::run_optional_lane` (`catch_unwind`-wrapped), so a
-  panic or hang in one lane degrades only that lane (e.g. "no resolved refs")
-  and never costs the code map itself. Source: `src/scanner_lanes.rs`.
+  caught panic degrades that lane (e.g. "no resolved refs") without losing the
+  already-persisted code map. `catch_unwind` is not a timeout or a process-crash
+  boundary; document guards and resource budgets handle other failure cases.
+  Source: `src/scanner_lanes.rs`.
 - **Code-only code map** — `symbols`, `outline`, `grep` and the reference tools see code only.
   Markdown, rst, asciidoc, vimdoc, csv, json, yaml, toml, ini, xml, properties, dotenv, diff,
   gitignore/gitattributes and fluent files are chunked and searched as documents (gated by
@@ -502,6 +501,91 @@ sweep's health (`gc-state.json`, shown as `last_gc` by `cache stats`) are in `sr
 Budget eviction never touches a locked, most-recently-used or recently built workspace (even over
 budget, which is reported instead); the rules live in `src/store_gc_protect.rs`.
 
+### Cache identity and layout
+
+`store_layout.rs` resolves the data root from `BASEMIND_DATA_HOME`, otherwise the
+platform application data directory. Runtime cache data is outside the checkout:
+
+```text
+<data-root>/cache/
+├── blobs/                         shared, content-addressed extraction artifacts
+├── gc.lock                        serializes cross-workspace sweeps
+└── workspaces/<workspace-key>/
+    ├── workspace.json             canonical root marker
+    ├── status.json                cheap statusline snapshot
+    ├── .lock                      workspace writer ownership
+    ├── views/<view>/              view metadata and secondary index
+    ├── lance/                     lazily opened intelligence tables
+    └── git-history.fjall/         precomputed history index
+```
+
+This is a navigation sketch; constants in `store_layout.rs` and component open
+functions define exact paths. A workspace key hashes the canonical checkout
+path. Linked worktrees therefore get distinct view state while sharing identical
+blobs. Views distinguish `working`, `staged`, and `rev-<sha7>`. Memory scope can
+span clones of a repository and is not the same identifier as a workspace key.
+Git history is shared with the main checkout for linked worktrees via
+`git_history::shared_history_basemind_dir`, while view indexes remain separate.
+The comms broker has its own store and lifecycle; it is not a view of the code
+index. Cache administration must account for the machine-wide blob scope.
+
+## Configuration and trust
+
+`config/mod.rs` discovers the project config (root `basemind.toml` or supported
+`.config/` locations), parses TOML, validates the selected schema and loads
+`ConfigV1`. The model separates scan/watch/cache/MCP settings from documents,
+code search, memory, comms, shells, crawl, LLM and resource settings.
+
+For supported document overrides, precedence is MCP over CLI over environment
+over file over defaults. `config/layered.rs` explicitly merges fields and records
+provenance; it is not an automatic override mechanism for every config field.
+`config/daemon.rs` and the workspace pool detect configuration changes while a
+scan uses its captured config snapshot.
+
+Repository configuration is a separate trust layer from operator arguments and
+environment. `config/trust.rs` sanitizes repository-supplied external endpoints,
+secret environment references and symlink settings unless the appropriate
+operator grant exists. `config/root_guard.rs` bounds admitted workspace roots;
+extra-root containment lives in scanner enumeration. `url.rs` validates crawl
+targets and private-host policy. Config symlinks must resolve inside the
+workspace. Changes to these boundaries need the trust/root/security tests, not
+only a config round-trip test.
+
+## Privacy and protected workspaces
+
+Document extraction and the explicit `redact_text` tool share redaction machinery
+but have different output contracts. The tool can return redacted text,
+detections and the token-to-original rehydration map to a caller. It accepts
+custom patterns/terms and pseudonym dictionaries; `pii/` supplies pattern
+validation, relabeling, translation and pseudonym handling. Optional Candle NER
+uses `mcp/ner_windowing.rs` for tokenizer-aware coverage. `require_ner` makes
+fallback or incomplete NER an error rather than a successful pattern-only result.
+
+The scan path does not persist the rehydration map or derive a decryption key
+from workspace identifiers. `rehydration_ref` remains empty for compatibility;
+old map blobs are handled by cleanup/GC. `vault` encrypts/decrypts or edits maps
+in memory, while its caller owns persistence and keys. This is distinct from
+encryption of the full index at rest, which is a deployment/volume concern.
+
+A `safe/` entry marks a protected workspace (`protected.rs`), including a symlink
+or an inspection failure. Without the gateway capability, the agent-facing
+server withholds `redact_text` and `vault`, rejects their direct calls, restricts
+shared-memory operations, and refuses ordinary index/memory resource URIs.
+The CLI redaction/vault paths enforce the corresponding boundary too.
+
+Safe mirror files are served separately as `basemind://safe/<path>` by
+`mcp/safe_resources.rs`, with bounded listing/reading, symlink refusal and checks
+on the opened file. The gateway capability is a cooperation contract with an
+external application; OS sandboxing must prevent agent processes from reaching
+original files or launching an unrestricted same-user engine. Basemind's tool
+filter alone is not that sandbox. The gateway application itself is outside
+this repository.
+
+Read [ADR-0015: privacy gateway](adr/0015-privacy-gateway-boundary.md) and
+[ADR-0013: encryption at rest](adr/0013-encryption-at-rest-comes-from-the-volume.md)
+before changing these contracts. Tests include `mcp_protected_surface`,
+`mcp_safe_resources`, `pii_patterns_smoke` and module-level redaction/NER tests.
+
 ## MCP surface
 
 The daemon hosts the MCP router (`rmcp`) over a per-workspace shared read stack; `basemind serve`
@@ -509,29 +593,36 @@ relays a client's stdio to it, and HTTP-native clients dial the daemon's streama
 directly (opt-in via `BASEMIND_ALLOW_HTTP`, bearer token in `<comms_dir>/http.addr`). The live
 contract is `tests/mcp_smoke.rs`.
 
-The surface is **nine domain tools**, each dispatching on a required, non-defaulted `mode` — not
-one tool per verb (ADR-0011). The same nine names are the CLI groups, checked per
-`(domain, mode)` by `tests/cli_parity/` (see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). `src/mcp/mode.rs` (`define_mode!`) is the
-single source of the wire spellings, the CLI parity table, and the telemetry keys.
+The main surface groups operations into domain tools with a required `mode`
+(ADR-0011). The documents build also adds the `vault` domain and the standalone
+`redact_text` tool. `BasemindServer::assemble_router` in `src/mcp/mod.rs` defines
+registration; `server_handler.rs` applies protected-workspace visibility.
+`src/mcp/mode.rs` (`define_mode!`) defines mode wire spellings and telemetry keys.
+CLI correspondence is checked by `tests/cli_parity/`, with documented exceptions
+(see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). Incomplete GraphRAG modes are
+called out in the [feature catalog](agents/features.md#incomplete-and-proposed-work).
 
 | Tool / CLI group | `mode` values | Gate |
 |---|---|---|
 | `code` | outline, symbols, grep, files, find, definition, references, callers, implementations, dependents, expand, semantic, chunk | always |
-| `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open | always |
-| `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search | always |
+| `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open; entities, rag | core always; entity modes require `graphrag`, with incomplete retrieval/CLI support |
+| `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search, show | always |
 | `memory` | put, get, list, search, delete, audit, documents, mine, proposals, accept, reject | always¹ |
 | `admin` | status, repo, rescan, cache_stats, gc, cache_clear, telemetry, compress, delta, checkpoint, waste | always |
 | `web` | scrape, crawl, map | `crawl` |
-| `agents` | register, list, thread_start, thread_list, join, leave, members, add_member, remove_member, archive, post, history, message, inbox, ack, wait | `comms` |
+| `agents` | register, list, thread_start, thread_list, join, leave, members, add_member, remove_member, archive, post, history, message, inbox, ack, wait, cleanup, status | `comms` |
 | `workspace` | workspaces, worktrees, branches, claim, release | `comms` |
 | `shell` | spawn, send, capture, kill, list, broadcast | `shells` |
+| `vault` | encrypt, decrypt, find, forget, inspect | `documents`; protected-workspace restrictions |
+| `redact_text` / CLI `redact` | direct parameters, no mode | `documents`; protected-workspace restrictions |
 
 ¹ Advertised always, body-gated on the `memory` / `documents` features.
 
 Conventions:
 
-- All paths are `RelPath` (byte-precise, repo-relative). No arbitrary `String`
-  paths.
+- Code-map paths use `RelPath` (byte-precise, repo-relative). Other boundaries
+  have their own contracts: redaction accepts a document path and safe resources
+  validate mirror-relative URIs. Apply the owning boundary's validation.
 - Responses are `JsonSchema`-derived and stable; new fields are additive with
   `#[serde(default)]`.
 - Lists are capped (`limit`, default 100, max 1000). Index scans use
@@ -543,7 +634,7 @@ Conventions:
   `helpers_documents.rs`, `helpers_graph.rs`, `helpers_grep.rs`, `helpers_impls.rs`,
   `helpers_intel.rs`, `helpers_web.rs`, and more — see [Source layout](#source-layout));
   `tools.rs` and the `tools_<area>.rs` siblings contain `#[tool]` shims only, one per domain.
-- No `output_schema` on any of the nine tools (each domain's modes return different response
+- No `output_schema` on the consolidated domain tools (each domain's modes return different response
   shapes; SEP-2106 allows one per tool). Annotations coarsen to the union of a domain's modes,
   resolving toward the side effect (e.g. `shell` advertises `destructive_hint` because `kill` is
   one of its modes, while `code` and `git` keep `read_only_hint: true` since none of their modes
@@ -593,6 +684,13 @@ walks into posting-list lookups. Source:
   worktree. Index sync runs on a dedicated two-thread pool.
 
 ## Resource governance
+
+MCP request admission is separate from scanner memory backpressure.
+`mcp/admission.rs` shares a bounded heavy-operation semaphore across hosted
+connections and returns a retryable `server_busy` response when its bounded queue
+wait expires. Control calls bypass those permits so health, coordination and
+task status remain responsive. `mcp/tasks.rs` defines slow-call offloading and
+the read-only operations that can be safely abandoned on cancellation.
 
 The `[resources]` config table (`src/config/resources.rs`) is the single place an operator bounds
 basemind's footprint on a constrained machine:
@@ -731,40 +829,29 @@ The daemon owns a separate Fjall store for agent communication (singleton per us
 
 ```mermaid
 flowchart TB
-  subgraph agents["Agents (same machine, multiple repos)"]
-    A1["Agent A — repo X"]
-    A2["Agent B — repo Y (same workspace)"]
-    HK["SessionStart hook\n(boot-subscribe + inject)"]
+  A1["Agent A"] --> R1["serve relay"]
+  A2["Agent B"] --> R2["serve relay"]
+  R1 --> MCP
+  R2 --> MCP
+  HTTP["Authenticated HTTP client"] --> MCP
+  Hook["Session hook / coordination CLI"] --> Broker
+  subgraph Daemon["User-global comms daemon"]
+    MCP["MCP router / per-session identity"] --> Pool["Workspace pool / shared read stacks"]
+    MCP --> Broker["Thread discovery, membership and delivery"]
+    Broker --> CommsStore["Comms Fjall store: agents, threads, messages, cursors"]
+    Broker --> Registry["Worktree registry and advisory claims"]
+    Pool --> Memory["Scoped memory index / optional LanceDB enrichment"]
   end
-  subgraph serve["basemind serve (per session: stdio relay to the daemon-hosted MCP router)"]
-    MT["MCP tools: memory + agents"]
-    CC["CommsClient (proxy)"]
-    PEER["rmcp Peer (push, best-effort)"]
-  end
-  subgraph daemon["basemind daemon (singleton, user-global)"]
-    FE["Front-ends: UDS"]
-    THREADS["Thread registry\n(scope: repo | path-glob | subject)"]
-    BR["Broker: explicit join, fan-out, refcount"]
-    CS["CommsStore (Fjall):\nthreads · members · messages_by_thread(front-matter)\n· message_body · subs · cursors · agents · registry"]
-  end
-  subgraph cache["Global cache\n~/.local/share/basemind"]
-    MEM["memory_by_key (scope, visibility, owner)"]
-    LAN["LanceDB memory (+agent_id +visibility)"]
-  end
-  A1 --> serve
-  A2 -->|own serve| daemon
-  HK -->|discover threads| daemon
-  CC -->|len-prefixed msgpack / JSON-RPC over UDS| FE --> BR --> THREADS --> CS
-  BR -. push .-> CC -. notify .-> PEER
-  MT --> cache
 ```
 
 ### Why a separate daemon
 
-The daemon is the sole Fjall writer (across all repos on the machine). This allows N `basemind serve`
-sessions on the same repo to read concurrently without downgrade-to-read-only races. The daemon is
-a singleton enforced by socket-bind-as-lock (a Unix domain socket whose successful bind IS the lock);
-stale sockets are reclaimed probe-before-unlink. It auto-starts on first need and stops on explicit `comms stop`.
+The daemon owns the comms store and its active workspace writers. Multiple
+`basemind serve` sessions therefore share those writers and read stacks. Startup
+acquires the daemon lock before binding its endpoint; Unix socket reclamation
+uses probe-before-unlink. Windows has a named-pipe transport. Spawn-on-demand,
+explicit stop, version replacement and idle cleanup are coordinated by
+`comms/singleton*.rs`, `daemon_lock.rs` and `comms/daemon_lifecycle.rs`.
 
 ### Daemon lifecycle and resource containment
 

@@ -147,7 +147,7 @@ full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-s
 #   only exists in a build with this feature.
 # Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
 hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
-graphrag = ["documents", "dep:lance-graph"]
+graphrag = ["documents", "dep:lance-graph", "dep:arrow-select", "dep:arrow-ipc", "dep:arrow56"]
 test-support = ["dep:tempfile"]
 
 ort-dynamic = ["xberg?/ort-dynamic"]
@@ -162,6 +162,14 @@ arc-swap = "1.9.2"
 # Bumping past 58 forks arrow into two versions and breaks Scannable/Schema type identity. ~keep
 arrow-array = { version = "=58", optional = true }
 arrow-schema = { version = "=58", optional = true }
+# graphrag: `concat_batches` over the graph table batches handed to lance-graph's Cypher
+# engine. Same `=58` pin as arrow-array/arrow-schema (see the fork note above).
+arrow-select = { version = "=58", optional = true }
+# graphrag: lance-graph 0.5.4 still builds against arrow 56 while lancedb 0.40 is on
+# arrow 58. The graph bridge crosses the boundary with an in-memory IPC roundtrip
+# (writer on 58, reader on 56) — see `batch_to_v56` in lance/graphrag.rs.
+arrow-ipc = { version = "=58", optional = true }
+arrow56 = { package = "arrow", version = "=56.2", default-features = false, features = ["ipc"], optional = true }
 base64 = "0.23"
 blake3 = "1"
 bstr = { version = "1", features = ["serde"] }
@@ -351,6 +359,10 @@ opt-level = 2
 
 [[example]]
 name = "doc_measure"
+required-features = ["documents"]
+
+[[example]]
+name = "document_benchmark"
 required-features = ["documents"]
 
 [[example]]

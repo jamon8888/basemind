@@ -108,6 +108,8 @@ pub fn table() -> Vec<Row> {
         pair("graph", "export", "graph export"),
         pair("graph", "display", "graph display"),
         pair("graph", "open", "graph open"),
+        pair("graph", "entities", "graph entities"),
+        pair("graph", "rag", "graph rag"),
         // ---- admin ----
         pair("admin", "status", "status"),
         pair("admin", "repo", "admin repo"),
