@@ -35,6 +35,7 @@ flowchart TD
   Helpers -->|daemon owns index| Daemon
   Helpers -->|local read| Cache["Workspace views and indexes"]
   Rescan["rescan"] -->|daemon running| Daemon
+  Rescan -->|no daemon| Cache
   Scan["Local scan/watch: exclusive writer lock"] --> Cache
   Daemon --> Cache
   Cache --> Blobs["Machine-global content-addressed blobs"]
@@ -104,7 +105,7 @@ src/
 │   │                         refs_by_path (code-intelligence reverse index)
 │   ├── keys.rs             — length-prefixed composite key encodings
 │   ├── grep_bloom.rs       — per-file trigram bloom rows: the `code grep` candidate prefilter
-│   │                         (ADR-0012)
+│   │                         ([ADR-0012: Grep content prefilter](adr/0012-grep-content-prefilter.md))
 │   ├── name_dict.rs        — resident dictionary of distinct callee / trait names behind
 │   │                         `references` / `callers` / `implementations`
 │   └── writer.rs           — atomic read-before-write upsert; per-file commit;
@@ -842,7 +843,6 @@ flowchart TB
     Pool --> Memory["Scoped memory index / optional LanceDB enrichment"]
   end
 ```
-
 
 ### Why a separate daemon
 

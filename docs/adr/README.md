@@ -67,7 +67,6 @@ referring to those decisions; the number alone is ambiguous. Status here mirrors
 the ADR text, while the [feature catalog](../agents/features.md) describes current
 implementation and limitations.
 
-Implementation specs live in [`../specs/`](../specs/). ADR-0012's spec is
-[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). ADR-0013
-constrains that spec's §14.0 rather than adding a new one. ADR-0014 governs which tier a path is
-indexed in, which is the question the spec's `documents` tier assumes rather than answers.
+Implementation specs live in [`../specs/`](../specs/). [ADR-0012: Multi-lane document retrieval](0012-multi-lane-document-retrieval.md)'s spec is
+[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). [ADR-0013: Encryption at rest comes from the volume](0013-encryption-at-rest-comes-from-the-volume.md)
+constrains that spec's §14.0 rather than adding a new one. [ADR-0014: Tier routing is declared by the caller](0014-tier-routing-is-declared-by-the-caller.md) governs which tier a path is indexed in, which is the question the spec's `documents` tier assumes rather than answers.

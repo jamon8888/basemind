@@ -930,7 +930,8 @@ pub(super) async fn run_graph_entities(
     };
 
     let scope = shared.scope.clone();
-    let max_rows = params.max_rows.unwrap_or(200).min(1000) as usize;
+    let configured_max_rows = shared.config.documents.graphrag.max_rows;
+    let max_rows = params.max_rows.unwrap_or(configured_max_rows).min(configured_max_rows) as usize;
     let cypher = params.cypher.clone();
 
     // Same rule as the open above: `execute_cypher` block_ons the lance runtime

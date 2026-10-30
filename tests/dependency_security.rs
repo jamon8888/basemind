@@ -26,6 +26,30 @@ fn direct_dependents(lock: &toml::Value, dependency: &str) -> Vec<(String, Strin
     matches
 }
 
+fn direct_dependents_matching(lock: &toml::Value, prefix: &str) -> Vec<(String, String)> {
+    let mut matches: Vec<_> = packages(lock)
+        .iter()
+        .filter(|package| {
+            package
+                .get("dependencies")
+                .and_then(toml::Value::as_array)
+                .is_some_and(|dependencies| {
+                    dependencies
+                        .iter()
+                        .any(|item| item.as_str().is_some_and(|dep| dep.starts_with(prefix)))
+                })
+        })
+        .map(|package| {
+            (
+                package["name"].as_str().expect("package name").to_string(),
+                package["version"].as_str().expect("package version").to_string(),
+            )
+        })
+        .collect();
+    matches.sort();
+    matches
+}
+
 fn version_at_least(version: &str, minimum: (u64, u64)) -> bool {
     let mut parts = version
         .split('.')
@@ -43,10 +67,9 @@ fn xberg_11_removes_the_vulnerable_quick_xml_line() {
     // as the `name version` form Cargo.lock uses when several versions coexist.
     // reqsign still pins quick-xml 0.37 transitively; ensure the vulnerable line is
     // not reintroduced through xberg itself (the original invariant this test protects).
-    let vulnerable_dependents: Vec<String> = packages(&lock)
-        .iter()
-        .filter(|package| package["name"].as_str() == Some("reqsign"))
-        .map(|package| package["name"].as_str().unwrap_or_default().to_string())
+    let vulnerable_dependents: Vec<String> = direct_dependents_matching(&lock, "quick-xml 0.37.")
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
     assert_eq!(vulnerable_dependents, ["reqsign"]);
 
