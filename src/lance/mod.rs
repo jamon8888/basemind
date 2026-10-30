@@ -280,12 +280,14 @@ impl LanceStore {
     /// Shared LanceDB connection — read surface for the graphrag module (spec 0016):
     /// the `graph entities` / `graph rag` tools run Cypher over the same connection
     /// the store owns, instead of reaching into the private `inner`.
+    #[cfg(feature = "graphrag")]
     pub(crate) fn connection(&self) -> &Connection {
         &self.inner.connection
     }
 
     /// The store's tokio runtime, for `block_on` around lance-graph's async Cypher
     /// execution from sync call sites (same contract as [`LanceStoreInner::rt`]).
+    #[cfg(feature = "graphrag")]
     pub(crate) fn runtime(&self) -> &Runtime {
         self.inner.rt()
     }
