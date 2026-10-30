@@ -175,6 +175,25 @@ pub enum GraphCmd {
         #[arg(long = "no-open")]
         no_open: bool,
     },
+    /// Read-only Cypher query over the entity graph (GLiNER mentions + co-occurrence).
+    Entities {
+        /// Cypher query string (read-only: MATCH, RETURN, WHERE, LIMIT, ORDER BY, WITH, UNION only).
+        cypher: String,
+        /// Maximum rows to return (server-side budget, default from config).
+        #[arg(long)]
+        max_rows: Option<u32>,
+    },
+    /// GraphRAG: hybrid retrieval via entity graph expansion.
+    Rag {
+        /// Natural language query to embed and expand.
+        query: String,
+        /// Number of hops for entity expansion (default from config, max 2).
+        #[arg(long)]
+        hops: Option<u8>,
+        /// Maximum fused candidates to return.
+        #[arg(long)]
+        max_results: Option<u32>,
+    },
 }
 
 /// Dispatch a `graph` subcommand through the in-process server.
@@ -341,6 +360,21 @@ pub async fn run(server: &BasemindServer, cmd: GraphCmd, opts: &Emit, out: &mut 
             max_edges,
             open: Some(!no_open),
             ..GraphParams::new(GraphMode::Open)
+        },
+        GraphCmd::Entities { cypher, max_rows } => GraphParams {
+            cypher: Some(cypher),
+            max_rows,
+            ..GraphParams::new(GraphMode::Entities)
+        },
+        GraphCmd::Rag {
+            query,
+            hops,
+            max_results,
+        } => GraphParams {
+            query: Some(query),
+            hops: hops.map(u32::from),
+            max_results,
+            ..GraphParams::new(GraphMode::Rag)
         },
     };
 

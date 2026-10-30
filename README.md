@@ -37,6 +37,10 @@ git history & blame · shared memory · web crawl · agent-to-agent comms
 
 ## What you get
 
+Developing Basemind with Claude Code or Codex? Start with the
+[agent guide](docs/agents/README.md) for the codebase map, feature gates,
+architecture, and validation workflow.
+
 basemind answers with **file paths, line numbers, and signatures — not whole files** — so a question
 about your code costs a small fraction of the tokens it takes to read the source.
 

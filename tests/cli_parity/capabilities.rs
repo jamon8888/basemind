@@ -108,6 +108,8 @@ pub fn table() -> Vec<Row> {
         pair("graph", "export", "graph export"),
         pair("graph", "display", "graph display"),
         pair("graph", "open", "graph open"),
+        pair("graph", "entities", "graph entities"),
+        pair("graph", "rag", "graph rag"),
         // ---- admin ----
         pair("admin", "status", "status"),
         pair("admin", "repo", "admin repo"),
@@ -256,6 +258,10 @@ pub fn table() -> Vec<Row> {
             "redact",
             "file/stdin redaction driver over the same engine as the `redact_text` MCP tool; the tool takes inline text and carries no mode enum, so there is no (tool, mode) pair to point at",
         ),
+    ]);
+    rows.extend([
+        mcp_only("graph", "entities", "GraphRAG entity lookup is currently MCP-only"),
+        mcp_only("graph", "rag", "GraphRAG retrieval is currently MCP-only"),
     ]);
     rows
 }
