@@ -910,27 +910,45 @@ pub(super) async fn run_graph_entities(
         Err(_) => return Err(McpError::internal_error("store locked", None)),
     };
     let lance_store = match &store.lance {
-        Some(ls) => ls,
+        Some(ls) => ls.clone(),
         None => {
-            return Err(McpError::invalid_params(
-                "graphrag feature not enabled or lance store not available",
-                None,
-            ));
+            // Read-only serve path: no document insert ever lazy-opened lance.
+            // Open the on-disk store for reading — via `open_existing`, which
+            // takes the (dim, model) identity from meta.json so a config drift
+            // cannot trigger the wipe-on-mismatch path. `LanceStore::open`
+            // block_ons its own runtime, which panics when called from inside
+            // this daemon runtime — so hop to a blocking thread first.
+            let dir = basemind_dir.join(crate::store_layout::LANCE_DIR);
+            tokio::task::spawn_blocking(move || crate::lance::open_existing(&dir))
+                .await
+                .map_err(|e| McpError::internal_error(format!("lance open task: {e}"), None))?
+                .map_err(|e| McpError::internal_error(format!("open lance store: {e}"), None))?
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "graphrag feature not enabled or lance store not available",
+                        None,
+                    )
+                })?
         }
     };
 
     let scope = shared.scope.clone();
     let max_rows = params.max_rows.unwrap_or(200).min(1000) as usize;
+    let cypher = params.cypher.clone();
 
-    let cypher_result = tokio::task::block_in_place(|| {
+    // Same rule as the open above: `execute_cypher` block_ons the lance runtime
+    // internally, so it must run off the daemon's async workers.
+    let cypher_result = tokio::task::spawn_blocking(move || {
         execute_cypher(
             lance_store.connection(),
             lance_store.runtime(),
             &scope,
-            &params.cypher,
+            &cypher,
             max_rows,
         )
     })
+    .await
+    .map_err(|e| McpError::internal_error(format!("cypher task: {e}"), None))?
     .map_err(|e| McpError::internal_error(format!("Cypher execution failed: {e}"), None))?;
 
     let truncated = cypher_result.rows.len() >= max_rows;

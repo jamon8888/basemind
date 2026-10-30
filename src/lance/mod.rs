@@ -82,6 +82,23 @@ struct LanceMeta {
 
 const META_FILE: &str = "meta.json";
 
+/// Open the existing lance store for read-side tools (the MCP `graph` modes)
+/// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
+/// identity is read back from `meta.json` instead of taken from config, so a
+/// caller that guesses wrong cannot destroy the store. Returns `None` when no
+/// store exists on disk (nothing was ever scanned with lance enabled).
+#[cfg(feature = "intelligence")]
+pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
+    let meta_path = dir.join(META_FILE);
+    if !meta_path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
+    let meta: LanceMeta =
+        serde_json::from_slice(&body).with_context(|| format!("parse {}", meta_path.display()))?;
+    LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
+}
+
 /// Schema version of the lance Arrow tables, bound to the release minor exactly like
 /// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. Bump `RELEASE_MINOR` whenever the
 /// `memory` or `documents` table column set changes; the resulting `LanceMeta` mismatch
