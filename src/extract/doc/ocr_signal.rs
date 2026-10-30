@@ -56,8 +56,10 @@ fn non_whitespace_chars(content: &str) -> usize {
 }
 
 fn sanitize_path_for_log(path: &Path) -> String {
-    let _ = path;
-    "<document>".to_string()
+    path.to_string_lossy()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 #[cfg(test)]
@@ -69,13 +71,13 @@ mod tests {
     fn sanitize_path_for_log_removes_control_characters() {
         assert_eq!(
             sanitize_path_for_log(Path::new("docs/evil\n\r\tname.pdf")),
-            "<document>"
+            "docs/evilname.pdf"
         );
     }
 
     #[test]
     fn log_path_drops_terminal_control_characters() {
         let safe = sanitize_path_for_log(Path::new("scan\u{1b}[2J\ncontract.png"));
-        assert_eq!(safe, "<document>");
+        assert_eq!(safe, "scan[2Jcontract.png");
     }
 }

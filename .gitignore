@@ -80,10 +80,5 @@ AGENTS.md
 CLAUDE.md
 # END ai-rulez
 
-# Shared, maintained repository entry points for Codex and Claude Code.
-# Keep these exceptions outside ai-rulez's generated ignore block.
-!/AGENTS.md
-!/CLAUDE.md
-
 .env
 /node_modules/

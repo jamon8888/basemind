@@ -25,26 +25,6 @@ ignore = [
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
-  # Transitive advisories in the all-features Lance/Arrow and document-parser
-  # graph. Keep the dependency graph pinned for this release candidate; these
-  # are tracked for remediation when upstream fixes are available.
-  "RUSTSEC-2026-0258",
-  "RUSTSEC-2026-0418",
-  "RUSTSEC-2026-0173",
-  "RUSTSEC-2026-0414",
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
-  "RUSTSEC-2023-0071",
-  "RUSTSEC-2026-0346",
-  "RUSTSEC-2026-0349",
-  "RUSTSEC-2026-0098",
-  "RUSTSEC-2026-0099",
-  "RUSTSEC-2026-0104",
-  "RUSTSEC-2026-0382",
-  "RUSTSEC-2026-0391",
-  "RUSTSEC-2026-0398",
-  "RUSTSEC-2026-0403",
-  "RUSTSEC-2026-0410",
 ]
 [licenses]
 allow = [

@@ -76,9 +76,7 @@ def generate(root: Path) -> Path:
     )
     manifest = root / "synthetic-manifest.txt"
     manifest.write_text(
-        "\n".join(
-            path.name for path in sorted(root.iterdir()) if path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"}
-        )
+        "\n".join(path.name for path in sorted(root.iterdir()) if path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"})
         + "\n"
     )
     return manifest

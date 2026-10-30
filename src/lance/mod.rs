@@ -82,22 +82,6 @@ struct LanceMeta {
 
 const META_FILE: &str = "meta.json";
 
-/// Open the existing lance store for read-side tools (the MCP `graph` modes)
-/// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
-/// identity is read back from `meta.json` instead of taken from config, so a
-/// caller that guesses wrong cannot destroy the store. Returns `None` when no
-/// store exists on disk (nothing was ever scanned with lance enabled).
-#[cfg(feature = "intelligence")]
-pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
-    let meta_path = dir.join(META_FILE);
-    if !meta_path.exists() {
-        return Ok(None);
-    }
-    let body = std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
-    let meta: LanceMeta = serde_json::from_slice(&body).with_context(|| format!("parse {}", meta_path.display()))?;
-    LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
-}
-
 /// Schema version of the lance Arrow tables, bound to the release minor exactly like
 /// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. Bump `RELEASE_MINOR` whenever the
 /// `memory` or `documents` table column set changes; the resulting `LanceMeta` mismatch
@@ -293,21 +277,6 @@ impl LanceStore {
         self.inner.dim
     }
 
-    /// Shared LanceDB connection — read surface for the graphrag module (spec 0016):
-    /// the `graph entities` / `graph rag` tools run Cypher over the same connection
-    /// the store owns, instead of reaching into the private `inner`.
-    #[cfg(feature = "graphrag")]
-    pub(crate) fn connection(&self) -> &Connection {
-        &self.inner.connection
-    }
-
-    /// The store's tokio runtime, for `block_on` around lance-graph's async Cypher
-    /// execution from sync call sites (same contract as [`LanceStoreInner::rt`]).
-    #[cfg(feature = "graphrag")]
-    pub(crate) fn runtime(&self) -> &Runtime {
-        self.inner.rt()
-    }
-
     pub fn embedding_model(&self) -> &str {
         &self.inner.embedding_model
     }
@@ -418,43 +387,6 @@ impl LanceStore {
                 None => q.only_if(scope_clause),
             };
             let mut stream = q.execute().await.context("run document search")?;
-            let mut hits = Vec::new();
-            while let Some(batch) = stream.try_next().await.context("stream next batch")? {
-                decode_document_hits(&batch, &mut hits)?;
-            }
-            anyhow::Ok(hits)
-        })
-    }
-
-    /// Fetch document chunks for specific paths (plain scan, no vector search).
-    ///
-    /// Used by the GraphRAG `rag` mode to pull the chunk text of graph-expanded
-    /// documents that the vector lane did not surface on its own.
-    pub fn document_chunks_for_paths(&self, scope: &str, paths: &[String], limit: usize) -> Result<Vec<DocumentHit>> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.inner.rt().block_on(async {
-            let table = self
-                .inner
-                .connection
-                .open_table(DOCUMENTS_TABLE)
-                .execute()
-                .await
-                .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
-            let path_list = paths
-                .iter()
-                .map(|p| format!("'{}'", escape_sql_literal(p)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let predicate = format!("scope = '{}' AND path IN ({path_list})", escape_sql_literal(scope));
-            let mut stream = table
-                .query()
-                .only_if(predicate)
-                .limit(limit)
-                .execute()
-                .await
-                .context("fetch document chunks")?;
             let mut hits = Vec::new();
             while let Some(batch) = stream.try_next().await.context("stream next batch")? {
                 decode_document_hits(&batch, &mut hits)?;
