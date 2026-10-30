@@ -352,7 +352,21 @@ pub(crate) fn extract_and_persist_doc(
         // Build GraphRAG entity graph from cached doc's NER sidecar (spec 0016).
         #[cfg(feature = "graphrag")]
         if cfg.graphrag.enabled {
-            if let Some(lance) = store.lance.as_ref() {
+            // The entity graph lives in lance even when `embed = false`. This path holds
+            // `&Store` (immutable) so `lance_or_open` is out of reach — open a standalone
+            // handle against the same `.basemind/lance/` dir instead; LanceDB connections
+            // to one store are independent and safe to hold in parallel.
+            let lance = store.lance.clone().or_else(|| {
+                preset_dim(&cfg.embedding_preset).ok().and_then(|dim| {
+                    let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
+                    crate::lance::LanceStore::open(&dir, dim, &cfg.embedding_preset)
+                        .map_err(|error| {
+                            tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build")
+                        })
+                        .ok()
+                })
+            });
+            if let Some(lance) = lance {
                 use crate::lance::graphrag::{
                     DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
                     upsert_graph_entities,
@@ -389,17 +403,14 @@ pub(crate) fn extract_and_persist_doc(
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
                         let _ = crate::lance::graphrag::upsert_graph_entities(
-                            &lance.inner.connection,
-                            &lance.inner.runtime,
+                            lance.connection(),
+                            lance.runtime(),
                             &entity_rows,
                         );
                     }
                     if !edge_rows.is_empty() {
-                        let _ = crate::lance::graphrag::upsert_graph_edges(
-                            &lance.inner.connection,
-                            &lance.inner.runtime,
-                            &edge_rows,
-                        );
+                        let _ =
+                            crate::lance::graphrag::upsert_graph_edges(lance.connection(), lance.runtime(), &edge_rows);
                     }
                 }
             }
@@ -467,7 +478,17 @@ pub(crate) fn extract_and_persist_doc(
     // Only runs when graphrag feature is enabled and config has graphrag.enabled = true.
     #[cfg(feature = "graphrag")]
     if cfg.graphrag.enabled {
-        if let Some(lance) = store.lance.as_ref() {
+        // Same standalone-open rationale as the cached-doc path above: `&Store` is
+        // immutable here, and the graph must survive `embed = false` on a fresh workspace.
+        let lance = store.lance.clone().or_else(|| {
+            preset_dim(&cfg.embedding_preset).ok().and_then(|dim| {
+                let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
+                crate::lance::LanceStore::open(&dir, dim, &cfg.embedding_preset)
+                    .map_err(|error| tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build"))
+                    .ok()
+            })
+        });
+        if let Some(lance) = lance {
             use crate::lance::graphrag::{
                 DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,
             };
@@ -504,17 +525,13 @@ pub(crate) fn extract_and_persist_doc(
             if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                 if !entity_rows.is_empty() {
                     let _ = crate::lance::graphrag::upsert_graph_entities(
-                        &lance.inner.connection,
-                        &lance.inner.runtime,
+                        lance.connection(),
+                        lance.runtime(),
                         &entity_rows,
                     );
                 }
                 if !edge_rows.is_empty() {
-                    let _ = crate::lance::graphrag::upsert_graph_edges(
-                        &lance.inner.connection,
-                        &lance.inner.runtime,
-                        &edge_rows,
-                    );
+                    let _ = crate::lance::graphrag::upsert_graph_edges(lance.connection(), lance.runtime(), &edge_rows);
                 }
             }
         }

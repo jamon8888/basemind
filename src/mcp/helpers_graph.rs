@@ -900,8 +900,8 @@ pub(super) fn run_graph_entities(
     cache: &MapCache,
     basemind_dir: &std::path::Path,
     params: super::types_graph::GraphEntitiesParams,
-    notice: Option<super::types::LifecycleNotice>,
-    started: std::time::Instant,
+    _notice: Option<super::types::LifecycleNotice>,
+    _started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
     use crate::lance::execute_cypher;
 
@@ -923,24 +923,20 @@ pub(super) fn run_graph_entities(
     let max_rows = params.max_rows.unwrap_or(200).min(1000) as usize;
 
     let cypher_result = execute_cypher(
-        &lance_store.inner.connection,
-        &lance_store.inner.runtime,
+        lance_store.connection(),
+        lance_store.runtime(),
         &scope,
         &params.cypher,
         max_rows,
     )
     .map_err(|e| McpError::internal_error(format!("Cypher execution failed: {e}"), None))?;
 
-    let elapsed = started.elapsed().as_micros() as u64;
-    json_result(
-        super::types_graph::GraphEntitiesResponse {
-            columns: cypher_result.columns,
-            rows: cypher_result.rows,
-            truncated: cypher_result.rows.len() >= max_rows,
-        },
-        notice,
-        elapsed,
-    )
+    let truncated = cypher_result.rows.len() >= max_rows;
+    json_result(&super::types_graph::GraphEntitiesResponse {
+        columns: cypher_result.columns,
+        rows: cypher_result.rows,
+        truncated,
+    })
 }
 
 #[cfg(not(feature = "graphrag"))]
