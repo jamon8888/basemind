@@ -666,55 +666,6 @@
             "format": "json"
           }
         },
-        "graphrag": {
-          "description": "GraphRAG entity graph built from the NER sidecar at scan time (spec 0016).",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "description": "Master switch - off by default.",
-              "type": "boolean",
-              "default": false
-            },
-            "labels": {
-              "description": "Labels projected as graph nodes. Numeric/secret labels are excluded by default.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "default": [
-                "person",
-                "organization",
-                "location"
-              ]
-            },
-            "max_rows": {
-              "description": "Max rows returned by Cypher queries (server-side budget).",
-              "type": "integer",
-              "minimum": 1,
-              "default": 200
-            },
-            "hops": {
-              "description": "Hop depth for graph rag expansion (1 or 2).",
-              "type": "integer",
-              "enum": [
-                1,
-                2
-              ],
-              "default": 2
-            }
-          },
-          "default": {
-            "enabled": false,
-            "labels": [
-              "person",
-              "organization",
-              "location"
-            ],
-            "max_rows": 200,
-            "hops": 2
-          }
-        },
         "embed_max_threads": {
           "description": "Maximum number of threads dedicated to ONNX embedding. `0` means\n\"auto = max(2, logical_cpus / 4)\" — a bounded fraction of available\ncores so the embedder never pins the machine. Both the document and\ncode-search tiers route their `embed_texts` calls through a single\nprocess-wide rayon `ThreadPool` of this size; code-map extraction\nkeeps the full global pool.",
           "type": "integer",
@@ -777,7 +728,7 @@
           "format": "uint",
           "minimum": 0,
           "default": 20
-        }
+}
       },
       "additionalProperties": false
     },
@@ -931,9 +882,7 @@
         "categories": {
           "description": "PII categories to redact. Empty = all categories supported by the engine.\nAccepted values: email, phone, ssn, credit_card, iban, ip_address, swift_bic,\npostal_code, date_of_birth, person, organization, location.",
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string" },
           "default": []
         },
         "strategy": {
@@ -953,17 +902,13 @@
         "custom_terms": {
           "description": "Custom literal terms to redact.",
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/RedactionCustomTerm"
-          },
+          "items": { "$ref": "#/$defs/RedactionCustomTerm" },
           "default": []
         },
         "custom_patterns": {
           "description": "Custom regex patterns to redact.",
           "type": "array",
-          "items": {
-            "$ref": "#/$defs/RedactionCustomPattern"
-          },
+          "items": { "$ref": "#/$defs/RedactionCustomPattern" },
           "default": []
         }
       },
@@ -971,12 +916,7 @@
     },
     "RedactionStrategy": {
       "type": "string",
-      "enum": [
-        "token_replace",
-        "mask",
-        "hash",
-        "drop"
-      ]
+      "enum": ["token_replace", "mask", "hash", "drop"]
     },
     "NerRedactionConfig": {
       "type": "object",
@@ -987,25 +927,18 @@
         },
         "model": {
           "description": "Override the ONNX model name.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": ["string", "null"]
         },
         "categories": {
           "description": "NER categories to detect.",
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string" },
           "default": []
         },
         "custom_labels": {
           "description": "Custom labels for zero-shot detection.",
           "type": "array",
-          "items": {
-            "type": "string"
-          },
+          "items": { "type": "string" },
           "default": []
         }
       },
@@ -1028,10 +961,7 @@
           "default": false
         }
       },
-      "required": [
-        "label",
-        "value"
-      ],
+      "required": ["label", "value"],
       "additionalProperties": false
     },
     "RedactionCustomPattern": {
@@ -1051,10 +981,7 @@
           "default": false
         }
       },
-      "required": [
-        "label",
-        "pattern"
-      ],
+      "required": ["label", "pattern"],
       "additionalProperties": false
     },
     "OcrConfig": {
