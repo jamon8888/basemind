@@ -543,7 +543,7 @@ fn main() -> Result<()> {
             .as_ref()
             .is_some_and(|path| path.file_name().is_some_and(|name| name == "synthetic-incremental.txt"));
 
-    let mut full_scan = |label: &str, store: &mut Store| -> Result<()> {
+    let full_scan = |label: &str, store: &mut Store, runs_out: &mut Vec<Value>| -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
@@ -583,11 +583,11 @@ fn main() -> Result<()> {
         );
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         value["cache_before_run"] = json!(cache_before);
-        runs.push(value);
+        runs_out.push(value);
         Ok(())
     };
 
-    let mut incremental_scan = |paths: &[PathBuf], store: &mut Store| -> Result<()> {
+    let incremental_scan = |paths: &[PathBuf], store: &mut Store, runs_out: &mut Vec<Value>| -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
@@ -619,14 +619,14 @@ fn main() -> Result<()> {
         );
         value["wall_clock_ms"] = json!(started.elapsed().as_millis());
         value["cache_before_run"] = json!(cache_before);
-        runs.push(value);
+        runs_out.push(value);
         Ok(())
     };
 
     match mode {
-        Mode::Cold => full_scan("cold", &mut store)?,
+        Mode::Cold => full_scan("cold", &mut store, &mut runs)?,
         Mode::Warm => {
-            full_scan("warm", &mut store)?;
+            full_scan("warm", &mut store, &mut runs)?;
         }
         Mode::Incremental => {
             let changed = changed_file
@@ -636,16 +636,16 @@ fn main() -> Result<()> {
             if should_mutate {
                 mutate_synthetic_incremental(&changed[0])?;
             }
-            incremental_scan(&changed, &mut store)?;
+            incremental_scan(&changed, &mut store, &mut runs)?;
         }
         Mode::All => {
-            full_scan("cold", &mut store)?;
-            full_scan("warm", &mut store)?;
+            full_scan("cold", &mut store, &mut runs)?;
+            full_scan("warm", &mut store, &mut runs)?;
             if let Some(path) = changed_file {
                 if should_mutate {
                     mutate_synthetic_incremental(&path)?;
                 }
-                incremental_scan(&[path], &mut store)?;
+                incremental_scan(&[path], &mut store, &mut runs)?;
             }
         }
     }
