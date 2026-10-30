@@ -362,6 +362,10 @@ name = "doc_measure"
 required-features = ["documents"]
 
 [[example]]
+name = "document_benchmark"
+required-features = ["documents"]
+
+[[example]]
 name = "lance_bench"
 required-features = ["documents"]
 
