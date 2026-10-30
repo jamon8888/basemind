@@ -34,7 +34,7 @@ use crate::extract::doc::ocr_signal;
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc_with_metrics};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
-use crate::lance::{DocumentRow, PendingBatch};
+use crate::lance::{DocEntitySidecar, DocumentRow, PendingBatch};
 use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::scanner_filter::Filters;
@@ -308,8 +308,11 @@ fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
     let mut candidates: Vec<(String, String)> = Vec::new();
     for m in re.captures_iter(content) {
         let full = m.get(0).map(|t| t.as_str()).unwrap_or_default().to_string();
-        candidates.push((format!("{}{}", m[2].to_lowercase(), m[3]), full.clone()));
-        candidates.push((m[1].to_lowercase(), full));
+        let class = m.get(2).map(|value| value.as_str()).unwrap_or_default();
+        let ordinal = m.get(3).map(|value| value.as_str()).unwrap_or_default();
+        let anchor = m.get(1).map(|value| value.as_str()).unwrap_or_default();
+        candidates.push((format!("{}{}", class.to_lowercase(), ordinal), full.clone()));
+        candidates.push((anchor.to_lowercase(), full));
     }
     if candidates.is_empty() {
         return;
