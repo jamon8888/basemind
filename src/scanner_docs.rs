@@ -34,7 +34,9 @@ use crate::extract::doc::ocr_signal;
 use crate::extract::doc::{DocConfig, FileMapDoc, extract_doc_with_metrics};
 use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
-use crate::lance::{DocEntitySidecar, DocumentRow, PendingBatch};
+#[cfg(feature = "graphrag")]
+use crate::lance::DocEntitySidecar;
+use crate::lance::{DocumentRow, PendingBatch};
 use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::scanner_filter::Filters;
@@ -296,6 +298,7 @@ fn matches_mime(entry: &str, mime_type: &str) -> bool {
 /// (`EntityKeySource::GatewayToken`) instead of a document-local span literal.
 /// Matching is normalization-tolerant (lowercase, alphanumerics only) because
 /// the span text and the token interior are normalized differently.
+#[cfg(feature = "graphrag")]
 fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
     static TOKEN_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = TOKEN_RE.get_or_init(|| {
