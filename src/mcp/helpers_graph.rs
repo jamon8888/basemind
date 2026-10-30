@@ -751,8 +751,6 @@ impl CallProjection {
     }
 }
 
-/// Shared BFS scaffolding: node vec, name→index map, frontier queue, and truncation flags. The
-/// two directions differ only in which end of a discovered edge is the new node.
 struct Bfs {
     nodes: Vec<CallGraphNode>,
     index_of: AHashMap<String, u32>,
@@ -785,8 +783,6 @@ impl Bfs {
         }
     }
 
-    /// Intern `name` as a node at `depth + 1` (or reuse an existing one), enqueueing it on first
-    /// sight. Returns its index, or `None` when a new node would exceed `max_nodes`.
     fn intern(&mut self, name: &str, depth: u32, sites: impl FnOnce(&str) -> Vec<CallGraphSite>) -> Option<u32> {
         if let Some(&idx) = self.index_of.get(name) {
             return Some(idx);
@@ -815,8 +811,6 @@ impl Bfs {
         }
     }
 
-    /// `callers` step: `parent` (a caller) links to `current` (the callee). Returns `false` when
-    /// the node budget is exhausted (caller should stop).
     fn link(
         &mut self,
         parent: &str,
@@ -838,8 +832,6 @@ impl Bfs {
         }
     }
 
-    /// `callees` step: `current` (a caller) links to `child` (the callee). Returns `false` when
-    /// the node budget is exhausted.
     fn link_child(
         &mut self,
         current_idx: u32,
@@ -861,8 +853,6 @@ impl Bfs {
         }
     }
 
-    /// Resolve the final truncation flag. Precedence: an exhausted node budget (already recorded)
-    /// wins; then a truncated underlying graph build (`scan_cap`); then a depth-gated frontier.
     fn finish(mut self, build_truncated: bool) -> BfsOutcome {
         if self.truncation_reason.is_none() && build_truncated {
             self.truncated = true;
@@ -880,8 +870,6 @@ impl Bfs {
     }
 }
 
-/// Collapse a `name → set of names` adjacency into sorted, deduplicated lists for deterministic
-/// BFS traversal order (the underlying `AHashSet` iteration order is not stable).
 fn sorted_adjacency(map: AHashMap<String, AHashSet<String>>) -> AHashMap<String, Vec<String>> {
     map.into_iter()
         .map(|(key, set)| {
@@ -892,7 +880,6 @@ fn sorted_adjacency(map: AHashMap<String, AHashSet<String>>) -> AHashMap<String,
         .collect()
 }
 
-/// Handle `graph` mode `entities` — read-only Cypher query over the entity graph.
 #[cfg(feature = "graphrag")]
 pub(super) async fn run_graph_entities(
     shared: &SharedReadStack,
@@ -912,12 +899,6 @@ pub(super) async fn run_graph_entities(
     let lance_store = match &store.lance {
         Some(ls) => ls.clone(),
         None => {
-            // Read-only serve path: no document insert ever lazy-opened lance.
-            // Open the on-disk store for reading — via `open_existing`, which
-            // takes the (dim, model) identity from meta.json so a config drift
-            // cannot trigger the wipe-on-mismatch path. `LanceStore::open`
-            // block_ons its own runtime, which panics when called from inside
-            // this daemon runtime — so hop to a blocking thread first.
             let dir = basemind_dir.join(crate::store_layout::LANCE_DIR);
             tokio::task::spawn_blocking(move || crate::lance::open_existing(&dir))
                 .await
@@ -928,14 +909,13 @@ pub(super) async fn run_graph_entities(
                 })?
         }
     };
+    drop(store);
 
     let scope = shared.scope.clone();
     let configured_max_rows = shared.config.documents.graphrag.max_rows as u32;
     let max_rows = params.max_rows.unwrap_or(configured_max_rows).min(configured_max_rows) as usize;
     let cypher = params.cypher.clone();
 
-    // Same rule as the open above: `execute_cypher` block_ons the lance runtime
-    // internally, so it must run off the daemon's async workers.
     let cypher_result = tokio::task::spawn_blocking(move || {
         execute_cypher(
             lance_store.connection(),
@@ -975,12 +955,6 @@ pub(super) async fn run_graph_entities(
     ))
 }
 
-/// Handle `graph` mode `rag` — GraphRAG hybrid retrieval.
-///
-/// Pipeline: embed the query → vector top-k over the documents table → seed the
-/// entity graph with the entities of those documents → expand over the co-occurrence
-/// edges (`hops`, capped at 2) → pull the chunks of graph-reachable documents the
-/// vector lane missed → fuse both lanes (see [`crate::lance::graphrag::fuse_results`]).
 pub(super) async fn run_graph_rag(
     shared: &SharedReadStack,
     _idx: Option<&crate::index::IndexDb>,

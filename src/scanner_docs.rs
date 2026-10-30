@@ -117,14 +117,24 @@ pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
 
 #[cfg(feature = "graphrag")]
 fn lance_or_open_fallback(store: &Store, preset: &str) -> Option<Arc<crate::lance::LanceStore>> {
-    store.lance.clone().or_else(|| {
-        preset_dim(preset).ok().and_then(|dim| {
-            let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
-            crate::lance::LanceStore::open(&dir, dim, preset)
-                .map_err(|error| tracing::warn!(?error, "graphrag: open LanceStore failed; skipping graph build"))
-                .ok()
-        })
-    })
+    if let Some(lance) = &store.lance {
+        return Some(lance.clone());
+    }
+    let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
+    match crate::lance::open_existing(&dir) {
+        Ok(Some(lance)) => Some(Arc::new(lance)),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "graphrag: open existing LanceStore failed; skipping graph build"
+            );
+            if let Err(error) = preset_dim(preset) {
+                tracing::warn!(?error, "graphrag: unknown embedding preset; graph build skipped");
+            }
+            None
+        }
+    }
 }
 
 /// Translate the project-level `[documents]` config into the xberg-facing
