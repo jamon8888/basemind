@@ -10,11 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-31
+
+> **Minor release.** `RELEASE_MINOR` goes 35 → 36, so the first scan after upgrading pays one
+> full re-index (durable, not destructive — see `src/version.rs`).
+
 ### Added
 
 - **Versioned `redact_text` NER profiles.** Callers can select the historical
   `full@1` label set or the reduced `legal-fr@1` profile; responses expose the
-  resolved profile and ordered labels for reproducible coverage checks.
+  resolved profile and ordered labels for reproducible coverage checks. Without a
+  profile, `full@1` stays the default.
+- **Near-empty OCR results are surfaced**: a document whose OCR yields almost no text is
+  flagged instead of passing as an empty success; the warning logs `<document>`, not the path.
+- **GraphRAG behind the `graphrag` feature** (`([#143])`): entity graph and hybrid retrieval,
+  `graph entities` / `graph rag` on the CLI with MCP parity, gateway-token reconciliation and a
+  panic-free read path. The feature is not part of `full`, so the published binaries do not
+  carry it.
+
+### Fixed
+
+- **A French phone number stops at its nine digits** (`([#126])`): `+33` has its own exact
+  pattern, so a phone followed by a street number no longer swallows it and leaves the street
+  name in clear text (#114).
+- **The Intel macOS `full` profile compiles and packages again.**
 
 ## [0.35.0] - 2026-10-25
 
@@ -247,6 +266,8 @@ designed at all; see issues #7–#12.
 [#76]: https://github.com/jamon8888/basemind/pull/76
 [#94]: https://github.com/jamon8888/basemind/pull/94
 [#93]: https://github.com/jamon8888/basemind/pull/93
+[#126]: https://github.com/jamon8888/basemind/pull/126
+[#143]: https://github.com/jamon8888/basemind/pull/143
 
 ## [0.26.0] - 2026-09-01
 
