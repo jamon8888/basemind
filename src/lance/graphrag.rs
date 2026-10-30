@@ -619,19 +619,8 @@ pub fn execute_cypher(
         let mut row = Vec::with_capacity(result.num_columns());
         for col in result.columns() {
             // lance-graph runs on arrow 56 — downcast through its array types.
-            let val = if let Some(s) = col.as_any().downcast_ref::<arrow56::array::StringArray>() {
-                s.value(i).to_string()
-            } else if let Some(u) = col.as_any().downcast_ref::<arrow56::array::Int64Array>() {
-                u.value(i).to_string()
-            } else if let Some(u) = col.as_any().downcast_ref::<arrow56::array::UInt64Array>() {
-                u.value(i).to_string()
-            } else if let Some(f) = col.as_any().downcast_ref::<arrow56::array::Float64Array>() {
-                f.value(i).to_string()
-            } else if let Some(b) = col.as_any().downcast_ref::<arrow56::array::BooleanArray>() {
-                b.value(i).to_string()
-            } else {
-                "?".to_string()
-            };
+            let val =
+                arrow56::util::display::array_value_to_string(col.as_ref(), i).unwrap_or_else(|_| "?".to_string());
             row.push(val);
         }
         rows.push(row);

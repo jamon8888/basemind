@@ -42,10 +42,7 @@ use super::mode::{GraphMode, reject_unsupported};
 use super::shared_state::SharedReadStack;
 use super::types_archmap::ArchitectureMapParams;
 use super::types_community::CommunitiesParams;
-use super::types_graph::{
-    CallGraphNode, CallGraphParams, CallGraphResponse, CallGraphSite, GraphEntitiesParams, GraphEntitiesResponse,
-    GraphParams, GraphRagParams, GraphRagResponse,
-};
+use super::types_graph::{CallGraphNode, CallGraphParams, CallGraphResponse, CallGraphSite, GraphParams};
 use super::types_graphview::{DisplayParams, GraphExportParams, UiParams};
 use super::types_traverse::{NeighborsParams, PathParams, SubgraphParams};
 use crate::extract::SymbolKind;
@@ -900,8 +897,8 @@ pub(super) fn run_graph_entities(
     cache: &MapCache,
     basemind_dir: &std::path::Path,
     params: super::types_graph::GraphEntitiesParams,
-    _notice: Option<super::types::LifecycleNotice>,
-    _started: std::time::Instant,
+    notice: Option<super::types::LifecycleNotice>,
+    started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
     use crate::lance::execute_cypher;
 
@@ -936,6 +933,8 @@ pub(super) fn run_graph_entities(
         columns: cypher_result.columns,
         rows: cypher_result.rows,
         truncated,
+        notice,
+        elapsed_us: elapsed_us(started),
     })
 }
 
@@ -957,20 +956,20 @@ pub(super) fn run_graph_entities(
 
 /// Handle `graph` mode `rag` — GraphRAG hybrid retrieval.
 pub(super) async fn run_graph_rag(
-    shared: &SharedReadStack,
-    idx: Option<&crate::index::IndexDb>,
-    cache: &MapCache,
-    basemind_dir: &std::path::Path,
-    params: super::types_graph::GraphRagParams,
-    notice: Option<super::types::LifecycleNotice>,
-    started: std::time::Instant,
+    _shared: &SharedReadStack,
+    _idx: Option<&crate::index::IndexDb>,
+    _cache: &MapCache,
+    _basemind_dir: &std::path::Path,
+    _params: super::types_graph::GraphRagParams,
+    _notice: Option<super::types::LifecycleNotice>,
+    _started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
     #[cfg(not(feature = "graphrag"))]
     {
-        return Err(McpError::invalid_params(
+        Err(McpError::invalid_params(
             "graph rag mode requires the graphrag feature",
             None,
-        ));
+        ))
     }
 
     // This is a placeholder implementation - full GraphRAG would:

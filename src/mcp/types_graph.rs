@@ -221,11 +221,16 @@ pub struct GraphEntitiesParams {
     pub max_rows: Option<u32>,
 }
 
+#[cfg(feature = "graphrag")]
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GraphEntitiesResponse {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<super::types::LifecycleNotice>,
+    #[serde(default)]
+    pub elapsed_us: u64,
 }
 
 /// Graph rag mode: hybrid retrieval via entity graph expansion.
@@ -242,12 +247,14 @@ pub struct GraphRagParams {
     pub max_results: Option<u32>,
 }
 
+#[cfg(feature = "graphrag")]
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GraphRagResponse {
     pub hits: Vec<GraphRagHit>,
     pub truncated: bool,
 }
 
+#[cfg(feature = "graphrag")]
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct GraphRagHit {
     pub path: String,

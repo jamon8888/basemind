@@ -1,5 +1,7 @@
 //! Public scan measurements used by benchmark and operator tooling.
 
+#![cfg_attr(not(feature = "documents"), allow(dead_code))]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
