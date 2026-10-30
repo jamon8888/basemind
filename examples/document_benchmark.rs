@@ -142,6 +142,7 @@ fn manifest(root: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn json_report(
     mode: &str,
     report: &ScanReport,
