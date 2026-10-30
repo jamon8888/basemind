@@ -338,7 +338,7 @@ fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
         if ent.is_gateway_token || ent.gateway_token.is_some() {
             continue;
         }
-        let needle = norm(&ent.text);
+        let needle = norm(&ent.literal);
         if needle.len() < 3 {
             continue;
         }
@@ -447,7 +447,7 @@ pub(crate) fn extract_and_persist_doc(
                     upsert_graph_entities,
                 };
 
-                let doc_entities: Vec<DocEntitySidecar> = cached
+                let mut doc_entities: Vec<DocEntitySidecar> = cached
                     .entities
                     .iter()
                     .map(|e| {
@@ -572,7 +572,7 @@ pub(crate) fn extract_and_persist_doc(
             };
 
             // Convert FileMapDoc entities to DocEntitySidecar format
-            let doc_entities: Vec<DocEntitySidecar> = doc
+            let mut doc_entities: Vec<DocEntitySidecar> = doc
                 .entities
                 .iter()
                 .map(|e| {

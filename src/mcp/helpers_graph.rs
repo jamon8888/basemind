@@ -343,18 +343,21 @@ pub(super) async fn run_graph(state: &super::ServerState, params: GraphParams) -
             )
             .await
         }
-        GraphMode::Entities => run_graph_entities(
-            shared,
-            idx,
-            &cache,
-            &basemind_dir,
-            super::types_graph::GraphEntitiesParams {
-                cypher: require_field(mode, "cypher", cypher)?,
-                max_rows,
-            },
-            notice,
-            started,
-        ),
+        GraphMode::Entities => {
+            run_graph_entities(
+                shared,
+                idx,
+                &cache,
+                &basemind_dir,
+                super::types_graph::GraphEntitiesParams {
+                    cypher: require_field(mode, "cypher", cypher)?,
+                    max_rows,
+                },
+                notice,
+                started,
+            )
+            .await
+        }
         GraphMode::Rag => {
             run_graph_rag(
                 shared,
@@ -891,7 +894,7 @@ fn sorted_adjacency(map: AHashMap<String, AHashSet<String>>) -> AHashMap<String,
 
 /// Handle `graph` mode `entities` — read-only Cypher query over the entity graph.
 #[cfg(feature = "graphrag")]
-pub(super) fn run_graph_entities(
+pub(super) async fn run_graph_entities(
     shared: &SharedReadStack,
     idx: Option<&crate::index::IndexDb>,
     cache: &MapCache,
@@ -919,13 +922,15 @@ pub(super) fn run_graph_entities(
     let scope = shared.scope.clone();
     let max_rows = params.max_rows.unwrap_or(200).min(1000) as usize;
 
-    let cypher_result = execute_cypher(
-        lance_store.connection(),
-        lance_store.runtime(),
-        &scope,
-        &params.cypher,
-        max_rows,
-    )
+    let cypher_result = tokio::task::block_in_place(|| {
+        execute_cypher(
+            lance_store.connection(),
+            lance_store.runtime(),
+            &scope,
+            &params.cypher,
+            max_rows,
+        )
+    })
     .map_err(|e| McpError::internal_error(format!("Cypher execution failed: {e}"), None))?;
 
     let truncated = cypher_result.rows.len() >= max_rows;
@@ -939,7 +944,7 @@ pub(super) fn run_graph_entities(
 }
 
 #[cfg(not(feature = "graphrag"))]
-pub(super) fn run_graph_entities(
+pub(super) async fn run_graph_entities(
     _shared: &SharedReadStack,
     _idx: Option<&crate::index::IndexDb>,
     _cache: &MapCache,
