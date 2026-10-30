@@ -56,12 +56,8 @@ fn non_whitespace_chars(content: &str) -> usize {
 }
 
 fn sanitize_path_for_log(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed("<unknown>"))
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect()
+    let _ = path;
+    "<document>".to_string()
 }
 
 #[cfg(test)]
@@ -73,13 +69,13 @@ mod tests {
     fn sanitize_path_for_log_removes_control_characters() {
         assert_eq!(
             sanitize_path_for_log(Path::new("docs/evil\n\r\tname.pdf")),
-            "evilname.pdf"
+            "<document>"
         );
     }
 
     #[test]
     fn log_path_drops_terminal_control_characters() {
         let safe = sanitize_path_for_log(Path::new("scan\u{1b}[2J\ncontract.png"));
-        assert_eq!(safe, "[2Jcontract.png");
+        assert_eq!(safe, "<document>");
     }
 }

@@ -346,6 +346,8 @@ pub struct DocEntitySidecar {
     pub is_token: bool,                // true when literal is a token_replace marker like [EMAIL_1]
     pub is_gateway_token: bool,        // true when literal is a gaze gateway token like <deadbeef:Email_1>
     pub gateway_token: Option<String>, // the gaze token (e.g., <deadbeef:Email_1>) when is_gateway_token
+    pub start: u32,
+    pub end: u32,
     pub chunk_idx: u32,
     pub doc_path: String,
 }
@@ -619,8 +621,11 @@ pub fn execute_cypher(
         let mut row = Vec::with_capacity(result.num_columns());
         for col in result.columns() {
             // lance-graph runs on arrow 56 — downcast through its array types.
-            let val =
-                arrow56::util::display::array_value_to_string(col.as_ref(), i).unwrap_or_else(|_| "?".to_string());
+            let val = if col.is_null(i) {
+                "<null>".to_string()
+            } else {
+                arrow56::util::display::array_value_to_string(col.as_ref(), i).unwrap_or_else(|_| "?".to_string())
+            };
             row.push(val);
         }
         rows.push(row);

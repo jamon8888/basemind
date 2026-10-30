@@ -308,14 +308,20 @@ fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
     });
 
     // (normalized key, full token) per occurrence — inner and bare anchor.
-    let mut candidates: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<(usize, usize, String, String)> = Vec::new();
     for m in re.captures_iter(content) {
         let full = m.get(0).map(|t| t.as_str()).unwrap_or_default().to_string();
         let class = m.get(2).map(|value| value.as_str()).unwrap_or_default();
         let ordinal = m.get(3).map(|value| value.as_str()).unwrap_or_default();
         let anchor = m.get(1).map(|value| value.as_str()).unwrap_or_default();
-        candidates.push((format!("{}{}", class.to_lowercase(), ordinal), full.clone()));
-        candidates.push((anchor.to_lowercase(), full));
+        let span = m.get(0).expect("regex match");
+        candidates.push((
+            span.start(),
+            span.end(),
+            format!("{}{}", class.to_lowercase(), ordinal),
+            full.clone(),
+        ));
+        candidates.push((span.start(), span.end(), anchor.to_lowercase(), full));
     }
     if candidates.is_empty() {
         return;
@@ -339,9 +345,15 @@ fn reconcile_gateway_tokens(entities: &mut [DocEntitySidecar], content: &str) {
         // Exact needle match wins over containment.
         let hit = candidates
             .iter()
-            .find(|(k, _)| *k == needle)
-            .or_else(|| candidates.iter().find(|(k, _)| k.contains(&needle)));
-        if let Some((_, full)) = hit {
+            .filter(|(start, end, _, _)| ent.start as usize >= *start && ent.end as usize <= *end)
+            .find(|(_, _, k, _)| *k == needle)
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|(start, end, _, _)| ent.start as usize >= *start && ent.end as usize <= *end)
+                    .find(|(_, _, k, _)| k.contains(&needle))
+            });
+        if let Some((_, _, _, full)) = hit {
             ent.is_gateway_token = true;
             ent.gateway_token = Some(full.clone());
             ent.literal = full.clone();
@@ -450,6 +462,8 @@ pub(crate) fn extract_and_persist_doc(
                             is_token,
                             is_gateway_token,
                             gateway_token,
+                            start: e.start,
+                            end: e.end,
                             chunk_idx: 0,
                             doc_path: rel.to_string(),
                         }
@@ -573,6 +587,8 @@ pub(crate) fn extract_and_persist_doc(
                         is_token,
                         is_gateway_token,
                         gateway_token,
+                        start: e.start,
+                        end: e.end,
                         chunk_idx: 0, // We don't have chunk_idx in DocEntity, approximate
                         doc_path: rel.to_string(),
                     }
