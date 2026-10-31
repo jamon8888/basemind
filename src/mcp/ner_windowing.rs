@@ -309,14 +309,26 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         while last + 1 < pieces.len() && pieces[last + 1].c1 - pieces[index].c0 <= WINDOW_CHARS {
             last += 1;
         }
-        // … then to the token budget.
+        // … then to the token budget. Token count is monotone as segments are
+        // appended, so binary search avoids re-tokenizing every shorter prefix
+        // of dense text during planning.
         let slice_at = |end: usize| text.get(pieces[index].b0..pieces[end].b1).unwrap_or("");
-        let mut tokens = window_token_count(&budget.tokenizer, slice_at(last))?;
-        while tokens > budget.tokens_for_text && last > index {
-            last -= 1;
-            tokens = window_token_count(&budget.tokenizer, slice_at(last))?;
+        let mut fitting_last = None;
+        let mut low = index;
+        let mut high = last;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let tokens = window_token_count(&budget.tokenizer, slice_at(mid))?;
+            if tokens <= budget.tokens_for_text {
+                fitting_last = Some(mid);
+                low = mid.saturating_add(1);
+            } else if mid == 0 {
+                break;
+            } else {
+                high = mid - 1;
+            }
         }
-        if tokens > budget.tokens_for_text {
+        let Some(last) = fitting_last else {
             return if windows.is_empty() {
                 Err("even the first window does not fit the token budget".to_string())
             } else {
@@ -325,7 +337,7 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
                     cut_off: Some(pieces[index].b0),
                 })
             };
-        }
+        };
         windows.push(Window {
             start: pieces[index].b0,
             end: pieces[last].b1,
