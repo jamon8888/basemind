@@ -301,6 +301,16 @@ fn window_token_count(tokenizer: &tokenizers::Tokenizer, slice: &str) -> Result<
 /// when the very first window cannot fit, because then nothing can run.
 pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan, String> {
     let pieces = segments(text);
+    // The backend tokenizes pre-split words independently, so token counts are
+    // additive across segments. Compute each segment once; the old planner
+    // re-tokenized the entire candidate slice on every binary-search probe.
+    let mut token_prefix = Vec::with_capacity(pieces.len() + 1);
+    token_prefix.push(0usize);
+    for piece in &pieces {
+        let slice = text.get(piece.b0..piece.b1).unwrap_or("");
+        let count = window_token_count(&budget.tokenizer, slice)?;
+        token_prefix.push(token_prefix.last().copied().unwrap_or(0) + count);
+    }
     let mut windows = Vec::new();
     let mut index = 0usize;
     while index < pieces.len() {
@@ -312,13 +322,12 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         // … then to the token budget. Token count is monotone as segments are
         // appended, so binary search avoids re-tokenizing every shorter prefix
         // of dense text during planning.
-        let slice_at = |end: usize| text.get(pieces[index].b0..pieces[end].b1).unwrap_or("");
         let mut fitting_last = None;
         let mut low = index;
         let mut high = last;
         while low <= high {
             let mid = low + (high - low) / 2;
-            let tokens = window_token_count(&budget.tokenizer, slice_at(mid))?;
+            let tokens = token_prefix[mid + 1] - token_prefix[index];
             if tokens <= budget.tokens_for_text {
                 fitting_last = Some(mid);
                 low = mid.saturating_add(1);
