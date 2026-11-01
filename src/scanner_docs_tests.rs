@@ -53,6 +53,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         embedding_preset: "multilingual".to_string(),
         ..DocumentsConfig::default()
     };
+    doc.config_digest = "d".to_string();
     assert!(
         !cached_doc_is_reusable(&doc, &switched, true, "d"),
         "switching balanced -> multilingual (same dim, different model) must force recompute"
@@ -69,6 +70,10 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     assert!(
         !cached_embeddings_are_reusable(&doc, &switched),
         "changing the embedding preset must invalidate only the vector stage"
+    );
+    assert!(
+        !cached_doc_content_is_reusable(&doc, &switched, "other"),
+        "a changed extraction digest must reject stale content"
     );
 }
 
