@@ -47,24 +47,23 @@ fn default_hops() -> u8 {
 }
 
 /// Normalize a literal for global identity (ClearLiteral path).
-/// Case-fold + ASCII-fold + whitespace collapse.
+/// Case-fold + ASCII-fold + whitespace collapse. Any non-alphanumeric
+/// character acts as a separator (collapsed into a single space), so
+/// "john-smith" and "John.Smith" both normalize to "john smith".
 pub fn normalize_literal(s: &str) -> String {
-    // Simple ASCII normalization: lowercase, collapse whitespace, strip non-alnum except space
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for ch in s.chars() {
         let lower = ch.to_lowercase().collect::<String>();
         for c in lower.chars() {
-            if c.is_ascii_alphanumeric() || c == ' ' {
-                if c == ' ' {
-                    if !prev_space {
-                        out.push(' ');
-                        prev_space = true;
-                    }
-                } else {
-                    out.push(c);
-                    prev_space = false;
-                }
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+                prev_space = false;
+            } else if !prev_space && !out.is_empty() {
+                // Non-alphanumeric (space, punctuation): separator. Leading
+                // separators produce nothing (trim would strip them anyway).
+                out.push(' ');
+                prev_space = true;
             }
         }
     }
