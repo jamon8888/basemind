@@ -52,6 +52,7 @@ pub(crate) fn cached_embeddings_are_reusable(cached: &FileMapDoc, cfg: &Document
 
 /// Compatibility predicate used by focused unit tests and older callers: all cached output,
 /// including vectors when requested, must match the active configuration.
+#[cfg(test)]
 pub(crate) fn cached_doc_is_reusable(
     cached: &FileMapDoc,
     cfg: &DocumentsConfig,
@@ -72,6 +73,7 @@ pub(crate) fn cached_dense_input(chunk: &DocChunk) -> String {
 }
 
 /// Refresh only the embedding stage of a cached document, preserving extracted content and NER.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_cached_embeddings(
     store: &Store,
     hash: &Hash,
