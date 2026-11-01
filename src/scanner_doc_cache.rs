@@ -90,7 +90,7 @@ pub(crate) fn refresh_cached_embeddings(
         filters.doc_phase.admit().map_err(|spent| {
             anyhow::Error::new(crate::extract::ExtractError::DocDeferred(format!(
                 "the {}s document-phase budget ([documents] phase_budget_secs) is spent",
-                spent.as_secs()
+                spent.elapsed.as_secs()
             )))
         })?;
         let started = std::time::Instant::now();

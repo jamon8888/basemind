@@ -43,7 +43,9 @@ use crate::scanner_filter::Filters;
 use crate::store::Store;
 #[path = "scanner_doc_cache.rs"]
 mod cache;
-pub(crate) use cache::{cached_doc_content_is_reusable, cached_doc_is_reusable, cached_embeddings_are_reusable};
+pub(crate) use cache::cached_doc_content_is_reusable;
+#[cfg(test)]
+pub(crate) use cache::{cached_doc_is_reusable, cached_embeddings_are_reusable};
 
 /// Per-file deferred-LanceDB-write descriptor. Constructed inside `process_file`'s parallel
 /// worker; consumed in the single-threaded apply pass via [`flush_document_batches`].
