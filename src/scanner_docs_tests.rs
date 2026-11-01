@@ -1,3 +1,4 @@
+use super::cache::{cached_doc_is_reusable, cached_embeddings_are_reusable};
 use super::*;
 
 #[test]
@@ -12,7 +13,7 @@ fn preset_dim_for_balanced_returns_768() {
 #[test]
 fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     use crate::extract::doc::{DocChunk, FileMapDoc};
-    let doc = FileMapDoc {
+    let mut doc = FileMapDoc {
         config_digest: String::new(),
         linear_chunked: false,
         text_fallback: false,
