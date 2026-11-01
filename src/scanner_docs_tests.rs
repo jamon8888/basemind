@@ -62,6 +62,14 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         cached_doc_is_reusable(&doc, &switched, false, "d"),
         "embedding off: cached doc is always reusable"
     );
+    assert!(
+        cached_doc_content_is_reusable(&doc, &switched, "d"),
+        "changing only the embedding preset must preserve extracted content and NER"
+    );
+    assert!(
+        !cached_embeddings_are_reusable(&doc, &switched),
+        "changing the embedding preset must invalidate only the vector stage"
+    );
 }
 
 /// Structural regression guard for the streaming-flush memory fix: the accumulated per-file

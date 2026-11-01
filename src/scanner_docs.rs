@@ -407,7 +407,7 @@ pub(crate) fn extract_and_persist_doc(
     let hash_hex = hashing::hex_str(&hex_buf);
 
     if let Some(mut cached) = store.read_doc_by_hex(hash_hex).ok().flatten()
-        && cached_doc_is_reusable(&cached, cfg, embed, &filters.doc_digest)
+        && cached_doc_content_is_reusable(&cached, cfg, &filters.doc_digest)
     {
         // The same pass rewrites whatever the blob still carries from an older regime —
         // a digest-less blob is stamped with the current one, and a rehydration_ref left
@@ -442,6 +442,44 @@ pub(crate) fn extract_and_persist_doc(
                 .write_doc(hash, &cached)
                 .with_context(|| format!("rewrite doc blob for {rel}"))?;
         }
+
+        // A model or provider change must not throw away extraction, chunking, or NER work. The
+        // document digest deliberately excludes embedding settings, so the cached chunks remain
+        // valid and can be re-embedded in place. This is the first stage-specific reuse seam for
+        // the document pipeline (#134). If re-embedding fails, return the error rather than
+        // publishing a partially updated blob.
+        if embed && !cached_embeddings_are_reusable(&cached, cfg) && !cached.chunks.is_empty() {
+            let embedding_started = std::time::Instant::now();
+            let preset = cfg.embedding_preset.as_str();
+            let embedder = crate::embeddings::SharedEmbedder::load_with_provider(
+                preset,
+                resources.effective_embed_threads(cfg.embed_max_threads),
+                resources.embed_batch_size,
+                resources.onnx_provider,
+            )
+            .with_context(|| format!("load embedding model for cached document {rel}"))?;
+            let inputs: Vec<&str> = cached.chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+            let vectors = embedder
+                .embed_batch(&inputs)
+                .with_context(|| format!("embed cached document {rel}"))?;
+            if vectors.len() != cached.chunks.len() {
+                anyhow::bail!(
+                    "cached document embedding returned {} vectors for {} chunks",
+                    vectors.len(),
+                    cached.chunks.len()
+                );
+            }
+            for (chunk, vector) in cached.chunks.iter_mut().zip(vectors) {
+                chunk.embedding = vector;
+            }
+            cached.embedding_model = cfg.embedding_preset.clone();
+            cached.embedding_dim = embedder.dim();
+            store
+                .write_doc(hash, &cached)
+                .with_context(|| format!("write re-embedded doc blob for {rel}"))?;
+            metrics.add_embedding(embedding_started.elapsed());
+        }
+
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
         store.touch_doc_blob(hash_hex);
@@ -671,15 +709,12 @@ pub(crate) fn doc_entry_settled(
         && (existing.embedded || existing.embed_attempted || !embed_requested)
 }
 
-/// True when a cached document blob can be reused without re-extraction. When embedding is on the
-/// cached blob must carry embeddings produced by the current preset — matching both its **dimension**
-/// AND its **model**. The model check is load-bearing: `balanced` and `multilingual` share dim 768,
-/// so a dim-only gate would falsely reuse stale-model vectors when switching between them. A preset
-/// change (dim OR model) therefore forces recompute — same gate as `chunk_and_embed`. An
-/// empty-of-chunks doc is always reusable (recompute would yield nothing anyway). When embedding is
-/// off, any cached doc is reusable (chunks only). In every case the blob must have been produced
+/// True when a cached document's extracted content, chunks, and enrichment outputs can be reused
+/// without re-extraction. Embedding identity is checked separately by
+/// [`cached_embeddings_are_reusable`], allowing a preset change to re-embed the existing chunks
+/// without repeating format extraction or NER. In every case the blob must have been produced
 /// under the current `config_digest` (or predate digests, in which case the caller stamps it).
-fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool, config_digest: &str) -> bool {
+fn cached_doc_content_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, config_digest: &str) -> bool {
     if !cached.config_digest.is_empty() && cached.config_digest != config_digest {
         return false;
     }
@@ -694,7 +729,12 @@ fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: boo
     if cached.redaction_fingerprint != want_fingerprint {
         return false;
     }
-    if !embed || cached.chunks.is_empty() {
+    true
+}
+
+/// True when the cached chunks already carry vectors from the current embedding preset.
+fn cached_embeddings_are_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig) -> bool {
+    if cached.chunks.is_empty() {
         return true;
     }
     let want_dim = preset_dim(&cfg.embedding_preset).ok();
@@ -705,6 +745,13 @@ fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: boo
             .chunks
             .iter()
             .all(|c| c.embedding.len() == cached.embedding_dim as usize)
+}
+
+/// Compatibility predicate used by the focused unit tests and older callers: all cached output,
+/// including vectors when requested, must match the active configuration.
+fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool, config_digest: &str) -> bool {
+    cached_doc_content_is_reusable(cached, cfg, config_digest)
+        && (!embed || cached_embeddings_are_reusable(cached, cfg))
 }
 
 /// Assemble the deferred-write descriptor from an extracted-or-cached document. Decides — while the

@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Document scans reuse extracted chunks and NER results when only the embedding preset changes;
+  cached chunks are re-embedded in place instead of re-running format extraction.
+
 ## [0.36.0] - 2026-10-31
 
 > **Minor release.** `RELEASE_MINOR` goes 35 → 36, so the first scan after upgrading pays one
