@@ -800,7 +800,7 @@ pub fn expand_entity_graph(
         out.push(ExpandedEntity {
             entity_id: entity_id.clone(),
             hop,
-            chain,
+            chain: chain.clone(),
         });
         if out.len() >= max_expand || hop >= hops {
             continue;

@@ -118,7 +118,7 @@ pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
 #[cfg(feature = "graphrag")]
 fn lance_or_open_fallback(store: &Store, preset: &str) -> Option<Arc<crate::lance::LanceStore>> {
     if let Some(lance) = &store.lance {
-        return Some(lance.clone());
+        return Some(Arc::new(lance.clone()));
     }
     let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
     match crate::lance::open_existing(&dir) {
