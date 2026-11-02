@@ -84,9 +84,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.timeout_seconds <= 0 or args.quality_tolerance < 0:
-        parser.error(
-            "timeout and quality tolerance must be non-negative, with timeout > 0"
-        )
+        parser.error("timeout and quality tolerance must be non-negative, with timeout > 0")
     candidates: list[dict[str, int]] = []
     for scan, embed, batch, docs in itertools.product(
         args.scan_threads,
@@ -159,13 +157,8 @@ def main() -> int:
                 quality = _quality(report)
                 peak_rss = cold.get("peak_rss_bytes")
                 stats = cold.get("stats") or {}
-                timed_out = (
-                    int(stats.get("doc_timeouts", 0)) > 0
-                    or int(stats.get("parse_timeouts", 0)) > 0
-                )
-                skipped = int(stats.get("docs_deferred", 0)) + int(
-                    stats.get("extract_failed", 0)
-                )
+                timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(stats.get("parse_timeouts", 0)) > 0
+                skipped = int(stats.get("docs_deferred", 0)) + int(stats.get("extract_failed", 0))
                 entry.update(
                     {
                         "report": report,
@@ -177,10 +170,7 @@ def main() -> int:
                 reasons: list[str] = []
                 if peak_rss is None:
                     reasons.append("rss_unavailable")
-                elif (
-                    args.rss_ceiling_mb is not None
-                    and peak_rss > args.rss_ceiling_mb * 1024 * 1024
-                ):
+                elif args.rss_ceiling_mb is not None and peak_rss > args.rss_ceiling_mb * 1024 * 1024:
                     reasons.append("rss_ceiling")
                 if timed_out:
                     reasons.append("timeout")
@@ -196,15 +186,7 @@ def main() -> int:
         results.append(entry)
 
     accepted = [item for item in results if item.get("accepted")]
-    accepted.sort(
-        key=lambda item: (
-            -(
-                item.get("cold", {})
-                .get("throughput", {})
-                .get("documents_per_second", 0.0)
-            )
-        )
-    )
+    accepted.sort(key=lambda item: -(item.get("cold", {}).get("throughput", {}).get("documents_per_second", 0.0)))
     output = {
         "candidates": len(results),
         "accepted": len(accepted),
