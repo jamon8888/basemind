@@ -4,28 +4,67 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
-TIMINGS = ("extraction", "chunking", "ner", "embedding", "persistence", "total")
-THROUGHPUT = ("documents_per_second", "bytes_per_second", "tokens_per_second", "chunks_per_second")
+TIMINGS = (
+    "candidates",
+    "extraction",
+    "chunking",
+    "ner",
+    "embedding",
+    "persistence",
+    "purge",
+    "flush",
+    "resolve",
+    "lanes",
+    "total",
+)
+THROUGHPUT = (
+    "documents_per_second",
+    "bytes_per_second",
+    "tokens_per_second",
+    "chunks_per_second",
+    "ner_documents_per_second",
+    "ner_tokens_per_second",
+)
 STATS = (
     "scanned",
     "updated",
+    "updated_with_warnings",
+    "reused_extraction",
     "skipped_unchanged",
+    "skipped_too_large",
+    "skipped_non_utf8",
+    "skipped_no_lang",
+    "skipped_binary",
     "docs_indexed",
     "docs_chunks",
     "docs_tokens",
     "docs_bytes",
+    "reused_doc_extraction",
+    "reembedded_doc_embeddings",
     "docs_degraded",
+    "docs_text_fallback",
     "doc_timeouts",
+    "docs_tombstoned",
     "docs_deferred",
+    "abandoned_extractions",
+    "refreshed_extraction",
+    "tier_migrated",
     "read_failed",
     "extract_failed",
+    "parse_timeouts",
+    "removed",
 )
 CONFIGURATION = (
     "embedding_preset",
     "onnx_provider",
+    "precision",
+    "ner_enabled",
+    "ner_backend",
+    "ner_model",
     "scan_threads",
     "embed_threads",
     "embed_batch_size",
@@ -48,10 +87,17 @@ def require_keys(obj: dict, keys: tuple[str, ...], path: str, errors: list[str])
 
 def number(obj: dict, key: str, path: str, errors: list[str]) -> float | None:
     value = obj.get(key)
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
         errors.append(f"{path}.{key} must be numeric")
         return None
     return float(value)
+
+
+def non_negative_number(obj: dict, key: str, path: str, errors: list[str]) -> float | None:
+    value = number(obj, key, path, errors)
+    if value is not None and value < 0:
+        errors.append(f"{path}.{key} must be non-negative")
+    return value
 
 
 def main() -> int:
@@ -108,10 +154,30 @@ def main() -> int:
         require_keys(
             require_object(run.get("stats"), f"runs[{index}].stats", errors), STATS, f"runs[{index}].stats", errors
         )
-        for key in ("peak_rss_bytes",):
+        first_searchable = run.get("first_searchable_result_ms")
+        if first_searchable is not None and (
+            not isinstance(first_searchable, (int, float))
+            or isinstance(first_searchable, bool)
+            or not math.isfinite(float(first_searchable))
+        ):
+            errors.append(f"runs[{index}].first_searchable_result_ms must be numeric or null")
+        elif first_searchable is not None and first_searchable < 0:
+            errors.append(f"runs[{index}].first_searchable_result_ms must be non-negative")
+        for key in ("peak_rss_bytes", "peak_rss_before_bytes", "peak_rss_delta_bytes"):
             value = run.get(key)
             if value is not None and (not isinstance(value, int) or value < 0):
                 errors.append(f"runs[{index}].{key} must be a non-negative integer or null")
+        timings = require_object(run.get("timings_ms"), f"runs[{index}].timings_ms", errors)
+        throughput = require_object(run.get("throughput"), f"runs[{index}].throughput", errors)
+        stats = require_object(run.get("stats"), f"runs[{index}].stats", errors)
+        for key in TIMINGS:
+            non_negative_number(timings, key, f"runs[{index}].timings_ms", errors)
+        for key in THROUGHPUT:
+            non_negative_number(throughput, key, f"runs[{index}].throughput", errors)
+        for key in STATS:
+            value = stats.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                errors.append(f"runs[{index}].stats.{key} must be a non-negative integer")
 
     required_modes = tuple(mode.strip() for mode in args.require_modes.split(",") if mode.strip())
     for mode in required_modes:
