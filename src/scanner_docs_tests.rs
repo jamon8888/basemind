@@ -623,6 +623,7 @@ fn seeded_doc_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceSto
             mime_type: "text/plain".to_string(),
             text: "body".to_string(),
             heading_path: String::new(),
+            cites: String::new(),
             byte_start: 0,
             byte_end: 4,
             rehydration_ref: None,

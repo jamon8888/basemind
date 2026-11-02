@@ -626,7 +626,7 @@ mod tests {
     fn phrase_lane_uses_positional_word_tokens() {
         assert_eq!(PHRASE_INDEX, ("documents_text_phrase_idx", "text"));
         let query = phrase_query("Smith v Acme").expect("phrase query builds");
-        assert_eq!(query.columns(), ["text".to_string()].into_iter().collect());
+        assert_eq!(query.columns(), ["text".to_string()].into_iter().collect::<Vec<_>>());
         let FtsQuery::Phrase(phrase) = query.query else {
             panic!("quoted spans must use a positional phrase query");
         };

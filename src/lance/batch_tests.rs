@@ -9,6 +9,7 @@ fn doc_rows(scope: &str, path: &str, n: usize, tag: &str) -> Vec<DocumentRow> {
             mime_type: "text/plain".into(),
             text: format!("{tag} {path} {c}"),
             heading_path: String::new(),
+            cites: String::new(),
             byte_start: 0,
             byte_end: 1,
             rehydration_ref: None,
