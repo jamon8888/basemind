@@ -13,11 +13,17 @@ use super::DocumentModelProfile;
 /// returning the document. Keeping the count here makes the loss observable to Basemind callers
 /// without depending on xberg's internal metadata map.
 pub(crate) fn dictionary_filtered_line_count(warnings: &[xberg::types::ProcessingWarning]) -> Option<usize> {
-    const PREFIX: &str = "Tesseract removed ";
-    const SUFFIX: &str = " OCR line(s) because";
+    const MARKER: &str = "Tesseract removed ";
     warnings.iter().find_map(|warning| {
-        let count = warning.message.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
-        count.parse().ok()
+        let start = warning.message.find(MARKER)? + MARKER.len();
+        let rest = warning.message[start..].trim_start();
+        let digit_end = rest
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digit_end == 0 || !rest[digit_end..].trim_start().starts_with("OCR line") {
+            return None;
+        }
+        rest[..digit_end].parse().ok()
     })
 }
 
@@ -111,5 +117,14 @@ mod tests {
             message: "document was truncated".into(),
         }];
         assert_eq!(dictionary_filtered_line_count(&warnings), None);
+    }
+
+    #[test]
+    fn accepts_xberg_warning_context_and_whitespace() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "tesseract".into(),
+            message: "ocr: Tesseract removed   7 OCR line(s) because the dictionary changed".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(7));
     }
 }
