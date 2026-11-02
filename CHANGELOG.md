@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The document benchmark verifier now validates every emitted skip/defer counter and runtime
+  setting, plus non-negative timing, throughput, RSS, and first-result telemetry; incomplete or
+  malformed reports can no longer pass release gates.
 - Transparent raster images are composited over white before OCR, preventing alpha
   channels from becoming black pages in xberg's RGB conversion path.
 - Document cache fingerprints now include the configured ONNX provider, preventing
