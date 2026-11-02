@@ -180,6 +180,16 @@ fn basemind_phrase(
     crate::lance::fts::search_phrase_on(lance, phrase, predicate, limit)
 }
 
+#[cfg(feature = "documents")]
+fn basemind_exact(
+    lance: &crate::lance::LanceStore,
+    term: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_exact_on(lance, term, predicate, limit)
+}
+
 /// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
@@ -621,6 +631,13 @@ pub(super) async fn run_search_documents(
             let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
             let mut merged = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                for hit in basemind_exact(&lance, candidate, &predicate, limit)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(hit);
+                    }
+                }
+            }
             for phrase in phrases {
                 for hit in basemind_phrase(&lance, &phrase, &predicate, limit)? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
