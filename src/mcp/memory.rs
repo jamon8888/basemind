@@ -170,6 +170,16 @@ fn basemind_lexical(
     crate::lance::fts::search_relaxed_on(lance, terms, predicate, limit, max_relaxations)
 }
 
+#[cfg(feature = "documents")]
+fn basemind_phrase(
+    lance: &crate::lance::LanceStore,
+    phrase: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_phrase_on(lance, phrase, predicate, limit)
+}
+
 /// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
@@ -606,9 +616,27 @@ pub(super) async fn run_search_documents(
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
         let hits_raw = tokio::task::spawn_blocking(move || {
-            let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
             let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
-            basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)
+            let phrases = crate::lance::fts::quoted_phrases(&query);
+            let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
+            let mut merged = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for phrase in phrases {
+                for hit in basemind_phrase(&lance, &phrase, &predicate, limit)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(hit);
+                    }
+                }
+            }
+            if !terms.is_empty() {
+                for hit in basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(hit);
+                    }
+                }
+            }
+            merged.truncate(limit);
+            Ok::<Vec<crate::lance::fts::LexicalHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?

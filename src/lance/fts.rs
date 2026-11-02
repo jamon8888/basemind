@@ -207,6 +207,31 @@ pub fn phrase_query(phrase: &str) -> Result<FullTextSearchQuery> {
     )))
 }
 
+/// Extract non-empty quoted spans, preserving their order and ignoring escaped quotes.
+pub fn quoted_phrases(query: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut start = None;
+    let mut escaped = false;
+    for (index, character) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            match start.take() {
+                Some(begin) if begin < index => phrases.push(query[begin..index].to_string()),
+                Some(_) => {}
+                None => start = Some(index + character.len_utf8()),
+            }
+        }
+    }
+    phrases
+}
+
 /// A lexical hit.
 ///
 /// No `distance`: LanceDB's FTS returns a relevance score, not an L2 distance, and the two are not
@@ -292,6 +317,25 @@ pub async fn search_lexical(
     let mut stream = q.execute().await.context("run lexical search")?;
     let mut hits = Vec::new();
     while let Some(batch) = stream.try_next().await.context("stream lexical batch")? {
+        decode_lexical_hits(&batch, &mut hits)?;
+    }
+    Ok(hits)
+}
+
+pub async fn search_phrase(
+    table: &Table,
+    phrase: &str,
+    scope_predicate: &str,
+    limit: usize,
+) -> Result<Vec<LexicalHit>> {
+    let q = table
+        .query()
+        .full_text_search(phrase_query(phrase)?)
+        .only_if(scope_predicate)
+        .limit(limit);
+    let mut stream = q.execute().await.context("run phrase search")?;
+    let mut hits = Vec::new();
+    while let Some(batch) = stream.try_next().await.context("stream phrase batch")? {
         decode_lexical_hits(&batch, &mut hits)?;
     }
     Ok(hits)
@@ -477,6 +521,26 @@ pub fn search_relaxed_on(
     })
 }
 
+pub fn search_phrase_on(
+    store: &LanceStore,
+    phrase: &str,
+    scope_predicate: &str,
+    limit: usize,
+) -> Result<Vec<LexicalHit>> {
+    use crate::lance::schema::DOCUMENTS_TABLE;
+
+    store.inner.rt().block_on(async {
+        let table = store
+            .inner
+            .connection
+            .open_table(DOCUMENTS_TABLE)
+            .execute()
+            .await
+            .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+        search_phrase(&table, phrase, scope_predicate, limit).await
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +597,15 @@ mod tests {
                 .expect("phrase tokenizer builds")
                 .has_positions()
         );
+    }
+
+    #[test]
+    fn quoted_phrase_parser_preserves_order() {
+        assert_eq!(
+            quoted_phrases("find \"Smith v. Acme\" and \"No. 3\""),
+            vec!["Smith v. Acme", "No. 3"]
+        );
+        assert!(quoted_phrases("unterminated \"phrase").is_empty());
     }
 
     /// `identity` is the dedupe key across relaxation rounds. Two hits are the same chunk when path

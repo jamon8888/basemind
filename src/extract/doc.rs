@@ -36,6 +36,7 @@ mod chunking;
 pub(crate) mod citations;
 #[cfg(test)]
 pub(crate) use chunking::dense_retrieval_text;
+#[cfg(feature = "crawl")]
 pub(crate) use chunking::heading_path_of;
 use chunking::prepare_doc_chunk;
 
