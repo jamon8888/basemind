@@ -137,6 +137,9 @@ def main() -> int:
         try:
             # shell=False is intentional: every value is passed as one argv element;
             # document contents are never interpolated into a shell command.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            # nosec B603 -- the benchmark binary and all arguments are explicit argv values.
             completed = subprocess.run(
                 command,
                 check=False,
