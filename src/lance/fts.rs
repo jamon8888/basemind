@@ -45,7 +45,9 @@
 use anyhow::{Context, Result};
 use futures::TryStreamExt;
 use lancedb::index::Index;
-use lancedb::index::scalar::{FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator};
+use lancedb::index::scalar::{
+    FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+};
 // `full_text_search` is on the `QueryBase` trait, not inherent on `Query` — without this import
 // the method does not resolve, and the error names `struct lancedb::query::Query`, which points at
 // the type rather than at the missing trait in scope.
@@ -72,6 +74,7 @@ pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
 /// The identifier column is kept in a separate trigram index so statute and docket lookups do not
 /// inherit stemming or stop-word removal from the topical keyword lane.
 pub const EXACT_INDEX: (&str, &str) = ("documents_cites_idx", "cites");
+pub const PHRASE_INDEX: (&str, &str) = ("documents_text_phrase_idx", "text");
 
 /// The columns the keyword lane covers.
 ///
@@ -108,6 +111,17 @@ fn exact_index_params(cfg: &FtsConfig) -> FtsIndexBuilder {
         .remove_stop_words(false)
         .ascii_folding(cfg.ascii_folding)
         .max_token_length(Some(cfg.max_token_length as usize))
+}
+
+fn phrase_index_params(cfg: &FtsConfig) -> Result<FtsIndexBuilder> {
+    Ok(FtsIndexBuilder::default()
+        .base_tokenizer("simple".to_string())
+        .language(&cfg.stemmer_language)?
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(cfg.ascii_folding)
+        .max_token_length(Some(cfg.max_token_length as usize))
+        .with_position(true))
 }
 
 /// Attach the keyword indexes to `table`, replacing any existing ones of the same name.
@@ -158,6 +172,19 @@ pub async fn ensure_keyword_index(table: &Table, cfg: &FtsConfig) -> Result<()> 
         .execute()
         .await
         .with_context(|| format!("create {name} on {column}"))?;
+    let (name, column) = PHRASE_INDEX;
+    if existing.iter().any(|i| i.name == name) {
+        table
+            .drop_index(name)
+            .await
+            .with_context(|| format!("drop stale {name}"))?;
+    }
+    table
+        .create_index(&[column], Index::FTS(phrase_index_params(cfg)?))
+        .name(name.to_string())
+        .execute()
+        .await
+        .with_context(|| format!("create {name} on {column}"))?;
     Ok(())
 }
 
@@ -168,6 +195,15 @@ pub fn exact_query(term: &str) -> Result<FullTextSearchQuery> {
             .with_column(Some(EXACT_INDEX.1.to_string()))
             .with_operator(Operator::And)
             .with_fuzziness(Some(0)),
+    )))
+}
+
+/// Build a positional, non-stemming phrase query for quoted spans.
+pub fn phrase_query(phrase: &str) -> Result<FullTextSearchQuery> {
+    Ok(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new(phrase.to_string())
+            .with_column(Some(PHRASE_INDEX.1.to_string()))
+            .with_slop(0),
     )))
 }
 
@@ -480,6 +516,23 @@ mod tests {
         let params = keyword_index_params(&FtsConfig::default()).expect("defaults must build");
         // Consuming it proves the builder is a real value, not a placeholder.
         let _ = params.base_tokenizer("simple".to_string());
+    }
+
+    #[test]
+    fn phrase_lane_uses_positional_word_tokens() {
+        assert_eq!(PHRASE_INDEX, ("documents_text_phrase_idx", "text"));
+        let query = phrase_query("Smith v Acme").expect("phrase query builds");
+        assert_eq!(query.columns(), ["text".to_string()].into_iter().collect());
+        let FtsQuery::Phrase(phrase) = query.query else {
+            panic!("quoted spans must use a positional phrase query");
+        };
+        assert_eq!(phrase.column.as_deref(), Some("text"));
+        assert_eq!(phrase.slop, 0);
+        assert!(
+            phrase_index_params(&FtsConfig::default())
+                .expect("phrase tokenizer builds")
+                .has_positions()
+        );
     }
 
     /// `identity` is the dedupe key across relaxation rounds. Two hits are the same chunk when path
