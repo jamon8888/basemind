@@ -64,7 +64,9 @@ def run_one(
         )
     except subprocess.TimeoutExpired as exc:
         elapsed_ms = (time.perf_counter() - started) * 1000.0
-        raise RuntimeError(f"redact timed out after {elapsed_ms:.1f} ms (limit {timeout:.1f} s)") from exc
+        raise RuntimeError(
+            f"redact timed out after {elapsed_ms:.1f} ms (limit {timeout:.1f} s)"
+        ) from exc
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if completed.returncode != 0:
         raise RuntimeError(
@@ -74,11 +76,15 @@ def run_one(
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"redact returned invalid JSON: {exc}\n{completed.stdout[:500]}") from exc
+        raise RuntimeError(
+            f"redact returned invalid JSON: {exc}\n{completed.stdout[:500]}"
+        ) from exc
     if payload.get("ner_ran") is not True:
         raise RuntimeError("NER did not run; refusing to record a pattern-only sample")
     if payload.get("ner_truncated") is not False:
-        raise RuntimeError("NER coverage was truncated; refusing to record an incomplete sample")
+        raise RuntimeError(
+            "NER coverage was truncated; refusing to record an incomplete sample"
+        )
     if payload.get("ner_profile", {}).get("name") != profile:
         raise RuntimeError("redact response did not confirm the requested NER profile")
     return elapsed_ms, payload
@@ -101,12 +107,18 @@ def assert_deterministic(first: dict, second: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/basemind"))
-    parser.add_argument("--model", type=Path, required=True, help="GLiNER2 model directory")
-    parser.add_argument("--profile", default="legal-fr@1", choices=("full@1", "legal-fr@1"))
+    parser.add_argument(
+        "--model", type=Path, required=True, help="GLiNER2 model directory"
+    )
+    parser.add_argument(
+        "--profile", default="legal-fr@1", choices=("full@1", "legal-fr@1")
+    )
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
-    parser.add_argument("--baseline", type=Path, help="prior benchmark JSON for p95 comparison")
+    parser.add_argument(
+        "--baseline", type=Path, help="prior benchmark JSON for p95 comparison"
+    )
     parser.add_argument(
         "--max-p95-regression",
         type=float,
@@ -115,8 +127,15 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, help="write JSON results to this path")
     args = parser.parse_args()
-    if args.repetitions < 1 or args.warmups < 0 or args.timeout_seconds <= 0 or args.max_p95_regression < 0:
-        parser.error("--repetitions positive, --warmups non-negative, timeout positive, regression non-negative")
+    if (
+        args.repetitions < 1
+        or args.warmups < 0
+        or args.timeout_seconds <= 0
+        or args.max_p95_regression < 0
+    ):
+        parser.error(
+            "--repetitions positive, --warmups non-negative, timeout positive, regression non-negative"
+        )
     if not args.binary.is_file():
         parser.error(f"binary does not exist: {args.binary}")
     if not args.model.is_dir():
@@ -153,10 +172,20 @@ def main() -> int:
         for size in sizes:
             probe_text = make_text(size, -1)
             _, first_probe = run_one(
-                args.binary, args.model, root, args.profile, probe_text, args.timeout_seconds
+                args.binary,
+                args.model,
+                root,
+                args.profile,
+                probe_text,
+                args.timeout_seconds,
             )
             _, second_probe = run_one(
-                args.binary, args.model, root, args.profile, probe_text, args.timeout_seconds
+                args.binary,
+                args.model,
+                root,
+                args.profile,
+                probe_text,
+                args.timeout_seconds,
             )
             assert_deterministic(first_probe, second_probe)
             samples = [
@@ -180,8 +209,12 @@ def main() -> int:
                 try:
                     previous = float(baseline["sizes"][str(size)]["p95_ms"])
                 except (KeyError, TypeError, ValueError) as exc:
-                    parser.error(f"baseline has no valid p95_ms for {size} chars: {exc}")
-                delta = (summary["p95_ms"] - previous) / previous if previous > 0 else 0.0
+                    parser.error(
+                        f"baseline has no valid p95_ms for {size} chars: {exc}"
+                    )
+                delta = (
+                    (summary["p95_ms"] - previous) / previous if previous > 0 else 0.0
+                )
                 summary["baseline_p95_ms"] = previous
                 summary["p95_delta_fraction"] = delta
                 if delta > args.max_p95_regression:
