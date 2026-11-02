@@ -27,6 +27,9 @@ section also reports `ner_documents_per_second` and `ner_tokens_per_second`,
 derived only from the ingestion NER stage timing; these are intentionally
 separate from the `redact_text` NER path. The optional quality manifest reports
 embedding recall/nDCG and NER category/text coverage.
+Every bounded-out or failed file is also listed in the run's private-path
+`skip_reasons` array with its explicit status reason; this makes aggregate skip
+counters auditable without exposing document contents.
 When supplied, `--quality-baseline` adds recall, nDCG, and NER coverage deltas
 against a prior JSON report (either the full benchmark output or its `quality`
 object). The default allowed regression is `0.01` (one percentage point); set

@@ -64,6 +64,13 @@ struct NerExpectation {
 struct FirstResultObserver {
     started: Instant,
     first_searchable_ms: Option<u128>,
+    skip_reasons: Vec<SkipReason>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SkipReason {
+    path: String,
+    reason: &'static str,
 }
 
 impl FirstResultObserver {
@@ -71,12 +78,36 @@ impl FirstResultObserver {
         Self {
             started,
             first_searchable_ms: None,
+            skip_reasons: Vec::new(),
         }
     }
 }
 
 impl ScanObserver for FirstResultObserver {
-    fn on_file(&mut self, _result: FileResult) {}
+    fn on_file(&mut self, result: FileResult) {
+        let reason = match result.status {
+            basemind::scanner::FileStatus::SkippedTooLarge { .. } => Some("skipped_too_large"),
+            basemind::scanner::FileStatus::SkippedNonUtf8 => Some("skipped_non_utf8"),
+            basemind::scanner::FileStatus::SkippedNoLang => Some("skipped_no_lang"),
+            basemind::scanner::FileStatus::SkippedBinary => Some("skipped_binary"),
+            basemind::scanner::FileStatus::ReadFailed { .. } => Some("read_failed"),
+            basemind::scanner::FileStatus::ExtractFailed { .. } => Some("extract_failed"),
+            basemind::scanner::FileStatus::ParseTimedOut => Some("parse_timeout"),
+            #[cfg(feature = "documents")]
+            basemind::scanner::FileStatus::DocTimedOut => Some("doc_timeout"),
+            #[cfg(feature = "documents")]
+            basemind::scanner::FileStatus::DocTombstoned => Some("doc_tombstoned"),
+            #[cfg(feature = "documents")]
+            basemind::scanner::FileStatus::DocDeferred => Some("doc_deferred"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.skip_reasons.push(SkipReason {
+                path: result.path,
+                reason,
+            });
+        }
+    }
 
     fn on_searchable(&mut self) {
         if self.first_searchable_ms.is_none() {
@@ -149,6 +180,7 @@ fn json_report(
     manifest_files: usize,
     manifest_bytes: u64,
     first_result_ms: Option<u128>,
+    skip_reasons: &[SkipReason],
     config: &ConfigV1,
     rss_before: Option<u64>,
     rss_after: Option<u64>,
@@ -164,6 +196,7 @@ fn json_report(
         "cancelled": report.cancelled,
         "first_result_ms": first_result_ms,
         "first_searchable_result_ms": first_result_ms,
+        "skip_reasons": skip_reasons,
         "rss_before_bytes": rss_before,
         "rss_after_bytes": rss_after,
         "peak_rss_bytes": basemind::sysres::sample().peak_bytes,
@@ -640,6 +673,7 @@ fn main() -> Result<()> {
             manifest_files.len(),
             manifest_bytes,
             observer.first_searchable_ms,
+            &observer.skip_reasons,
             &config,
             rss_before,
             basemind::sysres::sample().current_bytes,
@@ -676,6 +710,7 @@ fn main() -> Result<()> {
             paths.len(),
             selected_bytes,
             observer.first_searchable_ms,
+            &observer.skip_reasons,
             &config,
             rss_before,
             basemind::sysres::sample().current_bytes,
