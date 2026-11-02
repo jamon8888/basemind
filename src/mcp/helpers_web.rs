@@ -235,6 +235,7 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
         let lance = lance_store(state).await?;
         let embedder = embedder(state).await?;
         let documents_cfg = state.shared.config.documents.clone();
+        let fts_cfg = documents_cfg.fts.clone();
         let scope_for_block = scope.clone();
         let final_url_for_block = result.final_url.clone();
         let mime_for_block = result.content_type.clone();
@@ -254,6 +255,9 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
         .await
         .map_err(|e| mcp_internal("spawn_blocking", e))?
         .map_err(|e| mcp_internal("index_page", e))?;
+
+        crate::lance::fts::build_index_after_ingest(lance.as_ref(), &fts_cfg)
+            .map_err(|e| mcp_internal("build document FTS indexes", e))?;
 
         WebScrapeResponse {
             url: url_str,
@@ -429,6 +433,9 @@ async fn run_web_crawl(
     }
 
     let outcomes: Vec<WebCrawlPageOutcome> = outcomes.into_iter().flatten().collect();
+
+    crate::lance::fts::build_index_after_ingest(lance.as_ref(), &documents_cfg.fts)
+        .map_err(|e| mcp_internal("build document FTS indexes", e))?;
 
     json_result(&WebCrawlResponse {
         seed_url: url_str,
