@@ -31,6 +31,9 @@ use crate::config::{
     OnnxProvider, RedactionConfig, RedactionStrategy, SummarizationConfig, SummarizationStrategy,
 };
 
+mod numbered_headings;
+use numbered_headings::{collect_numbered_headings, numbered_heading_path};
+
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
 /// about for downstream vector search.
@@ -550,8 +553,10 @@ fn run_guarded(
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
     let ledger = doc_guard::AbandonedThreads::global();
+    let extraction_path = path.clone();
     doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
-        prepare_extraction_input(&path, mime_type.as_deref()).map(|input| runtime.block_on(extract(input, &krz_config)))
+        prepare_extraction_input(&extraction_path, mime_type.as_deref())
+            .map(|input| runtime.block_on(extract(input, &krz_config)))
     })
     .map_err(|error| match error {
         DeadlineError::Elapsed => {
@@ -577,7 +582,7 @@ fn run_guarded(
             ))
         }
         DeadlineError::Failed(message) => ExtractError::Document(message),
-    })
+    })?
 }
 
 /// xberg 1.3.x converts images with alpha directly to RGB, which turns transparent
@@ -793,14 +798,24 @@ pub(crate) fn extract_doc_with_metrics(
     let mut dense_inputs = Vec::new();
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
     if linear {
+        let numbered_headings = collect_numbered_headings(&result.content);
         for (start, end) in doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap) {
-            let (chunk, dense_input) = prepare_doc_chunk(
+            let (mut chunk, mut dense_input) = prepare_doc_chunk(
                 result.content[start..end].to_string(),
                 start,
                 end,
                 None,
                 embed_requested,
             );
+            // The linear guard intentionally bypasses xberg's markdown splitter. Recover the
+            // explicit numbered section spine with a bounded source pre-pass so large legal
+            // documents retain the same structural signal as the normal chunking path.
+            chunk.heading_path = numbered_heading_path(&numbered_headings, start, end);
+            if let (Some(path), Some(input)) = (Some(chunk.heading_path.as_str()), dense_input.as_mut())
+                && !path.is_empty()
+            {
+                *input = format!("{path}\n\n{input}");
+            }
             chunks.push(chunk);
             dense_inputs.extend(dense_input);
         }
@@ -974,6 +989,12 @@ fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> St
     out
 }
 
+/// Recover citation-shaped headings for the linear large-document path.
+///
+/// This deliberately accepts only explicit Roman numerals or dotted Arabic outlines (and a
+/// single Arabic number when its caption is all-caps). Ordinary prose such as `4. The parties`
+/// is not promoted to structure. The parser is local to the source bytes before the chunk and
+/// therefore cannot invent a heading from another document or from an embedding result.
 fn prepare_doc_chunk(
     content: String,
     byte_start: usize,
