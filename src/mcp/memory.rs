@@ -624,7 +624,7 @@ pub(super) async fn run_search_documents(
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
         let has_more = hits_raw.len() > offset.saturating_add(limit);
-        let hits = hits_raw
+        let hits: Vec<DocumentSearchHit> = hits_raw
             .into_iter()
             .skip(offset)
             .take(limit)
@@ -673,7 +673,7 @@ pub(super) async fn run_search_documents(
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
         let has_more = hits_raw.len() > offset.saturating_add(limit);
-        let hits = hits_raw
+        let hits: Vec<DocumentSearchHit> = hits_raw
             .into_iter()
             .skip(offset)
             .take(limit)
@@ -714,6 +714,8 @@ pub(super) async fn run_search_documents(
     // result stream, so the next cursor can advance without duplicating or skipping hits when a
     // reranker changes their order.
     let budget = super::budget::apply_budget(std::mem::take(&mut hits), params.max_tokens);
+    let budgeted = budget.budgeted;
+    let budget_kept_len = budget.items.len();
     hits = budget.items;
 
     if reranker_enabled && !hits.is_empty() {
@@ -787,12 +789,12 @@ pub(super) async fn run_search_documents(
     };
 
     let page_start = cursor_offset.saturating_sub(raw_page_len as u64);
-    let next_offset = if budget.budgeted {
-        page_start.saturating_add(budget.items.len() as u64)
+    let next_offset = if budgeted {
+        page_start.saturating_add(budget_kept_len as u64)
     } else {
         cursor_offset
     };
-    let next_cursor = if !cursor_invalidated && limit > 0 && (has_more || budget.budgeted) {
+    let next_cursor = if !cursor_invalidated && limit > 0 && (has_more || budgeted) {
         Some(crate::mcp::cursor::Cursor::encode_documents(
             next_offset,
             cursor_generation,
@@ -804,8 +806,8 @@ pub(super) async fn run_search_documents(
     format_response(
         &SearchDocumentsResponse {
             query: params.query,
-            budgeted: budget.budgeted,
-            hits: budget.items,
+            budgeted,
+            hits,
             next_cursor,
             cursor_invalidated,
             elapsed_us: elapsed_us(__body),
