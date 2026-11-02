@@ -83,7 +83,17 @@ struct LanceMeta {
     /// at batch-build time, not at open.
     #[serde(default)]
     schema_ver: u32,
+    /// Stable identifier for the lexical tokenizer/index semantics. Keeping this in the
+    /// wipe identity makes a tokenizer change rebuild the Lance tables instead of silently
+    /// querying an index built with different tokenization rules. The serde default lets
+    /// metadata written before this field was introduced deserialize and deliberately mismatch.
+    #[serde(default)]
+    tokenizer_config: String,
 }
+
+/// Stable description of the tokenizer/index construction semantics. Change this value whenever
+/// those semantics change so opening the store deliberately wipes stale lexical indexes.
+const TOKENIZER_CONFIG: &str = "simple-v1";
 
 const META_FILE: &str = "meta.json";
 /// Persistent document-search generation lives beside the Lance directory. `wipe_on_mismatch`
@@ -260,6 +270,7 @@ impl LanceStore {
             dim,
             embedding_model: embedding_model.to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
         let wiped = wipe_on_mismatch(dir, &meta_path, &expected)?;
         let generation = if wiped {

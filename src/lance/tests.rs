@@ -38,7 +38,7 @@ fn row_predicate_pins_key_and_escapes_quotes() {
     );
 }
 
-/// A pre-0.5 `meta.json` (no `schema_ver`) must deserialize as `schema_ver = 0` and,
+/// A pre-0.5 `meta.json` (no `schema_ver` or tokenizer marker) must deserialize with defaults and,
 /// because that differs from the current `MEMORY_SCHEMA_VER`, force a wipe — never a
 /// parse error. This is the guard against the memory-table column add faulting at
 /// batch-build time on upgrade.
@@ -53,13 +53,14 @@ fn pre_0_5_meta_without_schema_ver_triggers_wipe() {
         dim: 384,
         embedding_model: "balanced".to_string(),
         schema_ver: MEMORY_SCHEMA_VER,
+        tokenizer_config: TOKENIZER_CONFIG.to_string(),
     };
     assert_ne!(MEMORY_SCHEMA_VER, 0, "current schema ver must differ from the legacy 0");
     wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
     assert!(!keep.exists(), "stale lance dir should have been wiped");
 }
 
-/// A matching `meta.json` (same dim, model, and `schema_ver`) leaves the store intact.
+/// A matching `meta.json` (same dim, model, schema and tokenizer marker) leaves the store intact.
 #[test]
 fn matching_meta_preserves_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -68,6 +69,7 @@ fn matching_meta_preserves_store() {
         dim: 384,
         embedding_model: "balanced".to_string(),
         schema_ver: MEMORY_SCHEMA_VER,
+        tokenizer_config: TOKENIZER_CONFIG.to_string(),
     };
     std::fs::write(&meta_path, serde_json::to_vec(&expected).unwrap()).unwrap();
     let keep = sentinel(dir.path());
@@ -85,6 +87,7 @@ fn schema_ver_bump_triggers_wipe() {
         dim: 384,
         embedding_model: "balanced".to_string(),
         schema_ver: MEMORY_SCHEMA_VER,
+        tokenizer_config: TOKENIZER_CONFIG.to_string(),
     };
     std::fs::write(&meta_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
     let keep = sentinel(dir.path());
