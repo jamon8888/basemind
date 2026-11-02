@@ -17,7 +17,7 @@ pub(crate) fn dense_retrieval_text<'a>(
     }
 }
 
-pub(super) fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> String {
+pub(crate) fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> String {
     let Some(context) = heading_context.filter(|c| !c.headings.is_empty()) else {
         return String::new();
     };

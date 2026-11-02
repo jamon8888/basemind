@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use xberg::chunking::{ChunkingConfig, chunk_text};
+use xberg::core::config::processing::ChunkerType;
 
 use crate::config::DocumentsConfig;
 use crate::embeddings::SharedEmbedder;
@@ -57,6 +58,7 @@ pub fn index_page(
     }
 
     let chunking_cfg = ChunkingConfig {
+        chunker_type: ChunkerType::Markdown,
         max_characters: documents_cfg.max_characters,
         overlap: documents_cfg.overlap,
         ..Default::default()
@@ -102,10 +104,7 @@ pub fn index_page(
             chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
             mime_type: mime_type.to_string(),
             text: chunk.content.clone(),
-            // Web pages are chunked as plain text: there is no heading structure to carry down, so
-            // the breadcrumb is empty rather than absent. The column is non-null and the keyword
-            // lane indexes it, so it has to be written as `""` and not skipped.
-            heading_path: String::new(),
+            heading_path: crate::extract::doc::heading_path_of(chunk.metadata.heading_context.as_ref()),
             cites: String::new(),
             byte_start,
             byte_end,
