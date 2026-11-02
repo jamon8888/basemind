@@ -36,6 +36,19 @@ for the current platform setup. CI covers base/full builds on Linux/macOS and a
 `comms shells` Windows leg; publishing has additional platform/runtime checks.
 `--all-features` is not equivalent to the release `full` feature set.
 
+On Intel macOS (`x86_64-apple-darwin`), the documents feature should use the
+release-compatible dynamic runtime when a complete static `ort-sys` development
+bundle is not installed:
+
+```sh
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+  cargo test --features documents,ort-dynamic --lib
+```
+
+`ORT_DYLIB_PATH` must point to an x86_64 ONNX Runtime dylib. A runtime-only
+dylib cannot satisfy `ort-sys`'s static build requirements; the release packager
+vendors the pinned Intel-compatible dylib automatically.
+
 For documentation-only changes, check links, Markdown formatting and
 `git diff --check`. Build the website when changing its MDX/configuration. Report
 which checks actually ran and any unavailable checks; changing docs does not
