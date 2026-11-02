@@ -295,6 +295,9 @@ pub fn build_graph_from_entities(
     }
 
     for ((doc_path, chunk_idx), entities) in chunk_entities {
+        let mut entities = entities;
+        let mut unique = HashSet::with_capacity(entities.len());
+        entities.retain(|entity| unique.insert(entity.clone()));
         // Fully connected within chunk (undirected, but store both directions for Cypher convenience)
         for i in 0..entities.len() {
             for j in i + 1..entities.len() {
@@ -385,6 +388,34 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
             .context("open graph_entities table")?;
 
         // Build batch
+        // Gateway-token nodes are shared across documents. Merge their existing
+        // counts before deleting old label variants so rescans do not split the
+        // node when GLiNER changes its span label.
+        let mut rows_to_insert = rows.to_vec();
+        for row in rows_to_insert.iter_mut().filter(|row| row.key_source == 2) {
+            let predicate = format!(
+                "scope = '{}' AND key_source = 2 AND gateway_token = '{}'",
+                escape_sql_literal(&row.scope),
+                escape_sql_literal(&row.gateway_token)
+            );
+            let mut stream = table
+                .query()
+                .only_if(predicate)
+                .execute()
+                .await
+                .context("query existing gateway entities")?;
+            let mut existing_count = 0u32;
+            while let Some(batch) = stream.try_next().await.context("stream existing gateway entities")? {
+                if let Some(counts) = batch
+                    .column_by_name("mention_count")
+                    .and_then(|column| column.as_any().downcast_ref::<arrow_array::UInt32Array>())
+                {
+                    existing_count = existing_count.saturating_add(counts.values().iter().copied().sum());
+                }
+            }
+            row.mention_count = row.mention_count.saturating_add(existing_count);
+        }
+
         let mut scope = arrow_array::builder::StringBuilder::new();
         let mut label = arrow_array::builder::StringBuilder::new();
         let mut key_source = arrow_array::builder::UInt8Builder::new();
@@ -398,7 +429,7 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
         let mut doc_path = arrow_array::builder::StringBuilder::new();
         let mut doc_chunk_idx = arrow_array::builder::UInt32Builder::new();
 
-        for r in rows {
+        for r in &rows_to_insert {
             scope.append_value(&r.scope);
             label.append_value(&r.label);
             key_source.append_value(r.key_source);
@@ -435,12 +466,11 @@ pub fn upsert_graph_entities(connection: &Connection, runtime: &Runtime, rows: &
 
         // Delete-then-insert for upsert semantics (key = scope+label+key_source+normalized_literal+document_path+gateway_token)
         // We build a predicate per row — acceptable since entity count per scan is modest.
-        for r in rows {
+        for r in &rows_to_insert {
             let predicate = match r.key_source {
-                2 => format!( // GatewayToken: key is scope+label+key_source+gateway_token
-                    "scope = '{}' AND label = '{}' AND key_source = {} AND gateway_token = '{}'",
+                2 => format!( // GatewayToken: key is scope+key_source+gateway_token; label may be stale
+                    "scope = '{}' AND key_source = {} AND gateway_token = '{}'",
                     escape_sql_literal(&r.scope),
-                    escape_sql_literal(&r.label),
                     r.key_source,
                     escape_sql_literal(&r.gateway_token),
                 ),
