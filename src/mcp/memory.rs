@@ -681,7 +681,7 @@ pub(super) async fn run_search_documents(
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
         let query = params.query.clone();
-        let hits_raw = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
             if let Some(mime) = mime.as_deref() {
                 predicate.push_str(" AND mime_type = '");
@@ -750,8 +750,7 @@ pub(super) async fn run_search_documents(
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
-        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
-        hits_raw
+        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?
     };
 
     attach_doc_metadata(
