@@ -69,6 +69,10 @@ pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
     ("documents_heading_idx", "heading_path"),
 ];
 
+/// The identifier column is kept in a separate trigram index so statute and docket lookups do not
+/// inherit stemming or stop-word removal from the topical keyword lane.
+pub const EXACT_INDEX: (&str, &str) = ("documents_cites_idx", "cites");
+
 /// The columns the keyword lane covers.
 ///
 /// Every one of them carries an FTS index, and that is the contract: `search_lexical` names no
@@ -93,6 +97,17 @@ pub fn keyword_index_params(cfg: &FtsConfig) -> Result<FtsIndexBuilder> {
         .ascii_folding(cfg.ascii_folding)
         .max_token_length(Some(cfg.max_token_length as usize))
         .custom_stop_words(Some(cfg.custom_stop_words.clone())))
+}
+
+fn exact_index_params(cfg: &FtsConfig) -> FtsIndexBuilder {
+    FtsIndexBuilder::default()
+        .base_tokenizer("ngram".to_string())
+        .ngram_min_length(cfg.ngram_min_length)
+        .ngram_max_length(cfg.ngram_max_length)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(cfg.ascii_folding)
+        .max_token_length(Some(cfg.max_token_length as usize))
 }
 
 /// Attach the keyword indexes to `table`, replacing any existing ones of the same name.
@@ -130,7 +145,30 @@ pub async fn ensure_keyword_index(table: &Table, cfg: &FtsConfig) -> Result<()> 
             .await
             .with_context(|| format!("create {name} on {column}"))?;
     }
+    let (name, column) = EXACT_INDEX;
+    if existing.iter().any(|i| i.name == name) {
+        table
+            .drop_index(name)
+            .await
+            .with_context(|| format!("drop stale {name}"))?;
+    }
+    table
+        .create_index(&[column], Index::FTS(exact_index_params(cfg)))
+        .name(name.to_string())
+        .execute()
+        .await
+        .with_context(|| format!("create {name} on {column}"))?;
     Ok(())
+}
+
+/// Build the exact identifier query. No fuzziness or stemming is allowed on this path.
+pub fn exact_query(term: &str) -> Result<FullTextSearchQuery> {
+    Ok(FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new(term.to_string())
+            .with_column(Some(EXACT_INDEX.1.to_string()))
+            .with_operator(Operator::And)
+            .with_fuzziness(Some(0)),
+    )))
 }
 
 /// A lexical hit.

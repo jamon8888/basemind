@@ -33,6 +33,7 @@ use crate::config::{
 
 mod numbered_headings;
 use numbered_headings::{collect_numbered_headings, numbered_heading_path};
+pub(crate) mod citations;
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care

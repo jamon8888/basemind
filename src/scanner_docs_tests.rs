@@ -32,6 +32,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
             text: "hello".to_string(),
             embedding: vec![0.0_f32; 768],
             heading_path: String::new(),
+            cites: String::new(),
         }],
         embedding_model: "balanced".to_string(),
         embedding_dim: 768,

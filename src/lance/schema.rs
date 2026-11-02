@@ -37,6 +37,7 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new("mime_type", DataType::Utf8, false),
         Field::new("text", DataType::Utf8, false),
         Field::new("heading_path", DataType::Utf8, false),
+        Field::new("cites", DataType::Utf8, false),
         Field::new("byte_start", DataType::UInt32, false),
         Field::new("byte_end", DataType::UInt32, false),
         Field::new("rehydration_ref", DataType::Utf8, true),

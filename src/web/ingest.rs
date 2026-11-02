@@ -106,6 +106,7 @@ pub fn index_page(
             // the breadcrumb is empty rather than absent. The column is non-null and the keyword
             // lane indexes it, so it has to be written as `""` and not skipped.
             heading_path: String::new(),
+            cites: String::new(),
             byte_start,
             byte_end,
             rehydration_ref: None,
