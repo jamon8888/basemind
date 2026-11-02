@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added a standalone runtime-tuning matrix driver for the PDF/Office benchmark.
+  It evaluates bounded scanner, embedding, batch, and document-concurrency
+  settings in fresh processes and rejects candidates that exceed RSS, timeout,
+  skip/failure, or quality gates.
 - The document benchmark now reports ingestion-NER document and token throughput
   separately from total indexing throughput, making NER tuning measurable without
   conflating it with `redact_text` latency.
