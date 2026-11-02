@@ -67,6 +67,8 @@ python3 scripts/tune_document_runtime.py /private/docs \
   --manifest /private/docs-manifest.txt \
   --quality-manifest benchmarks/document_quality.example.jsonl \
   --quality-baseline /private/baseline.json \
+  --throughput-baseline /private/ner-baseline.json \
+  --min-ner-throughput-ratio 1.05 \
   --scan-threads 2,4 --embed-threads 2,4 \
   --embed-batch-size 16,32 --max-concurrent-documents 1,2 \
   --rss-ceiling-mb 8192 --output /private/runtime-matrix.json
@@ -74,4 +76,7 @@ python3 scripts/tune_document_runtime.py /private/docs \
 
 The matrix is evidence-only: CPU remains the reference provider, and an
 alternate provider must be passed explicitly and measured on the target corpus
-before it is adopted as a deployment default.
+before it is adopted as a deployment default. When `--throughput-baseline` is
+provided, every candidate must meet the requested minimum ratio against the
+baseline cold `ner_tokens_per_second`; the ratio and measured values are kept
+in the JSON report.

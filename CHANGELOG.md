@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The runtime tuning matrix can now enforce an ingestion-NER token-throughput
+  improvement against a prior cold benchmark while retaining the existing
+  quality and resource gates.
 - Added a standalone runtime-tuning matrix driver for the PDF/Office benchmark.
   It evaluates bounded scanner, embedding, batch, and document-concurrency
   settings in fresh processes and rejects candidates that exceed RSS, timeout,

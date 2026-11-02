@@ -50,6 +50,14 @@ def _cold_run(report: dict[str, Any]) -> dict[str, Any]:
     return report.get("runs", [{}])[0]
 
 
+def _ner_throughput(report: dict[str, Any]) -> tuple[float, float]:
+    throughput = _cold_run(report).get("throughput") or {}
+    return (
+        float(throughput.get("ner_documents_per_second", 0.0)),
+        float(throughput.get("ner_tokens_per_second", 0.0)),
+    )
+
+
 def _quality(report: dict[str, Any], require_baseline: bool) -> tuple[float, float, float, bool]:
     quality = report.get("quality") or {}
     retrieval = quality.get("retrieval") or {}
@@ -107,6 +115,15 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--quality-baseline", type=Path)
+    parser.add_argument(
+        "--throughput-baseline", type=Path, help="prior benchmark JSON for the ingestion-NER throughput gate"
+    )
+    parser.add_argument(
+        "--min-ner-throughput-ratio",
+        type=float,
+        default=1.0,
+        help="minimum candidate/baseline NER token-throughput ratio",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--scan-threads", type=_ints, default=[2])
     parser.add_argument("--embed-threads", type=_ints, default=[2])
@@ -118,8 +135,23 @@ def main() -> int:
     parser.add_argument("--quality-tolerance", type=float, default=0.01)
     args = parser.parse_args()
 
-    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0 or args.quality_tolerance < 0:
-        parser.error("timeout and quality tolerance must be non-negative, with timeout > 0")
+    if (
+        not math.isfinite(args.timeout_seconds)
+        or args.timeout_seconds <= 0
+        or args.quality_tolerance < 0
+        or not math.isfinite(args.min_ner_throughput_ratio)
+        or args.min_ner_throughput_ratio < 0
+    ):
+        parser.error("timeout must be finite and positive; tolerances and throughput ratio must be non-negative")
+    ner_baseline: tuple[float, float] | None = None
+    if args.throughput_baseline:
+        try:
+            baseline_report = json.loads(args.throughput_baseline.read_text(encoding="utf-8"))
+            ner_baseline = _ner_throughput(baseline_report)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            parser.error(f"invalid --throughput-baseline: {error}")
+        if ner_baseline[1] <= 0:
+            parser.error("--throughput-baseline has no positive cold ner_tokens_per_second")
     candidates: list[dict[str, int]] = []
     for scan, embed, batch, docs in itertools.product(
         args.scan_threads,
@@ -194,6 +226,7 @@ def main() -> int:
                 report = _json_report(completed.stdout)
                 cold = _cold_run(report)
                 quality = _quality(report, args.quality_baseline is not None)
+                ner_documents_per_second, ner_tokens_per_second = _ner_throughput(report)
                 peak_rss = cold.get("peak_rss_bytes")
                 stats = cold.get("stats") or {}
                 timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(stats.get("parse_timeouts", 0)) > 0
@@ -203,6 +236,10 @@ def main() -> int:
                         "report": report,
                         "cold": cold,
                         "quality": quality[:3],
+                        "ner_throughput": {
+                            "documents_per_second": ner_documents_per_second,
+                            "tokens_per_second": ner_tokens_per_second,
+                        },
                         "peak_rss_bytes": peak_rss,
                     }
                 )
@@ -220,6 +257,8 @@ def main() -> int:
                     reasons.append("skip_or_failure")
                 if not quality[3]:
                     reasons.append("quality_regression")
+                if ner_baseline is not None and ner_tokens_per_second < ner_baseline[1] * args.min_ner_throughput_ratio:
+                    reasons.append("ner_throughput_regression")
                 entry["accepted"] = not reasons
                 entry["rejection_reasons"] = reasons
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
@@ -238,6 +277,8 @@ def main() -> int:
     output = {
         "candidates": len(results),
         "accepted": len(accepted),
+        "ner_throughput_baseline": ner_baseline,
+        "min_ner_throughput_ratio": args.min_ner_throughput_ratio,
         "best": accepted[0] if accepted else None,
         "results": results,
     }
