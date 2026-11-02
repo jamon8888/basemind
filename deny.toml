@@ -29,6 +29,10 @@ ignore = [
   # calamine/candle dependencies require zip ^8 and basemind does not call the
   # vulnerable ZipArchive::extract or stream-extraction APIs.
   "RUSTSEC-2026-0429",
+  # thrift 0.17.0 is transitive through parquet/datafusion/Lance. Basemind uses those crates for
+  # local document/vector persistence and does not expose a thrift binary-protocol listener; the
+  # vulnerable peer-controlled read_bytes path is therefore not reachable through our service.
+  "RUSTSEC-2026-0435",
   # Transitive advisories in the all-features Lance/Arrow and document-parser
   # graph. Keep the dependency graph pinned for this release candidate; these
   # are tracked for remediation when upstream fixes are available.
