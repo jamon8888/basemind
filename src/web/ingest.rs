@@ -39,6 +39,7 @@ pub struct IndexedPage {
 /// across both sources. Citation extraction is opt-in for caller-supplied web
 /// scopes; host-derived scopes remain citation-free and therefore cannot enter
 /// the exact identifier lane.
+#[allow(clippy::too_many_arguments)]
 pub fn index_page(
     lance: &LanceStore,
     embedder: &Arc<SharedEmbedder>,
