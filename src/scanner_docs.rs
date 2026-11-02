@@ -958,6 +958,12 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
             actual,
             "preset/runtime dim mismatch — refusing to write document batch"
         );
+        if store.lance_dir_exists()
+            && let Err(error) =
+                crate::lance::bump_document_generation_for_dir(&store.basemind_dir.join(crate::store::LANCE_DIR))
+        {
+            tracing::warn!(?error, "failed to invalidate document cursors after dimension mismatch");
+        }
         return 0;
     }
     let mut inserted = 0usize;

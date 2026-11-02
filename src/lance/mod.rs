@@ -101,6 +101,15 @@ const META_FILE: &str = "meta.json";
 /// what lets a resumed cursor detect a schema/model rebuild after process restart.
 const GENERATION_SUFFIX: &str = ".generation";
 
+/// Bump the durable document-search generation without opening Lance. This is used when a scan
+/// refuses a document batch before `LanceStore::open` (for example, a vector-dimension mismatch):
+/// an outstanding cursor must still be invalidated even though no rows were written.
+pub fn bump_document_generation_for_dir(dir: &Path) -> Result<u64> {
+    let path = generation_path(dir);
+    let current = read_generation(&path)?;
+    bump_generation_file(&path, current)
+}
+
 /// Open the existing lance store for read-side tools (the MCP `graph` modes)
 /// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
 /// identity is read back from `meta.json` instead of taken from config, so a

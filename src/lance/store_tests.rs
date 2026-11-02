@@ -101,6 +101,16 @@ mod tests {
         assert_eq!(read_generation(&generation).unwrap(), 8);
     }
 
+    #[test]
+    fn generation_can_be_bumped_without_opening_lance() {
+        let dir = tempfile::tempdir().unwrap();
+        let lance_dir = dir.path().join("lance");
+        std::fs::create_dir_all(&lance_dir).unwrap();
+        assert_eq!(read_generation(&generation_path(&lance_dir)).unwrap(), 1);
+        assert_eq!(bump_document_generation_for_dir(&lance_dir).unwrap(), 2);
+        assert_eq!(read_generation(&generation_path(&lance_dir)).unwrap(), 2);
+    }
+
     /// A bumped `schema_ver` (e.g. a future minor) on an otherwise-identical store wipes.
     #[test]
     fn schema_ver_bump_triggers_wipe() {
