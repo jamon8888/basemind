@@ -238,6 +238,7 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
         let scope_for_block = scope.clone();
         let final_url_for_block = result.final_url.clone();
         let mime_for_block = result.content_type.clone();
+        let extract_citations = params.scope.is_some() && documents_cfg.citations.extract;
         let indexed = tokio::task::spawn_blocking(move || {
             index_page(
                 lance.as_ref(),
@@ -247,6 +248,7 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
                 &final_url_for_block,
                 &mime_for_block,
                 &body_text,
+                extract_citations,
             )
         })
         .await
@@ -355,6 +357,7 @@ async fn run_web_crawl(
         let mime_for_block = page.content_type.clone();
         let status_code = page.status_code;
         let normalized_url = page.normalized_url.clone();
+        let extract_citations = params.scope.is_some() && docs_for_block.citations.extract;
 
         outcomes.push(None);
 
@@ -369,6 +372,7 @@ async fn run_web_crawl(
                     &path_for_block,
                     &mime_for_block,
                     &body_text,
+                    extract_citations,
                 )
             })
             .await;

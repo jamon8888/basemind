@@ -36,7 +36,9 @@ pub struct IndexedPage {
 ///
 /// `documents_cfg` controls chunk sizing (max_characters, overlap) so web
 /// chunking matches disk chunking — agents see consistent retrieval behaviour
-/// across both sources.
+/// across both sources. Citation extraction is opt-in for caller-supplied web
+/// scopes; host-derived scopes remain citation-free and therefore cannot enter
+/// the exact identifier lane.
 pub fn index_page(
     lance: &LanceStore,
     embedder: &Arc<SharedEmbedder>,
@@ -45,6 +47,7 @@ pub fn index_page(
     path: &str,
     mime_type: &str,
     body: &str,
+    extract_citations: bool,
 ) -> Result<IndexedPage> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -98,6 +101,15 @@ pub fn index_page(
         }
         let byte_start = u32::try_from(chunk.metadata.byte_start).unwrap_or(u32::MAX);
         let byte_end = u32::try_from(chunk.metadata.byte_end).unwrap_or(u32::MAX);
+        let cites = if extract_citations {
+            crate::extract::doc::citations::extract_citations(
+                &chunk.content,
+                documents_cfg.citations.max_per_chunk as usize,
+            )
+            .join(" ")
+        } else {
+            String::new()
+        };
         rows.push(DocumentRow {
             scope: scope.to_string(),
             path: path.to_string(),
@@ -105,7 +117,7 @@ pub fn index_page(
             mime_type: mime_type.to_string(),
             text: chunk.content.clone(),
             heading_path: crate::extract::doc::heading_path_of(chunk.metadata.heading_context.as_ref()),
-            cites: String::new(),
+            cites,
             byte_start,
             byte_end,
             rehydration_ref: None,
