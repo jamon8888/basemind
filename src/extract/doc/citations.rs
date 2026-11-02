@@ -10,7 +10,10 @@ pub(crate) fn extract_citations(text: &str, max_per_chunk: usize) -> Vec<String>
     while i < bytes.len() && out.len() < max_per_chunk {
         let (start, marker_len) = if i + 2 <= bytes.len() && bytes[i..i + 2] == [0xC2, 0xA7] {
             (i, 2)
-        } else if i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"no.") {
+        } else if i + 3 <= bytes.len()
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && bytes[i..i + 3].eq_ignore_ascii_case(b"no.")
+        {
             (i, 3)
         } else {
             i += 1;
@@ -48,6 +51,10 @@ pub(crate) fn extract_citations(text: &str, max_per_chunk: usize) -> Vec<String>
     out
 }
 
+pub(crate) fn filter_self_references(citations: &mut Vec<String>, excluded: &[String]) {
+    citations.retain(|citation| !excluded.iter().any(|value| value.eq_ignore_ascii_case(citation)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::extract_citations;
@@ -60,10 +67,16 @@ mod tests {
     }
     #[test]
     fn dedupes_and_caps() {
-        assert_eq!(extract_citations("§ 362 § 362 No. 3", 1), vec!["§ 362"]);
+        assert_eq!(extract_citations("§ 362 § 362 No. 3", 8), vec!["§ 362", "No. 3"]);
+        assert_eq!(extract_citations("§ 362 § 365 No. 3", 1), vec!["§ 362"]);
     }
     #[test]
     fn rejects_markers_without_digits() {
         assert!(extract_citations("No. other text § (a)", 8).is_empty());
+    }
+
+    #[test]
+    fn no_marker_requires_word_boundary() {
+        assert_eq!(extract_citations("Reno. 2 is not a docket; No. 3 is", 8), vec!["No. 3"]);
     }
 }
