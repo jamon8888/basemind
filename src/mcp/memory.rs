@@ -680,28 +680,78 @@ pub(super) async fn run_search_documents(
         let lance = lance_store(state).await?;
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
+        let query = params.query.clone();
         let hits_raw = tokio::task::spawn_blocking(move || {
-            lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            let mut merged = Vec::with_capacity(limit);
+            let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                for hit in basemind_exact(&lance, candidate, &predicate, limit)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(DocumentSearchHit {
+                            path: hit.path,
+                            chunk_idx: hit.chunk_idx,
+                            text: hit.text,
+                            mime_type: hit.mime_type,
+                            byte_start: hit.byte_start,
+                            byte_end: hit.byte_end,
+                            distance: 0.0,
+                            rerank_score: None,
+                            keywords: Vec::new(),
+                            entities: Vec::new(),
+                            summary: None,
+                        });
+                    }
+                }
+            }
+            for phrase in crate::lance::fts::quoted_phrases(&query) {
+                for hit in basemind_phrase(&lance, &phrase, &predicate, limit)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(DocumentSearchHit {
+                            path: hit.path,
+                            chunk_idx: hit.chunk_idx,
+                            text: hit.text,
+                            mime_type: hit.mime_type,
+                            byte_start: hit.byte_start,
+                            byte_end: hit.byte_end,
+                            distance: 0.0,
+                            rerank_score: None,
+                            keywords: Vec::new(),
+                            entities: Vec::new(),
+                            summary: None,
+                        });
+                    }
+                }
+            }
+            for hit in lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())? {
+                if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                    merged.push(DocumentSearchHit {
+                        path: hit.path,
+                        chunk_idx: hit.chunk_idx,
+                        text: hit.text,
+                        mime_type: hit.mime_type,
+                        byte_start: hit.byte_start,
+                        byte_end: hit.byte_end,
+                        distance: hit.distance,
+                        rerank_score: None,
+                        keywords: Vec::new(),
+                        entities: Vec::new(),
+                        summary: None,
+                    });
+                }
+            }
+            merged.truncate(limit);
+            Ok::<Vec<DocumentSearchHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
         hits_raw
-            .into_iter()
-            .map(|h| DocumentSearchHit {
-                path: h.path,
-                chunk_idx: h.chunk_idx,
-                text: h.text,
-                mime_type: h.mime_type,
-                byte_start: h.byte_start,
-                byte_end: h.byte_end,
-                distance: h.distance,
-                rerank_score: None,
-                keywords: Vec::new(),
-                entities: Vec::new(),
-                summary: None,
-            })
-            .collect()
     };
 
     attach_doc_metadata(
