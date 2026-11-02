@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Document cache fingerprints now include the configured ONNX provider, preventing
   embeddings, NER, layout, or OCR outputs from being reused across runtimes with
   different execution behavior.
+- Document metadata now preserves xberg's exact count of OCR lines removed by its
+  dictionary filter, making partial OCR loss visible to indexing and diagnostics.
 
 ## [0.36.0] - 2026-10-31
 
