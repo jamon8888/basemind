@@ -1,3 +1,4 @@
+use super::cache::{cached_doc_is_reusable, cached_embeddings_are_reusable};
 use super::*;
 
 #[test]
@@ -12,7 +13,7 @@ fn preset_dim_for_balanced_returns_768() {
 #[test]
 fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     use crate::extract::doc::{DocChunk, FileMapDoc};
-    let doc = FileMapDoc {
+    let mut doc = FileMapDoc {
         config_digest: String::new(),
         linear_chunked: false,
         text_fallback: false,
@@ -53,6 +54,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         embedding_preset: "multilingual".to_string(),
         ..DocumentsConfig::default()
     };
+    doc.config_digest = "d".to_string();
     assert!(
         !cached_doc_is_reusable(&doc, &switched, true, "d"),
         "switching balanced -> multilingual (same dim, different model) must force recompute"
@@ -61,6 +63,18 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     assert!(
         cached_doc_is_reusable(&doc, &switched, false, "d"),
         "embedding off: cached doc is always reusable"
+    );
+    assert!(
+        cached_doc_content_is_reusable(&doc, &switched, "d"),
+        "changing only the embedding preset must preserve extracted content and NER"
+    );
+    assert!(
+        !cached_embeddings_are_reusable(&doc, &switched),
+        "changing the embedding preset must invalidate only the vector stage"
+    );
+    assert!(
+        !cached_doc_content_is_reusable(&doc, &switched, "other"),
+        "a changed extraction digest must reject stale content"
     );
 }
 

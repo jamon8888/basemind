@@ -41,6 +41,9 @@ use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::scanner_filter::Filters;
 use crate::store::Store;
+#[path = "scanner_doc_cache.rs"]
+mod cache;
+pub(crate) use cache::cached_doc_content_is_reusable;
 
 /// Per-file deferred-LanceDB-write descriptor. Constructed inside `process_file`'s parallel
 /// worker; consumed in the single-threaded apply pass via [`flush_document_batches`].
@@ -407,7 +410,7 @@ pub(crate) fn extract_and_persist_doc(
     let hash_hex = hashing::hex_str(&hex_buf);
 
     if let Some(mut cached) = store.read_doc_by_hex(hash_hex).ok().flatten()
-        && cached_doc_is_reusable(&cached, cfg, embed, &filters.doc_digest)
+        && cached_doc_content_is_reusable(&cached, cfg, &filters.doc_digest)
     {
         // The same pass rewrites whatever the blob still carries from an older regime —
         // a digest-less blob is stamped with the current one, and a rehydration_ref left
@@ -442,6 +445,10 @@ pub(crate) fn extract_and_persist_doc(
                 .write_doc(hash, &cached)
                 .with_context(|| format!("rewrite doc blob for {rel}"))?;
         }
+
+        // A model change reuses extracted content, chunks, and NER, then refreshes only vectors.
+        cache::refresh_cached_embeddings(store, hash, rel, &mut cached, cfg, embed, resources, filters, metrics)?;
+
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
         store.touch_doc_blob(hash_hex);
@@ -669,42 +676,6 @@ pub(crate) fn doc_entry_settled(
         && !(embed_requested && reflush)
         && existing.rehydration_ref.is_none()
         && (existing.embedded || existing.embed_attempted || !embed_requested)
-}
-
-/// True when a cached document blob can be reused without re-extraction. When embedding is on the
-/// cached blob must carry embeddings produced by the current preset — matching both its **dimension**
-/// AND its **model**. The model check is load-bearing: `balanced` and `multilingual` share dim 768,
-/// so a dim-only gate would falsely reuse stale-model vectors when switching between them. A preset
-/// change (dim OR model) therefore forces recompute — same gate as `chunk_and_embed`. An
-/// empty-of-chunks doc is always reusable (recompute would yield nothing anyway). When embedding is
-/// off, any cached doc is reusable (chunks only). In every case the blob must have been produced
-/// under the current `config_digest` (or predate digests, in which case the caller stamps it).
-fn cached_doc_is_reusable(cached: &FileMapDoc, cfg: &DocumentsConfig, embed: bool, config_digest: &str) -> bool {
-    if !cached.config_digest.is_empty() && cached.config_digest != config_digest {
-        return false;
-    }
-    // Mirror the write path (extract/doc.rs): redaction disabled stamps `None`, enabled
-    // stamps `Some(hash)`. Demanding `Some` unconditionally kills reuse for every
-    // redaction-off corpus; a config change or enable/disable flip still forces re-extract.
-    let want_fingerprint: Option<String> = if cfg.redaction.enabled {
-        Some(crate::extract::doc::hash_redaction_config(&cfg.redaction))
-    } else {
-        None
-    };
-    if cached.redaction_fingerprint != want_fingerprint {
-        return false;
-    }
-    if !embed || cached.chunks.is_empty() {
-        return true;
-    }
-    let want_dim = preset_dim(&cfg.embedding_preset).ok();
-    cached.embedding_dim > 0
-        && Some(cached.embedding_dim) == want_dim
-        && cached.embedding_model == cfg.embedding_preset
-        && cached
-            .chunks
-            .iter()
-            .all(|c| c.embedding.len() == cached.embedding_dim as usize)
 }
 
 /// Assemble the deferred-write descriptor from an extracted-or-cached document. Decides — while the
