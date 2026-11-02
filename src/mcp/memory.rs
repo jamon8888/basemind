@@ -599,7 +599,14 @@ pub(super) async fn run_search_documents(
     // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
-    let query_fingerprint = document_query_fingerprint(&params, &scope, lexical_only);
+    let query_fingerprint = document_query_fingerprint(
+        &params,
+        &scope,
+        lexical_only,
+        reranker_enabled,
+        reranker_top_k,
+        explicit_preset.as_deref(),
+    );
 
     let (mut hits, cursor_generation, cursor_offset, raw_page_len, has_more, cursor_invalidated) = if lexical_only {
         let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
@@ -818,13 +825,21 @@ pub(super) async fn run_search_documents(
 
 const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 100_000;
 
-fn document_query_fingerprint(params: &SearchDocumentsParams, scope: &str, lexical_only: bool) -> u64 {
+fn document_query_fingerprint(
+    params: &SearchDocumentsParams,
+    scope: &str,
+    lexical_only: bool,
+    reranker_enabled: bool,
+    reranker_top_k: usize,
+    reranker_preset: Option<&str>,
+) -> u64 {
     let material = format!(
-        "{scope}\n{lexical_only}\n{}\n{}\n{}\n{}",
+        "{scope}\n{lexical_only}\n{reranker_enabled}\n{reranker_top_k}\n{}\n{}\n{}\n{}\n{}",
         params.query,
         params.mime_type.as_deref().unwrap_or_default(),
         params.entity_category.as_deref().unwrap_or_default(),
         params.keywords_contains.as_deref().unwrap_or_default(),
+        reranker_preset.unwrap_or_default(),
     );
     let digest = blake3::hash(material.as_bytes());
     u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("blake3 digest has 8 bytes"))
@@ -991,7 +1006,7 @@ mod document_cursor_tests {
             cursor: None,
             overrides: Default::default(),
         };
-        let fingerprint = document_query_fingerprint(&params, "repo", false);
+        let fingerprint = document_query_fingerprint(&params, "repo", false, false, 0, None);
         let cursor = Cursor::encode_documents(10, 4, fingerprint);
         assert_eq!(
             document_cursor_offset(Some(&cursor), 4, fingerprint).expect("cursor"),
