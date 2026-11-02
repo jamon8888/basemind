@@ -98,7 +98,10 @@ def main() -> int:
         "sizes": {},
     }
     for size in sizes:
-        samples = [run_one(args.binary, args.model, args.profile, make_text(size, run))[0] for run in range(args.repetitions)]
+        samples = [
+            run_one(args.binary, args.model, args.profile, make_text(size, run))[0]
+            for run in range(args.repetitions)
+        ]
         summary = {
             "p50_ms": percentile(samples, 50),
             "p95_ms": percentile(samples, 95),
