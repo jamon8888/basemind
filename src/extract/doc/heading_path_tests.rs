@@ -80,3 +80,35 @@ fn stored_heading_path_is_the_prefix_of_the_dense_retrieval_input() {
         "and must still carry the body, which the column does not store"
     );
 }
+
+#[test]
+fn numbered_heading_path_keeps_roman_and_dotted_arabic_citations() {
+    let source = "IV. TERMINATION\nBody\n4.1 Convenience\nMore body\n";
+    let headings = collect_numbered_headings(source);
+    assert_eq!(numbered_heading_path(&headings, 18, source.len()), "IV. TERMINATION");
+}
+
+#[test]
+fn numbered_heading_path_does_not_promote_normal_sentence() {
+    let source = "4. The landlord may terminate.\nBody\n";
+    let headings = collect_numbered_headings(source);
+    assert_eq!(numbered_heading_path(&headings, 0, source.len()), "");
+}
+
+#[test]
+fn numbered_heading_path_uses_only_headings_active_at_chunk_start() {
+    let source = "4.1 Child\nBody\n4.2 Sibling\nMore\n";
+    let headings = collect_numbered_headings(source);
+    assert_eq!(numbered_heading_path(&headings, 10, source.len()), "4.1 Child");
+    assert_eq!(numbered_heading_path(&headings, 25, source.len()), "4.2 Sibling");
+}
+
+#[test]
+fn numbered_heading_path_validates_roman_tokens() {
+    let source = "iv. Lowercase\nCIVIL Not a heading\n";
+    let headings = collect_numbered_headings(source);
+    assert_eq!(
+        numbered_heading_path(&headings, source.len(), source.len()),
+        "iv. Lowercase"
+    );
+}

@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different execution behavior.
 - Document metadata now preserves xberg's exact count of OCR lines removed by its
   dictionary filter, making partial OCR loss visible to indexing and diagnostics.
+- Large linear-chunked documents now retain explicit Roman and dotted-Arabic section
+  breadcrumbs (including their citation numbers) for lexical and dense retrieval.
 
 ## [0.36.0] - 2026-10-31
 

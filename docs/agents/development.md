@@ -92,6 +92,12 @@ For language changes, follow the
 Queries in `src/queries/` override the language-pack fallback; prose/data grammars
 also need the tier-routing decision in `lang::is_non_code`.
 
+Large text documents bypass xberg's markdown splitter through the linear chunking
+guard. That path uses a bounded Basemind-side pre-pass for explicit Roman and
+dotted-Arabic section markers (for example `IV.` and `4.1`) so legal citation
+structure remains in `heading_path`; ordinary prose is not promoted. The normal
+xberg heading context remains authoritative whenever it is available.
+
 ### Change configuration
 
 Update the Rust config type/defaults, validation, trust handling, and any
