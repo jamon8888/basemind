@@ -124,7 +124,7 @@ pub(crate) fn preset_dim(name: &str) -> anyhow::Result<u16> {
 #[cfg(feature = "graphrag")]
 fn lance_or_open_fallback(store: &Store, preset: &str) -> Option<Arc<crate::lance::LanceStore>> {
     if let Some(lance) = &store.lance {
-        return Some(lance.clone());
+        return Some(Arc::new(lance.clone()));
     }
     let dir = store.basemind_dir.join(crate::store_layout::LANCE_DIR);
     match crate::lance::open_existing(&dir) {
@@ -502,6 +502,8 @@ pub(crate) fn extract_and_persist_doc(
                     hops: cfg.graphrag.hops,
                 };
 
+                let _ =
+                    crate::lance::graphrag::delete_graph_for_document(lance.connection(), lance.runtime(), scope, rel);
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
                         let _ = crate::lance::graphrag::upsert_graph_entities(
@@ -622,6 +624,7 @@ pub(crate) fn extract_and_persist_doc(
                 hops: cfg.graphrag.hops,
             };
 
+            let _ = crate::lance::graphrag::delete_graph_for_document(lance.connection(), lance.runtime(), scope, rel);
             if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                 if !entity_rows.is_empty() {
                     let _ = crate::lance::graphrag::upsert_graph_entities(
@@ -691,6 +694,10 @@ pub(crate) fn doc_entry_settled(
 /// is on, the doc has embeddings, it has chunks, and it is under the per-doc chunk cap. The heavy
 /// row-building (chunk text + embedding vectors) is deferred to [`flush_document_batches`], which
 /// re-reads the persisted blob per file so no embeddings are held across the corpus.
+// This descriptor intentionally carries the scan context alongside the document so the
+// deferred flush can remain allocation-bounded; grouping it into a temporary struct would
+// obscure the ownership boundary between extraction and persistence.
+#[allow(clippy::too_many_arguments)]
 fn pending_from_doc(
     doc: &FileMapDoc,
     rel: &str,

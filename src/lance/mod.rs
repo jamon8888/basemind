@@ -22,6 +22,9 @@ mod documents_unit_tests;
 pub mod fts;
 /// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
 #[cfg(feature = "graphrag")]
+pub mod graph_api;
+
+#[cfg(feature = "graphrag")]
 pub mod graphrag;
 pub mod schema;
 /// Unit tests; out of line by the line cap (`tests/max_lines.rs`).
