@@ -33,24 +33,33 @@ def make_text(length: int, run: int) -> str:
     return repeated
 
 
-def run_one(binary: Path, model: Path, profile: str, text: str) -> tuple[float, dict]:
+def run_one(binary: Path, model: Path, profile: str, text: str, timeout: float) -> tuple[float, dict]:
     started = time.perf_counter()
-    completed = subprocess.run(
-        [
-            str(binary),
-            "redact",
-            "--text",
-            text,
-            "--ner-model-dir",
-            str(model),
-            "--ner-profile",
-            profile,
-            "--json",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    command = [
+        str(binary),
+        "redact",
+        "--text",
+        text,
+        "--ner-model-dir",
+        str(model),
+        "--ner-profile",
+        profile,
+        "--json",
+    ]
+    try:
+        # shell=False is intentional: all arguments are passed as an argv list,
+        # never interpolated into a shell command. The binary/model paths are
+        # explicit benchmark inputs, not data from the documents being tested.
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        raise RuntimeError(f"redact timed out after {elapsed_ms:.1f} ms (limit {timeout:.1f} s)") from exc
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if completed.returncode != 0:
         raise RuntimeError(
@@ -77,10 +86,11 @@ def main() -> int:
     parser.add_argument("--profile", default="legal-fr@1", choices=("full@1", "legal-fr@1"))
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--timeout-seconds", type=float, default=120.0)
     parser.add_argument("--output", type=Path, help="write JSON results to this path")
     args = parser.parse_args()
-    if args.repetitions < 1 or args.warmups < 0:
-        parser.error("--repetitions must be positive and --warmups non-negative")
+    if args.repetitions < 1 or args.warmups < 0 or args.timeout_seconds <= 0:
+        parser.error("--repetitions must be positive, --warmups non-negative, and timeout positive")
     if not args.binary.is_file():
         parser.error(f"binary does not exist: {args.binary}")
     if not args.model.is_dir():
@@ -88,18 +98,20 @@ def main() -> int:
 
     sizes = (200, 2_000, 8_000)
     for run in range(args.warmups):
-        run_one(args.binary, args.model, args.profile, make_text(200, -(run + 1)))
+        run_one(args.binary, args.model, args.profile, make_text(200, -(run + 1)), args.timeout_seconds)
 
     results: dict[str, object] = {
         "binary": str(args.binary),
         "model": str(args.model),
         "profile": args.profile,
         "repetitions": args.repetitions,
+        "timing": "cold_cli_process",
+        "timeout_seconds": args.timeout_seconds,
         "sizes": {},
     }
     for size in sizes:
         samples = [
-            run_one(args.binary, args.model, args.profile, make_text(size, run))[0]
+            run_one(args.binary, args.model, args.profile, make_text(size, run), args.timeout_seconds)[0]
             for run in range(args.repetitions)
         ]
         summary = {

@@ -17,9 +17,13 @@ python3 scripts/bench_redact_ner.py \
   --output redact-ner.json
 ```
 
-The first warm-up call is excluded from the reported samples. Every measured
-sample must confirm `ner_ran: true`, `ner_truncated: false`, and the requested
-profile in the response. The command exits non-zero instead of recording a
-pattern-only or partially covered result. The JSON includes p50, p95, mean, and
-raw samples for each size, making it suitable for comparing providers and
-runtime tuning without mixing in document extraction timings.
+The first warm-up call is excluded from the reported samples. Each sample is a
+fresh CLI process, so the result is intentionally labeled
+`timing: "cold_cli_process"` and includes process/model startup; it must not be
+presented as warm in-process inference latency. Every measured sample must
+confirm `ner_ran: true`, `ner_truncated: false`, and the requested profile in
+the response. The command exits non-zero instead of recording a pattern-only,
+partially covered, or timed-out result. The JSON includes p50, p95, mean, and
+raw samples for each size, making it suitable for comparing complete gateway
+request cost and provider/runtime configurations without mixing in document
+extraction timings.
