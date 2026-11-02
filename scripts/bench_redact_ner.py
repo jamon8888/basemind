@@ -106,14 +106,27 @@ def main() -> int:
     parser.add_argument("--repetitions", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--baseline", type=Path, help="prior benchmark JSON for p95 comparison")
+    parser.add_argument(
+        "--max-p95-regression",
+        type=float,
+        default=0.0,
+        help="allowed fractional p95 increase against --baseline (default: 0)",
+    )
     parser.add_argument("--output", type=Path, help="write JSON results to this path")
     args = parser.parse_args()
-    if args.repetitions < 1 or args.warmups < 0 or args.timeout_seconds <= 0:
-        parser.error("--repetitions must be positive, --warmups non-negative, and timeout positive")
+    if args.repetitions < 1 or args.warmups < 0 or args.timeout_seconds <= 0 or args.max_p95_regression < 0:
+        parser.error("--repetitions positive, --warmups non-negative, timeout positive, regression non-negative")
     if not args.binary.is_file():
         parser.error(f"binary does not exist: {args.binary}")
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
+    baseline = None
+    if args.baseline:
+        try:
+            baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read --baseline: {exc}")
 
     sizes = (200, 2_000, 8_000)
     with tempfile.TemporaryDirectory(prefix="basemind-redact-bench-") as temp_root:
@@ -163,6 +176,18 @@ def main() -> int:
                 "mean_ms": statistics.fmean(samples),
                 "samples_ms": samples,
             }
+            if baseline is not None:
+                try:
+                    previous = float(baseline["sizes"][str(size)]["p95_ms"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    parser.error(f"baseline has no valid p95_ms for {size} chars: {exc}")
+                delta = (summary["p95_ms"] - previous) / previous if previous > 0 else 0.0
+                summary["baseline_p95_ms"] = previous
+                summary["p95_delta_fraction"] = delta
+                if delta > args.max_p95_regression:
+                    raise RuntimeError(
+                        f"{size} chars p95 regressed by {delta:.1%} (allowed {args.max_p95_regression:.1%})"
+                    )
             results["sizes"][str(size)] = summary  # type: ignore[index]
             print(
                 f"{size:>5} chars  p50={summary['p50_ms']:.1f} ms  "

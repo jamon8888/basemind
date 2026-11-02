@@ -31,3 +31,16 @@ twice and compares detections plus coverage metadata; a fixed provider/config
 that produces different spans fails the benchmark. Each invocation uses an
 isolated temporary `--root`, so concurrent benchmark runs cannot append to the
 same workspace telemetry file.
+
+To enforce a latency regression gate against a prior run:
+
+```sh
+python3 scripts/bench_redact_ner.py --model /path/to/gliner2 \
+  --baseline redact-ner-baseline.json --max-p95-regression 0
+```
+
+The baseline must be a previous JSON result from this runner. The command adds
+the prior p95 and fractional delta to each size and exits non-zero when any p95
+exceeds the allowed regression. Precision/recall still requires a labeled
+gateway corpus; the document benchmark's NER quality manifest is the reference
+format for that separate quality gate.
