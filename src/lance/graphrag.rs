@@ -158,6 +158,25 @@ pub fn entity_node_id(key: &EntityNodeKey) -> String {
     }
 }
 
+/// Return the stable graph label for an extracted entity. Gateway tokens carry the
+/// authoritative class (`<anchor:Class_N>`); the NER label is only a noisy span
+/// classification and must not split one token into multiple ks2 nodes.
+fn graph_label(entity: &DocEntitySidecar) -> String {
+    if entity.is_gateway_token {
+        if let Some(token) = entity.gateway_token.as_deref().or(Some(entity.literal.as_str())) {
+            if let Some(class) = token
+                .strip_prefix('<')
+                .and_then(|value| value.strip_suffix('>'))
+                .and_then(|value| value.split_once(':').map(|(_, class)| class))
+                .map(|class| class.rsplit_once('_').map(|(class, _)| class).unwrap_or(class))
+            {
+                return class.to_ascii_lowercase();
+            }
+        }
+    }
+    entity.label.clone()
+}
+
 /// Build the entity graph from DocEntity sidecar records produced by the scanner.
 ///
 /// Called at scan time after document extraction with NER enabled.
@@ -172,7 +191,8 @@ pub fn build_graph_from_entities(
     let mut edge_map: HashMap<EdgeKey, GraphEdgeRow> = HashMap::new();
 
     for ent in doc_entities {
-        if !allowed.contains(&ent.label) {
+        let label = graph_label(ent);
+        if !allowed.contains(&label) {
             continue; // label not projected
         }
 
@@ -196,16 +216,16 @@ pub fn build_graph_from_entities(
 
         let node_key = match key_source {
             0 => EntityNodeKey::TokenOfDocument {
-                label: ent.label.clone(),
+                label: label.clone(),
                 literal: ent.literal.clone(),
                 doc_path: ent.doc_path.clone(),
             },
             1 => EntityNodeKey::ClearLiteral {
-                label: ent.label.clone(),
+                label: label.clone(),
                 normalized: normalized_literal.clone(),
             },
             _ => EntityNodeKey::GatewayToken {
-                label: ent.label.clone(),
+                label: label.clone(),
                 gateway_token: gateway_token.clone(),
             },
         };
@@ -213,7 +233,7 @@ pub fn build_graph_from_entities(
         // Upsert entity node
         let entity_row = entity_map.entry(node_key.clone()).or_insert_with(|| GraphEntityRow {
             scope: scope.to_string(),
-            label: ent.label.clone(),
+            label,
             key_source,
             normalized_literal: normalized_literal.clone(),
             document_path: document_path.clone(),
@@ -240,7 +260,8 @@ pub fn build_graph_from_entities(
     // Second pass: build co-occurrence edges per chunk
     let mut chunk_entities: HashMap<(String, u32), Vec<EntityNodeKey>> = HashMap::new();
     for ent in doc_entities {
-        if !allowed.contains(&ent.label) {
+        let label = graph_label(ent);
+        if !allowed.contains(&label) {
             continue;
         }
         let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
@@ -257,18 +278,15 @@ pub fn build_graph_from_entities(
         };
         let node_key = match key_source {
             0 => EntityNodeKey::TokenOfDocument {
-                label: ent.label.clone(),
+                label: label.clone(),
                 literal: ent.literal.clone(),
                 doc_path: ent.doc_path.clone(),
             },
             1 => EntityNodeKey::ClearLiteral {
-                label: ent.label.clone(),
+                label: label.clone(),
                 normalized: normalized_literal,
             },
-            _ => EntityNodeKey::GatewayToken {
-                label: ent.label.clone(),
-                gateway_token,
-            },
+            _ => EntityNodeKey::GatewayToken { label, gateway_token },
         };
         chunk_entities
             .entry((ent.doc_path.clone(), ent.chunk_idx))
@@ -993,5 +1011,58 @@ mod tests {
         map.insert(k1, 1);
         map.insert(k2, 2);
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn gateway_token_class_is_authoritative_for_graph_label() {
+        let entity = DocEntitySidecar {
+            label: "person".into(),
+            literal: "<4b31c7ee:Email_1>".into(),
+            is_token: false,
+            is_gateway_token: true,
+            gateway_token: Some("<4b31c7ee:Email_1>".into()),
+            start: 0,
+            end: 23,
+            chunk_idx: 0,
+            doc_path: "a.txt".into(),
+        };
+        assert_eq!(graph_label(&entity), "email");
+    }
+
+    #[test]
+    fn gateway_token_label_variance_deduplicates_to_one_node() {
+        let entities = vec![
+            DocEntitySidecar {
+                label: "email".into(),
+                literal: "<4b31c7ee:Email_1>".into(),
+                is_token: false,
+                is_gateway_token: true,
+                gateway_token: Some("<4b31c7ee:Email_1>".into()),
+                start: 0,
+                end: 23,
+                chunk_idx: 0,
+                doc_path: "a.txt".into(),
+            },
+            DocEntitySidecar {
+                label: "person".into(),
+                literal: "<4b31c7ee:Email_1>".into(),
+                is_token: false,
+                is_gateway_token: true,
+                gateway_token: Some("<4b31c7ee:Email_1>".into()),
+                start: 24,
+                end: 47,
+                chunk_idx: 1,
+                doc_path: "b.txt".into(),
+            },
+        ];
+        let config = GraphragConfig {
+            enabled: true,
+            labels: vec!["email".into()],
+            ..Default::default()
+        };
+        let (nodes, _) = build_graph_from_entities("scope", &entities, &config).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].mention_count, 2);
+        assert_eq!(nodes[0].label, "email");
     }
 }
