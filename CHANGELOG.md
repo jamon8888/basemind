@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
+
+### Changed
+
+- Document scans reuse extracted chunks and NER results when only the embedding preset changes;
+  cached chunks are re-embedded in place instead of re-running format extraction.
+
 ## [0.36.0] - 2026-10-31
 
 > **Minor release.** `RELEASE_MINOR` goes 35 → 36, so the first scan after upgrading pays one
@@ -57,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The runtime tuning matrix can now enforce an ingestion-NER token-throughput
+  improvement against a prior cold benchmark while retaining the existing
+  quality and resource gates.
+- Added a standalone runtime-tuning matrix driver for the PDF/Office benchmark.
+  It evaluates bounded scanner, embedding, batch, and document-concurrency
+  settings in fresh processes and rejects candidates that exceed RSS, timeout,
+  skip/failure, or quality gates.
+- The document benchmark now reports ingestion-NER document and token throughput
+  separately from total indexing throughput, making NER tuning measurable without
+  conflating it with `redact_text` latency.
 - **A SIREN/SIRET passing the Luhn check is re-labelled `tax_id`, not `phone`**, the label the
   caller may act on — the token is renamed `[TAX_ID_n]` in text and map on the tool path.
 - **The scan path stops persisting the rehydration map**: no blob is written,

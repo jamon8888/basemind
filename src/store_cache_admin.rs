@@ -239,8 +239,12 @@ pub(crate) fn cache_stats_in(basemind_dir: &Path, blobs_dir: &Path) -> Result<Ca
     let telemetry_bytes = file_size(&basemind_dir.join(TELEMETRY_FILENAME))?;
     let git_history_bytes = dir_size(&basemind_dir.join(crate::git_history::GIT_HISTORY_DIR))?;
 
-    let total_bytes = dir_size(basemind_dir)? + blobs_bytes;
     let accounted = blobs_bytes + views_bytes + lance_bytes + git_cache_bytes + telemetry_bytes + git_history_bytes;
+    // Components are measured independently while the daemon may still append telemetry or
+    // rotate cache files. Keep the reported total conservative if a file disappears between
+    // component walks; otherwise `other_bytes` would saturate at zero and the public accounting
+    // invariant would be violated for that snapshot.
+    let total_bytes = (dir_size(basemind_dir)? + blobs_bytes).max(accounted);
     let other_bytes = total_bytes.saturating_sub(accounted);
 
     let rss = crate::sysres::sample();

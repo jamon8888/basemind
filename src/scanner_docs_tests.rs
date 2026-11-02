@@ -1,3 +1,4 @@
+use super::cache::{cached_doc_is_reusable, cached_embeddings_are_reusable};
 use super::*;
 
 #[test]
@@ -12,7 +13,7 @@ fn preset_dim_for_balanced_returns_768() {
 #[test]
 fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     use crate::extract::doc::{DocChunk, FileMapDoc};
-    let doc = FileMapDoc {
+    let mut doc = FileMapDoc {
         config_digest: String::new(),
         linear_chunked: false,
         text_fallback: false,
@@ -53,6 +54,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         embedding_preset: "multilingual".to_string(),
         ..DocumentsConfig::default()
     };
+    doc.config_digest = "d".to_string();
     assert!(
         !cached_doc_is_reusable(&doc, &switched, true, "d"),
         "switching balanced -> multilingual (same dim, different model) must force recompute"
@@ -61,6 +63,18 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     assert!(
         cached_doc_is_reusable(&doc, &switched, false, "d"),
         "embedding off: cached doc is always reusable"
+    );
+    assert!(
+        cached_doc_content_is_reusable(&doc, &switched, "d"),
+        "changing only the embedding preset must preserve extracted content and NER"
+    );
+    assert!(
+        !cached_embeddings_are_reusable(&doc, &switched),
+        "changing the embedding preset must invalidate only the vector stage"
+    );
+    assert!(
+        !cached_doc_content_is_reusable(&doc, &switched, "other"),
+        "a changed extraction digest must reject stale content"
     );
 }
 
@@ -83,6 +97,7 @@ fn pending_doc_batch_is_metadata_only() {
         embedded: true,
         embed_attempted: true,
         reused: false,
+        reembedded: false,
         degraded: false,
         text_fallback: false,
         rehydration_ref: None,
@@ -140,7 +155,7 @@ fn pending_from_doc_marks_a_failed_embed_as_attempted_not_embedded() {
     let cfg = DocumentsConfig::default();
 
     let failed = doc_fixture(3, 0);
-    let batch = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, true, false);
+    let batch = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, true, false, false);
     assert!(!batch.embedded, "no vectors => not embedded");
     assert!(
         batch.embed_attempted,
@@ -149,17 +164,17 @@ fn pending_from_doc_marks_a_failed_embed_as_attempted_not_embedded() {
     assert!(!batch.emit_rows, "a vectorless doc emits no LanceDB rows");
 
     let ok = doc_fixture(3, 768);
-    let batch = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, false);
+    let batch = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, false, false);
     assert!(
         batch.embedded && batch.embed_attempted,
         "a successful embed sets both flags"
     );
 
-    let off = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, false, false);
+    let off = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, false, false, false);
     assert!(off.embedded, "embed off leaves the requirement trivially satisfied");
     assert!(!off.embed_attempted, "embed off ran no attempt");
 
-    let reused = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, true);
+    let reused = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, true, false);
     assert!(
         !reused.embed_attempted,
         "a reused blob ran no fresh attempt (already embedded)"

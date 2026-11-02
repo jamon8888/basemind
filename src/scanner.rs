@@ -166,6 +166,8 @@ pub struct ScanStats {
     /// fresh xberg extraction (+ embedding). Mirrors `reused_extraction` for the doc tier: rename /
     /// rewrite churn should show up here, never as fresh extraction work (issue #44).
     pub reused_doc_extraction: usize,
+    /// Cached documents whose vectors were refreshed without repeating extraction or NER.
+    pub reembedded_doc_embeddings: usize,
     /// Subset of `docs_indexed` chunked by the linear fallback instead of xberg's markdown splitter
     /// because the file exceeded `[documents] markdown_chunk_max_bytes` / `plain_text_chunk_max_bytes`.
     pub docs_degraded: usize,
@@ -301,6 +303,7 @@ pub enum FileStatus {
         /// True when the doc was served from the cached `.doc.msgpack` blob rather than freshly
         /// extracted (mirrors `Updated::reused`); drives the `reused_doc_extraction` counter.
         reused: bool,
+        reembedded: bool,
         /// True when the linear fallback chunker produced the chunks (drives `docs_degraded`).
         degraded: bool,
         /// True when structured extraction failed and the file was re-read as `text/plain` (drives
