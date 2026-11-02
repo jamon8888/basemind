@@ -12,7 +12,6 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
-use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -33,7 +32,11 @@ use crate::config::{
 
 mod numbered_headings;
 use numbered_headings::{collect_numbered_headings, numbered_heading_path};
+mod chunking;
 pub(crate) mod citations;
+#[cfg(test)]
+pub(crate) use chunking::dense_retrieval_text;
+use chunking::prepare_doc_chunk;
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
@@ -983,76 +986,6 @@ pub(crate) fn extract_doc_with_metrics(
         linear_chunked: linear,
         text_fallback,
     })
-}
-
-/// Dense retrieval benefits from structural heading context, while the persisted text and lexical
-/// search input must remain the exact source span described by the chunk's byte offsets.
-fn dense_retrieval_text<'a>(content: &'a str, heading_context: Option<&xberg::types::HeadingContext>) -> Cow<'a, str> {
-    match heading_context {
-        Some(context) if !context.headings.is_empty() => {
-            Cow::Owned(xberg::chunking::render_heading_breadcrumb(content, context))
-        }
-        _ => Cow::Borrowed(content),
-    }
-}
-
-/// The breadcrumb a chunk sits under, or `""` when it has no heading context.
-///
-/// Rendered from `context.headings` rather than by calling
-/// `xberg::chunking::render_heading_breadcrumb`, which takes the source content and appends the
-/// chunk body after the breadcrumb — so it returns `"# Guide > ## Setup\n\n<the body>"`, not a
-/// breadcrumb. xberg already has the right function for this (`builder::heading_path_from_context`)
-/// but it is `pub(crate)`, so it is not reachable from here.
-///
-/// The format matches `render_heading_breadcrumb`'s prefix exactly, so the stored column and the
-/// dense input describe the same path with the same spelling. Note this is **not** what spec 0012
-/// §6 shows: the spec's `IV. TERMINATION > 4. Convenience` does not correspond to any rendering,
-/// real or intended.
-fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> String {
-    let Some(context) = heading_context.filter(|c| !c.headings.is_empty()) else {
-        return String::new();
-    };
-    let mut out = String::new();
-    for (i, heading) in context.headings.iter().enumerate() {
-        if i > 0 {
-            out.push_str(" > ");
-        }
-        for _ in 0..heading.level {
-            out.push('#');
-        }
-        let _ = write!(out, " {}", heading.text);
-    }
-    out
-}
-
-/// Recover citation-shaped headings for the linear large-document path.
-///
-/// This deliberately accepts only explicit Roman numerals or dotted Arabic outlines (and a
-/// single Arabic number when its caption is all-caps). Ordinary prose such as `4. The parties`
-/// is not promoted to structure. The parser is local to the source bytes before the chunk and
-/// therefore cannot invent a heading from another document or from an embedding result.
-fn prepare_doc_chunk(
-    content: String,
-    byte_start: usize,
-    byte_end: usize,
-    heading_context: Option<&xberg::types::HeadingContext>,
-    embed_requested: bool,
-) -> (DocChunk, Option<String>) {
-    // The breadcrumb used to be computed only when an embed was requested, so a lexical-only store
-    // (`embed = false`) never had it — the configuration where the lexical lane is the *only* lane
-    // and this column is the whole structural signal. `dense_retrieval_text` is untouched: it still
-    // inlines the breadcrumb with the body, which is what the embedder wants.
-    let heading_path = heading_path_of(heading_context);
-    let dense_input = embed_requested.then(|| dense_retrieval_text(&content, heading_context).into_owned());
-    let chunk = DocChunk {
-        byte_start: u32::try_from(byte_start).unwrap_or(u32::MAX),
-        byte_end: u32::try_from(byte_end).unwrap_or(u32::MAX),
-        text: content,
-        embedding: Vec::new(),
-        heading_path,
-        cites: String::new(),
-    };
-    (chunk, dense_input)
 }
 
 /// What the redaction fingerprint must cover: the config *and* the post-processing the

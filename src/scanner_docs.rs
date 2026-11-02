@@ -748,13 +748,7 @@ fn pending_from_doc(
         text_fallback: doc.text_fallback,
     }
 }
-
-/// Turn a document's chunks into LanceDB rows. Hoists the per-row constant strings out of the map so
-/// they allocate once instead of once per chunk (a doc can have hundreds of chunks).
-///
-/// Takes `doc` by value to move `chunk.text` and `chunk.embedding` directly into each row —
-/// avoids cloning the chunk text (potentially large) and the embedding vector (`Vec<f32>`,
-/// hundreds of kilobytes per chunk at typical preset dimensions).
+/// Turn document chunks into LanceDB rows, hoisting per-row constants.
 fn build_doc_rows(
     doc: FileMapDoc,
     rel: &str,
