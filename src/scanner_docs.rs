@@ -694,6 +694,10 @@ pub(crate) fn doc_entry_settled(
 /// is on, the doc has embeddings, it has chunks, and it is under the per-doc chunk cap. The heavy
 /// row-building (chunk text + embedding vectors) is deferred to [`flush_document_batches`], which
 /// re-reads the persisted blob per file so no embeddings are held across the corpus.
+// This descriptor intentionally carries the scan context alongside the document so the
+// deferred flush can remain allocation-bounded; grouping it into a temporary struct would
+// obscure the ownership boundary between extraction and persistence.
+#[allow(clippy::too_many_arguments)]
 fn pending_from_doc(
     doc: &FileMapDoc,
     rel: &str,
