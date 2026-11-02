@@ -156,6 +156,7 @@ fn json_report(
 ) -> Value {
     let stats = report.stats;
     let total_seconds = report.timings.total_ms as f64 / 1_000.0;
+    let ner_seconds = report.timings.ner_ms as f64 / 1_000.0;
     json!({
         "mode": mode,
         "manifest_files": manifest_files,
@@ -176,6 +177,8 @@ fn json_report(
             "bytes_per_second": if total_seconds > 0.0 { stats.docs_bytes as f64 / total_seconds } else { 0.0 },
             "chunks_per_second": if total_seconds > 0.0 { stats.docs_chunks as f64 / total_seconds } else { 0.0 },
             "tokens_per_second": if total_seconds > 0.0 { stats.docs_tokens as f64 / total_seconds } else { 0.0 },
+            "ner_documents_per_second": if ner_seconds > 0.0 { stats.docs_indexed as f64 / ner_seconds } else { 0.0 },
+            "ner_tokens_per_second": if ner_seconds > 0.0 { stats.docs_tokens as f64 / ner_seconds } else { 0.0 },
         },
         "configuration": {
             "embedding_preset": config.documents.embedding_preset,

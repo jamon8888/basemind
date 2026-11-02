@@ -62,6 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The document benchmark now reports ingestion-NER document and token throughput
+  separately from total indexing throughput, making NER tuning measurable without
+  conflating it with `redact_text` latency.
 - **A SIREN/SIRET passing the Luhn check is re-labelled `tax_id`, not `phone`**, the label the
   caller may act on — the token is renamed `[TAX_ID_n]` in text and map on the tool path.
 - **The scan path stops persisting the rehydration map**: no blob is written,
