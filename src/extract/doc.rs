@@ -545,8 +545,7 @@ fn run_guarded(
     krz_config: ExtractionConfig,
     config: &DocConfig,
 ) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
-    let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-    input.mime_type = mime_type.map(str::to_string);
+    let input = prepare_extraction_input(path, mime_type)?;
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
     let ledger = doc_guard::AbandonedThreads::global();
@@ -578,6 +577,46 @@ fn run_guarded(
         }
         DeadlineError::Failed(message) => ExtractError::Document(message),
     })
+}
+
+/// xberg 1.3.x converts PNGs with alpha directly to RGB, which turns transparent
+/// pixels black before OCR. Compose transparent PNGs over white at the boundary so
+/// OCR sees the same page a human sees. Other formats continue through the URI path.
+fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> Result<ExtractInput, ExtractError> {
+    if mime_type != Some("image/png") {
+        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+        input.mime_type = mime_type.map(str::to_string);
+        return Ok(input);
+    }
+
+    let bytes =
+        std::fs::read(path).map_err(|error| ExtractError::Document(format!("read PNG {}: {error}", path.display())))?;
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .map_err(|error| ExtractError::Document(format!("decode PNG {}: {error}", path.display())))?;
+    let rgba = decoded.to_rgba8();
+    if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
+        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+        input.mime_type = mime_type.map(str::to_string);
+        return Ok(input);
+    }
+
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = u32::from(pixel[3]);
+        let dst = rgb.get_pixel_mut(x, y);
+        for channel in 0..3 {
+            dst[channel] = ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha)) / 255) as u8;
+        }
+    }
+    let mut normalized = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut normalized, image::ImageFormat::Png)
+        .map_err(|error| ExtractError::Document(format!("encode normalized PNG {}: {error}", path.display())))?;
+    Ok(ExtractInput::from_bytes(
+        normalized.into_inner(),
+        "image/png",
+        path.file_name().map(|name| name.to_string_lossy().into_owned()),
+    ))
 }
 
 pub use super::doc_metrics::extract_doc;
