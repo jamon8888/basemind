@@ -632,7 +632,13 @@ pub(super) async fn run_search_documents(
             let mut merged = Vec::new();
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                for hit in basemind_exact(&lance, candidate, &predicate, limit)? {
+                for hit in basemind_exact(&lance, &candidate, &predicate, limit)? {
+                    if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                        .iter()
+                        .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                    {
+                        continue;
+                    }
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(hit);
                     }
@@ -691,7 +697,13 @@ pub(super) async fn run_search_documents(
             let mut merged = Vec::with_capacity(limit);
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                for hit in basemind_exact(&lance, candidate, &predicate, limit)? {
+                for hit in basemind_exact(&lance, &candidate, &predicate, limit)? {
+                    if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                        .iter()
+                        .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                    {
+                        continue;
+                    }
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(DocumentSearchHit {
                             path: hit.path,

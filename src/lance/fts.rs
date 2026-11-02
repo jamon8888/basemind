@@ -233,14 +233,10 @@ pub fn quoted_phrases(query: &str) -> Vec<String> {
 }
 
 /// Return an identifier-shaped query for the exact lane, if present.
-pub fn exact_candidate(query: &str) -> Option<&str> {
-    let has_section = query.contains('§') && query.bytes().any(|byte| byte.is_ascii_digit());
-    let has_docket = query
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|parts| parts[0].eq_ignore_ascii_case("no.") && parts[1].bytes().any(|b| b.is_ascii_digit()));
-    (has_section || has_docket).then_some(query.trim())
+pub fn exact_candidate(query: &str) -> Option<String> {
+    crate::extract::doc::citations::extract_citations(query, 1)
+        .into_iter()
+        .next()
 }
 
 /// A lexical hit.
@@ -255,6 +251,7 @@ pub struct LexicalHit {
     pub mime_type: String,
     pub byte_start: u32,
     pub byte_end: u32,
+    pub cites: String,
 }
 
 impl LexicalHit {
@@ -395,6 +392,7 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
     let mime = strings("mime_type")?;
     let byte_start = uints("byte_start")?;
     let byte_end = uints("byte_end")?;
+    let cites = strings("cites")?;
 
     for i in 0..batch.num_rows() {
         out.push(LexicalHit {
@@ -404,6 +402,7 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
             mime_type: mime.value(i).to_string(),
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
+            cites: cites.value(i).to_string(),
         });
     }
     Ok(())
@@ -655,8 +654,12 @@ mod tests {
 
     #[test]
     fn identifier_queries_route_to_exact_lane() {
-        assert_eq!(exact_candidate("§ 362(a)(1)"), Some("§ 362(a)(1)"));
-        assert_eq!(exact_candidate("No. 2-24-1234"), Some("No. 2-24-1234"));
+        assert_eq!(exact_candidate("§ 362(a)(1)"), Some("§ 362(a)(1)".to_string()));
+        assert_eq!(exact_candidate("No. 2-24-1234"), Some("No. 2-24-1234".to_string()));
+        assert_eq!(
+            exact_candidate("Which authority applies under § 362(a)(1)?"),
+            Some("§ 362(a)(1)".to_string())
+        );
         assert_eq!(exact_candidate("termination notice"), None);
     }
 
@@ -722,6 +725,7 @@ mod tests {
             mime_type: "text/markdown".to_string(),
             byte_start: 0,
             byte_end: 1,
+            cites: String::new(),
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
     }
