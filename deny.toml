@@ -25,6 +25,10 @@ ignore = [
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  # New alias for the same zip 8.x symlink-allocation advisory; the transitive
+  # calamine/candle dependencies require zip ^8 and basemind does not call the
+  # vulnerable ZipArchive::extract or stream-extraction APIs.
+  "RUSTSEC-2026-0429",
   # Transitive advisories in the all-features Lance/Arrow and document-parser
   # graph. Keep the dependency graph pinned for this release candidate; these
   # are tracked for remediation when upstream fixes are available.
