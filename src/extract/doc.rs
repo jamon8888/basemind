@@ -871,6 +871,10 @@ pub(crate) fn extract_doc_with_metrics(
 
     let mut metadata = metadata_pairs(&result.metadata);
 
+    if let Some(count) = ocr_signal::dictionary_filtered_line_count(&result.processing_warnings) {
+        metadata.push(("dictionary_filtered_line_count".to_string(), count.to_string()));
+    }
+
     if let Some(ocr_chars) = ocr_empty_chars {
         metadata.push(ocr_signal::note(ocr_chars));
     }

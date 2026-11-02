@@ -7,6 +7,20 @@ use std::path::Path;
 
 use super::DocumentModelProfile;
 
+/// Recover xberg's exact dictionary-filter count from its processing warning.
+///
+/// xberg currently uses the count to emit a warning, then removes the scratch metadata key before
+/// returning the document. Keeping the count here makes the loss observable to Basemind callers
+/// without depending on xberg's internal metadata map.
+pub(crate) fn dictionary_filtered_line_count(warnings: &[xberg::types::ProcessingWarning]) -> Option<usize> {
+    const PREFIX: &str = "Tesseract removed ";
+    const SUFFIX: &str = " OCR line(s) because";
+    warnings.iter().find_map(|warning| {
+        let count = warning.message.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+        count.parse().ok()
+    })
+}
+
 /// Fewer non-whitespace characters than this on an image OCR is "near-empty".
 const NEAR_EMPTY_OCR_CHARS: usize = 20;
 
@@ -62,7 +76,7 @@ fn sanitize_path_for_log(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_path_for_log;
+    use super::{dictionary_filtered_line_count, sanitize_path_for_log};
     use std::path::Path;
 
     #[test]
@@ -77,5 +91,25 @@ mod tests {
     fn log_path_drops_terminal_control_characters() {
         let safe = sanitize_path_for_log(Path::new("scan\u{1b}[2J\ncontract.png"));
         assert_eq!(safe, "<document>");
+    }
+
+    #[test]
+    fn preserves_xberg_dictionary_filter_count_from_warning() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "tesseract".into(),
+            message:
+                "Tesseract removed 33 OCR line(s) because their dictionary-checkable words were mostly not real words"
+                    .into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(33));
+    }
+
+    #[test]
+    fn ignores_unrelated_processing_warnings() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "chunking".into(),
+            message: "document was truncated".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), None);
     }
 }
