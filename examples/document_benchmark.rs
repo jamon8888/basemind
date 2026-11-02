@@ -447,7 +447,7 @@ fn quality_report(
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--scan-threads N] [--embed-threads N] [--embed-batch-size N] [--max-concurrent-documents N] [--onnx-provider cpu|auto|coreml|cuda|tensorrt] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -461,6 +461,11 @@ fn main() -> Result<()> {
     let mut incremental_file = None;
     let mut mutate_incremental = false;
     let mut mode = Mode::All;
+    let mut scan_threads = None;
+    let mut embed_threads = None;
+    let mut embed_batch_size = None;
+    let mut max_concurrent_documents = None;
+    let mut onnx_provider = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -500,6 +505,41 @@ fn main() -> Result<()> {
                 i += 1;
                 mode = Mode::parse(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?)?;
             }
+            "--scan-threads" => {
+                i += 1;
+                scan_threads = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?);
+            }
+            "--embed-threads" => {
+                i += 1;
+                embed_threads = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?);
+            }
+            "--embed-batch-size" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?;
+                if value == 0 {
+                    return Err(anyhow!("--embed-batch-size must be greater than zero"));
+                }
+                embed_batch_size = Some(value);
+            }
+            "--max-concurrent-documents" => {
+                i += 1;
+                max_concurrent_documents = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?);
+            }
+            "--onnx-provider" => {
+                i += 1;
+                onnx_provider = Some(match args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.as_str() {
+                    "cpu" => basemind::config::OnnxProvider::Cpu,
+                    "auto" => basemind::config::OnnxProvider::Auto,
+                    "coreml" | "core_ml" => basemind::config::OnnxProvider::CoreMl,
+                    "cuda" => basemind::config::OnnxProvider::Cuda,
+                    "tensorrt" | "tensor_rt" => basemind::config::OnnxProvider::TensorRt,
+                    other => {
+                        return Err(anyhow!(
+                            "unknown ONNX provider {other}; expected cpu, auto, coreml, cuda, or tensorrt"
+                        ));
+                    }
+                });
+            }
             other => return Err(anyhow!("unknown argument {other}\n{}", usage())),
         }
         i += 1;
@@ -529,6 +569,21 @@ fn main() -> Result<()> {
         .sum();
     let mut config = ConfigV1::with_defaults();
     config.documents.enabled = true;
+    if let Some(value) = scan_threads {
+        config.resources.scan_threads = value;
+    }
+    if let Some(value) = embed_threads {
+        config.resources.embed_threads = value;
+    }
+    if let Some(value) = embed_batch_size {
+        config.resources.embed_batch_size = value;
+    }
+    if let Some(value) = max_concurrent_documents {
+        config.resources.max_concurrent_documents = value;
+    }
+    if let Some(value) = onnx_provider {
+        config.resources.onnx_provider = value;
+    }
     let cache_before = root.join(".basemind/views/working/index.msgpack").is_file();
     let mut store = Store::open(&root, VIEW_WORKING).map_err(|error| anyhow!("open store: {error}"))?;
     let mut runs = Vec::new();

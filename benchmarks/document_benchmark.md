@@ -35,6 +35,12 @@ fails the benchmark command.
 Fixtures are intentionally small; use the private manifest for throughput and
 memory thresholds.
 
+To sweep runtime settings without editing the config file, pass
+`--scan-threads`, `--embed-threads`, `--embed-batch-size`,
+`--max-concurrent-documents`, and `--onnx-provider` (`cpu`, `auto`, `coreml`,
+`cuda`, or `tensorrt`). Every selected value is echoed in the JSON
+`configuration` object, so matrix results remain comparable and reproducible.
+
 For a proportional update benchmark, edit one manifest file between separate
 `--mode warm` and `--mode incremental` invocations, or select it explicitly
 with `--incremental-file path/to/file.docx`.

@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
+
 ### Changed
 
 - Document scans reuse extracted chunks and NER results when only the embedding preset changes;
