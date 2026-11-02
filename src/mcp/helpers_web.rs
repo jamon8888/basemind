@@ -236,13 +236,14 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
         let embedder = embedder(state).await?;
         let documents_cfg = state.shared.config.documents.clone();
         let fts_cfg = documents_cfg.fts.clone();
+        let lance_for_block = Arc::clone(&lance);
         let scope_for_block = scope.clone();
         let final_url_for_block = result.final_url.clone();
         let mime_for_block = result.content_type.clone();
         let extract_citations = params.scope.is_some() && documents_cfg.citations.extract;
         let indexed = tokio::task::spawn_blocking(move || {
             index_page(
-                lance.as_ref(),
+                lance_for_block.as_ref(),
                 &embedder,
                 &documents_cfg,
                 &scope_for_block,
