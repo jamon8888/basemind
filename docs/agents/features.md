@@ -17,7 +17,7 @@ unavailable; advertised modes alone do not prove that an operation can run.
 | --- | --- |
 | `intelligence` | Shared xberg/LanceDB/Arrow infrastructure. |
 | `tokenizer` | Real o200k token counting without the full intelligence stack. |
-| `documents` | Intelligence + tokenizer, document formats, OCR/layout processing, embeddings/reranking, enrichment and redaction dependencies. Runtime settings still select which operations run. |
+| `documents` | Intelligence + tokenizer, document formats, OCR/layout processing, embeddings/reranking, enrichment and redaction dependencies. Supported raster images with alpha are composited over white before OCR; runtime settings still select which operations run. |
 | `code-search` | Intelligence plus embeddings/reranking for semantic code retrieval. |
 | `memory` | Intelligence plus embedding/entity/keyword dependencies for durable agent memory. |
 | `crawl` | Documents plus crawlberg and URL handling. |

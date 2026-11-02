@@ -210,3 +210,21 @@ fn ocr_near_empty_signal_is_silent_when_the_profile_ran_no_ocr() {
         None
     );
 }
+
+#[test]
+fn transparent_png_is_composited_over_white_before_ocr() {
+    let file = tempfile::NamedTempFile::with_suffix(".png").expect("temp PNG");
+    let mut png = Vec::new();
+    let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode transparent PNG");
+    std::fs::write(file.path(), png).expect("write transparent PNG");
+
+    let input = super::prepare_extraction_input(file.path(), Some("image/png")).expect("normalize PNG");
+    let bytes = input.bytes.expect("normalized input uses bytes");
+    let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .expect("decode normalized PNG")
+        .to_rgb8();
+    assert_eq!(decoded.get_pixel(0, 0).0, [255, 255, 255]);
+}

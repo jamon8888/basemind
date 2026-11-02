@@ -122,9 +122,11 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmC
     let defaults = DocumentsConfig::default();
     let cutovers = (cfg.markdown_chunk_max_bytes, cfg.plain_text_chunk_max_bytes);
     let tag = if cutovers == (defaults.markdown_chunk_max_bytes, defaults.plain_text_chunk_max_bytes) {
-        "doc/1".to_string()
+        // Bump this when extraction preprocessing changes; this invalidates
+        // cached OCR generated before alpha compositing was introduced.
+        "doc/2".to_string()
     } else {
-        format!("doc/1/cutover={},{}", cutovers.0, cutovers.1)
+        format!("doc/2/cutover={},{}", cutovers.0, cutovers.1)
     };
     digest_of(
         &tag,

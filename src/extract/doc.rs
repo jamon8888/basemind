@@ -545,13 +545,13 @@ fn run_guarded(
     krz_config: ExtractionConfig,
     config: &DocConfig,
 ) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
-    let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-    input.mime_type = mime_type.map(str::to_string);
+    let path = path.to_path_buf();
+    let mime_type = mime_type.map(str::to_owned);
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
     let ledger = doc_guard::AbandonedThreads::global();
     doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
-        runtime.block_on(extract(input, &krz_config))
+        prepare_extraction_input(&path, mime_type.as_deref()).map(|input| runtime.block_on(extract(input, &krz_config)))
     })
     .map_err(|error| match error {
         DeadlineError::Elapsed => {
@@ -578,6 +578,83 @@ fn run_guarded(
         }
         DeadlineError::Failed(message) => ExtractError::Document(message),
     })
+}
+
+/// xberg 1.3.x converts images with alpha directly to RGB, which turns transparent
+/// pixels black before OCR. Compose supported raster images over white at the boundary
+/// so OCR sees the same page a human sees. The work runs inside `run_guarded`'s deadline.
+fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> Result<ExtractInput, ExtractError> {
+    if !matches!(
+        mime_type,
+        Some("image/png" | "image/webp" | "image/gif" | "image/tiff" | "image/bmp" | "image/x-portable-pixmap")
+    ) {
+        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+        input.mime_type = mime_type.map(str::to_string);
+        return Ok(input);
+    }
+
+    let bytes =
+        std::fs::read(path).map_err(|error| ExtractError::Document(format!("read PNG {}: {error}", path.display())))?;
+    if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
+        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+        input.mime_type = mime_type.map(str::to_string);
+        return Ok(input);
+    }
+    let decoded = image::load_from_memory(&bytes)
+        .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?;
+    let rgba = decoded.to_rgba8();
+    if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
+        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
+        input.mime_type = mime_type.map(str::to_string);
+        return Ok(input);
+    }
+
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = u32::from(pixel[3]);
+        let dst = rgb.get_pixel_mut(x, y);
+        for channel in 0..3 {
+            dst[channel] = ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha)) / 255) as u8;
+        }
+    }
+    let mut normalized = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut normalized, image::ImageFormat::Png)
+        .map_err(|error| ExtractError::Document(format!("encode normalized image {}: {error}", path.display())))?;
+    Ok(ExtractInput::from_bytes(
+        normalized.into_inner(),
+        "image/png",
+        path.file_name().map(|name| name.to_string_lossy().into_owned()),
+    ))
+}
+
+/// Inspect only the PNG header/chunks to avoid decoding ordinary opaque RGB PNGs.
+fn png_may_have_alpha(bytes: &[u8]) -> bool {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 29 || &bytes[..8] != SIGNATURE {
+        return true;
+    }
+    let color_type = bytes[25];
+    if matches!(color_type, 4 | 6) {
+        return true;
+    }
+    // Palette PNGs can carry transparency in a tRNS chunk.
+    let mut offset = 8usize;
+    while offset.saturating_add(12) <= bytes.len() {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let chunk_end = match offset.checked_add(12).and_then(|value| value.checked_add(length)) {
+            Some(value) if value <= bytes.len() => value,
+            _ => return true,
+        };
+        if &bytes[offset + 4..offset + 8] == b"tRNS" {
+            return true;
+        }
+        if &bytes[offset + 4..offset + 8] == b"IEND" {
+            break;
+        }
+        offset = chunk_end;
+    }
+    false
 }
 
 pub use super::doc_metrics::extract_doc;
