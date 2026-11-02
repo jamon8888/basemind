@@ -47,7 +47,7 @@ fn default_hops() -> u8 {
 }
 
 /// Normalize a literal for global identity (ClearLiteral path).
-/// Case-fold + ASCII-fold + whitespace collapse. Any non-alphanumeric
+/// Case-fold + whitespace collapse. Any non-alphanumeric
 /// character acts as a separator (collapsed into a single space), so
 /// "john-smith" and "John.Smith" both normalize to "john smith".
 pub fn normalize_literal(s: &str) -> String {
@@ -56,7 +56,7 @@ pub fn normalize_literal(s: &str) -> String {
     for ch in s.chars() {
         let lower = ch.to_lowercase().collect::<String>();
         for c in lower.chars() {
-            if c.is_ascii_alphanumeric() {
+            if c.is_alphanumeric() {
                 out.push(c);
                 prev_space = false;
             } else if !prev_space && !out.is_empty() {
@@ -568,6 +568,46 @@ pub fn delete_graph_for_scope(connection: &Connection, runtime: &Runtime, scope:
     })
 }
 
+/// Delete graph rows belonging to one document before rebuilding its NER projection.
+/// This prevents normalized-key changes (including Unicode normalization changes) from
+/// leaving stale entities or edges behind during incremental rescans.
+pub fn delete_graph_for_document(
+    connection: &Connection,
+    runtime: &Runtime,
+    scope: &str,
+    doc_path: &str,
+) -> Result<()> {
+    runtime.block_on(async {
+        let entities = connection
+            .open_table(GRAPH_ENTITIES_TABLE)
+            .execute()
+            .await
+            .context("open graph_entities table")?;
+        let predicate = format!(
+            "scope = '{}' AND document_path = '{}'",
+            escape_sql_literal(scope),
+            escape_sql_literal(doc_path)
+        );
+        entities
+            .delete(&predicate)
+            .await
+            .context("delete document graph entities")?;
+
+        let edges = connection
+            .open_table(GRAPH_EDGES_TABLE)
+            .execute()
+            .await
+            .context("open graph_edges table")?;
+        let predicate = format!(
+            "scope = '{}' AND doc_path = '{}'",
+            escape_sql_literal(scope),
+            escape_sql_literal(doc_path)
+        );
+        edges.delete(&predicate).await.context("delete document graph edges")?;
+        anyhow::Ok(())
+    })
+}
+
 /// Result of a Cypher query over the graph tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CypherResult {
@@ -588,6 +628,13 @@ pub fn execute_cypher(
     max_rows: usize,
 ) -> Result<CypherResult> {
     use lance_graph::{CypherQuery, GraphConfig};
+
+    if max_rows == 0 {
+        return Ok(CypherResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
 
     // Load graph tables as Arrow batches (block_on around the async loaders —
     // the MCP dispatch is sync here, and the store runtime owns the reactor).
@@ -795,7 +842,10 @@ pub fn expand_entity_graph(
         }
     }
 
-    while let Some((entity_id, hop, chain)) = queue.pop_front() {
+    while out.len() < max_expand {
+        let Some((entity_id, hop, chain)) = queue.pop_front() else {
+            break;
+        };
         out.push(ExpandedEntity {
             entity_id: entity_id.clone(),
             hop,
@@ -926,6 +976,7 @@ mod tests {
         assert_eq!(normalize_literal("JOHN  SMITH"), "john smith");
         assert_eq!(normalize_literal("john-smith"), "john smith");
         assert_eq!(normalize_literal("John.Smith"), "john smith");
+        assert_eq!(normalize_literal("Müller-Straße"), "müller straße");
     }
 
     #[test]

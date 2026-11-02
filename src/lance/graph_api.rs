@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, anyhow};
 
-use super::{graphrag, CypherResult, DocumentHit, LanceStore};
+use super::{CypherResult, DocumentHit, LanceStore, graphrag};
 
 impl LanceStore {
     /// Execute a read-only Cypher query over this store's entity graph (spec 0016).
@@ -87,39 +87,48 @@ impl LanceStore {
             .collect();
 
         // 4a. Documents reachable through the graph but absent from the vector lane.
-        let mut graph_doc_hop: HashMap<String, u8> = HashMap::new();
+        let mut graph_doc_meta: HashMap<String, (u8, Vec<String>)> = HashMap::new();
         for entity in &entities {
             if !expanded_ids.contains(entity.entity_id.as_str()) {
                 continue;
             }
             let hop = hop_of.get(entity.entity_id.as_str()).copied().unwrap_or(0);
-            let entry = graph_doc_hop.entry(entity.document_path.clone()).or_insert(hop);
-            if hop < *entry {
-                *entry = hop;
+            let chain = chain_of.get(entity.entity_id.as_str()).cloned().unwrap_or_default();
+            let entry = graph_doc_meta
+                .entry(entity.document_path.clone())
+                .or_insert((hop, chain.clone()));
+            if hop < entry.0 {
+                *entry = (hop, chain);
             }
         }
-        let fresh_paths: Vec<String> = graph_doc_hop
-            .keys()
-            .filter(|p| !hit_paths.contains(*p))
-            .cloned()
-            .collect();
-        let fresh_chunks = if fresh_paths.is_empty() {
-            Vec::new()
-        } else {
-            self.document_chunks_for_paths(scope, &fresh_paths, 40)?
-        };
+        let mut paths_by_hop: HashMap<u8, Vec<String>> = HashMap::new();
+        for (path, (hop, _)) in &graph_doc_meta {
+            if !hit_paths.contains(path) {
+                paths_by_hop.entry(*hop).or_default().push(path.clone());
+            }
+        }
+        let mut fresh_chunks = Vec::new();
+        let mut remaining = 40usize;
+        let mut hops_in_order: Vec<u8> = paths_by_hop.keys().copied().collect();
+        hops_in_order.sort_unstable();
+        for hop in hops_in_order {
+            if remaining == 0 {
+                break;
+            }
+            let Some(paths) = paths_by_hop.remove(&hop) else {
+                continue;
+            };
+            let mut ring = self.document_chunks_for_paths(scope, &paths, remaining)?;
+            remaining = remaining.saturating_sub(ring.len());
+            fresh_chunks.append(&mut ring);
+        }
 
         // 4b. Fuse.
         let graph_chunks: Vec<(DocumentHit, u8, Vec<String>)> = fresh_chunks
             .into_iter()
             .map(|hit| {
-                let hop = graph_doc_hop.get(&hit.path).copied().unwrap_or(1).max(1);
-                let chain = entities
-                    .iter()
-                    .find(|e| e.document_path == hit.path)
-                    .and_then(|e| chain_of.get(e.entity_id.as_str()))
-                    .cloned()
-                    .unwrap_or_default();
+                let (hop, chain) = graph_doc_meta.get(&hit.path).cloned().unwrap_or((1, Vec::new()));
+                let hop = hop.max(1);
                 (hit, hop, chain)
             })
             .collect();

@@ -502,6 +502,8 @@ pub(crate) fn extract_and_persist_doc(
                     hops: cfg.graphrag.hops,
                 };
 
+                let _ =
+                    crate::lance::graphrag::delete_graph_for_document(lance.connection(), lance.runtime(), scope, rel);
                 if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                     if !entity_rows.is_empty() {
                         let _ = crate::lance::graphrag::upsert_graph_entities(
@@ -622,6 +624,7 @@ pub(crate) fn extract_and_persist_doc(
                 hops: cfg.graphrag.hops,
             };
 
+            let _ = crate::lance::graphrag::delete_graph_for_document(lance.connection(), lance.runtime(), scope, rel);
             if let Ok((entity_rows, edge_rows)) = build_graph_from_entities(scope, &doc_entities, &graphrag_cfg) {
                 if !entity_rows.is_empty() {
                     let _ = crate::lance::graphrag::upsert_graph_entities(
