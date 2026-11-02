@@ -22,8 +22,11 @@ The harness also auto-discovers `fixtures/synthetic-manifest.txt` (or a root
 
 `all` executes cold, warm, and a one-file incremental pass. Each run reports
 stage timings, first persisted-searchable-result time, processed bytes/tokens/
-chunks throughput, RSS, configuration, and skip/failure counters. The optional
-quality manifest reports embedding recall/nDCG and NER category/text coverage.
+chunks throughput, RSS, configuration, and skip/failure counters. The throughput
+section also reports `ner_documents_per_second` and `ner_tokens_per_second`,
+derived only from the ingestion NER stage timing; these are intentionally
+separate from the `redact_text` NER path. The optional quality manifest reports
+embedding recall/nDCG and NER category/text coverage.
 When supplied, `--quality-baseline` adds recall, nDCG, and NER coverage deltas
 against a prior JSON report (either the full benchmark output or its `quality`
 object). The default allowed regression is `0.01` (one percentage point); set
