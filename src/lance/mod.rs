@@ -69,9 +69,9 @@ use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
 #[cfg(feature = "graphrag")]
 use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
-/// On-disk metadata for the lance store. Tracks the vector dim, the
-/// embedding-model identifier, and the Arrow table schema version; a mismatch on
-/// any field wipes the store.
+/// On-disk metadata for the lance store. Tracks the vector dim, embedding-model identifier,
+/// Arrow table schema version, and lexical tokenizer configuration; a mismatch on any field
+/// wipes the store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LanceMeta {
     dim: u16,
