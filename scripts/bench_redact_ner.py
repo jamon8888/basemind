@@ -30,8 +30,7 @@ def make_text(length: int, run: int) -> str:
         f"Benchmark request {run}: Alice Martin of Acme Conseil reviewed "
         "the contract for 12 rue de Paris, 75001 Paris. "
     )
-    repeated = (seed * ((length // len(seed)) + 2))[:length]
-    return repeated
+    return (seed * ((length // len(seed)) + 2))[:length]
 
 
 def run_one(binary: Path, model: Path, root: Path, profile: str, text: str, timeout: float) -> tuple[float, dict]:
@@ -187,7 +186,7 @@ def main() -> int:
                 try:
                     previous = float(baseline["sizes"][str(size)]["p95_ms"])
                 except (KeyError, TypeError, ValueError) as exc:
-                    parser.error(f"baseline has no valid p95_ms for {size} chars: {exc}")
+                    raise RuntimeError(f"baseline has no valid p95_ms for {size} chars: {exc}") from exc
                 delta = (summary["p95_ms"] - previous) / previous if previous > 0 else 0.0
                 summary["baseline_p95_ms"] = previous
                 summary["p95_delta_fraction"] = delta
