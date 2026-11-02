@@ -417,6 +417,9 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
                 if *reused {
                     ctx.stats.reused_doc_extraction += 1;
                 }
+                if o.doc_batch.as_ref().is_some_and(|batch| batch.reembedded) {
+                    ctx.stats.reembedded_doc_embeddings += 1;
+                }
                 if *degraded {
                     ctx.stats.docs_degraded += 1;
                 }

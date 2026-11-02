@@ -93,6 +93,9 @@ pub(crate) struct PendingDocBatch {
     /// rather than a fresh xberg extraction. Drives the `reused_doc_extraction` scan counter — the
     /// observable proof that churn (renames, rewrites) does not re-run extraction or embedding.
     pub reused: bool,
+    /// True when a reused extraction refreshed only its embedding vectors because the model or
+    /// provider identity changed. Kept separate from `reused` so cache-stage decisions are visible.
+    pub reembedded: bool,
     /// Hash of the encrypted rehydration blob, if redaction captured one.
     /// Threaded into [`crate::store::DocEntry`] so the GC live set protects it.
     pub rehydration_ref: Option<String>,
@@ -447,7 +450,8 @@ pub(crate) fn extract_and_persist_doc(
         }
 
         // A model change reuses extracted content, chunks, and NER, then refreshes only vectors.
-        cache::refresh_cached_embeddings(store, hash, rel, &mut cached, cfg, embed, resources, filters, metrics)?;
+        let reembedded =
+            cache::refresh_cached_embeddings(store, hash, rel, &mut cached, cfg, embed, resources, filters, metrics)?;
 
         // Keep this reused blob "young" so the blob GC's grace window protects it through a NoCache
         // rename's transient entry-less gap (issue #44) instead of reaping it and forcing a re-embed.
@@ -514,7 +518,9 @@ pub(crate) fn extract_and_persist_doc(
             }
         }
 
-        return Ok(Some(pending_from_doc(&cached, rel, hash_hex, scope, cfg, embed, true)));
+        return Ok(Some(pending_from_doc(
+            &cached, rel, hash_hex, scope, cfg, embed, true, reembedded,
+        )));
     }
 
     let mut doc_config = doc_config_from(cfg, llm, resources, embed);
@@ -637,7 +643,9 @@ pub(crate) fn extract_and_persist_doc(
         .with_context(|| format!("write doc blob for {rel}"))?;
     metrics.add_persistence(persistence_started.elapsed());
 
-    Ok(Some(pending_from_doc(&doc, rel, hash_hex, scope, cfg, embed, false)))
+    Ok(Some(pending_from_doc(
+        &doc, rel, hash_hex, scope, cfg, embed, false, false,
+    )))
 }
 
 /// Single source of truth for "will this pass embed this doc": embedding runs only on an `Inline`
@@ -691,6 +699,7 @@ fn pending_from_doc(
     cfg: &DocumentsConfig,
     embed: bool,
     reused: bool,
+    reembedded: bool,
 ) -> PendingDocBatch {
     let chunk_count = doc.chunks.len();
     let token_count = doc.content.split_whitespace().count();
@@ -726,6 +735,7 @@ fn pending_from_doc(
         // (the reuse gate requires them), so `embedded` covers it and the flag is moot there. ~keep
         embed_attempted: embed && !reused,
         reused,
+        reembedded,
         rehydration_ref: doc.rehydration_ref.clone(),
         degraded: doc.linear_chunked,
         text_fallback: doc.text_fallback,

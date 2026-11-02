@@ -574,6 +574,7 @@ fn process_doc(
                 chunk_count: batch.chunk_count,
                 embedding_dim: batch.embedding_dim,
                 reused: batch.reused,
+                reembedded: batch.reembedded,
                 degraded: batch.degraded,
                 text_fallback: batch.text_fallback,
             };

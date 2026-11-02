@@ -219,6 +219,7 @@ fn json_report(
             "docs_tokens": stats.docs_tokens,
             "docs_bytes": stats.docs_bytes,
             "reused_doc_extraction": stats.reused_doc_extraction,
+            "reembedded_doc_embeddings": stats.reembedded_doc_embeddings,
             "docs_degraded": stats.docs_degraded,
             "doc_timeouts": stats.doc_timeouts,
             "docs_tombstoned": stats.docs_tombstoned,

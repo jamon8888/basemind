@@ -84,7 +84,8 @@ pub(crate) fn refresh_cached_embeddings(
     resources: &ResourcesConfig,
     filters: &Filters,
     metrics: &ScanStageMetrics,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let mut reembedded = false;
     let embedding_allowed = embed_requested && !matches!(resources.document_models, DocumentModelProfile::None_);
     let under_chunk_cap = cached.chunks.len() <= cfg.max_chunks_per_document;
     if embedding_allowed && under_chunk_cap && !cached_embeddings_are_reusable(cached, cfg) && !cached.chunks.is_empty()
@@ -124,6 +125,7 @@ pub(crate) fn refresh_cached_embeddings(
             .write_doc(hash, cached)
             .map_err(|error| anyhow::anyhow!("write re-embedded doc blob for {rel}: {error}"))?;
         metrics.add_embedding(started.elapsed());
+        reembedded = true;
     }
     if !embedding_allowed && cached.embedding_dim > 0 {
         for chunk in &mut cached.chunks {
@@ -135,5 +137,5 @@ pub(crate) fn refresh_cached_embeddings(
             .write_doc(hash, cached)
             .map_err(|error| anyhow::anyhow!("clear disabled document vectors for {rel}: {error}"))?;
     }
-    Ok(())
+    Ok(reembedded)
 }
