@@ -63,7 +63,9 @@ def _quality(report: dict[str, Any]) -> tuple[float, float, float, bool]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
-    parser.add_argument("--binary", type=Path, required=True, help="release document_benchmark executable")
+    parser.add_argument(
+        "--binary", type=Path, required=True, help="release document_benchmark executable"
+    )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--quality-manifest", type=Path)
     parser.add_argument("--quality-baseline", type=Path)
@@ -79,10 +81,15 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.timeout_seconds <= 0 or args.quality_tolerance < 0:
-        parser.error("timeout and quality tolerance must be non-negative, with timeout > 0")
+        parser.error(
+            "timeout and quality tolerance must be non-negative, with timeout > 0"
+        )
     candidates: list[dict[str, int]] = []
     for scan, embed, batch, docs in itertools.product(
-        args.scan_threads, args.embed_threads, args.embed_batch_size, args.max_concurrent_documents
+        args.scan_threads,
+        args.embed_threads,
+        args.embed_batch_size,
+        args.max_concurrent_documents,
     ):
         if not scan or not embed or not batch or not docs:
             continue
@@ -144,9 +151,18 @@ def main() -> int:
                 quality = _quality(report)
                 peak_rss = cold.get("peak_rss_delta_bytes") or cold.get("peak_rss_bytes") or 0
                 stats = cold.get("stats") or {}
-                timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(stats.get("parse_timeouts", 0)) > 0
+                timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(
+                    stats.get("parse_timeouts", 0)
+                ) > 0
                 skipped = int(stats.get("docs_deferred", 0)) + int(stats.get("extract_failed", 0))
-                entry.update({"report": report, "cold": cold, "quality": quality[:3], "peak_rss_bytes": peak_rss})
+                entry.update(
+                    {
+                        "report": report,
+                        "cold": cold,
+                        "quality": quality[:3],
+                        "peak_rss_bytes": peak_rss,
+                    }
+                )
                 reasons: list[str] = []
                 if args.rss_ceiling_mb is not None and peak_rss > args.rss_ceiling_mb * 1024 * 1024:
                     reasons.append("rss_ceiling")
@@ -164,7 +180,11 @@ def main() -> int:
         results.append(entry)
 
     accepted = [item for item in results if item.get("accepted")]
-    accepted.sort(key=lambda item: (-(item.get("cold", {}).get("throughput", {}).get("documents_per_second", 0.0))))
+    accepted.sort(
+        key=lambda item: -(
+            item.get("cold", {}).get("throughput", {}).get("documents_per_second", 0.0)
+        )
+    )
     output = {
         "candidates": len(results),
         "accepted": len(accepted),
