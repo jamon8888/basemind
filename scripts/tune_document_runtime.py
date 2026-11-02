@@ -135,6 +135,8 @@ def main() -> int:
 
         entry: dict[str, Any] = {"configuration": candidate, "command": command}
         try:
+            # shell=False is intentional: every value is passed as one argv element;
+            # document contents are never interpolated into a shell command.
             completed = subprocess.run(
                 command,
                 check=False,
@@ -149,7 +151,7 @@ def main() -> int:
                 report = _json_report(completed.stdout)
                 cold = _cold_run(report)
                 quality = _quality(report)
-                peak_rss = cold.get("peak_rss_delta_bytes") or cold.get("peak_rss_bytes") or 0
+                peak_rss = cold.get("peak_rss_bytes")
                 stats = cold.get("stats") or {}
                 timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(
                     stats.get("parse_timeouts", 0)
@@ -164,7 +166,9 @@ def main() -> int:
                     }
                 )
                 reasons: list[str] = []
-                if args.rss_ceiling_mb is not None and peak_rss > args.rss_ceiling_mb * 1024 * 1024:
+                if peak_rss is None:
+                    reasons.append("rss_unavailable")
+                elif args.rss_ceiling_mb is not None and peak_rss > args.rss_ceiling_mb * 1024 * 1024:
                     reasons.append("rss_ceiling")
                 if timed_out:
                     reasons.append("timeout")
