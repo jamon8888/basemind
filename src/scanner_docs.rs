@@ -765,20 +765,17 @@ fn build_doc_rows(
     let rel_owned = rel.to_string();
     let mime_owned = doc.mime_type;
     let rehydration_ref = doc.rehydration_ref;
-    let excluded_cites: Vec<String> = doc
-        .metadata
-        .iter()
-        .flat_map(|(_, value)| crate::extract::doc::citations::extract_citations(value, 128))
-        .collect();
     doc.chunks
         .into_iter()
         .enumerate()
         .map(|(idx, chunk)| {
             let cites = if citations.extract {
-                let mut values =
-                    crate::extract::doc::citations::extract_citations(&chunk.text, citations.max_per_chunk as usize);
-                crate::extract::doc::citations::filter_self_references(&mut values, &excluded_cites);
-                values.join(" ")
+                chunk
+                    .cites
+                    .split_ascii_whitespace()
+                    .take(citations.max_per_chunk as usize)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             } else {
                 String::new()
             };

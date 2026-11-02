@@ -118,6 +118,7 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
             text: format!("chunk {i}"),
             embedding: vec![0.0_f32; embedding_dim as usize],
             heading_path: String::new(),
+            cites: String::new(),
         })
         .collect();
     FileMapDoc {

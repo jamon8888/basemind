@@ -231,6 +231,9 @@ pub struct DocChunk {
     /// the dense-only path would have skipped it. Empty for a chunk with no heading context.
     #[serde(default)]
     pub heading_path: String,
+    /// Legal identifiers extracted from the pre-redaction chunk text for exact retrieval.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cites: String,
 }
 
 /// Caller-supplied knobs for document extraction.
@@ -749,6 +752,24 @@ pub(crate) fn extract_doc_with_metrics(
         ExtractError::Document(message)
     })?;
 
+    // Preserve citation candidates from source text before redaction rewrites it.
+    let citation_exclusions: Vec<String> = metadata_pairs(&result.metadata)
+        .iter()
+        .flat_map(|(_, value)| citations::extract_citations(value, 128))
+        .collect();
+    let citation_sources: Vec<String> = if linear {
+        doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap)
+            .into_iter()
+            .map(|(start, end)| result.content[start..end].to_string())
+            .collect()
+    } else {
+        result
+            .chunks
+            .as_ref()
+            .map(|chunks| chunks.iter().map(|chunk| chunk.content.clone()).collect())
+            .unwrap_or_default()
+    };
+
     // #95: measured on the OCR text itself, before redaction and fallible embedding work.
     let ocr_empty_chars = ocr_signal::check(path, mime_type, &config.document_models, &result.content);
 
@@ -797,10 +818,22 @@ pub(crate) fn extract_doc_with_metrics(
     let chunking_started = std::time::Instant::now();
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
+    let citation_for = |index: usize| {
+        let mut values = citation_sources
+            .get(index)
+            .map(|text| citations::extract_citations(text, 256))
+            .unwrap_or_default();
+        citations::filter_self_references(&mut values, &citation_exclusions);
+        values.join(" ")
+    };
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
     if linear {
         let numbered_headings = collect_numbered_headings(&result.content);
-        for (start, end) in doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap) {
+        for (index, (start, end)) in
+            doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap)
+                .into_iter()
+                .enumerate()
+        {
             let (mut chunk, mut dense_input) = prepare_doc_chunk(
                 result.content[start..end].to_string(),
                 start,
@@ -812,6 +845,7 @@ pub(crate) fn extract_doc_with_metrics(
             // explicit numbered section spine with a bounded source pre-pass so large legal
             // documents retain the same structural signal as the normal chunking path.
             chunk.heading_path = numbered_heading_path(&numbered_headings, start, end);
+            chunk.cites = citation_for(index);
             if let (Some(path), Some(input)) = (Some(chunk.heading_path.as_str()), dense_input.as_mut())
                 && !path.is_empty()
             {
@@ -821,14 +855,15 @@ pub(crate) fn extract_doc_with_metrics(
             dense_inputs.extend(dense_input);
         }
     } else if let Some(input_chunks) = result.chunks {
-        for c in input_chunks {
-            let (chunk, dense_input) = prepare_doc_chunk(
+        for (index, c) in input_chunks.into_iter().enumerate() {
+            let (mut chunk, dense_input) = prepare_doc_chunk(
                 c.content,
                 c.metadata.byte_start,
                 c.metadata.byte_end,
                 c.metadata.heading_context.as_ref(),
                 embed_requested,
             );
+            chunk.cites = citation_for(index);
             chunks.push(chunk);
             if let Some(dense_input) = dense_input {
                 dense_inputs.push(dense_input);
@@ -1015,6 +1050,7 @@ fn prepare_doc_chunk(
         text: content,
         embedding: Vec::new(),
         heading_path,
+        cites: String::new(),
     };
     (chunk, dense_input)
 }
