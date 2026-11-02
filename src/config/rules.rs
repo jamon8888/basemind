@@ -113,8 +113,9 @@ pub fn code_digest(cfg: &CodeSearchConfig) -> String {
 }
 
 /// Fingerprint of the settings that shape a document's extracted content, chunks, keywords,
-/// entities and summary. `output` (MCP response format) and the embedding preset / threads are
-/// deliberately excluded: they do not change what is stored.
+/// entities and summary. `output` (MCP response format), the embedding preset, and thread counts
+/// are deliberately excluded: they do not change extracted content. The ONNX provider remains in
+/// the digest because it can change model output and numerical results across runtimes.
 pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmConfig) -> String {
     // The splitter cutovers decide which chunker a text file gets, so they belong in the digest, but only
     // when moved off their defaults: folding the defaults in would change every existing digest and
@@ -122,11 +123,11 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmC
     let defaults = DocumentsConfig::default();
     let cutovers = (cfg.markdown_chunk_max_bytes, cfg.plain_text_chunk_max_bytes);
     let tag = if cutovers == (defaults.markdown_chunk_max_bytes, defaults.plain_text_chunk_max_bytes) {
-        // Bump this when extraction preprocessing changes; this invalidates
-        // cached OCR generated before alpha compositing was introduced.
-        "doc/2".to_string()
+        // Bump this when extraction preprocessing or cache-key inputs change; this invalidates
+        // cached OCR and embeddings produced before provider identity became part of the key.
+        "doc/3".to_string()
     } else {
-        format!("doc/2/cutover={},{}", cutovers.0, cutovers.1)
+        format!("doc/3/cutover={},{}", cutovers.0, cutovers.1)
     };
     digest_of(
         &tag,
@@ -147,6 +148,10 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmC
             &cfg.ner,
             &cfg.summarization,
             resources.document_models,
+            // Provider selection affects ONNX-backed embeddings, NER, layout and OCR. Keep it in
+            // the extraction fingerprint so a cached document is never reused across runtimes
+            // with potentially different output or numerical behavior.
+            resources.onnx_provider,
             &llm.model,
         ),
     )
@@ -221,6 +226,14 @@ mod tests {
         let mut live = base.clone();
         live.max_pages += 1;
         assert_ne!(digest(&base), digest(&live));
+
+        let mut provider = resources.clone();
+        provider.onnx_provider = crate::config::OnnxProvider::CoreMl;
+        assert_ne!(
+            doc_digest(&base, &resources, &llm),
+            doc_digest(&base, &provider, &llm),
+            "changing the ONNX provider must invalidate cached document outputs"
+        );
     }
 
     #[test]
