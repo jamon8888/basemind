@@ -473,6 +473,7 @@ fn row_for(res: &FileResult, verbosity: Verbosity) -> Option<Row<'_>> {
             chunk_count,
             embedding_dim,
             reused,
+            reembedded,
             degraded,
             text_fallback,
         } => {
@@ -480,12 +481,17 @@ fn row_for(res: &FileResult, verbosity: Verbosity) -> Option<Row<'_>> {
                 None
             } else {
                 let cached = if *reused { ", cached" } else { "" };
+                let cached = if *reembedded {
+                    format!("{cached}, vectors refreshed")
+                } else {
+                    cached.to_string()
+                };
                 let cached = if *text_fallback {
                     format!("{cached}, read as plain text after a parse failure")
                 } else if *degraded {
                     format!("{cached}, linear chunking")
                 } else {
-                    cached.to_string()
+                    cached
                 };
                 Some(Row {
                     symbol: '✓',
