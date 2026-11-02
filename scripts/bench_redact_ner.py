@@ -14,6 +14,7 @@ import json
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,10 +34,14 @@ def make_text(length: int, run: int) -> str:
     return repeated
 
 
-def run_one(binary: Path, model: Path, profile: str, text: str, timeout: float) -> tuple[float, dict]:
+def run_one(
+    binary: Path, model: Path, root: Path, profile: str, text: str, timeout: float
+) -> tuple[float, dict]:
     started = time.perf_counter()
     command = [
         str(binary),
+        "--root",
+        str(root),
         "redact",
         "--text",
         text,
@@ -111,35 +116,58 @@ def main() -> int:
         parser.error(f"model directory does not exist: {args.model}")
 
     sizes = (200, 2_000, 8_000)
-    for run in range(args.warmups):
-        run_one(args.binary, args.model, args.profile, make_text(200, -(run + 1)), args.timeout_seconds)
+    with tempfile.TemporaryDirectory(prefix="basemind-redact-bench-") as temp_root:
+        root = Path(temp_root)
+        for run in range(args.warmups):
+            run_one(
+                args.binary,
+                args.model,
+                root,
+                args.profile,
+                make_text(200, -(run + 1)),
+                args.timeout_seconds,
+            )
 
-    results: dict[str, object] = {
-        "binary": str(args.binary),
-        "model": str(args.model),
-        "profile": args.profile,
-        "repetitions": args.repetitions,
-        "timing": "cold_cli_process",
-        "timeout_seconds": args.timeout_seconds,
-        "sizes": {},
-    }
-    for size in sizes:
-        probe_text = make_text(size, -1)
-        _, first_probe = run_one(args.binary, args.model, args.profile, probe_text, args.timeout_seconds)
-        _, second_probe = run_one(args.binary, args.model, args.profile, probe_text, args.timeout_seconds)
-        assert_deterministic(first_probe, second_probe)
-        samples = [
-            run_one(args.binary, args.model, args.profile, make_text(size, run), args.timeout_seconds)[0]
-            for run in range(args.repetitions)
-        ]
-        summary = {
-            "p50_ms": percentile(samples, 50),
-            "p95_ms": percentile(samples, 95),
-            "mean_ms": statistics.fmean(samples),
-            "samples_ms": samples,
+        results: dict[str, object] = {
+            "binary": str(args.binary),
+            "model": str(args.model),
+            "profile": args.profile,
+            "repetitions": args.repetitions,
+            "timing": "cold_cli_process",
+            "timeout_seconds": args.timeout_seconds,
+            "sizes": {},
         }
-        results["sizes"][str(size)] = summary  # type: ignore[index]
-        print(f"{size:>5} chars  p50={summary['p50_ms']:.1f} ms  p95={summary['p95_ms']:.1f} ms")
+        for size in sizes:
+            probe_text = make_text(size, -1)
+            _, first_probe = run_one(
+                args.binary, args.model, root, args.profile, probe_text, args.timeout_seconds
+            )
+            _, second_probe = run_one(
+                args.binary, args.model, root, args.profile, probe_text, args.timeout_seconds
+            )
+            assert_deterministic(first_probe, second_probe)
+            samples = [
+                run_one(
+                    args.binary,
+                    args.model,
+                    root,
+                    args.profile,
+                    make_text(size, run),
+                    args.timeout_seconds,
+                )[0]
+                for run in range(args.repetitions)
+            ]
+            summary = {
+                "p50_ms": percentile(samples, 50),
+                "p95_ms": percentile(samples, 95),
+                "mean_ms": statistics.fmean(samples),
+                "samples_ms": samples,
+            }
+            results["sizes"][str(size)] = summary  # type: ignore[index]
+            print(
+                f"{size:>5} chars  p50={summary['p50_ms']:.1f} ms  "
+                f"p95={summary['p95_ms']:.1f} ms"
+            )
 
     encoded = json.dumps(results, indent=2) + "\n"
     if args.output:

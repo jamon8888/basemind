@@ -28,4 +28,6 @@ raw samples for each size, making it suitable for comparing complete gateway
 request cost and provider/runtime configurations without mixing in document
 extraction timings. Before timing each size, the runner sends the same text
 twice and compares detections plus coverage metadata; a fixed provider/config
-that produces different spans fails the benchmark.
+that produces different spans fails the benchmark. Each invocation uses an
+isolated temporary `--root`, so concurrent benchmark runs cannot append to the
+same workspace telemetry file.
