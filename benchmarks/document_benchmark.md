@@ -48,3 +48,28 @@ with `--incremental-file path/to/file.docx`.
 The generated `synthetic-incremental.txt` is selected automatically and is
 updated in `all`/`incremental` runs. Use `--mutate-incremental` to opt into the
 same deterministic append for a selected text fixture.
+
+## Runtime tuning matrix
+
+Use `scripts/tune_document_runtime.py` to compare bounded runtime settings in
+fresh processes. The driver runs the cold benchmark once per combination of
+scanner threads, embedding threads, embedding batch size, and document
+concurrency. A candidate is rejected when it times out, skips/fails a document,
+exceeds `--rss-ceiling-mb`, or fails the supplied quality baseline. The fastest
+remaining candidate is reported as `best`; no candidate is silently selected
+when every combination violates a gate.
+
+```sh
+python3 scripts/tune_document_runtime.py /private/docs \
+  --binary target/release/examples/document_benchmark \
+  --manifest /private/docs-manifest.txt \
+  --quality-manifest benchmarks/document_quality.example.jsonl \
+  --quality-baseline /private/baseline.json \
+  --scan-threads 2,4 --embed-threads 2,4 \
+  --embed-batch-size 16,32 --max-concurrent-documents 1,2 \
+  --rss-ceiling-mb 8192 --output /private/runtime-matrix.json
+```
+
+The matrix is evidence-only: CPU remains the reference provider, and an
+alternate provider must be passed explicitly and measured on the target corpus
+before it is adopted as a deployment default.
