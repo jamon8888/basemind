@@ -12,8 +12,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -47,17 +50,49 @@ def _cold_run(report: dict[str, Any]) -> dict[str, Any]:
     return report.get("runs", [{}])[0]
 
 
-def _quality(report: dict[str, Any]) -> tuple[float, float, float, bool]:
+def _quality(report: dict[str, Any], require_baseline: bool) -> tuple[float, float, float, bool]:
     quality = report.get("quality") or {}
     retrieval = quality.get("retrieval") or {}
     ner = quality.get("ner") or {}
     comparison = quality.get("baseline_comparison") or {}
+    deltas = (
+        comparison.get("recall_delta"),
+        comparison.get("ndcg_delta"),
+        comparison.get("ner_coverage_delta"),
+    )
+    baseline_complete = not require_baseline or all(value is not None for value in deltas)
     return (
         float(retrieval.get("mean_recall", 0.0)),
         float(retrieval.get("mean_ndcg", 0.0)),
         float(ner.get("coverage", 0.0)),
-        bool(comparison.get("within_tolerance", True)),
+        bool(comparison.get("within_tolerance", True)) and baseline_complete,
     )
+
+
+def _stage_corpus(root: Path, manifest: Path, isolated_root: Path) -> Path:
+    """Symlink manifest files into an isolated root while keeping relative paths stable."""
+    root = root.resolve()
+    staged: list[str] = []
+    for raw in manifest.read_text(encoding="utf-8").splitlines():
+        item = raw.strip()
+        if not item or item.startswith("#"):
+            continue
+        source = (root / item).resolve()
+        if not source.is_file():
+            fallback = (manifest.parent / item).resolve()
+            source = fallback if fallback.is_file() else source
+        try:
+            relative = source.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"manifest entry is outside benchmark root: {item}") from error
+        target = isolated_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            target.symlink_to(source)
+        staged.append(relative.as_posix())
+    staged_manifest = isolated_root / "manifest.txt"
+    staged_manifest.write_text("\n".join(dict.fromkeys(staged)) + "\n", encoding="utf-8")
+    return staged_manifest
 
 
 def main() -> int:
@@ -83,7 +118,7 @@ def main() -> int:
     parser.add_argument("--quality-tolerance", type=float, default=0.01)
     args = parser.parse_args()
 
-    if args.timeout_seconds <= 0 or args.quality_tolerance < 0:
+    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0 or args.quality_tolerance < 0:
         parser.error("timeout and quality tolerance must be non-negative, with timeout > 0")
     candidates: list[dict[str, int]] = []
     for scan, embed, batch, docs in itertools.product(
@@ -105,37 +140,39 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     for candidate in candidates:
-        command = [
-            str(args.binary),
-            str(args.root),
-            "--manifest",
-            str(args.manifest),
-            "--mode",
-            "cold",
-            "--onnx-provider",
-            args.onnx_provider,
-        ]
-        for key, flag in (
-            ("scan_threads", "--scan-threads"),
-            ("embed_threads", "--embed-threads"),
-            ("embed_batch_size", "--embed-batch-size"),
-            ("max_concurrent_documents", "--max-concurrent-documents"),
-        ):
-            command.extend((flag, str(candidate[key])))
-        if args.quality_manifest:
-            command.extend(("--quality-manifest", str(args.quality_manifest)))
-        if args.quality_baseline:
-            command.extend(
-                (
-                    "--quality-baseline",
-                    str(args.quality_baseline),
-                    "--quality-tolerance",
-                    str(args.quality_tolerance),
-                )
-            )
-
-        entry: dict[str, Any] = {"configuration": candidate, "command": command}
+        isolated_root = Path(tempfile.mkdtemp(prefix="basemind-runtime-matrix-"))
+        entry: dict[str, Any] = {"configuration": candidate}
         try:
+            staged_manifest = _stage_corpus(args.root, args.manifest, isolated_root)
+            command = [
+                str(args.binary),
+                str(isolated_root),
+                "--manifest",
+                str(staged_manifest),
+                "--mode",
+                "cold",
+                "--onnx-provider",
+                args.onnx_provider,
+            ]
+            for key, flag in (
+                ("scan_threads", "--scan-threads"),
+                ("embed_threads", "--embed-threads"),
+                ("embed_batch_size", "--embed-batch-size"),
+                ("max_concurrent_documents", "--max-concurrent-documents"),
+            ):
+                command.extend((flag, str(candidate[key])))
+            if args.quality_manifest:
+                command.extend(("--quality-manifest", str(args.quality_manifest)))
+            if args.quality_baseline:
+                command.extend(
+                    (
+                        "--quality-baseline",
+                        str(args.quality_baseline),
+                        "--quality-tolerance",
+                        str(args.quality_tolerance),
+                    )
+                )
+            entry["command"] = command
             # shell=False is intentional: every value is passed as one argv element;
             # document contents are never interpolated into a shell command.
             # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
@@ -151,10 +188,12 @@ def main() -> int:
             entry["exit_code"] = completed.returncode
             if completed.returncode != 0:
                 entry["failure"] = (completed.stderr or completed.stdout)[-2000:]
+                entry["accepted"] = False
+                entry["rejection_reasons"] = ["benchmark_failed"]
             else:
                 report = _json_report(completed.stdout)
                 cold = _cold_run(report)
-                quality = _quality(report)
+                quality = _quality(report, args.quality_baseline is not None)
                 peak_rss = cold.get("peak_rss_bytes")
                 stats = cold.get("stats") or {}
                 timed_out = int(stats.get("doc_timeouts", 0)) > 0 or int(stats.get("parse_timeouts", 0)) > 0
@@ -174,6 +213,9 @@ def main() -> int:
                     reasons.append("rss_ceiling")
                 if timed_out:
                     reasons.append("timeout")
+                skipped += int(stats.get("read_failed", 0))
+                skipped += int(stats.get("docs_tombstoned", 0))
+                skipped += int(stats.get("skipped_too_large", 0))
                 if skipped:
                     reasons.append("skip_or_failure")
                 if not quality[3]:
@@ -183,6 +225,12 @@ def main() -> int:
         except (OSError, subprocess.TimeoutExpired, ValueError) as error:
             entry["exit_code"] = None
             entry["failure"] = str(error)
+            entry["accepted"] = False
+            entry["rejection_reasons"] = [
+                "timeout" if isinstance(error, subprocess.TimeoutExpired) else "process_error"
+            ]
+        finally:
+            shutil.rmtree(isolated_root, ignore_errors=True)
         results.append(entry)
 
     accepted = [item for item in results if item.get("accepted")]

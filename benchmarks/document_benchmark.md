@@ -54,8 +54,10 @@ same deterministic append for a selected text fixture.
 Use `scripts/tune_document_runtime.py` to compare bounded runtime settings in
 fresh processes. The driver runs the cold benchmark once per combination of
 scanner threads, embedding threads, embedding batch size, and document
-concurrency. A candidate is rejected when it times out, skips/fails a document,
-exceeds `--rss-ceiling-mb`, or fails the supplied quality baseline. The fastest
+concurrency, using a temporary isolated store for every candidate so prior
+indexes cannot turn a later run into a warm scan. A candidate is rejected when
+it times out, reports any read/extraction/tombstone/oversized-file skip, exceeds
+`--rss-ceiling-mb`, or fails the supplied quality baseline. The fastest
 remaining candidate is reported as `best`; no candidate is silently selected
 when every combination violates a gate.
 
