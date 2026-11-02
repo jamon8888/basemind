@@ -137,17 +137,20 @@ impl LanceStore {
                 .with_context(|| format!("open {table_name} table"))?;
             // Skip the delete (a scan plus a commit) when the table holds nothing to replace; this
             // is every batch of a first scan.
-            if table
+            let had_rows = table
                 .count_rows(None)
                 .await
                 .with_context(|| format!("count {table_name} rows"))?
-                > 0
-            {
+                > 0;
+            if had_rows {
                 table
                     .delete(&replace_predicate(key_col, &items))
                     .await
                     .with_context(|| format!("delete {} paths from {table_name}", items.len()))?;
                 self.after_commit(&table, table_name).await;
+                if table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
             }
             let flat: Vec<R> = items.into_iter().flat_map(|(_, _, rows)| rows).collect();
             if flat.is_empty() {
@@ -159,6 +162,9 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} {table_name} rows", flat.len()))?;
             self.after_commit(&table, table_name).await;
+            if table_name == DOCUMENTS_TABLE && !had_rows {
+                self.bump_document_generation()?;
+            }
             anyhow::Ok(())
         })
     }

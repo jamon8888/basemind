@@ -49,7 +49,7 @@ pub use graphrag::{
 };
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -84,6 +84,10 @@ struct LanceMeta {
 }
 
 const META_FILE: &str = "meta.json";
+/// Persistent document-search generation lives beside the Lance directory. `wipe_on_mismatch`
+/// removes everything under `.basemind/lance/`, so keeping this token outside that directory is
+/// what lets a resumed cursor detect a schema/model rebuild after process restart.
+const GENERATION_SUFFIX: &str = ".generation";
 
 /// Open the existing lance store for read-side tools (the MCP `graph` modes)
 /// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
@@ -218,8 +222,12 @@ struct LanceStoreInner {
     dim: u16,
     embedding_model: String,
     dir: PathBuf,
+    /// Sidecar path and current value for document-search cursor invalidation. The file is kept
+    /// beside `dir`, never below it, because the Lance migration path wipes that directory.
+    generation_path: PathBuf,
+    document_generation: Mutex<u64>,
     /// Commits per table since the last maintenance pass; drives bounded version retention.
-    commits: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    commits: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LanceStoreInner {
@@ -244,12 +252,19 @@ impl LanceStore {
     pub fn open(dir: &Path, dim: u16, embedding_model: &str) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let meta_path = dir.join(META_FILE);
+        let generation_path = generation_path(dir);
+        let generation = read_generation(&generation_path)?;
         let expected = LanceMeta {
             dim,
             embedding_model: embedding_model.to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
         };
-        wipe_on_mismatch(dir, &meta_path, &expected)?;
+        let wiped = wipe_on_mismatch(dir, &meta_path, &expected)?;
+        let generation = if wiped {
+            bump_generation_file(&generation_path, generation)?
+        } else {
+            generation
+        };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -287,7 +302,9 @@ impl LanceStore {
                 dim,
                 embedding_model: embedding_model.to_string(),
                 dir: dir.to_path_buf(),
-                commits: std::sync::Mutex::new(std::collections::HashMap::new()),
+                generation_path,
+                document_generation: Mutex::new(generation),
+                commits: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -319,6 +336,27 @@ impl LanceStore {
         &self.inner.dir
     }
 
+    /// Persistent generation for document-search cursors. Any document-table rebuild or delete
+    /// increments this value; callers can therefore reject a cursor from before a Lance wipe,
+    /// process restart, or incremental mutation.
+    pub fn document_generation(&self) -> u64 {
+        *self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn bump_document_generation(&self) -> Result<u64> {
+        let mut generation = self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = bump_generation_file(&self.inner.generation_path, *generation)?;
+        Ok(*generation)
+    }
+
     /// Replace all documents rows for the given `(scope, path)` pair and insert
     /// the supplied rows. Used by the scanner during incremental re-extract.
     pub fn replace_document(&self, scope: &str, path: &str, rows: Vec<DocumentRow>) -> Result<()> {
@@ -340,6 +378,7 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("delete existing rows for {scope}/{path}"))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
+            self.bump_document_generation()?;
             if rows.is_empty() {
                 return Ok(());
             }
@@ -586,7 +625,11 @@ impl LanceStore {
     /// Delete every `documents` row of `paths` in `scope`; the batched counterpart of
     /// [`Self::replace_document`] with no replacement rows.
     pub fn delete_documents_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
-        self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths)
+        let result = self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths);
+        if result.is_ok() && !paths.is_empty() {
+            self.bump_document_generation()?;
+        }
+        result
     }
 
     /// Delete every `doc_links` row of the given documents (ADR-0008) in bulk.
@@ -676,14 +719,38 @@ impl LanceStore {
     }
 }
 
-fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMeta) -> Result<()> {
+fn generation_path(dir: &Path) -> PathBuf {
+    let name = dir.file_name().and_then(|name| name.to_str()).unwrap_or("lance");
+    dir.with_file_name(format!("{name}{GENERATION_SUFFIX}"))
+}
+
+fn read_generation(path: &Path) -> Result<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => body
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("parse document generation {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(1),
+        Err(error) => Err(error).with_context(|| format!("read document generation {}", path.display())),
+    }
+}
+
+fn bump_generation_file(path: &Path, current: u64) -> Result<u64> {
+    let next = current.checked_add(1).unwrap_or(1);
+    let tmp = path.with_extension("generation.tmp");
+    std::fs::write(&tmp, next.to_string()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(next)
+}
+
+fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMeta) -> Result<bool> {
     if !meta_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let bytes = std::fs::read(meta_path).with_context(|| format!("read {}", meta_path.display()))?;
     let actual: LanceMeta = serde_json::from_slice(&bytes).with_context(|| format!("parse {}", meta_path.display()))?;
     if actual == *expected {
-        return Ok(());
+        return Ok(false);
     }
     tracing::warn!(
         old_dim = actual.dim,
@@ -704,7 +771,7 @@ fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMeta) -> Resul
             std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn ensure_table(connection: &Connection, name: &str, schema: arrow_schema::SchemaRef) -> Result<()> {

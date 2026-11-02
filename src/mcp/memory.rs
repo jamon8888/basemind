@@ -599,22 +599,35 @@ pub(super) async fn run_search_documents(
     // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
+    let query_fingerprint = document_query_fingerprint(&params, &scope, lexical_only);
 
-    let mut hits: Vec<DocumentSearchHit> = if lexical_only {
+    let (mut hits, cursor_generation, cursor_offset, has_more, cursor_invalidated) = if lexical_only {
         let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
         let hits_raw = tokio::task::spawn_blocking(move || {
+            if invalidated {
+                return Ok(Vec::new());
+            }
             let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
             let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
-            basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)
+            basemind_lexical(&lance, &terms, &predicate, fetch_limit, max_relaxations)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
-        hits_raw
+        let has_more = hits_raw.len() > offset.saturating_add(limit);
+        let hits = hits_raw
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|h| DocumentSearchHit {
                 path: h.path,
                 chunk_idx: h.chunk_idx,
@@ -629,20 +642,33 @@ pub(super) async fn run_search_documents(
                 entities: Vec::new(),
                 summary: None,
             })
-            .collect()
+            .collect();
+        (hits, generation, offset as u64 + limit as u64, has_more, invalidated)
     } else {
         let embedding = embed_query(state, &params.query).await?;
         let lance = lance_store(state).await?;
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
         let hits_raw = tokio::task::spawn_blocking(move || {
-            lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())
+            if invalidated {
+                return Ok(Vec::new());
+            }
+            lance.search_documents(&scope_for_lane, embedding, fetch_limit, mime.as_deref())
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
-        hits_raw
+        let has_more = hits_raw.len() > offset.saturating_add(limit);
+        let hits = hits_raw
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|h| DocumentSearchHit {
                 path: h.path,
                 chunk_idx: h.chunk_idx,
@@ -656,7 +682,8 @@ pub(super) async fn run_search_documents(
                 entities: Vec::new(),
                 summary: None,
             })
-            .collect()
+            .collect();
+        (hits, generation, offset as u64 + limit as u64, has_more, invalidated)
     };
 
     attach_doc_metadata(
@@ -738,15 +765,64 @@ pub(super) async fn run_search_documents(
     };
 
     let budget = super::budget::apply_budget(hits, params.max_tokens);
+    let next_offset = cursor_offset
+        .saturating_sub(limit as u64)
+        .saturating_add(budget.items.len() as u64);
+    let next_cursor = if !cursor_invalidated && (has_more || budget.budgeted) {
+        Some(crate::mcp::cursor::Cursor::encode_documents(
+            next_offset,
+            cursor_generation,
+            query_fingerprint,
+        ))
+    } else {
+        None
+    };
     format_response(
         &SearchDocumentsResponse {
             query: params.query,
             budgeted: budget.budgeted,
             hits: budget.items,
+            next_cursor,
+            cursor_invalidated,
             elapsed_us: elapsed_us(__body),
         },
         output_format,
     )
+}
+
+const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 100_000;
+
+fn document_query_fingerprint(params: &SearchDocumentsParams, scope: &str, lexical_only: bool) -> u64 {
+    let material = format!(
+        "{scope}\n{lexical_only}\n{}\n{}\n{}\n{}",
+        params.query,
+        params.mime_type.as_deref().unwrap_or_default(),
+        params.entity_category.as_deref().unwrap_or_default(),
+        params.keywords_contains.as_deref().unwrap_or_default(),
+    );
+    let digest = blake3::hash(material.as_bytes());
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("blake3 digest has 8 bytes"))
+}
+
+fn document_cursor_offset(
+    cursor: Option<&crate::mcp::cursor::Cursor>,
+    generation: u64,
+    query_fingerprint: u64,
+) -> Result<(usize, bool), McpError> {
+    let Some(cursor) = cursor else {
+        return Ok((0, false));
+    };
+    let (offset, cursor_generation, cursor_fingerprint) = cursor.decode_documents()?;
+    if cursor_generation != generation || cursor_fingerprint != query_fingerprint {
+        return Ok((0, true));
+    }
+    if offset > MAX_DOCUMENT_CURSOR_OFFSET {
+        return Err(McpError::invalid_params(
+            format!("document cursor offset exceeds {MAX_DOCUMENT_CURSOR_OFFSET}"),
+            None,
+        ));
+    }
+    Ok((offset as usize, false))
 }
 
 /// Load the parent doc blob for each unique hit path, copy its keywords +
@@ -867,5 +943,41 @@ mod scope_tests {
         assert_ne!(resolve_doc_scope(None, repo_scope), write_scope);
 
         assert_eq!(resolve_doc_scope(Some(&write_scope), repo_scope), write_scope);
+    }
+}
+
+#[cfg(all(test, feature = "documents"))]
+mod document_cursor_tests {
+    use super::*;
+    use crate::mcp::cursor::Cursor;
+
+    #[test]
+    fn cursor_generation_and_query_mismatch_invalidates() {
+        let params = SearchDocumentsParams {
+            query: "alpha".to_string(),
+            limit: Some(10),
+            max_tokens: None,
+            format: None,
+            mime_type: None,
+            scope: Some("repo".to_string()),
+            entity_category: None,
+            keywords_contains: None,
+            cursor: None,
+            overrides: Default::default(),
+        };
+        let fingerprint = document_query_fingerprint(&params, "repo", false);
+        let cursor = Cursor::encode_documents(10, 4, fingerprint);
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 4, fingerprint).expect("cursor"),
+            (10, false)
+        );
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 5, fingerprint).expect("stale generation"),
+            (0, true)
+        );
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 4, fingerprint.wrapping_add(1)).expect("different query"),
+            (0, true)
+        );
     }
 }

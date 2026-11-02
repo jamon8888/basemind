@@ -86,6 +86,19 @@ mod tests {
         assert!(keep.exists(), "matching meta must not wipe the store");
     }
 
+    #[test]
+    fn generation_sidecar_is_outside_wiped_lance_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lance_dir = dir.path().join("lance");
+        std::fs::create_dir_all(&lance_dir).unwrap();
+        let generation = generation_path(&lance_dir);
+        assert_eq!(generation, dir.path().join("lance.generation"));
+        std::fs::write(&generation, b"7").unwrap();
+        assert_eq!(read_generation(&generation).unwrap(), 7);
+        assert_eq!(bump_generation_file(&generation, 7).unwrap(), 8);
+        assert_eq!(read_generation(&generation).unwrap(), 8);
+    }
+
     /// A bumped `schema_ver` (e.g. a future minor) on an otherwise-identical store wipes.
     #[test]
     fn schema_ver_bump_triggers_wipe() {
