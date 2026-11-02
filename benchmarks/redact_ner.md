@@ -26,4 +26,6 @@ the response. The command exits non-zero instead of recording a pattern-only,
 partially covered, or timed-out result. The JSON includes p50, p95, mean, and
 raw samples for each size, making it suitable for comparing complete gateway
 request cost and provider/runtime configurations without mixing in document
-extraction timings.
+extraction timings. Before timing each size, the runner sends the same text
+twice and compares detections plus coverage metadata; a fixed provider/config
+that produces different spans fails the benchmark.

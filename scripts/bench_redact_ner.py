@@ -79,6 +79,20 @@ def run_one(binary: Path, model: Path, profile: str, text: str, timeout: float) 
     return elapsed_ms, payload
 
 
+def assert_deterministic(first: dict, second: dict) -> None:
+    fields = (
+        "detections",
+        "ner_profile",
+        "ner_ran",
+        "ner_windows",
+        "ner_window_chars",
+        "ner_truncated",
+    )
+    for field in fields:
+        if first.get(field) != second.get(field):
+            raise RuntimeError(f"NER output is not deterministic for field {field!r}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/release/basemind"))
@@ -110,6 +124,10 @@ def main() -> int:
         "sizes": {},
     }
     for size in sizes:
+        probe_text = make_text(size, -1)
+        _, first_probe = run_one(args.binary, args.model, args.profile, probe_text, args.timeout_seconds)
+        _, second_probe = run_one(args.binary, args.model, args.profile, probe_text, args.timeout_seconds)
+        assert_deterministic(first_probe, second_probe)
         samples = [
             run_one(args.binary, args.model, args.profile, make_text(size, run), args.timeout_seconds)[0]
             for run in range(args.repetitions)
