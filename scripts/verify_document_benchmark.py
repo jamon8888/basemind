@@ -135,10 +135,20 @@ def main() -> int:
         by_mode[mode] = run
         require_keys(
             run,
-            ("first_searchable_result_ms", "peak_rss_bytes", "throughput", "timings_ms", "stats"),
+            ("first_searchable_result_ms", "peak_rss_bytes", "skip_reasons", "throughput", "timings_ms", "stats"),
             f"runs[{index}]",
             errors,
         )
+        skip_reasons = run.get("skip_reasons")
+        if not isinstance(skip_reasons, list):
+            errors.append(f"runs[{index}].skip_reasons must be an array")
+        else:
+            for reason_index, raw_reason in enumerate(skip_reasons):
+                reason = require_object(raw_reason, f"runs[{index}].skip_reasons[{reason_index}]", errors)
+                if not isinstance(reason.get("path"), str) or not reason["path"]:
+                    errors.append(f"runs[{index}].skip_reasons[{reason_index}].path must be a non-empty string")
+                if not isinstance(reason.get("reason"), str) or not reason["reason"]:
+                    errors.append(f"runs[{index}].skip_reasons[{reason_index}].reason must be a non-empty string")
         require_keys(
             require_object(run.get("timings_ms"), f"runs[{index}].timings_ms", errors),
             TIMINGS,
