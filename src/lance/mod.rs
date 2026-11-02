@@ -378,8 +378,8 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("delete existing rows for {scope}/{path}"))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
-            self.bump_document_generation()?;
             if rows.is_empty() {
+                self.bump_document_generation()?;
                 return Ok(());
             }
             let batch = build_documents_batch(self.inner.dim, &rows)?;
@@ -389,6 +389,7 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} documents rows", rows.len()))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
+            self.bump_document_generation()?;
             anyhow::Ok(())
         })
     }

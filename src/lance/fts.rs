@@ -377,6 +377,10 @@ pub fn build_index_after_ingest(store: &LanceStore, cfg: &FtsConfig) -> Result<(
             .optimize(OptimizeAction::All)
             .await
             .context("optimize documents table after ingest")?;
+        // The tokenizer configuration is part of lexical-index semantics, but not of the
+        // Lance table schema. The keyword indexes are replaced on every rebuild, so advance
+        // the persisted document generation; old cursors must not resume against new ordering.
+        store.bump_document_generation()?;
         anyhow::Ok(())
     })
 }

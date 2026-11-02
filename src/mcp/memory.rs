@@ -601,7 +601,7 @@ pub(super) async fn run_search_documents(
     let lexical_only = !state.shared.config.documents.embed;
     let query_fingerprint = document_query_fingerprint(&params, &scope, lexical_only);
 
-    let (mut hits, cursor_generation, cursor_offset, has_more, cursor_invalidated) = if lexical_only {
+    let (mut hits, cursor_generation, cursor_offset, raw_page_len, has_more, cursor_invalidated) = if lexical_only {
         let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
@@ -643,7 +643,15 @@ pub(super) async fn run_search_documents(
                 summary: None,
             })
             .collect();
-        (hits, generation, offset as u64 + limit as u64, has_more, invalidated)
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
     } else {
         let embedding = embed_query(state, &params.query).await?;
         let lance = lance_store(state).await?;
@@ -683,7 +691,15 @@ pub(super) async fn run_search_documents(
                 summary: None,
             })
             .collect();
-        (hits, generation, offset as u64 + limit as u64, has_more, invalidated)
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
     };
 
     attach_doc_metadata(
@@ -693,6 +709,12 @@ pub(super) async fn run_search_documents(
         params.keywords_contains.as_deref(),
     )
     .await?;
+
+    // Budget the raw page before reranking. The kept items are therefore a prefix of the raw
+    // result stream, so the next cursor can advance without duplicating or skipping hits when a
+    // reranker changes their order.
+    let budget = super::budget::apply_budget(std::mem::take(&mut hits), params.max_tokens);
+    hits = budget.items;
 
     if reranker_enabled && !hits.is_empty() {
         let cfg = &state.shared.config.documents.reranker;
@@ -764,11 +786,13 @@ pub(super) async fn run_search_documents(
         _ => output_format,
     };
 
-    let budget = super::budget::apply_budget(hits, params.max_tokens);
-    let next_offset = cursor_offset
-        .saturating_sub(limit as u64)
-        .saturating_add(budget.items.len() as u64);
-    let next_cursor = if !cursor_invalidated && (has_more || budget.budgeted) {
+    let page_start = cursor_offset.saturating_sub(raw_page_len as u64);
+    let next_offset = if budget.budgeted {
+        page_start.saturating_add(budget.items.len() as u64)
+    } else {
+        cursor_offset
+    };
+    let next_cursor = if !cursor_invalidated && limit > 0 && (has_more || budget.budgeted) {
         Some(crate::mcp::cursor::Cursor::encode_documents(
             next_offset,
             cursor_generation,

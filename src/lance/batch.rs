@@ -148,12 +148,12 @@ impl LanceStore {
                     .await
                     .with_context(|| format!("delete {} paths from {table_name}", items.len()))?;
                 self.after_commit(&table, table_name).await;
-                if table_name == DOCUMENTS_TABLE {
-                    self.bump_document_generation()?;
-                }
             }
             let flat: Vec<R> = items.into_iter().flat_map(|(_, _, rows)| rows).collect();
             if flat.is_empty() {
+                if had_rows && table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
                 return anyhow::Ok(());
             }
             table
@@ -162,7 +162,7 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} {table_name} rows", flat.len()))?;
             self.after_commit(&table, table_name).await;
-            if table_name == DOCUMENTS_TABLE && !had_rows {
+            if table_name == DOCUMENTS_TABLE {
                 self.bump_document_generation()?;
             }
             anyhow::Ok(())
