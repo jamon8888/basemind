@@ -7,6 +7,8 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use super::cursor::Cursor;
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchDocumentsParams {
     #[serde(alias = "needle", alias = "pattern", alias = "q", alias = "text", alias = "search")]
@@ -55,6 +57,10 @@ pub struct SearchDocumentsParams {
     /// containing the substring are returned.
     #[serde(default)]
     pub keywords_contains: Option<String>,
+    /// Resume token returned by a previous page. Cursors are invalidated when the persisted
+    /// document index generation changes (including a Lance wipe/rebuild).
+    #[serde(default)]
+    pub cursor: Option<Cursor>,
     /// Per-query overrides for any `documents.*` config knob. Takes precedence over
     /// serve-time config and CLI flags. Known override fields (mirroring `[documents]`)
     /// are applied; unrecognized fields are silently ignored — flatten semantics
@@ -106,11 +112,16 @@ pub(crate) struct DocumentSearchHit {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SearchDocumentsResponse {
     pub query: String,
-    /// True when a `max_tokens` budget dropped trailing `hits`. `search_documents` has no
-    /// cursor; raise `max_tokens` (or omit it) to retrieve more hits.
+    /// True when a max_tokens budget dropped trailing hits.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
     pub hits: Vec<DocumentSearchHit>,
+    /// Opaque cursor for the next page, when more document hits remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Cursor>,
+    /// True when the supplied cursor belonged to a prior document-index generation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cursor_invalidated: bool,
     /// Server-side handler latency in microseconds — the tool body's own execution (index / vector
     /// search / graph walk + response construction), excluding MCP transport, argument
     /// deserialization, and response serialization. A first call against a cold server also

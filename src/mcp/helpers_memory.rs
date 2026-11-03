@@ -104,6 +104,7 @@ fn accepted(mode: MemoryMode) -> &'static [&'static str] {
             "scope",
             "entity_category",
             "keywords_contains",
+            "cursor",
             "documents config overrides",
         ],
         MemoryMode::Mine => &["window", "min_support", "min_confidence", "max_files_per_commit"],
@@ -262,6 +263,7 @@ async fn run_documents(state: &ServerState, mut params: MemoryParams) -> Result<
         scope: params.scope.take(),
         entity_category: params.entity_category.take(),
         keywords_contains: params.keywords_contains.take(),
+        cursor: params.cursor.take(),
         overrides: params.overrides,
     };
     super::memory::run_search_documents(state, p).await

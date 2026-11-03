@@ -20,9 +20,11 @@ mod documents_unit_tests;
 /// Lexical index build and query, out of line by the line cap.
 #[cfg(feature = "documents")]
 pub mod fts;
+mod generation;
 /// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
 #[cfg(feature = "graphrag")]
 pub mod graph_api;
+mod predicates;
 
 #[cfg(feature = "graphrag")]
 pub mod graphrag;
@@ -47,9 +49,10 @@ pub use graphrag::{
     upsert_graph_entities,
 };
 
+use generation::{bump_generation_file, generation_path, read_generation, wipe_on_mismatch};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{
@@ -72,9 +75,19 @@ struct LanceMeta {
     embedding_model: String,
     #[serde(default)]
     schema_ver: u32,
+    #[serde(default)]
+    tokenizer_config: String,
 }
 
+const TOKENIZER_CONFIG: &str = "simple-v1";
 const META_FILE: &str = "meta.json";
+const GENERATION_SUFFIX: &str = ".generation";
+
+pub fn bump_document_generation_for_dir(dir: &Path) -> Result<u64> {
+    let path = generation_path(dir);
+    let current = read_generation(&path)?;
+    bump_generation_file(&path, current)
+}
 
 #[cfg(feature = "intelligence")]
 pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
@@ -204,8 +217,10 @@ struct LanceStoreInner {
     dim: u16,
     embedding_model: String,
     dir: PathBuf,
+    generation_path: PathBuf,
+    document_generation: Mutex<u64>,
     /// Commits per table since the last maintenance pass; drives bounded version retention.
-    commits: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    commits: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LanceStoreInner {
@@ -230,12 +245,20 @@ impl LanceStore {
     pub fn open(dir: &Path, dim: u16, embedding_model: &str) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let meta_path = dir.join(META_FILE);
+        let generation_path = generation_path(dir);
+        let generation = read_generation(&generation_path)?;
         let expected = LanceMeta {
             dim,
             embedding_model: embedding_model.to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
-        wipe_on_mismatch(dir, &meta_path, &expected)?;
+        let wiped = wipe_on_mismatch(dir, &meta_path, &expected)?;
+        let generation = if wiped {
+            bump_generation_file(&generation_path, generation)?
+        } else {
+            generation
+        };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -273,7 +296,9 @@ impl LanceStore {
                 dim,
                 embedding_model: embedding_model.to_string(),
                 dir: dir.to_path_buf(),
-                commits: std::sync::Mutex::new(std::collections::HashMap::new()),
+                generation_path,
+                document_generation: Mutex::new(generation),
+                commits: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -305,6 +330,24 @@ impl LanceStore {
         &self.inner.dir
     }
 
+    pub fn document_generation(&self) -> u64 {
+        *self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn bump_document_generation(&self) -> Result<u64> {
+        let mut generation = self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = bump_generation_file(&self.inner.generation_path, *generation)?;
+        Ok(*generation)
+    }
+
     pub fn replace_document(&self, scope: &str, path: &str, rows: Vec<DocumentRow>) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -325,6 +368,7 @@ impl LanceStore {
                 .with_context(|| format!("delete existing rows for {scope}/{path}"))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
             if rows.is_empty() {
+                self.bump_document_generation()?;
                 return Ok(());
             }
             let batch = build_documents_batch(self.inner.dim, &rows)?;
@@ -334,6 +378,7 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} documents rows", rows.len()))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
+            self.bump_document_generation()?;
             anyhow::Ok(())
         })
     }
@@ -618,6 +663,9 @@ impl LanceStore {
                     .await
                     .with_context(|| format!("delete {} paths from {table_name} in {scope}", batch.len()))?;
                 self.after_commit(&table, table_name).await;
+                if table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
             }
             anyhow::Ok(())
         })
@@ -653,37 +701,6 @@ impl LanceStore {
             anyhow::Ok(hits)
         })
     }
-}
-
-fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMeta) -> Result<()> {
-    if !meta_path.exists() {
-        return Ok(());
-    }
-    let bytes = std::fs::read(meta_path).with_context(|| format!("read {}", meta_path.display()))?;
-    let actual: LanceMeta = serde_json::from_slice(&bytes).with_context(|| format!("parse {}", meta_path.display()))?;
-    if actual == *expected {
-        return Ok(());
-    }
-    tracing::warn!(
-        old_dim = actual.dim,
-        new_dim = expected.dim,
-        old_model = %actual.embedding_model,
-        new_model = %expected.embedding_model,
-        old_schema_ver = actual.schema_ver,
-        new_schema_ver = expected.schema_ver,
-        "lance store dim/model/schema mismatch — wiping {}",
-        dir.display()
-    );
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry.context("entry")?;
-        let p = entry.path();
-        if p.is_dir() {
-            std::fs::remove_dir_all(&p).with_context(|| format!("remove {}", p.display()))?;
-        } else {
-            std::fs::remove_file(&p).with_context(|| format!("remove {}", p.display()))?;
-        }
-    }
-    Ok(())
 }
 
 async fn ensure_table(connection: &Connection, name: &str, schema: arrow_schema::SchemaRef) -> Result<()> {
@@ -1089,31 +1106,8 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-pub(crate) fn escape_sql_literal(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> String {
-    format!(
-        "scope = '{}' AND visibility = '{}' AND agent_id = '{}'",
-        escape_sql_literal(scope),
-        escape_sql_literal(visibility),
-        escape_sql_literal(agent_id),
-    )
-}
-
-fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str) -> String {
-    format!(
-        "{} AND key = '{}'",
-        memory_namespace_predicate(scope, visibility, agent_id),
-        escape_sql_literal(key),
-    )
-}
-
-pub fn now_micros() -> i64 {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
-}
+#[allow(unused_imports)]
+pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate, now_micros};
 
 #[cfg(test)]
 #[path = "tests.rs"]

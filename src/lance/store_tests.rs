@@ -48,7 +48,7 @@ mod tests {
         );
     }
 
-    /// A pre-0.5 `meta.json` (no `schema_ver`) must deserialize as `schema_ver = 0` and,
+    /// A pre-0.5 `meta.json` (no `schema_ver` or tokenizer marker) must deserialize with defaults and,
     /// because that differs from the current `MEMORY_SCHEMA_VER`, force a wipe — never a
     /// parse error. This is the guard against the memory-table column add faulting at
     /// batch-build time on upgrade.
@@ -63,13 +63,14 @@ mod tests {
             dim: 384,
             embedding_model: "balanced".to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
         assert_ne!(MEMORY_SCHEMA_VER, 0, "current schema ver must differ from the legacy 0");
         wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
         assert!(!keep.exists(), "stale lance dir should have been wiped");
     }
 
-    /// A matching `meta.json` (same dim, model, and `schema_ver`) leaves the store intact.
+    /// A matching `meta.json` (same dim, model, schema and tokenizer marker) leaves the store intact.
     #[test]
     fn matching_meta_preserves_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -78,12 +79,36 @@ mod tests {
             dim: 384,
             embedding_model: "balanced".to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
         std::fs::write(&meta_path, serde_json::to_vec(&expected).unwrap()).unwrap();
         let keep = sentinel(dir.path());
 
         wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
         assert!(keep.exists(), "matching meta must not wipe the store");
+    }
+
+    #[test]
+    fn generation_sidecar_is_outside_wiped_lance_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lance_dir = dir.path().join("lance");
+        std::fs::create_dir_all(&lance_dir).unwrap();
+        let generation = generation_path(&lance_dir);
+        assert_eq!(generation, dir.path().join("lance.generation"));
+        std::fs::write(&generation, b"7").unwrap();
+        assert_eq!(read_generation(&generation).unwrap(), 7);
+        assert_eq!(bump_generation_file(&generation, 7).unwrap(), 8);
+        assert_eq!(read_generation(&generation).unwrap(), 8);
+    }
+
+    #[test]
+    fn generation_can_be_bumped_without_opening_lance() {
+        let dir = tempfile::tempdir().unwrap();
+        let lance_dir = dir.path().join("lance");
+        std::fs::create_dir_all(&lance_dir).unwrap();
+        assert_eq!(read_generation(&generation_path(&lance_dir)).unwrap(), 1);
+        assert_eq!(bump_document_generation_for_dir(&lance_dir).unwrap(), 2);
+        assert_eq!(read_generation(&generation_path(&lance_dir)).unwrap(), 2);
     }
 
     /// A bumped `schema_ver` (e.g. a future minor) on an otherwise-identical store wipes.
@@ -95,6 +120,7 @@ mod tests {
             dim: 384,
             embedding_model: "balanced".to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
         std::fs::write(&meta_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
         let keep = sentinel(dir.path());
@@ -105,6 +131,45 @@ mod tests {
         };
         wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
         assert!(!keep.exists(), "a schema_ver bump should wipe the store");
+    }
+
+    #[test]
+    fn tokenizer_config_bump_triggers_wipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join(META_FILE);
+        let on_disk = LanceMeta {
+            dim: 384,
+            embedding_model: "balanced".to_string(),
+            schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
+        };
+        std::fs::write(&meta_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        let keep = sentinel(dir.path());
+
+        let expected = LanceMeta {
+            tokenizer_config: "simple-v2".to_string(),
+            ..on_disk
+        };
+        wipe_on_mismatch(dir.path(), &meta_path, &expected).unwrap();
+        assert!(!keep.exists(), "a tokenizer config bump should wipe the store");
+    }
+
+    #[test]
+    #[cfg(feature = "documents")]
+    fn open_bumps_generation_after_tokenizer_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = LanceMeta {
+            dim: 384,
+            embedding_model: "balanced".to_string(),
+            schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: "simple-v0".to_string(),
+        };
+        std::fs::write(dir.path().join(META_FILE), serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        std::fs::write(generation_path(dir.path()), b"7").unwrap();
+
+        let _store = LanceStore::open(dir.path(), 384, "balanced").unwrap();
+
+        assert_eq!(read_generation(&generation_path(dir.path())).unwrap(), 8);
     }
 
     #[test]

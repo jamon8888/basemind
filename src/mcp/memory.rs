@@ -527,6 +527,12 @@ pub(super) async fn run_memory_search(
 ) -> Result<CallToolResult, McpError> {
     let __body = std::time::Instant::now();
     let limit = params.limit.unwrap_or(10).min(100) as usize;
+    if limit == 0 {
+        return Err(McpError::invalid_params(
+            "document search limit must be greater than zero",
+            None,
+        ));
+    }
     let (_, owner) = namespace(state, params.visibility);
     let visibility = lance_visibility(params.visibility).to_string();
     let agent_id = owner.to_string();
@@ -701,15 +707,55 @@ pub(super) async fn run_search_documents(
     // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
+    let has_metadata_filters = params.entity_category.is_some() || params.keywords_contains.is_some();
+    let candidate_limit = if has_metadata_filters {
+        limit.saturating_mul(8).clamp(limit, 1_000)
+    } else {
+        limit
+    };
+    let reranker_model = if reranker_enabled {
+        match state
+            .shared
+            .config
+            .documents
+            .reranker
+            .resolve_model(explicit_preset.as_deref())
+        {
+            crate::config::ResolvedRerankerModel::Preset { name } => Some(format!("preset:{name}")),
+            crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+                Some(format!("custom:{model_id}:{model_file}"))
+            }
+        }
+    } else {
+        None
+    };
+    let query_fingerprint = document_query_fingerprint(
+        &params,
+        &scope,
+        lexical_only,
+        state.shared.config.documents.fusion.max_relaxations,
+        reranker_enabled,
+        reranker_top_k,
+        reranker_model.as_deref(),
+    );
 
-    let mut hits: Vec<DocumentSearchHit> = if lexical_only {
+    let (mut hits, cursor_generation, cursor_offset, raw_page_len, has_more, cursor_invalidated) = if lexical_only {
         let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
         let facet_sql_for_lane = facet_sql.clone();
         let mime_for_lane = params.mime_type.clone();
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(candidate_limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
         let hits_raw = tokio::task::spawn_blocking(move || {
+            if invalidated {
+                return Ok(Vec::new());
+            }
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
             if let Some(mime) = mime_for_lane.as_deref() {
                 predicate.push_str(" AND mime_type = '");
@@ -725,7 +771,7 @@ pub(super) async fn run_search_documents(
             let mut merged = Vec::new();
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                match basemind_exact(&lance, &candidate, &predicate, limit) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
                     Ok(hits) => {
                         for hit in hits {
                             if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
@@ -737,7 +783,7 @@ pub(super) async fn run_search_documents(
                             if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                                 merged.push(hit);
                             }
-                            if merged.len() >= limit {
+                            if merged.len() >= fetch_limit {
                                 break;
                             }
                         }
@@ -746,16 +792,16 @@ pub(super) async fn run_search_documents(
                 }
             }
             for phrase in phrases {
-                if merged.len() >= limit {
+                if merged.len() >= fetch_limit {
                     break;
                 }
-                match basemind_phrase(&lance, &phrase, &predicate, limit) {
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
                     Ok(hits) => {
                         for hit in hits {
                             if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                                 merged.push(hit);
                             }
-                            if merged.len() >= limit {
+                            if merged.len() >= fetch_limit {
                                 break;
                             }
                         }
@@ -763,24 +809,36 @@ pub(super) async fn run_search_documents(
                     Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
                 }
             }
-            if !terms.is_empty() && merged.len() < limit {
-                for hit in basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)? {
+            if !terms.is_empty() && merged.len() < fetch_limit {
+                for hit in basemind_lexical(&lance, &terms, &predicate, fetch_limit, max_relaxations)? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(hit);
                     }
                 }
             }
-            merged.truncate(limit);
+            merged.truncate(fetch_limit);
             Ok::<Vec<crate::lance::fts::LexicalHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
-        hits_raw
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
+        let hits: Vec<DocumentSearchHit> = hits_raw
             .into_iter()
+            .skip(offset)
+            .take(candidate_limit)
             // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
             .map(|h| lexical_hit_to_document_hit(h, 0.0))
-            .collect()
+            .collect();
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
     } else {
         let embedding = embed_query(state, &params.query).await?;
         let lance = lance_store(state).await?;
@@ -788,7 +846,16 @@ pub(super) async fn run_search_documents(
         let scope_for_lane = scope.clone();
         let query = params.query.clone();
         let facet_filter_for_lane = facet_filter.clone();
-        tokio::task::spawn_blocking(move || {
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(candidate_limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
+        let hits_raw = tokio::task::spawn_blocking(move || {
+            if invalidated {
+                return Ok(Vec::new());
+            }
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
             if let Some(mime) = mime.as_deref() {
                 predicate.push_str(" AND mime_type = '");
@@ -799,10 +866,10 @@ pub(super) async fn run_search_documents(
                 predicate.push_str(" AND ");
                 predicate.push_str(&facet_sql);
             }
-            let mut merged = Vec::with_capacity(limit);
+            let mut merged = Vec::with_capacity(fetch_limit);
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                match basemind_exact(&lance, &candidate, &predicate, limit) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
                     Ok(hits) => {
                         for hit in hits {
                             if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
@@ -814,7 +881,7 @@ pub(super) async fn run_search_documents(
                             if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                                 merged.push(lexical_hit_to_document_hit(hit, 0.0));
                             }
-                            if merged.len() >= limit {
+                            if merged.len() >= fetch_limit {
                                 break;
                             }
                         }
@@ -823,16 +890,16 @@ pub(super) async fn run_search_documents(
                 }
             }
             for phrase in crate::lance::fts::quoted_phrases(&query) {
-                if merged.len() >= limit {
+                if merged.len() >= fetch_limit {
                     break;
                 }
-                match basemind_phrase(&lance, &phrase, &predicate, limit) {
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
                     Ok(hits) => {
                         for hit in hits {
                             if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                                 merged.push(lexical_hit_to_document_hit(hit, 0.0));
                             }
-                            if merged.len() >= limit {
+                            if merged.len() >= fetch_limit {
                                 break;
                             }
                         }
@@ -840,11 +907,11 @@ pub(super) async fn run_search_documents(
                     Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
                 }
             }
-            if merged.len() < limit {
+            if merged.len() < fetch_limit {
                 for hit in lance.search_documents_filtered(
                     &scope_for_lane,
                     embedding,
-                    limit,
+                    fetch_limit,
                     mime.as_deref(),
                     Some(&facet_filter_for_lane),
                 )? {
@@ -867,17 +934,28 @@ pub(super) async fn run_search_documents(
                             summary,
                         });
                     }
-                    if merged.len() >= limit {
+                    if merged.len() >= fetch_limit {
                         break;
                     }
                 }
             }
-            merged.truncate(limit);
+            merged.truncate(fetch_limit);
             Ok::<Vec<DocumentSearchHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
-        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
+        let hits: Vec<DocumentSearchHit> = hits_raw.into_iter().skip(offset).take(candidate_limit).collect();
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
     };
 
     attach_doc_metadata(
@@ -952,6 +1030,8 @@ pub(super) async fn run_search_documents(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
+    hits.truncate(limit);
+
     let output_format = match params.format.as_deref().map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case("toon") => crate::config::OutputFormat::Toon,
         Some(f) if f.eq_ignore_ascii_case("json") => crate::config::OutputFormat::Json,
@@ -959,58 +1039,41 @@ pub(super) async fn run_search_documents(
     };
 
     let budget = super::budget::apply_budget(hits, params.max_tokens);
+    let budgeted = budget.budgeted;
+    let budget_kept_len = budget.items.len();
+    let page_start = cursor_offset.saturating_sub(raw_page_len as u64);
+    let next_offset = if budgeted {
+        page_start.saturating_add(budget_kept_len as u64)
+    } else {
+        cursor_offset
+    };
+    let next_cursor = if !cursor_invalidated && (has_more || budgeted) && next_offset <= MAX_DOCUMENT_CURSOR_OFFSET {
+        Some(crate::mcp::cursor::Cursor::encode_documents(
+            next_offset,
+            cursor_generation,
+            query_fingerprint,
+        ))
+    } else {
+        None
+    };
     format_response(
         &SearchDocumentsResponse {
             query: params.query,
-            budgeted: budget.budgeted,
+            budgeted,
             hits: budget.items,
+            next_cursor,
+            cursor_invalidated,
             elapsed_us: elapsed_us(__body),
         },
         output_format,
     )
 }
 
-/// Load the parent doc blob for each unique hit path, copy its keywords +
-/// entities onto every hit pointing at that path, and (optionally) drop hits
-/// whose parent fails an `entity_category` / `keywords_contains` filter.
-///
-/// We deliberately do this BEFORE the reranker so the cross-encoder only
-/// rescores survivors. Per-blob cost is bounded by the result-set size (at
-/// most `limit` distinct paths); blobs are skipped silently when the path is
-/// no longer in the working-tree index (e.g. file deleted between scan and
-/// query) — a missing blob is not an error.
-#[cfg(feature = "documents")]
-async fn attach_doc_metadata(
-    _state: &ServerState,
-    hits: &mut Vec<DocumentSearchHit>,
-    entity_category: Option<&str>,
-    keywords_contains: Option<&str>,
-) -> Result<(), McpError> {
-    let cat_needle = entity_category.map(|s| s.to_lowercase());
-    let kw_needle = keywords_contains.map(|s| s.to_lowercase());
-
-    hits.retain_mut(|hit| {
-        if let Some(needle) = cat_needle.as_deref()
-            && !hit
-                .entities
-                .iter()
-                .any(|entity| entity.category.to_lowercase().contains(needle))
-        {
-            return false;
-        }
-        if let Some(needle) = kw_needle.as_deref()
-            && !hit
-                .keywords
-                .iter()
-                .any(|keyword| keyword.text.to_lowercase().contains(needle))
-        {
-            return false;
-        }
-        true
-    });
-    Ok(())
-}
-
+#[path = "memory_documents.rs"]
+mod document_helpers;
+use document_helpers::{
+    MAX_DOCUMENT_CURSOR_OFFSET, attach_doc_metadata, document_cursor_offset, document_query_fingerprint,
+};
 #[cfg(all(test, feature = "crawl"))]
 mod scope_tests {
     use super::resolve_doc_scope;
