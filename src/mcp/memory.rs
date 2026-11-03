@@ -191,7 +191,46 @@ fn basemind_exact(
 }
 
 #[cfg(feature = "documents")]
+fn facets_to_wire(facets: crate::lance::DocumentFacets) -> (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>) {
+    let keywords = facets
+        .keywords
+        .unwrap_or_default()
+        .into_iter()
+        .map(|text| DocKeyword {
+            text,
+            score: 0.0,
+            algorithm: "stored".to_string(),
+        })
+        .collect();
+    let entities = facets
+        .entities
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entity| {
+            let (category, text) = entity.split_once(':')?;
+            Some(DocEntity {
+                category: category.to_string(),
+                text: text.to_string(),
+                start: 0,
+                end: text.len() as u32,
+                confidence: None,
+            })
+        })
+        .collect();
+    let summary = facets.summary.map(|text| DocSummary {
+        text,
+        // Lance stores the normalized summary text; the current document
+        // pipeline only persists extractive summaries, so preserve the wire
+        // contract expected by existing clients.
+        strategy: "extractive".to_string(),
+        token_count: None,
+    });
+    (keywords, entities, summary)
+}
+
+#[cfg(feature = "documents")]
 fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32) -> DocumentSearchHit {
+    let (keywords, entities, summary) = facets_to_wire(hit.facets);
     DocumentSearchHit {
         path: hit.path,
         chunk_idx: hit.chunk_idx,
@@ -200,10 +239,13 @@ fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32
         byte_start: hit.byte_start,
         byte_end: hit.byte_end,
         distance,
+        matched_lanes: vec!["lexical".to_string()],
+        retrieval_mode: "lexical".to_string(),
+        citation: hit.cites.lines().next().map(str::to_string),
         rerank_score: None,
-        keywords: Vec::new(),
-        entities: Vec::new(),
-        summary: None,
+        keywords,
+        entities,
+        summary,
     }
 }
 
@@ -630,6 +672,29 @@ pub(super) async fn run_search_documents(
 
     let limit = params.limit.unwrap_or(10).min(100) as usize;
     let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
+    let facet_filter = crate::lance::DocumentFacetFilter {
+        doc_type: crate::extract::doc::facets::doc_type(params.doc_type.as_deref()),
+        section: crate::extract::doc::facets::section(params.section.as_deref()),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(params.jurisdiction.as_deref()),
+        doc_date: crate::extract::doc::facets::doc_date(params.doc_date.as_deref()),
+    };
+    let facet_sql = {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("doc_type", facet_filter.doc_type.as_deref()),
+            ("section", facet_filter.section.as_deref()),
+            ("jurisdiction", facet_filter.jurisdiction.as_deref()),
+            ("doc_date", facet_filter.doc_date.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!(
+                    "({column} IS NULL OR {column} = '{}')",
+                    crate::lance::escape_sql_literal(value)
+                ));
+            }
+        }
+        clauses.join(" AND ")
+    };
 
     // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
     // reaching for it would embed the query and download a model to answer a question that does
@@ -642,8 +707,19 @@ pub(super) async fn run_search_documents(
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
+        let facet_sql_for_lane = facet_sql.clone();
+        let mime_for_lane = params.mime_type.clone();
         let hits_raw = tokio::task::spawn_blocking(move || {
-            let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime_for_lane.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            if !facet_sql_for_lane.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql_for_lane);
+            }
             let phrases = crate::lance::fts::quoted_phrases(&query);
             let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
             let mut merged = Vec::new();
@@ -711,12 +787,17 @@ pub(super) async fn run_search_documents(
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
         let query = params.query.clone();
+        let facet_filter_for_lane = facet_filter.clone();
         tokio::task::spawn_blocking(move || {
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
             if let Some(mime) = mime.as_deref() {
                 predicate.push_str(" AND mime_type = '");
                 predicate.push_str(&crate::lance::escape_sql_literal(mime));
                 predicate.push('\'');
+            }
+            if !facet_sql.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql);
             }
             let mut merged = Vec::with_capacity(limit);
             let mut seen = std::collections::HashSet::new();
@@ -760,8 +841,15 @@ pub(super) async fn run_search_documents(
                 }
             }
             if merged.len() < limit {
-                for hit in lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())? {
+                for hit in lance.search_documents_filtered(
+                    &scope_for_lane,
+                    embedding,
+                    limit,
+                    mime.as_deref(),
+                    Some(&facet_filter_for_lane),
+                )? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        let (keywords, entities, summary) = facets_to_wire(hit.facets.clone());
                         merged.push(DocumentSearchHit {
                             path: hit.path,
                             chunk_idx: hit.chunk_idx,
@@ -770,10 +858,13 @@ pub(super) async fn run_search_documents(
                             byte_start: hit.byte_start,
                             byte_end: hit.byte_end,
                             distance: hit.distance,
+                            matched_lanes: vec!["vector".to_string()],
+                            retrieval_mode: "vector".to_string(),
+                            citation: None,
                             rerank_score: None,
-                            keywords: Vec::new(),
-                            entities: Vec::new(),
-                            summary: None,
+                            keywords,
+                            entities,
+                            summary,
                         });
                     }
                     if merged.len() >= limit {
@@ -890,87 +981,30 @@ pub(super) async fn run_search_documents(
 /// query) — a missing blob is not an error.
 #[cfg(feature = "documents")]
 async fn attach_doc_metadata(
-    state: &ServerState,
+    _state: &ServerState,
     hits: &mut Vec<DocumentSearchHit>,
     entity_category: Option<&str>,
     keywords_contains: Option<&str>,
 ) -> Result<(), McpError> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut unique_paths: Vec<String> = Vec::with_capacity(hits.len());
-    {
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        for h in hits.iter() {
-            if seen.insert(h.path.as_str()) {
-                unique_paths.push(h.path.clone());
-            }
-        }
-    }
-
-    let pairs: Vec<(String, std::path::PathBuf)> = {
-        let store = state.shared.store.read().await;
-        unique_paths
-            .iter()
-            .filter_map(|p| {
-                store
-                    .lookup(p.as_str())
-                    .map(|entry| (p.clone(), store.blob_path_doc_hex(&entry.hash_hex)))
-            })
-            .collect()
-    };
-
-    type DocMeta = (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>);
-    let meta: ahash::AHashMap<String, Arc<DocMeta>> = tokio::task::spawn_blocking(move || {
-        let mut out: ahash::AHashMap<String, Arc<DocMeta>> = ahash::AHashMap::with_capacity(pairs.len());
-        for (path, blob_path) in pairs {
-            if !blob_path.exists() {
-                continue;
-            }
-            let bytes = match std::fs::read(&blob_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "read doc blob for metadata attach failed");
-                    continue;
-                }
-            };
-            match rmp_serde::from_slice::<crate::extract::doc::FileMapDoc>(&bytes) {
-                Ok(doc) => {
-                    out.insert(path, Arc::new((doc.keywords, doc.entities, doc.summary)));
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "decode doc blob for metadata attach failed");
-                }
-            }
-        }
-        out
-    })
-    .await
-    .unwrap_or_default();
-
     let cat_needle = entity_category.map(|s| s.to_lowercase());
     let kw_needle = keywords_contains.map(|s| s.to_lowercase());
 
     hits.retain_mut(|hit| {
-        let meta_arc = meta.get(&hit.path).cloned();
-
-        if let Some(needle) = cat_needle.as_deref() {
-            let ents = meta_arc.as_ref().map(|m| m.1.as_slice()).unwrap_or(&[]);
-            if !ents.iter().any(|e| e.category.to_lowercase().contains(needle)) {
-                return false;
-            }
+        if let Some(needle) = cat_needle.as_deref()
+            && !hit
+                .entities
+                .iter()
+                .any(|entity| entity.category.to_lowercase().contains(needle))
+        {
+            return false;
         }
-        if let Some(needle) = kw_needle.as_deref() {
-            let kws = meta_arc.as_ref().map(|m| m.0.as_slice()).unwrap_or(&[]);
-            if !kws.iter().any(|k| k.text.to_lowercase().contains(needle)) {
-                return false;
-            }
-        }
-
-        if let Some(m) = meta_arc {
-            hit.keywords = m.0.clone();
-            hit.entities = m.1.clone();
-            hit.summary = m.2.clone();
+        if let Some(needle) = kw_needle.as_deref()
+            && !hit
+                .keywords
+                .iter()
+                .any(|keyword| keyword.text.to_lowercase().contains(needle))
+        {
+            return false;
         }
         true
     });

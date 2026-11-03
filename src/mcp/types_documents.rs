@@ -25,6 +25,18 @@ pub struct SearchDocumentsParams {
     pub format: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
+    /// Optional curated document type facet (`pleading`, `contract`, `memo`, ...).
+    #[serde(default)]
+    pub doc_type: Option<String>,
+    /// Optional section facet derived from a heading breadcrumb.
+    #[serde(default)]
+    pub section: Option<String>,
+    /// Optional jurisdiction facet.
+    #[serde(default)]
+    pub jurisdiction: Option<String>,
+    /// Optional ISO-8601 document date facet (`YYYY-MM-DD`).
+    #[serde(default)]
+    pub doc_date: Option<String>,
     /// Which ingestion scope to search. Defaults to this repo's scope — the one the
     /// scanner's document lane writes under. Web pages are ingested under a **different**
     /// scope (`web:<host>`, echoed back by `web_scrape` / `web_crawl`), so reaching them
@@ -64,6 +76,14 @@ pub(crate) struct DocumentSearchHit {
     pub byte_start: u32,
     pub byte_end: u32,
     pub distance: f32,
+    /// Retrieval lanes that contributed this hit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_lanes: Vec<String>,
+    /// Primary retrieval mode for this hit (`lexical` or `vector`).
+    pub retrieval_mode: String,
+    /// First stored citation identifier, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation: Option<String>,
     /// Cross-encoder relevance score in `[0, 1]`. Present only when the reranker is
     /// enabled on the call; absent (`null` / omitted) when reranker is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -43,10 +43,12 @@
 //! because nothing has been measured yet.
 
 use anyhow::{Context, Result};
+use arrow_array::Array;
 use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::scalar::{
-    FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
+    BTreeIndexBuilder, FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator,
+    PhraseQuery,
 };
 // `full_text_search` is on the `QueryBase` trait, not inherent on `Query` — without this import
 // the method does not resolve, and the error names `struct lancedb::query::Query`, which points at
@@ -75,6 +77,17 @@ pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
 /// inherit stemming or stop-word removal from the topical keyword lane.
 pub const EXACT_INDEX: (&str, &str) = ("documents_cites_idx", "cites");
 pub const PHRASE_INDEX: (&str, &str) = ("documents_text_phrase_idx", "text_phrase");
+
+/// Scalar indexes used by in-store scope, MIME, and document-facet predicates.
+pub const FACET_INDEXES: [(&str, &str); 7] = [
+    ("documents_scope_btree", "scope"),
+    ("documents_path_btree", "path"),
+    ("documents_mime_type_btree", "mime_type"),
+    ("documents_doc_type_btree", "doc_type"),
+    ("documents_section_btree", "section"),
+    ("documents_jurisdiction_btree", "jurisdiction"),
+    ("documents_doc_date_btree", "doc_date"),
+];
 
 /// The columns the keyword lane covers.
 ///
@@ -188,6 +201,26 @@ pub async fn ensure_keyword_index(table: &Table, cfg: &FtsConfig) -> Result<()> 
     Ok(())
 }
 
+/// Attach the scalar indexes used by retrieval predicates.
+pub async fn ensure_facet_indexes(table: &Table) -> Result<()> {
+    let existing = table.list_indices().await.unwrap_or_default();
+    for (name, column) in FACET_INDEXES {
+        if existing.iter().any(|index| index.name == name) {
+            table
+                .drop_index(name)
+                .await
+                .with_context(|| format!("drop stale {name}"))?;
+        }
+        table
+            .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+            .name(name.to_string())
+            .execute()
+            .await
+            .with_context(|| format!("create {name} on {column}"))?;
+    }
+    Ok(())
+}
+
 /// Build the exact identifier query. No fuzziness or stemming is allowed on this path.
 pub fn exact_query(term: &str) -> Result<FullTextSearchQuery> {
     Ok(FullTextSearchQuery::new_query(FtsQuery::Match(
@@ -252,6 +285,7 @@ pub struct LexicalHit {
     pub byte_start: u32,
     pub byte_end: u32,
     pub cites: String,
+    pub facets: super::DocumentFacets,
 }
 
 impl LexicalHit {
@@ -393,6 +427,29 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
     let byte_start = uints("byte_start")?;
     let byte_end = uints("byte_end")?;
     let cites = strings("cites")?;
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+    };
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<arrow_array::ListArray>())
+    };
+    let value = |array: Option<&StringArray>, index: usize| {
+        array.and_then(|array| (!array.is_null(index)).then(|| array.value(index).to_string()))
+    };
+    let list_value = |array: Option<&arrow_array::ListArray>, index: usize| {
+        array.and_then(|array| {
+            if array.is_null(index) {
+                return None;
+            }
+            let values = array.value(index);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|i| values.value(i).to_string()).collect())
+        })
+    };
 
     for i in 0..batch.num_rows() {
         out.push(LexicalHit {
@@ -403,6 +460,15 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
             cites: cites.value(i).to_string(),
+            facets: super::DocumentFacets {
+                doc_type: value(optional_string("doc_type"), i),
+                section: value(optional_string("section"), i),
+                jurisdiction: value(optional_string("jurisdiction"), i),
+                doc_date: value(optional_string("doc_date"), i),
+                keywords: list_value(optional_list("keywords"), i),
+                entities: list_value(optional_list("entities"), i),
+                summary: value(optional_string("summary"), i),
+            },
         });
     }
     Ok(())
@@ -515,6 +581,7 @@ pub fn build_index_after_ingest(store: &LanceStore, cfg: &FtsConfig) -> Result<(
             .await
             .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
         ensure_keyword_index(&table, cfg).await?;
+        ensure_facet_indexes(&table).await?;
         table
             .optimize(OptimizeAction::All)
             .await
@@ -726,6 +793,7 @@ mod tests {
             byte_start: 0,
             byte_end: 1,
             cites: String::new(),
+            facets: crate::lance::DocumentFacets::default(),
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
     }

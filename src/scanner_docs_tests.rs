@@ -621,6 +621,7 @@ fn seeded_doc_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceSto
             path: (*path).to_string(),
             chunk_idx: 0,
             mime_type: "text/plain".to_string(),
+            facets: Default::default(),
             text: "body".to_string(),
             text_phrase: "body".to_string(),
             heading_path: String::new(),

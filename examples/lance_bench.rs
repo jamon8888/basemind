@@ -22,6 +22,7 @@ fn rows(doc: usize, chunks: usize, gen_: u32) -> Vec<DocumentRow> {
             path: format!("docs/d{doc:06}.md"),
             chunk_idx: c as u32,
             mime_type: "text/markdown".into(),
+            facets: Default::default(),
             text: format!("document {doc} chunk {c} generation {gen_} lorem ipsum dolor sit amet"),
             text_phrase: format!("document {doc} chunk {c} generation {gen_} lorem ipsum dolor sit amet"),
             heading_path: String::new(),
