@@ -191,7 +191,43 @@ fn basemind_exact(
 }
 
 #[cfg(feature = "documents")]
+fn facets_to_wire(facets: crate::lance::DocumentFacets) -> (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>) {
+    let keywords = facets
+        .keywords
+        .unwrap_or_default()
+        .into_iter()
+        .map(|text| DocKeyword {
+            text,
+            score: 0.0,
+            algorithm: "stored".to_string(),
+        })
+        .collect();
+    let entities = facets
+        .entities
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entity| {
+            let (category, text) = entity.split_once(':')?;
+            Some(DocEntity {
+                category: category.to_string(),
+                text: text.to_string(),
+                start: 0,
+                end: text.len() as u32,
+                confidence: None,
+            })
+        })
+        .collect();
+    let summary = facets.summary.map(|text| DocSummary {
+        text,
+        strategy: "stored".to_string(),
+        token_count: None,
+    });
+    (keywords, entities, summary)
+}
+
+#[cfg(feature = "documents")]
 fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32) -> DocumentSearchHit {
+    let (keywords, entities, summary) = facets_to_wire(hit.facets);
     DocumentSearchHit {
         path: hit.path,
         chunk_idx: hit.chunk_idx,
@@ -201,9 +237,9 @@ fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32
         byte_end: hit.byte_end,
         distance,
         rerank_score: None,
-        keywords: Vec::new(),
-        entities: Vec::new(),
-        summary: None,
+        keywords,
+        entities,
+        summary,
     }
 }
 
@@ -801,6 +837,7 @@ pub(super) async fn run_search_documents(
                     Some(&facet_filter_for_lane),
                 )? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        let (keywords, entities, summary) = facets_to_wire(hit.facets.clone());
                         merged.push(DocumentSearchHit {
                             path: hit.path,
                             chunk_idx: hit.chunk_idx,
@@ -810,9 +847,9 @@ pub(super) async fn run_search_documents(
                             byte_end: hit.byte_end,
                             distance: hit.distance,
                             rerank_score: None,
-                            keywords: Vec::new(),
-                            entities: Vec::new(),
-                            summary: None,
+                            keywords,
+                            entities,
+                            summary,
                         });
                     }
                     if merged.len() >= limit {

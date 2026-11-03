@@ -43,6 +43,7 @@
 //! because nothing has been measured yet.
 
 use anyhow::{Context, Result};
+use arrow_array::Array;
 use futures::TryStreamExt;
 use lancedb::index::Index;
 use lancedb::index::scalar::{
@@ -281,6 +282,7 @@ pub struct LexicalHit {
     pub byte_start: u32,
     pub byte_end: u32,
     pub cites: String,
+    pub facets: super::DocumentFacets,
 }
 
 impl LexicalHit {
@@ -422,6 +424,29 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
     let byte_start = uints("byte_start")?;
     let byte_end = uints("byte_end")?;
     let cites = strings("cites")?;
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+    };
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<arrow_array::ListArray>())
+    };
+    let value = |array: Option<&StringArray>, index: usize| {
+        array.and_then(|array| (!array.is_null(index)).then(|| array.value(index).to_string()))
+    };
+    let list_value = |array: Option<&arrow_array::ListArray>, index: usize| {
+        array.and_then(|array| {
+            if array.is_null(index) {
+                return None;
+            }
+            let values = array.value(index);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|i| values.value(i).to_string()).collect())
+        })
+    };
 
     for i in 0..batch.num_rows() {
         out.push(LexicalHit {
@@ -432,6 +457,15 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
             cites: cites.value(i).to_string(),
+            facets: super::DocumentFacets {
+                doc_type: value(optional_string("doc_type"), i),
+                section: value(optional_string("section"), i),
+                jurisdiction: value(optional_string("jurisdiction"), i),
+                doc_date: value(optional_string("doc_date"), i),
+                keywords: list_value(optional_list("keywords"), i),
+                entities: list_value(optional_list("entities"), i),
+                summary: value(optional_string("summary"), i),
+            },
         });
     }
     Ok(())
@@ -756,6 +790,7 @@ mod tests {
             byte_start: 0,
             byte_end: 1,
             cites: String::new(),
+            facets: super::DocumentFacets::default(),
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
     }

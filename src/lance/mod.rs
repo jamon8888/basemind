@@ -108,7 +108,7 @@ pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
 pub const MEMORY_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;
 
 /// One row in the `documents` table.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentFacets {
     /// Caller-curated document type; absent values remain `None`.
     pub doc_type: Option<String>,
