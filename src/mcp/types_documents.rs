@@ -76,6 +76,14 @@ pub(crate) struct DocumentSearchHit {
     pub byte_start: u32,
     pub byte_end: u32,
     pub distance: f32,
+    /// Retrieval lanes that contributed this hit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_lanes: Vec<String>,
+    /// Primary retrieval mode for this hit (`lexical` or `vector`).
+    pub retrieval_mode: String,
+    /// First stored citation identifier, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation: Option<String>,
     /// Cross-encoder relevance score in `[0, 1]`. Present only when the reranker is
     /// enabled on the call; absent (`null` / omitted) when reranker is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
