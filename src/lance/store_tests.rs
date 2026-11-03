@@ -155,6 +155,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "documents")]
+    fn open_bumps_generation_after_tokenizer_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = LanceMeta {
+            dim: 384,
+            embedding_model: "balanced".to_string(),
+            schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: "simple-v0".to_string(),
+        };
+        std::fs::write(dir.path().join(META_FILE), serde_json::to_vec(&on_disk).unwrap()).unwrap();
+        std::fs::write(generation_path(dir.path()), b"7").unwrap();
+
+        let _store = LanceStore::open(dir.path(), 384, "balanced").unwrap();
+
+        assert_eq!(read_generation(&generation_path(dir.path())).unwrap(), 8);
+    }
+
+    #[test]
     fn documents_schema_contains_rehydration_ref() {
         use crate::lance::schema::documents_schema;
         let schema = documents_schema(384);

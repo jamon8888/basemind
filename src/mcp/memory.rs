@@ -713,6 +713,22 @@ pub(super) async fn run_search_documents(
     } else {
         limit
     };
+    let reranker_model = if reranker_enabled {
+        match state
+            .shared
+            .config
+            .documents
+            .reranker
+            .resolve_model(explicit_preset.as_deref())
+        {
+            crate::config::ResolvedRerankerModel::Preset { name } => Some(format!("preset:{name}")),
+            crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+                Some(format!("custom:{model_id}:{model_file}"))
+            }
+        }
+    } else {
+        None
+    };
     let query_fingerprint = document_query_fingerprint(
         &params,
         &scope,
@@ -720,7 +736,7 @@ pub(super) async fn run_search_documents(
         state.shared.config.documents.fusion.max_relaxations,
         reranker_enabled,
         reranker_top_k,
-        explicit_preset.as_deref(),
+        reranker_model.as_deref(),
     );
 
     let (mut hits, cursor_generation, cursor_offset, raw_page_len, has_more, cursor_invalidated) = if lexical_only {
@@ -1062,7 +1078,7 @@ fn document_query_fingerprint(
     max_relaxations: u32,
     reranker_enabled: bool,
     reranker_top_k: usize,
-    reranker_preset: Option<&str>,
+    reranker_model: Option<&str>,
 ) -> u64 {
     let max_relaxations = max_relaxations.to_string();
     let reranker_top_k = reranker_top_k.to_string();
@@ -1078,10 +1094,15 @@ fn document_query_fingerprint(
         },
         reranker_top_k.as_str(),
         params.query.as_str(),
+        if params.mime_type.is_some() {
+            "mime-set"
+        } else {
+            "mime-unset"
+        },
         params.mime_type.as_deref().unwrap_or_default(),
         params.entity_category.as_deref().unwrap_or_default(),
         params.keywords_contains.as_deref().unwrap_or_default(),
-        reranker_preset.unwrap_or_default(),
+        reranker_model.unwrap_or_default(),
         max_tokens.as_str(),
     ];
     let mut material = Vec::new();
