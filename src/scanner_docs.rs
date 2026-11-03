@@ -824,20 +824,9 @@ fn document_facets(
         section: crate::extract::doc::facets::section_from_heading(Some(heading_path)),
         jurisdiction: crate::extract::doc::facets::jurisdiction(metadata_value("jurisdiction")),
         doc_date: crate::extract::doc::facets::doc_date(metadata_value("doc_date")),
-        keywords: (!keywords.is_empty()).then(|| {
-            keywords
-                .iter()
-                .map(|keyword| keyword.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        }),
-        entities: (!entities.is_empty()).then(|| {
-            entities
-                .iter()
-                .map(|entity| format!("{}:{}", entity.category, entity.text))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }),
+        keywords: (!keywords.is_empty()).then(|| keywords.iter().map(|keyword| keyword.text.clone()).collect()),
+        entities: (!entities.is_empty())
+            .then(|| entities.iter().map(|entity| format!("{}:{}", entity.category, entity.text)).collect()),
         summary: summary.map(str::to_string),
     }
 }

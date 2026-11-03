@@ -118,10 +118,10 @@ pub struct DocumentFacets {
     pub jurisdiction: Option<String>,
     /// Caller-curated ISO-8601 date.
     pub doc_date: Option<String>,
-    /// Newline-separated extracted keyword values.
-    pub keywords: Option<String>,
-    /// Newline-separated `category:value` entity values.
-    pub entities: Option<String>,
+    /// Extracted keyword values.
+    pub keywords: Option<Vec<String>>,
+    /// `category:value` entity values.
+    pub entities: Option<Vec<String>>,
     /// Document-level summary text.
     pub summary: Option<String>,
 }
@@ -789,6 +789,18 @@ fn append_optional(builder: &mut StringBuilder, value: Option<&str>) {
     }
 }
 
+fn append_optional_list(builder: &mut ListBuilder<StringBuilder>, value: Option<&[String]>) {
+    match value {
+        Some(values) => {
+            for value in values {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
 fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> {
     let mut scope = StringBuilder::new();
     let mut path = StringBuilder::new();
@@ -798,8 +810,8 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut section = StringBuilder::new();
     let mut jurisdiction = StringBuilder::new();
     let mut doc_date = StringBuilder::new();
-    let mut keywords = StringBuilder::new();
-    let mut entities = StringBuilder::new();
+    let mut keywords = ListBuilder::new(StringBuilder::new());
+    let mut entities = ListBuilder::new(StringBuilder::new());
     let mut summary = StringBuilder::new();
     let mut text = StringBuilder::new();
     let mut text_phrase = StringBuilder::new();
@@ -830,8 +842,8 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         append_optional(&mut section, r.facets.section.as_deref());
         append_optional(&mut jurisdiction, r.facets.jurisdiction.as_deref());
         append_optional(&mut doc_date, r.facets.doc_date.as_deref());
-        append_optional(&mut keywords, r.facets.keywords.as_deref());
-        append_optional(&mut entities, r.facets.entities.as_deref());
+        append_optional_list(&mut keywords, r.facets.keywords.as_deref());
+        append_optional_list(&mut entities, r.facets.entities.as_deref());
         append_optional(&mut summary, r.facets.summary.as_deref());
         text.append_value(&r.text);
         text_phrase.append_value(&r.text_phrase);
@@ -953,7 +965,7 @@ fn build_code_chunks_batch(dim: u16, rows: &[CodeRow]) -> Result<RecordBatch> {
 
 #[cfg(feature = "code-search")]
 fn decode_code_chunk_hits(batch: &RecordBatch, out: &mut Vec<CodeChunkHit>) -> Result<()> {
-    use arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float32Array, ListArray, UInt32Array};
     let str_col = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
@@ -1051,7 +1063,7 @@ fn build_memory_batch(dim: u16, rows: &[MemoryRow]) -> Result<RecordBatch> {
 }
 
 fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Result<()> {
-    use arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float32Array, ListArray, UInt32Array};
     let path = batch
         .column_by_name("path")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -1084,15 +1096,26 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
             .column_by_name(name)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
     };
+    let optional_list = |name: &str| batch.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<ListArray>());
     let doc_type = optional_string("doc_type");
     let section = optional_string("section");
     let jurisdiction = optional_string("jurisdiction");
     let doc_date = optional_string("doc_date");
-    let keywords = optional_string("keywords");
-    let entities = optional_string("entities");
+    let keywords = optional_list("keywords");
+    let entities = optional_list("entities");
     let summary = optional_string("summary");
     let optional_value = |array: Option<&StringArray>, i: usize| {
         array.and_then(|values| (!values.is_null(i)).then(|| values.value(i).to_string()))
+    };
+    let optional_values = |array: Option<&ListArray>, i: usize| {
+        array.and_then(|values| {
+            if values.is_null(i) {
+                return None;
+            }
+            let values = values.value(i);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|index| values.value(index).to_string()).collect())
+        })
     };
 
     for i in 0..batch.num_rows() {
@@ -1106,8 +1129,8 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
                 section: optional_value(section, i),
                 jurisdiction: optional_value(jurisdiction, i),
                 doc_date: optional_value(doc_date, i),
-                keywords: optional_value(keywords, i),
-                entities: optional_value(entities, i),
+                keywords: optional_values(keywords, i),
+                entities: optional_values(entities, i),
                 summary: optional_value(summary, i),
             },
             byte_start: byte_start.value(i),

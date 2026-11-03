@@ -18,8 +18,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `section` UTF-8 nullable deterministic section role
 /// - `jurisdiction` UTF-8 nullable caller-curated jurisdiction
 /// - `doc_date` UTF-8 nullable ISO-8601 document date
-/// - `keywords` UTF-8 nullable newline-separated extracted keywords
-/// - `entities` UTF-8 nullable newline-separated `category:value` entities
+/// - `keywords` List<Utf8> nullable extracted keywords
+/// - `entities` List<Utf8> nullable `category:value` entities
 /// - `summary` UTF-8 nullable document-level summary
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
 /// - `text_phrase` UTF-8  an unstemmed copy of `text` used by the positional phrase index
@@ -38,6 +38,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 ///   and the sibling `memory` / `code_chunks` tables in the same connection need a concrete dim
 ///   regardless. Nothing is written into the column on a lexical-only store.
 pub fn documents_schema(dim: u16) -> SchemaRef {
+    let list_inner = Arc::new(Field::new("item", DataType::Utf8, true));
     Arc::new(Schema::new(vec![
         Field::new("scope", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
@@ -47,8 +48,8 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new("section", DataType::Utf8, true),
         Field::new("jurisdiction", DataType::Utf8, true),
         Field::new("doc_date", DataType::Utf8, true),
-        Field::new("keywords", DataType::Utf8, true),
-        Field::new("entities", DataType::Utf8, true),
+        Field::new("keywords", DataType::List(Arc::clone(&list_inner)), true),
+        Field::new("entities", DataType::List(list_inner), true),
         Field::new("summary", DataType::Utf8, true),
         Field::new("text", DataType::Utf8, false),
         Field::new("text_phrase", DataType::Utf8, false),
