@@ -16,7 +16,14 @@ from pathlib import Path
 def write_zip(path: Path, files: dict[str, str]) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, content in files.items():
-            archive.writestr(name, content)
+            # Keep Office fixtures byte-for-byte reproducible across runs.  The
+            # default ``writestr`` path stamps each member with the current time,
+            # which makes benchmark inputs drift even when their source content
+            # is unchanged.
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            archive.writestr(info, content)
 
 
 def write_pdf(path: Path) -> None:
@@ -77,7 +84,9 @@ def generate(root: Path) -> Path:
     manifest = root / "synthetic-manifest.txt"
     manifest.write_text(
         "\n".join(
-            path.name for path in sorted(root.iterdir()) if path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"}
+            path.name
+            for path in sorted(root.iterdir())
+            if path.name != manifest.name and path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"}
         )
         + "\n"
     )
