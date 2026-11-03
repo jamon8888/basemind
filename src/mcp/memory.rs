@@ -976,12 +976,20 @@ async fn attach_doc_metadata(
 
     hits.retain_mut(|hit| {
         if let Some(needle) = cat_needle.as_deref() {
-            if !hit.entities.iter().any(|entity| entity.category.to_lowercase().contains(needle)) {
+            if !hit
+                .entities
+                .iter()
+                .any(|entity| entity.category.to_lowercase().contains(needle))
+            {
                 return false;
             }
         }
         if let Some(needle) = kw_needle.as_deref() {
-            if !hit.keywords.iter().any(|keyword| keyword.text.to_lowercase().contains(needle)) {
+            if !hit
+                .keywords
+                .iter()
+                .any(|keyword| keyword.text.to_lowercase().contains(needle))
+            {
                 return false;
             }
         }

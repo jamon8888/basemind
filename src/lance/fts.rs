@@ -206,7 +206,10 @@ pub async fn ensure_facet_indexes(table: &Table) -> Result<()> {
     let existing = table.list_indices().await.unwrap_or_default();
     for (name, column) in FACET_INDEXES {
         if existing.iter().any(|index| index.name == name) {
-            table.drop_index(name).await.with_context(|| format!("drop stale {name}"))?;
+            table
+                .drop_index(name)
+                .await
+                .with_context(|| format!("drop stale {name}"))?;
         }
         table
             .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))

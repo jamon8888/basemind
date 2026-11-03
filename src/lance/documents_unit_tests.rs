@@ -122,7 +122,12 @@ fn facet_lists_are_nullable_arrow_lists() {
         embedding: Vec::new(),
     }];
     let batch = build_documents_batch(384, &rows).expect("build facet row");
-    let keywords = batch.column_by_name("keywords").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+    let keywords = batch
+        .column_by_name("keywords")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
     let values = keywords.value(0).as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!(values.value(0), "termination");

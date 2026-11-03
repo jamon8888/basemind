@@ -1096,7 +1096,11 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
             .column_by_name(name)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
     };
-    let optional_list = |name: &str| batch.column_by_name(name).and_then(|c| c.as_any().downcast_ref::<ListArray>());
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+    };
     let doc_type = optional_string("doc_type");
     let section = optional_string("section");
     let jurisdiction = optional_string("jurisdiction");
