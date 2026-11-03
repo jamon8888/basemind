@@ -43,9 +43,13 @@
 //! because nothing has been measured yet.
 
 use anyhow::{Context, Result};
+use arrow_array::Array;
 use futures::TryStreamExt;
 use lancedb::index::Index;
-use lancedb::index::scalar::{FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator};
+use lancedb::index::scalar::{
+    BTreeIndexBuilder, FtsIndexBuilder, FtsQuery, FullTextSearchQuery, MatchQuery, MultiMatchQuery, Operator,
+    PhraseQuery,
+};
 // `full_text_search` is on the `QueryBase` trait, not inherent on `Query` — without this import
 // the method does not resolve, and the error names `struct lancedb::query::Query`, which points at
 // the type rather than at the missing trait in scope.
@@ -67,6 +71,22 @@ use super::LanceStore;
 pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
     ("documents_text_idx", "text"),
     ("documents_heading_idx", "heading_path"),
+];
+
+/// The identifier column is kept in a separate trigram index so statute and docket lookups do not
+/// inherit stemming or stop-word removal from the topical keyword lane.
+pub const EXACT_INDEX: (&str, &str) = ("documents_cites_idx", "cites");
+pub const PHRASE_INDEX: (&str, &str) = ("documents_text_phrase_idx", "text_phrase");
+
+/// Scalar indexes used by in-store scope, MIME, and document-facet predicates.
+pub const FACET_INDEXES: [(&str, &str); 7] = [
+    ("documents_scope_btree", "scope"),
+    ("documents_path_btree", "path"),
+    ("documents_mime_type_btree", "mime_type"),
+    ("documents_doc_type_btree", "doc_type"),
+    ("documents_section_btree", "section"),
+    ("documents_jurisdiction_btree", "jurisdiction"),
+    ("documents_doc_date_btree", "doc_date"),
 ];
 
 /// The columns the keyword lane covers.
@@ -93,6 +113,28 @@ pub fn keyword_index_params(cfg: &FtsConfig) -> Result<FtsIndexBuilder> {
         .ascii_folding(cfg.ascii_folding)
         .max_token_length(Some(cfg.max_token_length as usize))
         .custom_stop_words(Some(cfg.custom_stop_words.clone())))
+}
+
+fn exact_index_params(cfg: &FtsConfig) -> FtsIndexBuilder {
+    FtsIndexBuilder::default()
+        .base_tokenizer("ngram".to_string())
+        .ngram_min_length(cfg.ngram_min_length)
+        .ngram_max_length(cfg.ngram_max_length)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(cfg.ascii_folding)
+        .max_token_length(Some(cfg.max_token_length as usize))
+}
+
+fn phrase_index_params(cfg: &FtsConfig) -> Result<FtsIndexBuilder> {
+    Ok(FtsIndexBuilder::default()
+        .base_tokenizer("simple".to_string())
+        .language(&cfg.stemmer_language)?
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(cfg.ascii_folding)
+        .max_token_length(Some(cfg.max_token_length as usize))
+        .with_position(true))
 }
 
 /// Attach the keyword indexes to `table`, replacing any existing ones of the same name.
@@ -130,7 +172,104 @@ pub async fn ensure_keyword_index(table: &Table, cfg: &FtsConfig) -> Result<()> 
             .await
             .with_context(|| format!("create {name} on {column}"))?;
     }
+    let (name, column) = EXACT_INDEX;
+    if existing.iter().any(|i| i.name == name) {
+        table
+            .drop_index(name)
+            .await
+            .with_context(|| format!("drop stale {name}"))?;
+    }
+    table
+        .create_index(&[column], Index::FTS(exact_index_params(cfg)))
+        .name(name.to_string())
+        .execute()
+        .await
+        .with_context(|| format!("create {name} on {column}"))?;
+    let (name, column) = PHRASE_INDEX;
+    if existing.iter().any(|i| i.name == name) {
+        table
+            .drop_index(name)
+            .await
+            .with_context(|| format!("drop stale {name}"))?;
+    }
+    table
+        .create_index(&[column], Index::FTS(phrase_index_params(cfg)?))
+        .name(name.to_string())
+        .execute()
+        .await
+        .with_context(|| format!("create {name} on {column}"))?;
     Ok(())
+}
+
+/// Attach the scalar indexes used by retrieval predicates.
+pub async fn ensure_facet_indexes(table: &Table) -> Result<()> {
+    let existing = table.list_indices().await.unwrap_or_default();
+    for (name, column) in FACET_INDEXES {
+        if existing.iter().any(|index| index.name == name) {
+            table
+                .drop_index(name)
+                .await
+                .with_context(|| format!("drop stale {name}"))?;
+        }
+        table
+            .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+            .name(name.to_string())
+            .execute()
+            .await
+            .with_context(|| format!("create {name} on {column}"))?;
+    }
+    Ok(())
+}
+
+/// Build the exact identifier query. No fuzziness or stemming is allowed on this path.
+pub fn exact_query(term: &str) -> Result<FullTextSearchQuery> {
+    Ok(FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new(term.to_string())
+            .with_column(Some(EXACT_INDEX.1.to_string()))
+            .with_operator(Operator::And)
+            .with_fuzziness(Some(0)),
+    )))
+}
+
+/// Build a positional, non-stemming phrase query for quoted spans.
+pub fn phrase_query(phrase: &str) -> Result<FullTextSearchQuery> {
+    Ok(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new(phrase.to_string())
+            .with_column(Some(PHRASE_INDEX.1.to_string()))
+            .with_slop(0),
+    )))
+}
+
+/// Extract non-empty quoted spans, preserving their order and ignoring escaped quotes.
+pub fn quoted_phrases(query: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut start = None;
+    let mut escaped = false;
+    for (index, character) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            match start.take() {
+                Some(begin) if begin < index => phrases.push(query[begin..index].to_string()),
+                Some(_) => {}
+                None => start = Some(index + character.len_utf8()),
+            }
+        }
+    }
+    phrases
+}
+
+/// Return an identifier-shaped query for the exact lane, if present.
+pub fn exact_candidate(query: &str) -> Option<String> {
+    crate::extract::doc::citations::extract_citations(query, 1)
+        .into_iter()
+        .next()
 }
 
 /// A lexical hit.
@@ -145,6 +284,8 @@ pub struct LexicalHit {
     pub mime_type: String,
     pub byte_start: u32,
     pub byte_end: u32,
+    pub cites: String,
+    pub facets: super::DocumentFacets,
 }
 
 impl LexicalHit {
@@ -223,6 +364,39 @@ pub async fn search_lexical(
     Ok(hits)
 }
 
+pub async fn search_phrase(
+    table: &Table,
+    phrase: &str,
+    scope_predicate: &str,
+    limit: usize,
+) -> Result<Vec<LexicalHit>> {
+    let q = table
+        .query()
+        .full_text_search(phrase_query(phrase)?)
+        .only_if(scope_predicate)
+        .limit(limit);
+    let mut stream = q.execute().await.context("run phrase search")?;
+    let mut hits = Vec::new();
+    while let Some(batch) = stream.try_next().await.context("stream phrase batch")? {
+        decode_lexical_hits(&batch, &mut hits)?;
+    }
+    Ok(hits)
+}
+
+pub async fn search_exact(table: &Table, term: &str, scope_predicate: &str, limit: usize) -> Result<Vec<LexicalHit>> {
+    let q = table
+        .query()
+        .full_text_search(exact_query(term)?)
+        .only_if(scope_predicate)
+        .limit(limit);
+    let mut stream = q.execute().await.context("run exact search")?;
+    let mut hits = Vec::new();
+    while let Some(batch) = stream.try_next().await.context("stream exact batch")? {
+        decode_lexical_hits(&batch, &mut hits)?;
+    }
+    Ok(hits)
+}
+
 fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHit>) -> Result<()> {
     use anyhow::anyhow;
     use arrow_array::{StringArray, UInt32Array};
@@ -252,6 +426,30 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
     let mime = strings("mime_type")?;
     let byte_start = uints("byte_start")?;
     let byte_end = uints("byte_end")?;
+    let cites = strings("cites")?;
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+    };
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<arrow_array::ListArray>())
+    };
+    let value = |array: Option<&StringArray>, index: usize| {
+        array.and_then(|array| (!array.is_null(index)).then(|| array.value(index).to_string()))
+    };
+    let list_value = |array: Option<&arrow_array::ListArray>, index: usize| {
+        array.and_then(|array| {
+            if array.is_null(index) {
+                return None;
+            }
+            let values = array.value(index);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|i| values.value(i).to_string()).collect())
+        })
+    };
 
     for i in 0..batch.num_rows() {
         out.push(LexicalHit {
@@ -261,6 +459,16 @@ fn decode_lexical_hits(batch: &arrow_array::RecordBatch, out: &mut Vec<LexicalHi
             mime_type: mime.value(i).to_string(),
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
+            cites: cites.value(i).to_string(),
+            facets: super::DocumentFacets {
+                doc_type: value(optional_string("doc_type"), i),
+                section: value(optional_string("section"), i),
+                jurisdiction: value(optional_string("jurisdiction"), i),
+                doc_date: value(optional_string("doc_date"), i),
+                keywords: list_value(optional_list("keywords"), i),
+                entities: list_value(optional_list("entities"), i),
+                summary: value(optional_string("summary"), i),
+            },
         });
     }
     Ok(())
@@ -373,6 +581,7 @@ pub fn build_index_after_ingest(store: &LanceStore, cfg: &FtsConfig) -> Result<(
             .await
             .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
         ensure_keyword_index(&table, cfg).await?;
+        ensure_facet_indexes(&table).await?;
         table
             .optimize(OptimizeAction::All)
             .await
@@ -404,6 +613,41 @@ pub fn search_relaxed_on(
             .await
             .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
         search_relaxed(&table, terms, scope_predicate, limit, max_relaxations).await
+    })
+}
+
+pub fn search_phrase_on(
+    store: &LanceStore,
+    phrase: &str,
+    scope_predicate: &str,
+    limit: usize,
+) -> Result<Vec<LexicalHit>> {
+    use crate::lance::schema::DOCUMENTS_TABLE;
+
+    store.inner.rt().block_on(async {
+        let table = store
+            .inner
+            .connection
+            .open_table(DOCUMENTS_TABLE)
+            .execute()
+            .await
+            .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+        search_phrase(&table, phrase, scope_predicate, limit).await
+    })
+}
+
+pub fn search_exact_on(store: &LanceStore, term: &str, scope_predicate: &str, limit: usize) -> Result<Vec<LexicalHit>> {
+    use crate::lance::schema::DOCUMENTS_TABLE;
+
+    store.inner.rt().block_on(async {
+        let table = store
+            .inner
+            .connection
+            .open_table(DOCUMENTS_TABLE)
+            .execute()
+            .await
+            .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+        search_exact(&table, term, scope_predicate, limit).await
     })
 }
 
@@ -446,6 +690,48 @@ mod tests {
         let params = keyword_index_params(&FtsConfig::default()).expect("defaults must build");
         // Consuming it proves the builder is a real value, not a placeholder.
         let _ = params.base_tokenizer("simple".to_string());
+    }
+
+    #[test]
+    fn phrase_lane_uses_positional_word_tokens() {
+        assert_eq!(PHRASE_INDEX, ("documents_text_phrase_idx", "text_phrase"));
+        let query = phrase_query("Smith v Acme").expect("phrase query builds");
+        assert_eq!(
+            query.columns(),
+            ["text_phrase".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
+        let FtsQuery::Phrase(phrase) = query.query else {
+            panic!("quoted spans must use a positional phrase query");
+        };
+        assert_eq!(phrase.column.as_deref(), Some("text_phrase"));
+        assert_eq!(phrase.slop, 0);
+        assert!(
+            phrase_index_params(&FtsConfig::default())
+                .expect("phrase tokenizer builds")
+                .has_positions()
+        );
+    }
+
+    #[test]
+    fn quoted_phrase_parser_preserves_order() {
+        assert_eq!(
+            quoted_phrases("find \"Smith v. Acme\" and \"No. 3\""),
+            vec!["Smith v. Acme", "No. 3"]
+        );
+        assert!(quoted_phrases("unterminated \"phrase").is_empty());
+    }
+
+    #[test]
+    fn identifier_queries_route_to_exact_lane() {
+        assert_eq!(exact_candidate("§ 362(a)(1)"), Some("§ 362(a)(1)".to_string()));
+        assert_eq!(exact_candidate("No. 2-24-1234"), Some("No. 2-24-1234".to_string()));
+        assert_eq!(
+            exact_candidate("Which authority applies under § 362(a)(1)?"),
+            Some("§ 362(a)(1)".to_string())
+        );
+        assert_eq!(exact_candidate("termination notice"), None);
     }
 
     /// `identity` is the dedupe key across relaxation rounds. Two hits are the same chunk when path
@@ -510,6 +796,8 @@ mod tests {
             mime_type: "text/markdown".to_string(),
             byte_start: 0,
             byte_end: 1,
+            cites: String::new(),
+            facets: crate::lance::DocumentFacets::default(),
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
     }

@@ -12,7 +12,6 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
-use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -33,6 +32,14 @@ use crate::config::{
 
 mod numbered_headings;
 use numbered_headings::{collect_numbered_headings, numbered_heading_path};
+mod chunking;
+pub(crate) mod citations;
+pub(crate) mod facets;
+#[cfg(test)]
+pub(crate) use chunking::dense_retrieval_text;
+#[cfg(feature = "crawl")]
+pub(crate) use chunking::heading_path_of;
+use chunking::prepare_doc_chunk;
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
@@ -230,6 +237,10 @@ pub struct DocChunk {
     /// the dense-only path would have skipped it. Empty for a chunk with no heading context.
     #[serde(default)]
     pub heading_path: String,
+    /// Newline-separated legal identifiers extracted from the source chunk for exact retrieval,
+    /// excluding identifiers overlapping a redaction finding.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cites: String,
 }
 
 /// Caller-supplied knobs for document extraction.
@@ -748,6 +759,41 @@ pub(crate) fn extract_doc_with_metrics(
         ExtractError::Document(message)
     })?;
 
+    // Preserve citation candidates from source text before redaction rewrites it.
+    let citation_exclusions: Vec<String> = metadata_pairs(&result.metadata)
+        .iter()
+        .flat_map(|(_, value)| citations::extract_citations(value, 128))
+        .collect();
+    let citation_sources: Vec<(String, u32, u32)> = if linear {
+        doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap)
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    result.content[start..end].to_string(),
+                    u32::try_from(start).unwrap_or(u32::MAX),
+                    u32::try_from(end).unwrap_or(u32::MAX),
+                )
+            })
+            .collect()
+    } else {
+        result
+            .chunks
+            .as_ref()
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .map(|chunk| {
+                        (
+                            chunk.content.clone(),
+                            u32::try_from(chunk.metadata.byte_start).unwrap_or(u32::MAX),
+                            u32::try_from(chunk.metadata.byte_end).unwrap_or(u32::MAX),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     // #95: measured on the OCR text itself, before redaction and fallible embedding work.
     let ocr_empty_chars = ocr_signal::check(path, mime_type, &config.document_models, &result.content);
 
@@ -796,10 +842,32 @@ pub(crate) fn extract_doc_with_metrics(
     let chunking_started = std::time::Instant::now();
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
+    let citation_for = |index: usize| {
+        let Some((source, source_start, _source_end)) = citation_sources.get(index) else {
+            return String::new();
+        };
+        let mut values: Vec<String> = citations::extract_citation_spans(source, 256)
+            .into_iter()
+            .filter(|(_, start, end)| {
+                let start = source_start.saturating_add(u32::try_from(*start).unwrap_or(u32::MAX));
+                let end = source_start.saturating_add(u32::try_from(*end).unwrap_or(u32::MAX));
+                !redaction_findings
+                    .iter()
+                    .any(|finding| finding.start < end && finding.end > start)
+            })
+            .map(|(value, _, _)| value)
+            .collect();
+        citations::filter_self_references(&mut values, &citation_exclusions);
+        values.join("\n")
+    };
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
     if linear {
         let numbered_headings = collect_numbered_headings(&result.content);
-        for (start, end) in doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap) {
+        for (index, (start, end)) in
+            doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap)
+                .into_iter()
+                .enumerate()
+        {
             let (mut chunk, mut dense_input) = prepare_doc_chunk(
                 result.content[start..end].to_string(),
                 start,
@@ -811,6 +879,7 @@ pub(crate) fn extract_doc_with_metrics(
             // explicit numbered section spine with a bounded source pre-pass so large legal
             // documents retain the same structural signal as the normal chunking path.
             chunk.heading_path = numbered_heading_path(&numbered_headings, start, end);
+            chunk.cites = citation_for(index);
             if let (Some(path), Some(input)) = (Some(chunk.heading_path.as_str()), dense_input.as_mut())
                 && !path.is_empty()
             {
@@ -820,14 +889,15 @@ pub(crate) fn extract_doc_with_metrics(
             dense_inputs.extend(dense_input);
         }
     } else if let Some(input_chunks) = result.chunks {
-        for c in input_chunks {
-            let (chunk, dense_input) = prepare_doc_chunk(
+        for (index, c) in input_chunks.into_iter().enumerate() {
+            let (mut chunk, dense_input) = prepare_doc_chunk(
                 c.content,
                 c.metadata.byte_start,
                 c.metadata.byte_end,
                 c.metadata.heading_context.as_ref(),
                 embed_requested,
             );
+            chunk.cites = citation_for(index);
             chunks.push(chunk);
             if let Some(dense_input) = dense_input {
                 dense_inputs.push(dense_input);
@@ -949,81 +1019,12 @@ pub(crate) fn extract_doc_with_metrics(
     })
 }
 
-/// Dense retrieval benefits from structural heading context, while the persisted text and lexical
-/// search input must remain the exact source span described by the chunk's byte offsets.
-fn dense_retrieval_text<'a>(content: &'a str, heading_context: Option<&xberg::types::HeadingContext>) -> Cow<'a, str> {
-    match heading_context {
-        Some(context) if !context.headings.is_empty() => {
-            Cow::Owned(xberg::chunking::render_heading_breadcrumb(content, context))
-        }
-        _ => Cow::Borrowed(content),
-    }
-}
-
-/// The breadcrumb a chunk sits under, or `""` when it has no heading context.
-///
-/// Rendered from `context.headings` rather than by calling
-/// `xberg::chunking::render_heading_breadcrumb`, which takes the source content and appends the
-/// chunk body after the breadcrumb — so it returns `"# Guide > ## Setup\n\n<the body>"`, not a
-/// breadcrumb. xberg already has the right function for this (`builder::heading_path_from_context`)
-/// but it is `pub(crate)`, so it is not reachable from here.
-///
-/// The format matches `render_heading_breadcrumb`'s prefix exactly, so the stored column and the
-/// dense input describe the same path with the same spelling. Note this is **not** what spec 0012
-/// §6 shows: the spec's `IV. TERMINATION > 4. Convenience` does not correspond to any rendering,
-/// real or intended.
-fn heading_path_of(heading_context: Option<&xberg::types::HeadingContext>) -> String {
-    let Some(context) = heading_context.filter(|c| !c.headings.is_empty()) else {
-        return String::new();
-    };
-    let mut out = String::new();
-    for (i, heading) in context.headings.iter().enumerate() {
-        if i > 0 {
-            out.push_str(" > ");
-        }
-        for _ in 0..heading.level {
-            out.push('#');
-        }
-        let _ = write!(out, " {}", heading.text);
-    }
-    out
-}
-
-/// Recover citation-shaped headings for the linear large-document path.
-///
-/// This deliberately accepts only explicit Roman numerals or dotted Arabic outlines (and a
-/// single Arabic number when its caption is all-caps). Ordinary prose such as `4. The parties`
-/// is not promoted to structure. The parser is local to the source bytes before the chunk and
-/// therefore cannot invent a heading from another document or from an embedding result.
-fn prepare_doc_chunk(
-    content: String,
-    byte_start: usize,
-    byte_end: usize,
-    heading_context: Option<&xberg::types::HeadingContext>,
-    embed_requested: bool,
-) -> (DocChunk, Option<String>) {
-    // The breadcrumb used to be computed only when an embed was requested, so a lexical-only store
-    // (`embed = false`) never had it — the configuration where the lexical lane is the *only* lane
-    // and this column is the whole structural signal. `dense_retrieval_text` is untouched: it still
-    // inlines the breadcrumb with the body, which is what the embedder wants.
-    let heading_path = heading_path_of(heading_context);
-    let dense_input = embed_requested.then(|| dense_retrieval_text(&content, heading_context).into_owned());
-    let chunk = DocChunk {
-        byte_start: u32::try_from(byte_start).unwrap_or(u32::MAX),
-        byte_end: u32::try_from(byte_end).unwrap_or(u32::MAX),
-        text: content,
-        embedding: Vec::new(),
-        heading_path,
-    };
-    (chunk, dense_input)
-}
-
 /// What the redaction fingerprint must cover: the config *and* the post-processing the
 /// extractor applies to the engine's findings on its own motion (currently the tax_id
 /// re-labelling — SIREN/SIRET company identifiers — see [`crate::pii`]). Bumping the tag
 /// makes every redacted document re-extract once, so a cached blob whose findings were
 /// never re-labelled cannot be served alongside re-labelled ones.
-const REDACTION_PIPELINE_TAG: &str = "redaction-pipeline/2";
+const REDACTION_PIPELINE_TAG: &str = "redaction-pipeline/3";
 
 /// Deterministic fingerprint of a `RedactionConfig` (+ the pipeline tag) for cache
 /// invalidation. Two configs that produce identical redaction behaviour hash to the same

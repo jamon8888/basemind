@@ -14,13 +14,26 @@ use super::DocumentModelProfile;
 /// without depending on xberg's internal metadata map.
 pub(crate) fn dictionary_filtered_line_count(warnings: &[xberg::types::ProcessingWarning]) -> Option<usize> {
     const MARKER: &str = "Tesseract removed ";
+    let marker_finder = memchr::memmem::Finder::new(MARKER.as_bytes());
     warnings.iter().find_map(|warning| {
-        let start = warning.message.find(MARKER)? + MARKER.len();
+        if !warning.source.trim().eq_ignore_ascii_case("tesseract") {
+            return None;
+        }
+        let start = marker_finder.find(warning.message.as_bytes())? + MARKER.len();
         let rest = warning.message[start..].trim_start();
         let digit_end = rest
             .find(|character: char| !character.is_ascii_digit())
             .unwrap_or(rest.len());
-        if digit_end == 0 || !rest[digit_end..].trim_start().starts_with("OCR line") {
+        if digit_end == 0 {
+            return None;
+        }
+        let after_count = rest[digit_end..].trim_start();
+        let after_line = after_count.strip_prefix("OCR line")?;
+        if after_line
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
             return None;
         }
         rest[..digit_end].parse().ok()
@@ -126,5 +139,29 @@ mod tests {
             message: "ocr: Tesseract removed   7 OCR line(s) because the dictionary changed".into(),
         }];
         assert_eq!(dictionary_filtered_line_count(&warnings), Some(7));
+    }
+
+    #[test]
+    fn requires_tesseract_source_and_complete_line_token() {
+        let warnings = vec![
+            xberg::types::ProcessingWarning {
+                source: "chunking".into(),
+                message: "Tesseract removed 9 OCR line(s) because context changed".into(),
+            },
+            xberg::types::ProcessingWarning {
+                source: "tesseract".into(),
+                message: "Tesseract removed 9 OCR lineage records".into(),
+            },
+        ];
+        assert_eq!(dictionary_filtered_line_count(&warnings), None);
+    }
+
+    #[test]
+    fn accepts_tabs_between_count_and_line() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "Tesseract".into(),
+            message: "Tesseract removed 12\tOCR line(s) because context changed".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(12));
     }
 }

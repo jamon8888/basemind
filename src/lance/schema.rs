@@ -14,7 +14,15 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `path`      UTF-8     repo-relative path of the source file
 /// - `chunk_idx` UInt32    0-based index of this chunk within the file
 /// - `mime_type` UTF-8     IANA MIME type xberg detected
+/// - `doc_type` UTF-8 nullable caller-curated document type
+/// - `section` UTF-8 nullable deterministic section role
+/// - `jurisdiction` UTF-8 nullable caller-curated jurisdiction
+/// - `doc_date` UTF-8 nullable ISO-8601 document date
+/// - `keywords` List<Utf8> nullable extracted keywords
+/// - `entities` List<Utf8> nullable `category:value` entities
+/// - `summary` UTF-8 nullable document-level summary
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
+/// - `text_phrase` UTF-8  an unstemmed copy of `text` used by the positional phrase index
 /// - `heading_path`  UTF-8  the Markdown heading breadcrumb the chunk sits under, `""` when it has
 ///   none. Its own column because the keyword lane indexes it (see [`crate::lance::fts`]), and
 ///   because Lance builds at most one inverted index per column. Computed unconditionally by the
@@ -30,13 +38,23 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 ///   and the sibling `memory` / `code_chunks` tables in the same connection need a concrete dim
 ///   regardless. Nothing is written into the column on a lexical-only store.
 pub fn documents_schema(dim: u16) -> SchemaRef {
+    let list_inner = Arc::new(Field::new("item", DataType::Utf8, true));
     Arc::new(Schema::new(vec![
         Field::new("scope", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_idx", DataType::UInt32, false),
         Field::new("mime_type", DataType::Utf8, false),
+        Field::new("doc_type", DataType::Utf8, true),
+        Field::new("section", DataType::Utf8, true),
+        Field::new("jurisdiction", DataType::Utf8, true),
+        Field::new("doc_date", DataType::Utf8, true),
+        Field::new("keywords", DataType::List(Arc::clone(&list_inner)), true),
+        Field::new("entities", DataType::List(list_inner), true),
+        Field::new("summary", DataType::Utf8, true),
         Field::new("text", DataType::Utf8, false),
+        Field::new("text_phrase", DataType::Utf8, false),
         Field::new("heading_path", DataType::Utf8, false),
+        Field::new("cites", DataType::Utf8, false),
         Field::new("byte_start", DataType::UInt32, false),
         Field::new("byte_end", DataType::UInt32, false),
         Field::new("rehydration_ref", DataType::Utf8, true),

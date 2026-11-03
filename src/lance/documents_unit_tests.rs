@@ -38,8 +38,11 @@ fn a_vectorless_document_row_builds_with_a_null_embedding() {
         path: "safe/a.md".to_string(),
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
+        facets: Default::default(),
         text: "clause de résiliation".to_string(),
+        text_phrase: "clause de résiliation".to_string(),
         heading_path: String::new(),
+        cites: String::new(),
         byte_start: 0,
         byte_end: 21,
         rehydration_ref: None,
@@ -68,8 +71,11 @@ fn the_heading_breadcrumb_is_written_to_the_batch() {
         path: "safe/a.md".to_string(),
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
+        facets: Default::default(),
         text: "Trente jours pour cure.".to_string(),
+        text_phrase: "Trente jours pour cure.".to_string(),
         heading_path: "# Résiliation > ## Préavis".to_string(),
+        cites: String::new(),
         byte_start: 0,
         byte_end: 23,
         rehydration_ref: None,
@@ -86,6 +92,76 @@ fn the_heading_breadcrumb_is_written_to_the_batch() {
     assert_eq!(column.null_count(), 0, "an absent breadcrumb is empty, never null");
 }
 
+#[test]
+fn facet_lists_are_nullable_arrow_lists() {
+    use arrow_array::{Array, ListArray, StringArray};
+    use arrow_schema::DataType;
+    let schema = crate::lance::schema::documents_schema(384);
+    for name in ["keywords", "entities"] {
+        let field = schema.field_with_name(name).expect("facet column exists");
+        assert!(field.is_nullable());
+        assert!(matches!(field.data_type(), DataType::List(_)));
+    }
+    let rows = vec![DocumentRow {
+        scope: "repo:x".into(),
+        path: "safe/a.md".into(),
+        chunk_idx: 0,
+        mime_type: "text/markdown".into(),
+        facets: DocumentFacets {
+            keywords: Some(vec!["termination".into(), "notice".into()]),
+            entities: Some(vec!["PERSON:Acme".into()]),
+            ..Default::default()
+        },
+        text: "t".into(),
+        text_phrase: "t".into(),
+        heading_path: String::new(),
+        cites: String::new(),
+        byte_start: 0,
+        byte_end: 1,
+        rehydration_ref: None,
+        embedding: Vec::new(),
+    }];
+    let batch = build_documents_batch(384, &rows).expect("build facet row");
+    let keywords = batch
+        .column_by_name("keywords")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let values_array = keywords.value(0);
+    let values = values_array.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.value(0), "termination");
+}
+
+#[test]
+fn absent_facet_lists_are_written_as_null() {
+    let rows = vec![DocumentRow {
+        scope: "repo:x".into(),
+        path: "safe/a.md".into(),
+        chunk_idx: 0,
+        mime_type: "text/markdown".into(),
+        facets: DocumentFacets {
+            keywords: None,
+            entities: None,
+            ..Default::default()
+        },
+        text: "t".into(),
+        text_phrase: "t".into(),
+        heading_path: String::new(),
+        cites: String::new(),
+        byte_start: 0,
+        byte_end: 1,
+        rehydration_ref: None,
+        embedding: Vec::new(),
+    }];
+    let batch = build_documents_batch(384, &rows).expect("build row without facets");
+    for name in ["keywords", "entities"] {
+        let column = batch.column_by_name(name).expect("facet column exists");
+        assert_eq!(column.null_count(), 1, "absent {name} must be a null list");
+    }
+}
+
 /// The nullable column must not become a hole. A row that *claims* a vector of the wrong length
 /// would misalign the index silently, which is worse than an error.
 #[test]
@@ -95,8 +171,11 @@ fn a_wrong_length_vector_is_still_rejected() {
         path: "safe/a.md".to_string(),
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
+        facets: Default::default(),
         text: "t".to_string(),
+        text_phrase: "t".to_string(),
         heading_path: String::new(),
+        cites: String::new(),
         byte_start: 0,
         byte_end: 1,
         rehydration_ref: None,

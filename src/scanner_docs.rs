@@ -19,7 +19,6 @@
 //!    RAM is one file's rows, independent of corpus size (the streaming write
 //!    that replaced the old "accumulate every file's rows, then write once" pass
 //!    which held multiple GB resident on a large repo).
-
 #![cfg(feature = "documents")]
 
 use std::path::Path;
@@ -36,7 +35,7 @@ use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
 #[cfg(feature = "graphrag")]
 use crate::lance::DocEntitySidecar;
-use crate::lance::{DocumentRow, PendingBatch};
+use crate::lance::{DocumentFacets, DocumentRow, PendingBatch};
 use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::scanner_filter::Filters;
@@ -748,42 +747,93 @@ fn pending_from_doc(
         text_fallback: doc.text_fallback,
     }
 }
-
-/// Turn a document's chunks into LanceDB rows. Hoists the per-row constant strings out of the map so
-/// they allocate once instead of once per chunk (a doc can have hundreds of chunks).
-///
-/// Takes `doc` by value to move `chunk.text` and `chunk.embedding` directly into each row —
-/// avoids cloning the chunk text (potentially large) and the embedding vector (`Vec<f32>`,
-/// hundreds of kilobytes per chunk at typical preset dimensions).
-fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
+fn build_doc_rows(
+    doc: FileMapDoc,
+    rel: &str,
+    scope: &str,
+    citations: &crate::config::CitationsConfig,
+) -> Vec<DocumentRow> {
+    let FileMapDoc {
+        mime_type,
+        rehydration_ref,
+        metadata,
+        keywords,
+        entities,
+        summary,
+        chunks,
+        ..
+    } = doc;
     let scope_owned = scope.to_string();
     let rel_owned = rel.to_string();
-    let mime_owned = doc.mime_type;
-    let rehydration_ref = doc.rehydration_ref;
-    doc.chunks
+    let mime_owned = mime_type;
+    chunks
         .into_iter()
         .enumerate()
-        .map(|(idx, chunk)| DocumentRow {
-            scope: scope_owned.clone(),
-            path: rel_owned.clone(),
-            chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
-            mime_type: mime_owned.clone(),
-            text: chunk.text,
-            heading_path: chunk.heading_path,
-            byte_start: chunk.byte_start,
-            byte_end: chunk.byte_end,
-            rehydration_ref: rehydration_ref.clone(),
-            embedding: chunk.embedding,
+        .map(|(idx, chunk)| {
+            let cites = if citations.extract {
+                chunk
+                    .cites
+                    .lines()
+                    .take(citations.max_per_chunk as usize)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            DocumentRow {
+                scope: scope_owned.clone(),
+                path: rel_owned.clone(),
+                chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
+                mime_type: mime_owned.clone(),
+                facets: document_facets(
+                    &metadata,
+                    &keywords,
+                    &entities,
+                    summary.as_ref().map(|summary| summary.text.as_str()),
+                    &chunk.heading_path,
+                ),
+                text: chunk.text.clone(),
+                text_phrase: chunk.text,
+                heading_path: chunk.heading_path,
+                cites,
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                rehydration_ref: rehydration_ref.clone(),
+                embedding: chunk.embedding,
+            }
         })
         .collect()
 }
 
-/// Purge the LanceDB `documents` rows AND the `index.doc_files` entries of docs that no longer
-/// exist (or are no longer routed to the doc tier). Serial apply pass; mirrors
-/// `scanner_code::delete_stale_code_chunks`. The tracking entry is dropped unconditionally (the doc
-/// cache metadata must not leak for a removed file); the LanceDB delete is best-effort and never
-/// *creates* the store. External-root docs were written under a per-root scope, so the delete uses
-/// [`doc_scope_for`] to match it.
+fn document_facets(
+    metadata: &[(String, String)],
+    keywords: &[crate::extract::doc::DocKeyword],
+    entities: &[crate::extract::doc::DocEntity],
+    summary: Option<&str>,
+    heading_path: &str,
+) -> DocumentFacets {
+    let metadata_value = |key: &str| {
+        metadata
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    };
+    DocumentFacets {
+        doc_type: crate::extract::doc::facets::doc_type(metadata_value("doc_type")),
+        section: crate::extract::doc::facets::section_from_heading(Some(heading_path)),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(metadata_value("jurisdiction")),
+        doc_date: crate::extract::doc::facets::doc_date(metadata_value("doc_date")),
+        keywords: (!keywords.is_empty()).then(|| keywords.iter().map(|keyword| keyword.text.clone()).collect()),
+        entities: (!entities.is_empty()).then(|| {
+            entities
+                .iter()
+                .map(|entity| format!("{}:{}", entity.category, entity.text))
+                .collect()
+        }),
+        summary: summary.map(str::to_string),
+    }
+}
+
 pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::Config, scope: &str, stale: &[String]) {
     if stale.is_empty() {
         return;
@@ -912,22 +962,12 @@ pub(crate) fn purge_unembedded_documents(
     applied
 }
 
-/// Stream every pending document batch into LanceDB, one file at a time. Opens the store lazily — if
-/// no batch will emit rows (no embeddings configured) no LanceDB connection is ever made.
-///
-/// For each row-emitting file this re-reads the file's already-persisted `.doc.msgpack` blob, builds
-/// its [`DocumentRow`]s, writes them, and drops them before the next file — so peak embed-write RAM
-/// is one document's rows plus one Arrow batch, independent of corpus size. (The blob is guaranteed
-/// on disk here: every doc that produced a batch was written by `extract_and_persist_doc` or was a
-/// cache hit, both before this post-barrier lane runs.)
-///
-/// Returns the number of files for which rows were written. Errors are logged and skipped on a
-/// per-file basis so one malformed embedding doesn't abort the scan.
-pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocBatch>, embedding_model: &str) -> usize {
-    // Rows are emitted for a lexical-only scan too: `embed = false` stores a null vector, it does not
-    // suppress the row. The dimension comes from the configured preset, not from a batch — on a
-    // lexical-only scan no batch carries one, and requiring one here is what used to make the whole
-    // flush a no-op before a single row was built.
+pub(crate) fn flush_document_batches(
+    store: &mut Store,
+    batches: Vec<PendingDocBatch>,
+    embedding_model: &str,
+    citations: &crate::config::CitationsConfig,
+) -> usize {
     let emit = batches.iter().any(|b| b.emit_rows);
     if !emit {
         return 0;
@@ -943,9 +983,6 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
             return 0;
         }
     };
-    // Every emitting batch that carries vectors must agree with the preset's dimension. A lexical-only
-    // batch carries none, so the previous "find a batch with a dimension" lookup could not express
-    // this: it both gated the whole flush and skipped the check whenever it found nothing.
     if let Some(actual) = batches
         .iter()
         .filter(|b| b.emit_rows && b.embedding_dim > 0)
@@ -976,8 +1013,6 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
         }
     };
 
-    // One delete+append commit pair per BATCH_MAX_DOCS documents instead of per document (#76);
-    // rows are still built one document at a time, so peak RAM is one batch's rows.
     let mut pending: PendingBatch<DocumentRow> = PendingBatch::default();
     let flush = |pending: &mut PendingBatch<DocumentRow>, inserted: &mut usize| {
         let items = pending.take();
@@ -1008,7 +1043,7 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
                 continue;
             }
         };
-        let rows = build_doc_rows(doc, &batch.rel_path, &batch.doc_scope);
+        let rows = build_doc_rows(doc, &batch.rel_path, &batch.doc_scope, citations);
         if rows.is_empty() {
             continue;
         }
@@ -1023,14 +1058,6 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
     inserted
 }
 
-/// Build the keyword index over the rows just written, then compact.
-///
-/// Called once per flush, after every batch. Per-file indexing would rebuild the index once per
-/// document, which on a large corpus dwarfs the extraction cost.
-///
-/// Best-effort and warned, not fatal: a missing lexical index degrades the query path to
-/// vector-only, whereas failing the scan would lose the embeddings that *were* just written. An
-/// index that silently did not build is the failure worth watching for, so it is logged at warn.
 pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::config::Config) {
     if !config.documents.enabled {
         return;
@@ -1058,16 +1085,6 @@ pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::confi
     }
 }
 
-/// Choose the LanceDB scope for a document. Repo files keep the scan-wide `default_scope`;
-/// external-root files (absolute key, see [`crate::path::RelPath::is_external`]) are scoped
-/// `path:<extra_root>` so they group under the out-of-repo tree they came from rather than the
-/// repository's own doc scope.
-///
-/// `scope` is a retrieval partition, and every reader must honour it: `search_documents` filters on
-/// it unconditionally (`src/lance/mod.rs`), so a row under `path:<root>` is only returned to a caller
-/// that asks for that scope. An earlier version of this comment claimed "`search_documents` has no
-/// scope filter — so this only partitions storage", which was false and had been for long enough to
-/// justify the write/delete mismatch described on `PendingDocBatch::doc_scope`.
 pub(crate) fn doc_scope_for<'a>(
     rel: &str,
     default_scope: &'a str,

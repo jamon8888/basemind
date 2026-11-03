@@ -33,12 +33,10 @@ pub mod schema;
 mod store_tests;
 /// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
 /// (`tests/max_lines.rs`).
-/// Test-only inherent methods; out of line by the line cap.
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
 pub use batch::{BATCH_MAX_DOCS, BATCH_MAX_ROWS, PendingBatch, SCAN_RETENTION};
-use generation::{bump_generation_file, generation_path, read_generation, wipe_on_mismatch};
 
 #[cfg(feature = "documents")]
 pub use doc_links::DocLinkRow;
@@ -50,7 +48,9 @@ pub use graphrag::{
     upsert_graph_entities,
 };
 
+use generation::{bump_generation_file, generation_path, read_generation, wipe_on_mismatch};
 use std::path::{Path, PathBuf};
+
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -69,52 +69,26 @@ use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
 #[cfg(feature = "graphrag")]
 use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
-/// On-disk metadata for the lance store. Tracks the vector dim, embedding-model identifier,
-/// Arrow table schema version, and lexical tokenizer configuration; a mismatch on any field
-/// wipes the store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LanceMeta {
     dim: u16,
     embedding_model: String,
-    /// Arrow schema version of the `memory` / `documents` tables (see
-    /// [`MEMORY_SCHEMA_VER`]). `#[serde(default)]` makes a pre-0.5 `meta.json` (which
-    /// lacks this field) deserialize as `0`, forcing a wipe on upgrade rather than a
-    /// parse error — the table column set changed, and a stale-arity table would fault
-    /// at batch-build time, not at open.
     #[serde(default)]
     schema_ver: u32,
-    /// Stable identifier for the lexical tokenizer/index semantics. Keeping this in the
-    /// wipe identity makes a tokenizer change rebuild the Lance tables instead of silently
-    /// querying an index built with different tokenization rules. The serde default lets
-    /// metadata written before this field was introduced deserialize and deliberately mismatch.
     #[serde(default)]
     tokenizer_config: String,
 }
 
-/// Stable description of the tokenizer/index construction semantics. Change this value whenever
-/// those semantics change so opening the store deliberately wipes stale lexical indexes.
 const TOKENIZER_CONFIG: &str = "simple-v1";
-
 const META_FILE: &str = "meta.json";
-/// Persistent document-search generation lives beside the Lance directory. `wipe_on_mismatch`
-/// removes everything under `.basemind/lance/`, so keeping this token outside that directory is
-/// what lets a resumed cursor detect a schema/model rebuild after process restart.
 const GENERATION_SUFFIX: &str = ".generation";
 
-/// Bump the durable document-search generation without opening Lance. This is used when a scan
-/// refuses a document batch before `LanceStore::open` (for example, a vector-dimension mismatch):
-/// an outstanding cursor must still be invalidated even though no rows were written.
 pub fn bump_document_generation_for_dir(dir: &Path) -> Result<u64> {
     let path = generation_path(dir);
     let current = read_generation(&path)?;
     bump_generation_file(&path, current)
 }
 
-/// Open the existing lance store for read-side tools (the MCP `graph` modes)
-/// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
-/// identity is read back from `meta.json` instead of taken from config, so a
-/// caller that guesses wrong cannot destroy the store. Returns `None` when no
-/// store exists on disk (nothing was ever scanned with lance enabled).
 #[cfg(feature = "intelligence")]
 pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
     let meta_path = dir.join(META_FILE);
@@ -126,66 +100,69 @@ pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
     LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
 }
 
-/// Schema version of the lance Arrow tables, bound to the release minor exactly like
-/// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. Bump `RELEASE_MINOR` whenever the
-/// `memory` or `documents` table column set changes; the resulting `LanceMeta` mismatch
-/// wipes and rebuilds the lance dir.
 pub const MEMORY_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;
 
-/// One row in the `documents` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentFacets {
+    pub doc_type: Option<String>,
+    pub section: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub doc_date: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub entities: Option<Vec<String>>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFacetFilter {
+    pub doc_type: Option<String>,
+    pub section: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub doc_date: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub scope: String,
     pub path: String,
     pub chunk_idx: u32,
     pub mime_type: String,
+    pub facets: DocumentFacets,
     pub text: String,
-    /// The Markdown heading breadcrumb this chunk sits under, `""` when it has none.
-    ///
-    /// Carried all the way to the table because the keyword lane indexes it. It used to stop at
-    /// [`crate::extract::doc::DocChunk`]: the extractor computed it, and nothing downstream ever
-    /// read it, so the index built over a column that did not exist.
+    pub text_phrase: String,
     pub heading_path: String,
+    pub cites: String,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// Vault key for the document's encrypted rehydration map. `None` until
-    /// extraction runs with redaction enabled for the document.
     pub rehydration_ref: Option<String>,
     pub embedding: Vec<f32>,
 }
 
-/// One row in the `memory` table.
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     pub scope: String,
     pub key: String,
     pub value: String,
     pub tags: Vec<String>,
-    /// Memory tier: `"group"` (shared) or `"individual"` (per-agent).
     pub visibility: String,
-    /// Owner of an individual-tier row; empty string for the group tier.
     pub agent_id: String,
     pub embedding: Vec<f32>,
-    /// Microseconds since unix epoch.
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-/// A search hit from the `documents` table.
 #[derive(Debug, Clone)]
 pub struct DocumentHit {
     pub path: String,
     pub chunk_idx: u32,
     pub text: String,
     pub mime_type: String,
+    pub facets: DocumentFacets,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer). LanceDB returns this
-    /// in the `_distance` column.
     pub distance: f32,
 }
 
-/// A search hit from the `memory` table.
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub key: String,
@@ -194,7 +171,6 @@ pub struct MemoryHit {
     pub distance: f32,
 }
 
-/// One row in the `code_chunks` table.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeRow {
@@ -212,7 +188,6 @@ pub struct CodeRow {
     pub embedding: Vec<f32>,
 }
 
-/// A search hit from the `code_chunks` table — a pointer, not a body.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeChunkHit {
@@ -225,7 +200,6 @@ pub struct CodeChunkHit {
     pub line_end: u32,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer).
     pub distance: f32,
 }
 
@@ -243,8 +217,6 @@ struct LanceStoreInner {
     dim: u16,
     embedding_model: String,
     dir: PathBuf,
-    /// Sidecar path and current value for document-search cursor invalidation. The file is kept
-    /// beside `dir`, never below it, because the Lance migration path wipes that directory.
     generation_path: PathBuf,
     document_generation: Mutex<u64>,
     /// Commits per table since the last maintenance pass; drives bounded version retention.
@@ -358,9 +330,6 @@ impl LanceStore {
         &self.inner.dir
     }
 
-    /// Persistent generation for document-search cursors. Any document-table rebuild or delete
-    /// increments this value; callers can therefore reject a cursor from before a Lance wipe,
-    /// process restart, or incremental mutation.
     pub fn document_generation(&self) -> u64 {
         *self
             .inner
@@ -379,8 +348,6 @@ impl LanceStore {
         Ok(*generation)
     }
 
-    /// Replace all documents rows for the given `(scope, path)` pair and insert
-    /// the supplied rows. Used by the scanner during incremental re-extract.
     pub fn replace_document(&self, scope: &str, path: &str, rows: Vec<DocumentRow>) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -416,8 +383,6 @@ impl LanceStore {
         })
     }
 
-    /// Insert / upsert one memory row keyed by `(scope, key)`. Existing rows
-    /// with the same key are removed first.
     pub fn upsert_memory(&self, row: MemoryRow) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -436,8 +401,6 @@ impl LanceStore {
         })
     }
 
-    /// Delete one memory entry by `(scope, visibility, agent_id, key)`. Returns the
-    /// number of rows LanceDB actually deleted (`0` when no row matched the predicate).
     pub fn delete_memory(&self, scope: &str, visibility: &str, agent_id: &str, key: &str) -> Result<u64> {
         self.inner.rt().block_on(async {
             let table = self
@@ -453,13 +416,23 @@ impl LanceStore {
         })
     }
 
-    /// KNN over the documents table for one scope.
     pub fn search_documents(
         &self,
         scope: &str,
         query: Vec<f32>,
         limit: usize,
         mime_type_filter: Option<&str>,
+    ) -> Result<Vec<DocumentHit>> {
+        self.search_documents_filtered(scope, query, limit, mime_type_filter, None)
+    }
+
+    pub fn search_documents_filtered(
+        &self,
+        scope: &str,
+        query: Vec<f32>,
+        limit: usize,
+        mime_type_filter: Option<&str>,
+        facet_filter: Option<&DocumentFacetFilter>,
     ) -> Result<Vec<DocumentHit>> {
         if query.len() != usize::from(self.inner.dim) {
             return Err(anyhow!(
@@ -477,11 +450,26 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
             let mut q = table.vector_search(query).context("build vector search")?.limit(limit);
-            let scope_clause = format!("scope = '{}'", escape_sql_literal(scope));
-            q = match mime_type_filter {
-                Some(m) => q.only_if(format!("{scope_clause} AND mime_type = '{}'", escape_sql_literal(m))),
-                None => q.only_if(scope_clause),
-            };
+            let mut predicates = vec![format!("scope = '{}'", escape_sql_literal(scope))];
+            if let Some(m) = mime_type_filter {
+                predicates.push(format!("mime_type = '{}'", escape_sql_literal(m)));
+            }
+            if let Some(facets) = facet_filter {
+                for (column, value) in [
+                    ("doc_type", facets.doc_type.as_deref()),
+                    ("section", facets.section.as_deref()),
+                    ("jurisdiction", facets.jurisdiction.as_deref()),
+                    ("doc_date", facets.doc_date.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        predicates.push(format!(
+                            "({column} IS NULL OR {column} = '{}')",
+                            escape_sql_literal(value)
+                        ));
+                    }
+                }
+            }
+            q = q.only_if(predicates.join(" AND "));
             let mut stream = q.execute().await.context("run document search")?;
             let mut hits = Vec::new();
             while let Some(batch) = stream.try_next().await.context("stream next batch")? {
@@ -491,10 +479,6 @@ impl LanceStore {
         })
     }
 
-    /// Fetch document chunks for specific paths (plain scan, no vector search).
-    ///
-    /// Used by the GraphRAG `rag` mode to pull the chunk text of graph-expanded
-    /// documents that the vector lane did not surface on its own.
     pub fn document_chunks_for_paths(&self, scope: &str, paths: &[String], limit: usize) -> Result<Vec<DocumentHit>> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -528,10 +512,6 @@ impl LanceStore {
         })
     }
 
-    /// KNN over the memory table for one `(scope, visibility, agent_id)` namespace.
-    ///
-    /// The `visibility` + `agent_id` predicate is mandatory so an individual search never
-    /// returns another agent's rows and a group search only sees group rows.
     pub fn search_memory(
         &self,
         scope: &str,
@@ -575,9 +555,6 @@ impl LanceStore {
         })
     }
 
-    /// Replace all `code_chunks` rows for a `(scope, path)` pair and insert the supplied rows.
-    /// Delete-then-insert mirrors [`Self::replace_document`] so a re-scan never leaves stale
-    /// chunks behind.
     #[cfg(feature = "code-search")]
     pub fn replace_code_chunks(&self, scope: &str, path: &str, rows: Vec<CodeRow>) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -612,9 +589,6 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row for a `(scope, path)` pair without inserting replacements.
-    /// The scanner's stale-file pass calls this when a file is removed, so a deleted path leaves no
-    /// dangling `search_code` hits. Idempotent — deleting a path with no rows is a no-op.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks(&self, scope: &str, path: &str) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -638,24 +612,15 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row of `paths` in `scope`, batching the paths into `IN (...)`
-    /// predicates so a purge of N files is a handful of deletes rather than N table versions.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::CODE_CHUNKS_TABLE, "path", scope, paths)
     }
 
-    /// Delete every `documents` row of `paths` in `scope`; the batched counterpart of
-    /// [`Self::replace_document`] with no replacement rows.
     pub fn delete_documents_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
-        let result = self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths);
-        if result.is_ok() && !paths.is_empty() {
-            self.bump_document_generation()?;
-        }
-        result
+        self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths)
     }
 
-    /// Delete every `doc_links` row of the given documents (ADR-0008) in bulk.
     #[cfg(feature = "documents")]
     pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
@@ -667,8 +632,6 @@ impl LanceStore {
     }
 
     pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {
-        // Each batch is one delete transaction (a new table version plus a scan of `path`), so a
-        // large purge is dominated by the batch COUNT; 2000 literals keep the predicate small.
         const BATCH: usize = 2_000;
         if paths.is_empty() {
             return Ok(());
@@ -681,9 +644,6 @@ impl LanceStore {
                 .execute()
                 .await
                 .with_context(|| format!("open {table_name} table"))?;
-            // Nothing stored for this scope (the common case on the first scan after an upgrade, or
-            // with embeddings off): skip the N/200 deletes, each of which scans the table and may
-            // commit a table version.
             let in_scope = table
                 .count_rows(Some(format!("scope = '{}'", escape_sql_literal(scope))))
                 .await
@@ -703,13 +663,14 @@ impl LanceStore {
                     .await
                     .with_context(|| format!("delete {} paths from {table_name} in {scope}", batch.len()))?;
                 self.after_commit(&table, table_name).await;
+                if table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
             }
             anyhow::Ok(())
         })
     }
 
-    /// KNN over the `code_chunks` table for one scope. Returns pointer hits (path + span +
-    /// symbol + distance), best-first.
     #[cfg(feature = "code-search")]
     pub fn search_code_chunks(&self, scope: &str, query: Vec<f32>, limit: usize) -> Result<Vec<CodeChunkHit>> {
         if query.len() != usize::from(self.inner.dim) {
@@ -755,23 +716,47 @@ async fn ensure_table(connection: &Connection, name: &str, schema: arrow_schema:
     Ok(())
 }
 
+fn append_optional(builder: &mut StringBuilder, value: Option<&str>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn append_optional_list(builder: &mut ListBuilder<StringBuilder>, value: Option<&[String]>) {
+    match value {
+        Some(values) => {
+            for value in values {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
 fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> {
     let mut scope = StringBuilder::new();
     let mut path = StringBuilder::new();
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
+    let mut doc_type = StringBuilder::new();
+    let mut section = StringBuilder::new();
+    let mut jurisdiction = StringBuilder::new();
+    let mut doc_date = StringBuilder::new();
+    let mut keywords = ListBuilder::new(StringBuilder::new());
+    let mut entities = ListBuilder::new(StringBuilder::new());
+    let mut summary = StringBuilder::new();
     let mut text = StringBuilder::new();
+    let mut text_phrase = StringBuilder::new();
     let mut heading_path = StringBuilder::new();
+    let mut cites = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
     let mut byte_end = UInt32Builder::new();
     let mut rehydration_ref = StringBuilder::new();
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
-        // An empty `embedding` means the scan ran with `embed = false`: the row is lexical-only and
-        // the vector column is null. A *non-empty* vector of the wrong length is still a bug — that
-        // one would silently misalign the index — so the length check survives for the case that can
-        // actually be wrong.
         if !r.embedding.is_empty() && r.embedding.len() != usize::from(dim) {
             return Err(anyhow!(
                 "documents row embedding dim {} does not match store dim {}",
@@ -783,11 +768,17 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         path.append_value(&r.path);
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
+        append_optional(&mut doc_type, r.facets.doc_type.as_deref());
+        append_optional(&mut section, r.facets.section.as_deref());
+        append_optional(&mut jurisdiction, r.facets.jurisdiction.as_deref());
+        append_optional(&mut doc_date, r.facets.doc_date.as_deref());
+        append_optional_list(&mut keywords, r.facets.keywords.as_deref());
+        append_optional_list(&mut entities, r.facets.entities.as_deref());
+        append_optional(&mut summary, r.facets.summary.as_deref());
         text.append_value(&r.text);
-        // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
-        // so `""` is what "no breadcrumb" reads back as, and the tokenizer sees an empty document
-        // rather than a missing value.
+        text_phrase.append_value(&r.text_phrase);
         heading_path.append_value(&r.heading_path);
+        cites.append_value(&r.cites);
         byte_start.append_value(r.byte_start);
         byte_end.append_value(r.byte_end);
         match &r.rehydration_ref {
@@ -795,11 +786,6 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             None => rehydration_ref.append_null(),
         }
         if r.embedding.is_empty() {
-            // `FixedSizeListBuilder::finish` asserts `values.len() == len * list_len`, so a
-            // null slot still owes the child array `dim` values — `append(false)` only writes
-            // the null buffer and does not pad. Without this the lexical-only path panics inside
-            // arrow instead of writing the row. The values are never read: the null buffer is
-            // what marks the slot absent, and `null_count()` is what the test reads.
             embedding.values().append_nulls(dim as usize);
             embedding.append(false);
         } else {
@@ -818,8 +804,17 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(path.finish()),
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
+            Arc::new(doc_type.finish()),
+            Arc::new(section.finish()),
+            Arc::new(jurisdiction.finish()),
+            Arc::new(doc_date.finish()),
+            Arc::new(keywords.finish()),
+            Arc::new(entities.finish()),
+            Arc::new(summary.finish()),
             Arc::new(text.finish()),
+            Arc::new(text_phrase.finish()),
             Arc::new(heading_path.finish()),
+            Arc::new(cites.finish()),
             Arc::new(byte_start.finish()),
             Arc::new(byte_end.finish()),
             Arc::new(rehydration_ref.finish()),
@@ -990,7 +985,7 @@ fn build_memory_batch(dim: u16, rows: &[MemoryRow]) -> Result<RecordBatch> {
 }
 
 fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Result<()> {
-    use arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float32Array, ListArray, UInt32Array};
     let path = batch
         .column_by_name("path")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -1018,6 +1013,36 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
     let distance = batch
         .column_by_name("_distance")
         .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+    };
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+    };
+    let doc_type = optional_string("doc_type");
+    let section = optional_string("section");
+    let jurisdiction = optional_string("jurisdiction");
+    let doc_date = optional_string("doc_date");
+    let keywords = optional_list("keywords");
+    let entities = optional_list("entities");
+    let summary = optional_string("summary");
+    let optional_value = |array: Option<&StringArray>, i: usize| {
+        array.and_then(|values| (!values.is_null(i)).then(|| values.value(i).to_string()))
+    };
+    let optional_values = |array: Option<&ListArray>, i: usize| {
+        array.and_then(|values| {
+            if values.is_null(i) {
+                return None;
+            }
+            let values = values.value(i);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|index| values.value(index).to_string()).collect())
+        })
+    };
 
     for i in 0..batch.num_rows() {
         out.push(DocumentHit {
@@ -1025,6 +1050,15 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
             chunk_idx: chunk_idx.value(i),
             text: text.value(i).to_string(),
             mime_type: mime.value(i).to_string(),
+            facets: DocumentFacets {
+                doc_type: optional_value(doc_type, i),
+                section: optional_value(section, i),
+                jurisdiction: optional_value(jurisdiction, i),
+                doc_date: optional_value(doc_date, i),
+                keywords: optional_values(keywords, i),
+                entities: optional_values(entities, i),
+                summary: optional_value(summary, i),
+            },
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
             distance: distance.map(|d| d.value(i)).unwrap_or(0.0),
@@ -1072,19 +1106,10 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-/// Single-quote escape for the simple SQL-literal predicates we use.
-///
-/// `pub(crate)` because the documents lexical lane builds its own scope predicate
-/// (`src/mcp/memory.rs`) rather than going through a store method, and must escape
-/// the scope the same way every predicate here does.
 pub(crate) fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Predicate selecting a whole `(scope, visibility, agent_id)` memory namespace.
-///
-/// Used by [`LanceStore::search_memory`] so an individual search can never surface another
-/// agent's rows and a group search only sees group rows.
 fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> String {
     format!(
         "scope = '{}' AND visibility = '{}' AND agent_id = '{}'",
@@ -1094,9 +1119,6 @@ fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> 
     )
 }
 
-/// Predicate selecting exactly one memory row by `(scope, visibility, agent_id, key)`.
-///
-/// Used by [`LanceStore::upsert_memory`] (delete-then-insert) and [`LanceStore::delete_memory`].
 fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str) -> String {
     format!(
         "{} AND key = '{}'",
@@ -1105,8 +1127,6 @@ fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str
     )
 }
 
-/// Convenience: current time as microseconds since unix epoch, saturating on
-/// the (effectively impossible) clock-before-epoch case.
 pub fn now_micros() -> i64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)

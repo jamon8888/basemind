@@ -170,6 +170,85 @@ fn basemind_lexical(
     crate::lance::fts::search_relaxed_on(lance, terms, predicate, limit, max_relaxations)
 }
 
+#[cfg(feature = "documents")]
+fn basemind_phrase(
+    lance: &crate::lance::LanceStore,
+    phrase: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_phrase_on(lance, phrase, predicate, limit)
+}
+
+#[cfg(feature = "documents")]
+fn basemind_exact(
+    lance: &crate::lance::LanceStore,
+    term: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_exact_on(lance, term, predicate, limit)
+}
+
+#[cfg(feature = "documents")]
+fn facets_to_wire(facets: crate::lance::DocumentFacets) -> (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>) {
+    let keywords = facets
+        .keywords
+        .unwrap_or_default()
+        .into_iter()
+        .map(|text| DocKeyword {
+            text,
+            score: 0.0,
+            algorithm: "stored".to_string(),
+        })
+        .collect();
+    let entities = facets
+        .entities
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entity| {
+            let (category, text) = entity.split_once(':')?;
+            Some(DocEntity {
+                category: category.to_string(),
+                text: text.to_string(),
+                start: 0,
+                end: text.len() as u32,
+                confidence: None,
+            })
+        })
+        .collect();
+    let summary = facets.summary.map(|text| DocSummary {
+        text,
+        // Lance stores the normalized summary text; the current document
+        // pipeline only persists extractive summaries, so preserve the wire
+        // contract expected by existing clients.
+        strategy: "extractive".to_string(),
+        token_count: None,
+    });
+    (keywords, entities, summary)
+}
+
+#[cfg(feature = "documents")]
+fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32) -> DocumentSearchHit {
+    let (keywords, entities, summary) = facets_to_wire(hit.facets);
+    DocumentSearchHit {
+        path: hit.path,
+        chunk_idx: hit.chunk_idx,
+        text: hit.text,
+        mime_type: hit.mime_type,
+        byte_start: hit.byte_start,
+        byte_end: hit.byte_end,
+        distance,
+        matched_lanes: vec!["lexical".to_string()],
+        retrieval_mode: "lexical".to_string(),
+        citation: hit.cites.lines().next().map(str::to_string),
+        rerank_score: None,
+        keywords,
+        entities,
+        summary,
+    }
+}
+
 /// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
@@ -450,7 +529,7 @@ pub(super) async fn run_memory_search(
     let limit = params.limit.unwrap_or(10).min(100) as usize;
     if limit == 0 {
         return Err(McpError::invalid_params(
-            "memory search limit must be greater than zero",
+            "document search limit must be greater than zero",
             None,
         ));
     }
@@ -598,13 +677,30 @@ pub(super) async fn run_search_documents(
     };
 
     let limit = params.limit.unwrap_or(10).min(100) as usize;
-    if limit == 0 {
-        return Err(McpError::invalid_params(
-            "document search limit must be greater than zero",
-            None,
-        ));
-    }
     let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
+    let facet_filter = crate::lance::DocumentFacetFilter {
+        doc_type: crate::extract::doc::facets::doc_type(params.doc_type.as_deref()),
+        section: crate::extract::doc::facets::section(params.section.as_deref()),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(params.jurisdiction.as_deref()),
+        doc_date: crate::extract::doc::facets::doc_date(params.doc_date.as_deref()),
+    };
+    let facet_sql = {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("doc_type", facet_filter.doc_type.as_deref()),
+            ("section", facet_filter.section.as_deref()),
+            ("jurisdiction", facet_filter.jurisdiction.as_deref()),
+            ("doc_date", facet_filter.doc_date.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!(
+                    "({column} IS NULL OR {column} = '{}')",
+                    crate::lance::escape_sql_literal(value)
+                ));
+            }
+        }
+        clauses.join(" AND ")
+    };
 
     // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
     // reaching for it would embed the query and download a model to answer a question that does
@@ -612,9 +708,6 @@ pub(super) async fn run_search_documents(
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
     let has_metadata_filters = params.entity_category.is_some() || params.keywords_contains.is_some();
-    // Metadata is attached from the document blob after the Lance query. Fetch a bounded surplus
-    // when those filters are active so selective pages do not repeatedly revisit the same raw
-    // candidates; the cursor still advances by the raw candidates consumed.
     let candidate_limit = if has_metadata_filters {
         limit.saturating_mul(8).clamp(limit, 1_000)
     } else {
@@ -635,6 +728,8 @@ pub(super) async fn run_search_documents(
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
+        let facet_sql_for_lane = facet_sql.clone();
+        let mime_for_lane = params.mime_type.clone();
         let generation = lance.document_generation();
         let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
         let fetch_limit = offset
@@ -645,9 +740,68 @@ pub(super) async fn run_search_documents(
             if invalidated {
                 return Ok(Vec::new());
             }
-            let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
-            let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
-            basemind_lexical(&lance, &terms, &predicate, fetch_limit, max_relaxations)
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime_for_lane.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            if !facet_sql_for_lane.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql_for_lane);
+            }
+            let phrases = crate::lance::fts::quoted_phrases(&query);
+            let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
+            let mut merged = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
+                }
+            }
+            for phrase in phrases {
+                if merged.len() >= fetch_limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
+                }
+            }
+            if !terms.is_empty() && merged.len() < fetch_limit {
+                for hit in basemind_lexical(&lance, &terms, &predicate, fetch_limit, max_relaxations)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(hit);
+                    }
+                }
+            }
+            merged.truncate(fetch_limit);
+            Ok::<Vec<crate::lance::fts::LexicalHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
@@ -657,20 +811,8 @@ pub(super) async fn run_search_documents(
             .into_iter()
             .skip(offset)
             .take(candidate_limit)
-            .map(|h| DocumentSearchHit {
-                path: h.path,
-                chunk_idx: h.chunk_idx,
-                text: h.text,
-                mime_type: h.mime_type,
-                byte_start: h.byte_start,
-                byte_end: h.byte_end,
-                // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
-                distance: 0.0,
-                rerank_score: None,
-                keywords: Vec::new(),
-                entities: Vec::new(),
-                summary: None,
-            })
+            // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
+            .map(|h| lexical_hit_to_document_hit(h, 0.0))
             .collect();
         let raw_page_len = hits.len();
         (
@@ -686,6 +828,8 @@ pub(super) async fn run_search_documents(
         let lance = lance_store(state).await?;
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
+        let query = params.query.clone();
+        let facet_filter_for_lane = facet_filter.clone();
         let generation = lance.document_generation();
         let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
         let fetch_limit = offset
@@ -696,30 +840,97 @@ pub(super) async fn run_search_documents(
             if invalidated {
                 return Ok(Vec::new());
             }
-            lance.search_documents(&scope_for_lane, embedding, fetch_limit, mime.as_deref())
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            if !facet_sql.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql);
+            }
+            let mut merged = Vec::with_capacity(fetch_limit);
+            let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
+                }
+            }
+            for phrase in crate::lance::fts::quoted_phrases(&query) {
+                if merged.len() >= fetch_limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
+                }
+            }
+            if merged.len() < fetch_limit {
+                for hit in lance.search_documents_filtered(
+                    &scope_for_lane,
+                    embedding,
+                    fetch_limit,
+                    mime.as_deref(),
+                    Some(&facet_filter_for_lane),
+                )? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        let (keywords, entities, summary) = facets_to_wire(hit.facets.clone());
+                        merged.push(DocumentSearchHit {
+                            path: hit.path,
+                            chunk_idx: hit.chunk_idx,
+                            text: hit.text,
+                            mime_type: hit.mime_type,
+                            byte_start: hit.byte_start,
+                            byte_end: hit.byte_end,
+                            distance: hit.distance,
+                            matched_lanes: vec!["vector".to_string()],
+                            retrieval_mode: "vector".to_string(),
+                            citation: None,
+                            rerank_score: None,
+                            keywords,
+                            entities,
+                            summary,
+                        });
+                    }
+                    if merged.len() >= fetch_limit {
+                        break;
+                    }
+                }
+            }
+            merged.truncate(fetch_limit);
+            Ok::<Vec<DocumentSearchHit>, anyhow::Error>(merged)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
         let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
-        let hits: Vec<DocumentSearchHit> = hits_raw
-            .into_iter()
-            .skip(offset)
-            .take(candidate_limit)
-            .map(|h| DocumentSearchHit {
-                path: h.path,
-                chunk_idx: h.chunk_idx,
-                text: h.text,
-                mime_type: h.mime_type,
-                byte_start: h.byte_start,
-                byte_end: h.byte_end,
-                distance: h.distance,
-                rerank_score: None,
-                keywords: Vec::new(),
-                entities: Vec::new(),
-                summary: None,
-            })
-            .collect();
+        let hits: Vec<DocumentSearchHit> = hits_raw.into_iter().skip(offset).take(candidate_limit).collect();
         let raw_page_len = hits.len();
         (
             hits,
@@ -738,14 +949,6 @@ pub(super) async fn run_search_documents(
         params.keywords_contains.as_deref(),
     )
     .await?;
-
-    // Budget the raw page before reranking. The kept items are therefore a prefix of the raw
-    // result stream, so the next cursor can advance without duplicating or skipping hits when a
-    // reranker changes their order.
-    let budget = super::budget::apply_budget(std::mem::take(&mut hits), params.max_tokens);
-    let budgeted = budget.budgeted;
-    let budget_kept_len = budget.items.len();
-    hits = budget.items;
 
     if reranker_enabled && !hits.is_empty() {
         let cfg = &state.shared.config.documents.reranker;
@@ -811,8 +1014,6 @@ pub(super) async fn run_search_documents(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
-    // The candidate surplus is only an internal filtering/reranking buffer; the public page size
-    // remains the caller's requested limit.
     hits.truncate(limit);
 
     let output_format = match params.format.as_deref().map(str::trim) {
@@ -821,6 +1022,9 @@ pub(super) async fn run_search_documents(
         _ => output_format,
     };
 
+    let budget = super::budget::apply_budget(hits, params.max_tokens);
+    let budgeted = budget.budgeted;
+    let budget_kept_len = budget.items.len();
     let page_start = cursor_offset.saturating_sub(raw_page_len as u64);
     let next_offset = if budgeted {
         page_start.saturating_add(budget_kept_len as u64)
@@ -840,7 +1044,7 @@ pub(super) async fn run_search_documents(
         &SearchDocumentsResponse {
             query: params.query,
             budgeted,
-            hits,
+            hits: budget.items,
             next_cursor,
             cursor_invalidated,
             elapsed_us: elapsed_us(__body),
@@ -849,9 +1053,6 @@ pub(super) async fn run_search_documents(
     )
 }
 
-// The cursor is opaque but deliberately not a bearer capability: its payload is integrity-checked
-// only by the generation/fingerprint match. Keep the amount of skipped work bounded even when a
-// caller forges a syntactically valid offset.
 const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 10_000;
 
 fn document_query_fingerprint(
@@ -924,91 +1125,89 @@ fn document_cursor_offset(
 /// query) — a missing blob is not an error.
 #[cfg(feature = "documents")]
 async fn attach_doc_metadata(
-    state: &ServerState,
+    _state: &ServerState,
     hits: &mut Vec<DocumentSearchHit>,
     entity_category: Option<&str>,
     keywords_contains: Option<&str>,
 ) -> Result<(), McpError> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut unique_paths: Vec<String> = Vec::with_capacity(hits.len());
-    {
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        for h in hits.iter() {
-            if seen.insert(h.path.as_str()) {
-                unique_paths.push(h.path.clone());
-            }
-        }
-    }
-
-    let pairs: Vec<(String, std::path::PathBuf)> = {
-        let store = state.shared.store.read().await;
-        unique_paths
-            .iter()
-            .filter_map(|p| {
-                store
-                    .lookup(p.as_str())
-                    .map(|entry| (p.clone(), store.blob_path_doc_hex(&entry.hash_hex)))
-            })
-            .collect()
-    };
-
-    type DocMeta = (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>);
-    let meta: ahash::AHashMap<String, Arc<DocMeta>> = tokio::task::spawn_blocking(move || {
-        let mut out: ahash::AHashMap<String, Arc<DocMeta>> = ahash::AHashMap::with_capacity(pairs.len());
-        for (path, blob_path) in pairs {
-            if !blob_path.exists() {
-                continue;
-            }
-            let bytes = match std::fs::read(&blob_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "read doc blob for metadata attach failed");
-                    continue;
-                }
-            };
-            match rmp_serde::from_slice::<crate::extract::doc::FileMapDoc>(&bytes) {
-                Ok(doc) => {
-                    out.insert(path, Arc::new((doc.keywords, doc.entities, doc.summary)));
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "decode doc blob for metadata attach failed");
-                }
-            }
-        }
-        out
-    })
-    .await
-    .unwrap_or_default();
-
     let cat_needle = entity_category.map(|s| s.to_lowercase());
     let kw_needle = keywords_contains.map(|s| s.to_lowercase());
 
     hits.retain_mut(|hit| {
-        let meta_arc = meta.get(&hit.path).cloned();
-
-        if let Some(needle) = cat_needle.as_deref() {
-            let ents = meta_arc.as_ref().map(|m| m.1.as_slice()).unwrap_or(&[]);
-            if !ents.iter().any(|e| e.category.to_lowercase().contains(needle)) {
-                return false;
-            }
+        if let Some(needle) = cat_needle.as_deref()
+            && !hit
+                .entities
+                .iter()
+                .any(|entity| entity.category.to_lowercase().contains(needle))
+        {
+            return false;
         }
-        if let Some(needle) = kw_needle.as_deref() {
-            let kws = meta_arc.as_ref().map(|m| m.0.as_slice()).unwrap_or(&[]);
-            if !kws.iter().any(|k| k.text.to_lowercase().contains(needle)) {
-                return false;
-            }
-        }
-
-        if let Some(m) = meta_arc {
-            hit.keywords = m.0.clone();
-            hit.entities = m.1.clone();
-            hit.summary = m.2.clone();
+        if let Some(needle) = kw_needle.as_deref()
+            && !hit
+                .keywords
+                .iter()
+                .any(|keyword| keyword.text.to_lowercase().contains(needle))
+        {
+            return false;
         }
         true
     });
     Ok(())
+}
+
+#[cfg(all(test, feature = "documents"))]
+mod document_cursor_tests {
+    use super::*;
+    use crate::mcp::cursor::Cursor;
+
+    fn params() -> SearchDocumentsParams {
+        SearchDocumentsParams {
+            query: "alpha".to_string(),
+            limit: Some(10),
+            max_tokens: None,
+            format: None,
+            mime_type: None,
+            doc_type: None,
+            section: None,
+            jurisdiction: None,
+            doc_date: None,
+            scope: Some("repo".to_string()),
+            entity_category: None,
+            keywords_contains: None,
+            cursor: None,
+            overrides: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cursor_generation_and_query_mismatch_invalidates() {
+        let params = params();
+        let fingerprint = document_query_fingerprint(&params, "repo", false, 0, false, 0, None);
+        let cursor = Cursor::encode_documents(10, 4, fingerprint);
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 4, fingerprint).unwrap(),
+            (10, false)
+        );
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 5, fingerprint).unwrap(),
+            (0, true)
+        );
+        assert_eq!(
+            document_cursor_offset(Some(&cursor), 4, fingerprint.wrapping_add(1)).unwrap(),
+            (0, true)
+        );
+        let oversized = Cursor::encode_documents(MAX_DOCUMENT_CURSOR_OFFSET + 1, 4, fingerprint);
+        assert!(document_cursor_offset(Some(&oversized), 4, fingerprint).is_err());
+
+        let mut newline_params = params;
+        newline_params.query = "alpha\nrepo".to_string();
+        let first = document_query_fingerprint(&newline_params, "repo", false, 0, false, 0, None);
+        let mut shifted = newline_params;
+        shifted.query = "alpha".to_string();
+        shifted.mime_type = Some("repo\n".to_string());
+        let second = document_query_fingerprint(&shifted, "repo", false, 0, false, 0, None);
+        assert_ne!(first, second);
+    }
 }
 
 #[cfg(all(test, feature = "crawl"))]
@@ -1031,53 +1230,5 @@ mod scope_tests {
         assert_ne!(resolve_doc_scope(None, repo_scope), write_scope);
 
         assert_eq!(resolve_doc_scope(Some(&write_scope), repo_scope), write_scope);
-    }
-}
-
-#[cfg(all(test, feature = "documents"))]
-mod document_cursor_tests {
-    use super::*;
-    use crate::mcp::cursor::Cursor;
-
-    #[test]
-    fn cursor_generation_and_query_mismatch_invalidates() {
-        let params = SearchDocumentsParams {
-            query: "alpha".to_string(),
-            limit: Some(10),
-            max_tokens: None,
-            format: None,
-            mime_type: None,
-            scope: Some("repo".to_string()),
-            entity_category: None,
-            keywords_contains: None,
-            cursor: None,
-            overrides: Default::default(),
-        };
-        let fingerprint = document_query_fingerprint(&params, "repo", false, 0, false, 0, None);
-        let cursor = Cursor::encode_documents(10, 4, fingerprint);
-        assert_eq!(
-            document_cursor_offset(Some(&cursor), 4, fingerprint).expect("cursor"),
-            (10, false)
-        );
-        assert_eq!(
-            document_cursor_offset(Some(&cursor), 5, fingerprint).expect("stale generation"),
-            (0, true)
-        );
-        assert_eq!(
-            document_cursor_offset(Some(&cursor), 4, fingerprint.wrapping_add(1)).expect("different query"),
-            (0, true)
-        );
-
-        let oversized = Cursor::encode_documents(MAX_DOCUMENT_CURSOR_OFFSET + 1, 4, fingerprint);
-        assert!(document_cursor_offset(Some(&oversized), 4, fingerprint).is_err());
-
-        let mut newline_params = params;
-        newline_params.query = "alpha\nrepo".to_string();
-        let newline_fingerprint = document_query_fingerprint(&newline_params, "repo", false, 0, false, 0, None);
-        let mut shifted_params = newline_params;
-        shifted_params.query = "alpha".to_string();
-        shifted_params.mime_type = Some("repo\n".to_string());
-        let shifted_fingerprint = document_query_fingerprint(&shifted_params, "repo", false, 0, false, 0, None);
-        assert_ne!(newline_fingerprint, shifted_fingerprint);
     }
 }

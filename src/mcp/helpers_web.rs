@@ -235,23 +235,30 @@ async fn run_web_scrape(state: &ServerState, params: WebScrapeParams) -> Result<
         let lance = lance_store(state).await?;
         let embedder = embedder(state).await?;
         let documents_cfg = state.shared.config.documents.clone();
+        let fts_cfg = documents_cfg.fts.clone();
+        let lance_for_block = Arc::clone(&lance);
         let scope_for_block = scope.clone();
         let final_url_for_block = result.final_url.clone();
         let mime_for_block = result.content_type.clone();
+        let extract_citations = params.scope.is_some() && documents_cfg.citations.extract;
         let indexed = tokio::task::spawn_blocking(move || {
             index_page(
-                lance.as_ref(),
+                lance_for_block.as_ref(),
                 &embedder,
                 &documents_cfg,
                 &scope_for_block,
                 &final_url_for_block,
                 &mime_for_block,
                 &body_text,
+                extract_citations,
             )
         })
         .await
         .map_err(|e| mcp_internal("spawn_blocking", e))?
         .map_err(|e| mcp_internal("index_page", e))?;
+
+        crate::lance::fts::build_index_after_ingest(lance.as_ref(), &fts_cfg)
+            .map_err(|e| mcp_internal("build document FTS indexes", e))?;
 
         WebScrapeResponse {
             url: url_str,
@@ -355,6 +362,7 @@ async fn run_web_crawl(
         let mime_for_block = page.content_type.clone();
         let status_code = page.status_code;
         let normalized_url = page.normalized_url.clone();
+        let extract_citations = params.scope.is_some() && docs_for_block.citations.extract;
 
         outcomes.push(None);
 
@@ -369,6 +377,7 @@ async fn run_web_crawl(
                     &path_for_block,
                     &mime_for_block,
                     &body_text,
+                    extract_citations,
                 )
             })
             .await;
@@ -425,6 +434,9 @@ async fn run_web_crawl(
     }
 
     let outcomes: Vec<WebCrawlPageOutcome> = outcomes.into_iter().flatten().collect();
+
+    crate::lance::fts::build_index_after_ingest(lance.as_ref(), &documents_cfg.fts)
+        .map_err(|e| mcp_internal("build document FTS indexes", e))?;
 
     json_result(&WebCrawlResponse {
         seed_url: url_str,
