@@ -35,7 +35,7 @@ use crate::extract::doc_guard::ChunkCutovers;
 use crate::hashing::{self, Hash};
 #[cfg(feature = "graphrag")]
 use crate::lance::DocEntitySidecar;
-use crate::lance::{DocumentRow, PendingBatch};
+use crate::lance::{DocumentFacets, DocumentRow, PendingBatch};
 use crate::pii::{ChunkSpan, FindingInput};
 use crate::scanner::EmbedMode;
 use crate::scanner_filter::Filters;
@@ -754,11 +754,20 @@ fn build_doc_rows(
     scope: &str,
     citations: &crate::config::CitationsConfig,
 ) -> Vec<DocumentRow> {
+    let FileMapDoc {
+        mime_type,
+        rehydration_ref,
+        metadata,
+        keywords,
+        entities,
+        summary,
+        chunks,
+        ..
+    } = doc;
     let scope_owned = scope.to_string();
     let rel_owned = rel.to_string();
-    let mime_owned = doc.mime_type;
-    let rehydration_ref = doc.rehydration_ref;
-    doc.chunks
+    let mime_owned = mime_type;
+    chunks
         .into_iter()
         .enumerate()
         .map(|(idx, chunk)| {
@@ -777,6 +786,13 @@ fn build_doc_rows(
                 path: rel_owned.clone(),
                 chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
                 mime_type: mime_owned.clone(),
+                facets: document_facets(
+                    &metadata,
+                    &keywords,
+                    &entities,
+                    summary.as_ref().map(|summary| summary.text.as_str()),
+                    &chunk.heading_path,
+                ),
                 text: chunk.text.clone(),
                 text_phrase: chunk.text,
                 heading_path: chunk.heading_path,
@@ -788,6 +804,42 @@ fn build_doc_rows(
             }
         })
         .collect()
+}
+
+fn document_facets(
+    metadata: &[(String, String)],
+    keywords: &[crate::extract::doc::DocKeyword],
+    entities: &[crate::extract::doc::DocEntity],
+    summary: Option<&str>,
+    heading_path: &str,
+) -> DocumentFacets {
+    let metadata_value = |key: &str| {
+        metadata
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    };
+    DocumentFacets {
+        doc_type: crate::extract::doc::facets::doc_type(metadata_value("doc_type")),
+        section: crate::extract::doc::facets::section_from_heading(Some(heading_path)),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(metadata_value("jurisdiction")),
+        doc_date: crate::extract::doc::facets::doc_date(metadata_value("doc_date")),
+        keywords: (!keywords.is_empty()).then(|| {
+            keywords
+                .iter()
+                .map(|keyword| keyword.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        entities: (!entities.is_empty()).then(|| {
+            entities
+                .iter()
+                .map(|entity| format!("{}:{}", entity.category, entity.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        summary: summary.map(str::to_string),
+    }
 }
 
 /// Purge the LanceDB `documents` rows AND the `index.doc_files` entries of docs that no longer

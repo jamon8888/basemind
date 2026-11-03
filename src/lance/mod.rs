@@ -108,12 +108,31 @@ pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
 pub const MEMORY_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;
 
 /// One row in the `documents` table.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFacets {
+    /// Caller-curated document type; absent values remain `None`.
+    pub doc_type: Option<String>,
+    /// Deterministic section role derived from the heading breadcrumb when recognized.
+    pub section: Option<String>,
+    /// Caller-curated jurisdiction code.
+    pub jurisdiction: Option<String>,
+    /// Caller-curated ISO-8601 date.
+    pub doc_date: Option<String>,
+    /// Newline-separated extracted keyword values.
+    pub keywords: Option<String>,
+    /// Newline-separated `category:value` entity values.
+    pub entities: Option<String>,
+    /// Document-level summary text.
+    pub summary: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub scope: String,
     pub path: String,
     pub chunk_idx: u32,
     pub mime_type: String,
+    pub facets: DocumentFacets,
     pub text: String,
     /// Unmodified copy of the chunk text used by the positional phrase index.
     pub text_phrase: String,
@@ -724,11 +743,25 @@ async fn ensure_table(connection: &Connection, name: &str, schema: arrow_schema:
     Ok(())
 }
 
+fn append_optional(builder: &mut StringBuilder, value: Option<&str>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
 fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> {
     let mut scope = StringBuilder::new();
     let mut path = StringBuilder::new();
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
+    let mut doc_type = StringBuilder::new();
+    let mut section = StringBuilder::new();
+    let mut jurisdiction = StringBuilder::new();
+    let mut doc_date = StringBuilder::new();
+    let mut keywords = StringBuilder::new();
+    let mut entities = StringBuilder::new();
+    let mut summary = StringBuilder::new();
     let mut text = StringBuilder::new();
     let mut text_phrase = StringBuilder::new();
     let mut heading_path = StringBuilder::new();
@@ -754,6 +787,13 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         path.append_value(&r.path);
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
+        append_optional(&mut doc_type, r.facets.doc_type.as_deref());
+        append_optional(&mut section, r.facets.section.as_deref());
+        append_optional(&mut jurisdiction, r.facets.jurisdiction.as_deref());
+        append_optional(&mut doc_date, r.facets.doc_date.as_deref());
+        append_optional(&mut keywords, r.facets.keywords.as_deref());
+        append_optional(&mut entities, r.facets.entities.as_deref());
+        append_optional(&mut summary, r.facets.summary.as_deref());
         text.append_value(&r.text);
         text_phrase.append_value(&r.text_phrase);
         // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
@@ -791,6 +831,13 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(path.finish()),
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
+            Arc::new(doc_type.finish()),
+            Arc::new(section.finish()),
+            Arc::new(jurisdiction.finish()),
+            Arc::new(doc_date.finish()),
+            Arc::new(keywords.finish()),
+            Arc::new(entities.finish()),
+            Arc::new(summary.finish()),
             Arc::new(text.finish()),
             Arc::new(text_phrase.finish()),
             Arc::new(heading_path.finish()),

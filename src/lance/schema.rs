@@ -14,6 +14,13 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `path`      UTF-8     repo-relative path of the source file
 /// - `chunk_idx` UInt32    0-based index of this chunk within the file
 /// - `mime_type` UTF-8     IANA MIME type xberg detected
+/// - `doc_type` UTF-8 nullable caller-curated document type
+/// - `section` UTF-8 nullable deterministic section role
+/// - `jurisdiction` UTF-8 nullable caller-curated jurisdiction
+/// - `doc_date` UTF-8 nullable ISO-8601 document date
+/// - `keywords` UTF-8 nullable newline-separated extracted keywords
+/// - `entities` UTF-8 nullable newline-separated `category:value` entities
+/// - `summary` UTF-8 nullable document-level summary
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
 /// - `text_phrase` UTF-8  an unstemmed copy of `text` used by the positional phrase index
 /// - `heading_path`  UTF-8  the Markdown heading breadcrumb the chunk sits under, `""` when it has
@@ -36,6 +43,13 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_idx", DataType::UInt32, false),
         Field::new("mime_type", DataType::Utf8, false),
+        Field::new("doc_type", DataType::Utf8, true),
+        Field::new("section", DataType::Utf8, true),
+        Field::new("jurisdiction", DataType::Utf8, true),
+        Field::new("doc_date", DataType::Utf8, true),
+        Field::new("keywords", DataType::Utf8, true),
+        Field::new("entities", DataType::Utf8, true),
+        Field::new("summary", DataType::Utf8, true),
         Field::new("text", DataType::Utf8, false),
         Field::new("text_phrase", DataType::Utf8, false),
         Field::new("heading_path", DataType::Utf8, false),
