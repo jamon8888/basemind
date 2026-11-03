@@ -965,7 +965,7 @@ fn build_code_chunks_batch(dim: u16, rows: &[CodeRow]) -> Result<RecordBatch> {
 
 #[cfg(feature = "code-search")]
 fn decode_code_chunk_hits(batch: &RecordBatch, out: &mut Vec<CodeChunkHit>) -> Result<()> {
-    use arrow_array::{Float32Array, ListArray, UInt32Array};
+    use arrow_array::{Float32Array, UInt32Array};
     let str_col = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
