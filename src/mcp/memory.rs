@@ -219,7 +219,10 @@ fn facets_to_wire(facets: crate::lance::DocumentFacets) -> (Vec<DocKeyword>, Vec
         .collect();
     let summary = facets.summary.map(|text| DocSummary {
         text,
-        strategy: "stored".to_string(),
+        // Lance stores the normalized summary text; the current document
+        // pipeline only persists extractive summaries, so preserve the wire
+        // contract expected by existing clients.
+        strategy: "extractive".to_string(),
         token_count: None,
     });
     (keywords, entities, summary)

@@ -53,7 +53,18 @@ pub(crate) fn doc_date(value: Option<&str>) -> Option<String> {
     {
         return None;
     }
-    Some(value.to_string())
+    let year: u32 = value[..4].parse().ok()?;
+    let month: u32 = value[5..7].parse().ok()?;
+    let day: u32 = value[8..].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (1..=max_day).contains(&day).then(|| value.to_string())
 }
 
 /// Classify a Markdown heading breadcrumb without guessing when no rule matches.
@@ -71,7 +82,7 @@ pub(crate) fn section_from_heading(heading_path: Option<&str>) -> Option<String>
     rules.iter().find_map(|(section, needles)| {
         needles
             .iter()
-            .any(|needle| heading.contains(needle))
+            .any(|needle| starts_word(&heading, needle))
             .then(|| (*section).to_string())
     })
 }
@@ -79,6 +90,16 @@ pub(crate) fn section_from_heading(heading_path: Option<&str>) -> Option<String>
 fn normalize_vocab(value: Option<&str>, vocabulary: &[&str]) -> Option<String> {
     let value = value?.trim().to_ascii_lowercase();
     (!value.is_empty() && vocabulary.contains(&value.as_str())).then_some(value)
+}
+
+fn starts_word(heading: &str, needle: &str) -> bool {
+    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+    finder.find_iter(heading.as_bytes()).any(|start| {
+        heading[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric())
+    })
 }
 
 #[cfg(test)]
@@ -101,6 +122,8 @@ mod tests {
     fn dates_require_iso_calendar_shape() {
         assert_eq!(doc_date(Some("2026-11-03")), Some("2026-11-03".into()));
         assert_eq!(doc_date(Some("11/03/2026")), None);
+        assert_eq!(doc_date(Some("2026-02-31")), None);
+        assert_eq!(doc_date(Some("2024-02-29")), Some("2024-02-29".into()));
     }
 
     #[test]
@@ -110,5 +133,6 @@ mod tests {
             Some("holding".into())
         );
         assert_eq!(section_from_heading(Some("IV. Termination")), None);
+        assert_eq!(section_from_heading(Some("Counterfacts")), None);
     }
 }
