@@ -45,6 +45,11 @@ ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
   cargo test --features documents,ort-dynamic --lib
 ```
 
+That same `documents,ort-dynamic` feature substitution applies to the
+feature-specific commands above (and to `full` when checking the Intel target):
+the plain `documents`/`full` variants ask `ort-sys` for a static ONNX Runtime
+link and are expected to fail on an Intel host that only has the runtime dylib.
+
 `ORT_DYLIB_PATH` must point to an x86_64 ONNX Runtime dylib. A runtime-only
 dylib cannot satisfy `ort-sys`'s static build requirements; the release packager
 vendors the pinned Intel-compatible dylib automatically.
