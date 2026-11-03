@@ -1,6 +1,8 @@
 //! Durable document-search generation sidecar and Lance schema migration helpers.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -24,8 +26,24 @@ pub(super) fn read_generation(path: &Path) -> Result<u64> {
 
 pub(super) fn bump_generation_file(path: &Path, current: u64) -> Result<u64> {
     let next = current.checked_add(1).unwrap_or(1);
-    let tmp = path.with_extension("generation.tmp");
-    std::fs::write(&tmp, next.to_string()).with_context(|| format!("write {}", tmp.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("generation"),
+        std::process::id(),
+        nonce
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(next.to_string().as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    file.sync_all().with_context(|| format!("sync {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
     Ok(next)
 }
@@ -46,6 +64,8 @@ pub(super) fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMet
         new_model = %expected.embedding_model,
         old_schema_ver = actual.schema_ver,
         new_schema_ver = expected.schema_ver,
+        old_tokenizer_config = %actual.tokenizer_config,
+        new_tokenizer_config = %expected.tokenizer_config,
         "lance store dim/model/schema mismatch — wiping {}",
         dir.display()
     );

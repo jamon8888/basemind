@@ -448,6 +448,12 @@ pub(super) async fn run_memory_search(
 ) -> Result<CallToolResult, McpError> {
     let __body = std::time::Instant::now();
     let limit = params.limit.unwrap_or(10).min(100) as usize;
+    if limit == 0 {
+        return Err(McpError::invalid_params(
+            "memory search limit must be greater than zero",
+            None,
+        ));
+    }
     let (_, owner) = namespace(state, params.visibility);
     let visibility = lance_visibility(params.visibility).to_string();
     let agent_id = owner.to_string();
@@ -592,6 +598,12 @@ pub(super) async fn run_search_documents(
     };
 
     let limit = params.limit.unwrap_or(10).min(100) as usize;
+    if limit == 0 {
+        return Err(McpError::invalid_params(
+            "document search limit must be greater than zero",
+            None,
+        ));
+    }
     let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
 
     // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
@@ -599,10 +611,20 @@ pub(super) async fn run_search_documents(
     // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
     // lane, and it answers through a store opened without an embedder.
     let lexical_only = !state.shared.config.documents.embed;
+    let has_metadata_filters = params.entity_category.is_some() || params.keywords_contains.is_some();
+    // Metadata is attached from the document blob after the Lance query. Fetch a bounded surplus
+    // when those filters are active so selective pages do not repeatedly revisit the same raw
+    // candidates; the cursor still advances by the raw candidates consumed.
+    let candidate_limit = if has_metadata_filters {
+        limit.saturating_mul(8).clamp(limit, 1_000)
+    } else {
+        limit
+    };
     let query_fingerprint = document_query_fingerprint(
         &params,
         &scope,
         lexical_only,
+        state.shared.config.documents.fusion.max_relaxations,
         reranker_enabled,
         reranker_top_k,
         explicit_preset.as_deref(),
@@ -616,7 +638,7 @@ pub(super) async fn run_search_documents(
         let generation = lance.document_generation();
         let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
         let fetch_limit = offset
-            .checked_add(limit)
+            .checked_add(candidate_limit)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
         let hits_raw = tokio::task::spawn_blocking(move || {
@@ -630,11 +652,11 @@ pub(super) async fn run_search_documents(
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
-        let has_more = hits_raw.len() > offset.saturating_add(limit);
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
         let hits: Vec<DocumentSearchHit> = hits_raw
             .into_iter()
             .skip(offset)
-            .take(limit)
+            .take(candidate_limit)
             .map(|h| DocumentSearchHit {
                 path: h.path,
                 chunk_idx: h.chunk_idx,
@@ -667,7 +689,7 @@ pub(super) async fn run_search_documents(
         let generation = lance.document_generation();
         let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
         let fetch_limit = offset
-            .checked_add(limit)
+            .checked_add(candidate_limit)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
         let hits_raw = tokio::task::spawn_blocking(move || {
@@ -679,11 +701,11 @@ pub(super) async fn run_search_documents(
         .await
         .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
         .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
-        let has_more = hits_raw.len() > offset.saturating_add(limit);
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
         let hits: Vec<DocumentSearchHit> = hits_raw
             .into_iter()
             .skip(offset)
-            .take(limit)
+            .take(candidate_limit)
             .map(|h| DocumentSearchHit {
                 path: h.path,
                 chunk_idx: h.chunk_idx,
@@ -789,6 +811,10 @@ pub(super) async fn run_search_documents(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
+    // The candidate surplus is only an internal filtering/reranking buffer; the public page size
+    // remains the caller's requested limit.
+    hits.truncate(limit);
+
     let output_format = match params.format.as_deref().map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case("toon") => crate::config::OutputFormat::Toon,
         Some(f) if f.eq_ignore_ascii_case("json") => crate::config::OutputFormat::Json,
@@ -801,7 +827,7 @@ pub(super) async fn run_search_documents(
     } else {
         cursor_offset
     };
-    let next_cursor = if !cursor_invalidated && limit > 0 && (has_more || budgeted) {
+    let next_cursor = if !cursor_invalidated && (has_more || budgeted) && next_offset <= MAX_DOCUMENT_CURSOR_OFFSET {
         Some(crate::mcp::cursor::Cursor::encode_documents(
             next_offset,
             cursor_generation,
@@ -823,25 +849,46 @@ pub(super) async fn run_search_documents(
     )
 }
 
-const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 100_000;
+// The cursor is opaque but deliberately not a bearer capability: its payload is integrity-checked
+// only by the generation/fingerprint match. Keep the amount of skipped work bounded even when a
+// caller forges a syntactically valid offset.
+const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 10_000;
 
 fn document_query_fingerprint(
     params: &SearchDocumentsParams,
     scope: &str,
     lexical_only: bool,
+    max_relaxations: u32,
     reranker_enabled: bool,
     reranker_top_k: usize,
     reranker_preset: Option<&str>,
 ) -> u64 {
-    let material = format!(
-        "{scope}\n{lexical_only}\n{reranker_enabled}\n{reranker_top_k}\n{}\n{}\n{}\n{}\n{}",
-        params.query,
+    let max_relaxations = max_relaxations.to_string();
+    let reranker_top_k = reranker_top_k.to_string();
+    let max_tokens = params.max_tokens.unwrap_or_default().to_string();
+    let fields = [
+        scope,
+        if lexical_only { "lexical" } else { "vector" },
+        max_relaxations.as_str(),
+        if reranker_enabled {
+            "reranker-on"
+        } else {
+            "reranker-off"
+        },
+        reranker_top_k.as_str(),
+        params.query.as_str(),
         params.mime_type.as_deref().unwrap_or_default(),
         params.entity_category.as_deref().unwrap_or_default(),
         params.keywords_contains.as_deref().unwrap_or_default(),
         reranker_preset.unwrap_or_default(),
-    );
-    let digest = blake3::hash(material.as_bytes());
+        max_tokens.as_str(),
+    ];
+    let mut material = Vec::new();
+    for field in fields {
+        material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        material.extend_from_slice(field.as_bytes());
+    }
+    let digest = blake3::hash(&material);
     u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("blake3 digest has 8 bytes"))
 }
 
@@ -1006,7 +1053,7 @@ mod document_cursor_tests {
             cursor: None,
             overrides: Default::default(),
         };
-        let fingerprint = document_query_fingerprint(&params, "repo", false, false, 0, None);
+        let fingerprint = document_query_fingerprint(&params, "repo", false, 0, false, 0, None);
         let cursor = Cursor::encode_documents(10, 4, fingerprint);
         assert_eq!(
             document_cursor_offset(Some(&cursor), 4, fingerprint).expect("cursor"),
@@ -1020,5 +1067,17 @@ mod document_cursor_tests {
             document_cursor_offset(Some(&cursor), 4, fingerprint.wrapping_add(1)).expect("different query"),
             (0, true)
         );
+
+        let oversized = Cursor::encode_documents(MAX_DOCUMENT_CURSOR_OFFSET + 1, 4, fingerprint);
+        assert!(document_cursor_offset(Some(&oversized), 4, fingerprint).is_err());
+
+        let mut newline_params = params;
+        newline_params.query = "alpha\nrepo".to_string();
+        let newline_fingerprint = document_query_fingerprint(&newline_params, "repo", false, 0, false, 0, None);
+        let mut shifted_params = newline_params;
+        shifted_params.query = "alpha".to_string();
+        shifted_params.mime_type = Some("repo\n".to_string());
+        let shifted_fingerprint = document_query_fingerprint(&shifted_params, "repo", false, 0, false, 0, None);
+        assert_ne!(newline_fingerprint, shifted_fingerprint);
     }
 }

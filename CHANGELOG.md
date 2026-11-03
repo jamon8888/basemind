@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
+- Document search supports opaque continuation cursors, with durable generation invalidation when the Lance index is rebuilt.
 
 ### Changed
 

@@ -104,6 +104,7 @@ fn accepted(mode: MemoryMode) -> &'static [&'static str] {
             "scope",
             "entity_category",
             "keywords_contains",
+            "cursor",
             "documents config overrides",
         ],
         MemoryMode::Mine => &["window", "min_support", "min_confidence", "max_files_per_commit"],
