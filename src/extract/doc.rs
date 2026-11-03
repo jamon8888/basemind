@@ -34,6 +34,7 @@ mod numbered_headings;
 use numbered_headings::{collect_numbered_headings, numbered_heading_path};
 mod chunking;
 pub(crate) mod citations;
+pub(crate) mod facets;
 #[cfg(test)]
 pub(crate) use chunking::dense_retrieval_text;
 #[cfg(feature = "crawl")]
