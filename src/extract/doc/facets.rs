@@ -27,7 +27,11 @@ pub(crate) fn section(value: Option<&str>) -> Option<String> {
 /// Normalize an ISO-ish jurisdiction code without trying to infer one from prose.
 pub(crate) fn jurisdiction(value: Option<&str>) -> Option<String> {
     let value = value?.trim();
-    if value.is_empty() || value.len() > 32 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == '-' || b == '_')
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return None;
     }
@@ -55,14 +59,14 @@ pub(crate) fn doc_date(value: Option<&str>) -> Option<String> {
 /// Classify a Markdown heading breadcrumb without guessing when no rule matches.
 pub(crate) fn section_from_heading(heading_path: Option<&str>) -> Option<String> {
     let heading = heading_path?.to_ascii_lowercase();
-    let rules = [
-        ("caption", ["caption", "case name", "docket"]),
-        ("facts", ["facts", "background"]),
-        ("issues", ["issues", "question presented"]),
-        ("argument", ["argument", "arguments", "analysis"]),
-        ("holding", ["holding", "decision", "disposition"]),
-        ("reasoning", ["reasoning", "discussion"]),
-        ("signature", ["signature", "signed"]),
+    let rules: &[(&str, &[&str])] = &[
+        ("caption", &["caption", "case name", "docket"]),
+        ("facts", &["facts", "background"]),
+        ("issues", &["issues", "question presented"]),
+        ("argument", &["argument", "arguments", "analysis"]),
+        ("holding", &["holding", "decision", "disposition"]),
+        ("reasoning", &["reasoning", "discussion"]),
+        ("signature", &["signature", "signed"]),
     ];
     rules.iter().find_map(|(section, needles)| {
         needles
