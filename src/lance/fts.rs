@@ -74,7 +74,7 @@ pub const KEYWORD_INDEXES: [(&str, &str); 2] = [
 /// The identifier column is kept in a separate trigram index so statute and docket lookups do not
 /// inherit stemming or stop-word removal from the topical keyword lane.
 pub const EXACT_INDEX: (&str, &str) = ("documents_cites_idx", "cites");
-pub const PHRASE_INDEX: (&str, &str) = ("documents_text_phrase_idx", "text");
+pub const PHRASE_INDEX: (&str, &str) = ("documents_text_phrase_idx", "text_phrase");
 
 /// The columns the keyword lane covers.
 ///
@@ -623,18 +623,18 @@ mod tests {
 
     #[test]
     fn phrase_lane_uses_positional_word_tokens() {
-        assert_eq!(PHRASE_INDEX, ("documents_text_phrase_idx", "text"));
+        assert_eq!(PHRASE_INDEX, ("documents_text_phrase_idx", "text_phrase"));
         let query = phrase_query("Smith v Acme").expect("phrase query builds");
         assert_eq!(
             query.columns(),
-            ["text".to_string()]
+            ["text_phrase".to_string()]
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>()
         );
         let FtsQuery::Phrase(phrase) = query.query else {
             panic!("quoted spans must use a positional phrase query");
         };
-        assert_eq!(phrase.column.as_deref(), Some("text"));
+        assert_eq!(phrase.column.as_deref(), Some("text_phrase"));
         assert_eq!(phrase.slop, 0);
         assert!(
             phrase_index_params(&FtsConfig::default())

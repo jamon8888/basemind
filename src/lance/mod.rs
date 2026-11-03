@@ -115,13 +115,15 @@ pub struct DocumentRow {
     pub chunk_idx: u32,
     pub mime_type: String,
     pub text: String,
+    /// Unmodified copy of the chunk text used by the positional phrase index.
+    pub text_phrase: String,
     /// The Markdown heading breadcrumb this chunk sits under, `""` when it has none.
     ///
     /// Carried all the way to the table because the keyword lane indexes it. It used to stop at
     /// [`crate::extract::doc::DocChunk`]: the extractor computed it, and nothing downstream ever
     /// read it, so the index built over a column that did not exist.
     pub heading_path: String,
-    /// Space-separated legal identifiers extracted from this chunk for exact retrieval.
+    /// Newline-separated legal identifiers extracted from this chunk for exact retrieval.
     pub cites: String,
     pub byte_start: u32,
     pub byte_end: u32,
@@ -728,6 +730,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
     let mut text = StringBuilder::new();
+    let mut text_phrase = StringBuilder::new();
     let mut heading_path = StringBuilder::new();
     let mut cites = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
@@ -752,6 +755,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
         text.append_value(&r.text);
+        text_phrase.append_value(&r.text_phrase);
         // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
         // so `""` is what "no breadcrumb" reads back as, and the tokenizer sees an empty document
         // rather than a missing value.
@@ -788,6 +792,7 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
             Arc::new(text.finish()),
+            Arc::new(text_phrase.finish()),
             Arc::new(heading_path.finish()),
             Arc::new(cites.finish()),
             Arc::new(byte_start.finish()),

@@ -236,7 +236,8 @@ pub struct DocChunk {
     /// the dense-only path would have skipped it. Empty for a chunk with no heading context.
     #[serde(default)]
     pub heading_path: String,
-    /// Legal identifiers extracted from the pre-redaction chunk text for exact retrieval.
+    /// Newline-separated legal identifiers extracted from the source chunk for exact retrieval,
+    /// excluding identifiers overlapping a redaction finding.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cites: String,
 }
@@ -762,16 +763,33 @@ pub(crate) fn extract_doc_with_metrics(
         .iter()
         .flat_map(|(_, value)| citations::extract_citations(value, 128))
         .collect();
-    let citation_sources: Vec<String> = if linear {
+    let citation_sources: Vec<(String, u32, u32)> = if linear {
         doc_guard::linear_chunk_spans(&result.content, config.max_characters, config.overlap)
             .into_iter()
-            .map(|(start, end)| result.content[start..end].to_string())
+            .map(|(start, end)| {
+                (
+                    result.content[start..end].to_string(),
+                    u32::try_from(start).unwrap_or(u32::MAX),
+                    u32::try_from(end).unwrap_or(u32::MAX),
+                )
+            })
             .collect()
     } else {
         result
             .chunks
             .as_ref()
-            .map(|chunks| chunks.iter().map(|chunk| chunk.content.clone()).collect())
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .map(|chunk| {
+                        (
+                            chunk.content.clone(),
+                            u32::try_from(chunk.metadata.byte_start).unwrap_or(u32::MAX),
+                            u32::try_from(chunk.metadata.byte_end).unwrap_or(u32::MAX),
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
@@ -824,12 +842,22 @@ pub(crate) fn extract_doc_with_metrics(
     let mut chunks: Vec<DocChunk> = Vec::new();
     let mut dense_inputs = Vec::new();
     let citation_for = |index: usize| {
-        let mut values = citation_sources
-            .get(index)
-            .map(|text| citations::extract_citations(text, 256))
-            .unwrap_or_default();
+        let Some((source, source_start, _source_end)) = citation_sources.get(index) else {
+            return String::new();
+        };
+        let mut values: Vec<String> = citations::extract_citation_spans(source, 256)
+            .into_iter()
+            .filter(|(_, start, end)| {
+                let start = source_start.saturating_add(u32::try_from(*start).unwrap_or(u32::MAX));
+                let end = source_start.saturating_add(u32::try_from(*end).unwrap_or(u32::MAX));
+                !redaction_findings
+                    .iter()
+                    .any(|finding| finding.start < end && finding.end > start)
+            })
+            .map(|(value, _, _)| value)
+            .collect();
         citations::filter_self_references(&mut values, &citation_exclusions);
-        values.join(" ")
+        values.join("\n")
     };
     let embed_requested = config.embed && !matches!(config.document_models, DocumentModelProfile::None_);
     if linear {
@@ -995,7 +1023,7 @@ pub(crate) fn extract_doc_with_metrics(
 /// re-labelling — SIREN/SIRET company identifiers — see [`crate::pii`]). Bumping the tag
 /// makes every redacted document re-extract once, so a cached blob whose findings were
 /// never re-labelled cannot be served alongside re-labelled ones.
-const REDACTION_PIPELINE_TAG: &str = "redaction-pipeline/2";
+const REDACTION_PIPELINE_TAG: &str = "redaction-pipeline/3";
 
 /// Deterministic fingerprint of a `RedactionConfig` (+ the pipeline tag) for cache
 /// invalidation. Two configs that produce identical redaction behaviour hash to the same

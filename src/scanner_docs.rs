@@ -766,10 +766,10 @@ fn build_doc_rows(
             let cites = if citations.extract {
                 chunk
                     .cites
-                    .split_ascii_whitespace()
+                    .lines()
                     .take(citations.max_per_chunk as usize)
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join("\n")
             } else {
                 String::new()
             };
@@ -778,7 +778,8 @@ fn build_doc_rows(
                 path: rel_owned.clone(),
                 chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
                 mime_type: mime_owned.clone(),
-                text: chunk.text,
+                text: chunk.text.clone(),
+                text_phrase: chunk.text,
                 heading_path: chunk.heading_path,
                 cites,
                 byte_start: chunk.byte_start,

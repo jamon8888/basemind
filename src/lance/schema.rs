@@ -15,6 +15,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 /// - `chunk_idx` UInt32    0-based index of this chunk within the file
 /// - `mime_type` UTF-8     IANA MIME type xberg detected
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
+/// - `text_phrase` UTF-8  an unstemmed copy of `text` used by the positional phrase index
 /// - `heading_path`  UTF-8  the Markdown heading breadcrumb the chunk sits under, `""` when it has
 ///   none. Its own column because the keyword lane indexes it (see [`crate::lance::fts`]), and
 ///   because Lance builds at most one inverted index per column. Computed unconditionally by the
@@ -36,6 +37,7 @@ pub fn documents_schema(dim: u16) -> SchemaRef {
         Field::new("chunk_idx", DataType::UInt32, false),
         Field::new("mime_type", DataType::Utf8, false),
         Field::new("text", DataType::Utf8, false),
+        Field::new("text_phrase", DataType::Utf8, false),
         Field::new("heading_path", DataType::Utf8, false),
         Field::new("cites", DataType::Utf8, false),
         Field::new("byte_start", DataType::UInt32, false),

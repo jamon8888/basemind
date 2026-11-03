@@ -1,6 +1,14 @@
 //! Bounded extraction of identifier-shaped legal citations for the exact retrieval lane.
 
 pub(crate) fn extract_citations(text: &str, max_per_chunk: usize) -> Vec<String> {
+    extract_citation_spans(text, max_per_chunk)
+        .into_iter()
+        .map(|(value, _, _)| value)
+        .collect()
+}
+
+/// Extract normalized citation values with their byte spans in `text`.
+pub(crate) fn extract_citation_spans(text: &str, max_per_chunk: usize) -> Vec<(String, usize, usize)> {
     if max_per_chunk == 0 {
         return Vec::new();
     }
@@ -42,9 +50,9 @@ pub(crate) fn extract_citations(text: &str, max_per_chunk: usize) -> Vec<String>
         let value = text[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
         if !out
             .iter()
-            .any(|existing: &String| existing.eq_ignore_ascii_case(&value))
+            .any(|(existing, _, _): &(String, usize, usize)| existing.eq_ignore_ascii_case(&value))
         {
-            out.push(value);
+            out.push((value, start, end));
         }
         i = end;
     }
@@ -57,7 +65,7 @@ pub(crate) fn filter_self_references(citations: &mut Vec<String>, excluded: &[St
 
 #[cfg(test)]
 mod tests {
-    use super::extract_citations;
+    use super::{extract_citation_spans, extract_citations};
     #[test]
     fn extracts_statute_and_docket_references() {
         assert_eq!(
@@ -78,5 +86,18 @@ mod tests {
     #[test]
     fn no_marker_requires_word_boundary() {
         assert_eq!(extract_citations("Reno. 2 is not a docket; No. 3 is", 8), vec!["No. 3"]);
+    }
+
+    #[test]
+    fn spans_cover_complete_identifier_values() {
+        let text = "see No. 2-24-1234 and § 362(a)(1)";
+        let spans = extract_citation_spans(text, 8);
+        assert_eq!(
+            spans.iter().map(|(value, _, _)| value).collect::<Vec<_>>(),
+            vec!["No. 2-24-1234", "§ 362(a)(1)"]
+        );
+        for (value, start, end) in spans {
+            assert_eq!(&text[start..end], value);
+        }
     }
 }

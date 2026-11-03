@@ -190,6 +190,23 @@ fn basemind_exact(
     crate::lance::fts::search_exact_on(lance, term, predicate, limit)
 }
 
+#[cfg(feature = "documents")]
+fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32) -> DocumentSearchHit {
+    DocumentSearchHit {
+        path: hit.path,
+        chunk_idx: hit.chunk_idx,
+        text: hit.text,
+        mime_type: hit.mime_type,
+        byte_start: hit.byte_start,
+        byte_end: hit.byte_end,
+        distance,
+        rerank_score: None,
+        keywords: Vec::new(),
+        entities: Vec::new(),
+        summary: None,
+    }
+}
+
 /// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
@@ -632,26 +649,45 @@ pub(super) async fn run_search_documents(
             let mut merged = Vec::new();
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                for hit in basemind_exact(&lance, &candidate, &predicate, limit)? {
-                    if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
-                        .iter()
-                        .any(|cite| cite.eq_ignore_ascii_case(&candidate))
-                    {
-                        continue;
+                match basemind_exact(&lance, &candidate, &predicate, limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= limit {
+                                break;
+                            }
+                        }
                     }
-                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
-                        merged.push(hit);
-                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
                 }
             }
             for phrase in phrases {
-                for hit in basemind_phrase(&lance, &phrase, &predicate, limit)? {
-                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
-                        merged.push(hit);
+                if merged.len() >= limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= limit {
+                                break;
+                            }
+                        }
                     }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
                 }
             }
-            if !terms.is_empty() {
+            if !terms.is_empty() && merged.len() < limit {
                 for hit in basemind_lexical(&lance, &terms, &predicate, limit, max_relaxations)? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(hit);
@@ -666,20 +702,8 @@ pub(super) async fn run_search_documents(
         .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
         hits_raw
             .into_iter()
-            .map(|h| DocumentSearchHit {
-                path: h.path,
-                chunk_idx: h.chunk_idx,
-                text: h.text,
-                mime_type: h.mime_type,
-                byte_start: h.byte_start,
-                byte_end: h.byte_end,
-                // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
-                distance: 0.0,
-                rerank_score: None,
-                keywords: Vec::new(),
-                entities: Vec::new(),
-                summary: None,
-            })
+            // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
+            .map(|h| lexical_hit_to_document_hit(h, 0.0))
             .collect()
     } else {
         let embedding = embed_query(state, &params.query).await?;
@@ -697,32 +721,46 @@ pub(super) async fn run_search_documents(
             let mut merged = Vec::with_capacity(limit);
             let mut seen = std::collections::HashSet::new();
             if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
-                for hit in basemind_exact(&lance, &candidate, &predicate, limit)? {
-                    if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
-                        .iter()
-                        .any(|cite| cite.eq_ignore_ascii_case(&candidate))
-                    {
-                        continue;
+                match basemind_exact(&lance, &candidate, &predicate, limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= limit {
+                                break;
+                            }
+                        }
                     }
-                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
-                        merged.push(DocumentSearchHit {
-                            path: hit.path,
-                            chunk_idx: hit.chunk_idx,
-                            text: hit.text,
-                            mime_type: hit.mime_type,
-                            byte_start: hit.byte_start,
-                            byte_end: hit.byte_end,
-                            distance: 0.0,
-                            rerank_score: None,
-                            keywords: Vec::new(),
-                            entities: Vec::new(),
-                            summary: None,
-                        });
-                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
                 }
             }
             for phrase in crate::lance::fts::quoted_phrases(&query) {
-                for hit in basemind_phrase(&lance, &phrase, &predicate, limit)? {
+                if merged.len() >= limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
+                }
+            }
+            if merged.len() < limit {
+                for hit in lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(DocumentSearchHit {
                             path: hit.path,
@@ -731,30 +769,16 @@ pub(super) async fn run_search_documents(
                             mime_type: hit.mime_type,
                             byte_start: hit.byte_start,
                             byte_end: hit.byte_end,
-                            distance: 0.0,
+                            distance: hit.distance,
                             rerank_score: None,
                             keywords: Vec::new(),
                             entities: Vec::new(),
                             summary: None,
                         });
                     }
-                }
-            }
-            for hit in lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())? {
-                if seen.insert((hit.path.clone(), hit.chunk_idx)) {
-                    merged.push(DocumentSearchHit {
-                        path: hit.path,
-                        chunk_idx: hit.chunk_idx,
-                        text: hit.text,
-                        mime_type: hit.mime_type,
-                        byte_start: hit.byte_start,
-                        byte_end: hit.byte_end,
-                        distance: hit.distance,
-                        rerank_score: None,
-                        keywords: Vec::new(),
-                        entities: Vec::new(),
-                        summary: None,
-                    });
+                    if merged.len() >= limit {
+                        break;
+                    }
                 }
             }
             merged.truncate(limit);

@@ -107,7 +107,7 @@ pub fn index_page(
                 &chunk.content,
                 documents_cfg.citations.max_per_chunk as usize,
             )
-            .join(" ")
+            .join("\n")
         } else {
             String::new()
         };
@@ -117,6 +117,7 @@ pub fn index_page(
             chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
             mime_type: mime_type.to_string(),
             text: chunk.content.clone(),
+            text_phrase: chunk.content.clone(),
             heading_path: crate::extract::doc::heading_path_of(chunk.metadata.heading_context.as_ref()),
             cites,
             byte_start,

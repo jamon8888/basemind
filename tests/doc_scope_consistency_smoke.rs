@@ -25,6 +25,7 @@ fn row(scope: &str, path: &str, chunk_idx: u32, text: &str, dim: usize) -> Vec<D
         chunk_idx,
         mime_type: "text/markdown".to_string(),
         text: text.to_string(),
+        text_phrase: text.to_string(),
         heading_path: String::new(),
         cites: String::new(),
         byte_start: 0,
