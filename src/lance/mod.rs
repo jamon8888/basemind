@@ -24,6 +24,7 @@ mod generation;
 /// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
 #[cfg(feature = "graphrag")]
 pub mod graph_api;
+mod predicates;
 
 #[cfg(feature = "graphrag")]
 pub mod graphrag;
@@ -1106,31 +1107,7 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-pub(crate) fn escape_sql_literal(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> String {
-    format!(
-        "scope = '{}' AND visibility = '{}' AND agent_id = '{}'",
-        escape_sql_literal(scope),
-        escape_sql_literal(visibility),
-        escape_sql_literal(agent_id),
-    )
-}
-
-fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str) -> String {
-    format!(
-        "{} AND key = '{}'",
-        memory_namespace_predicate(scope, visibility, agent_id),
-        escape_sql_literal(key),
-    )
-}
-
-pub fn now_micros() -> i64 {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
-}
+pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate, now_micros};
 
 #[cfg(test)]
 #[path = "tests.rs"]

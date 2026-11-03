@@ -43,6 +43,9 @@ use crate::store::Store;
 #[path = "scanner_doc_cache.rs"]
 mod cache;
 pub(crate) use cache::cached_doc_content_is_reusable;
+#[path = "scanner_docs_scope.rs"]
+mod scope;
+pub(crate) use scope::doc_scope_for;
 
 /// Per-file deferred-LanceDB-write descriptor. Constructed inside `process_file`'s parallel
 /// worker; consumed in the single-threaded apply pass via [`flush_document_batches`].
@@ -1083,38 +1086,6 @@ pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::confi
             "documents FTS index build failed; keyword search will miss rows until the next scan"
         );
     }
-}
-
-pub(crate) fn doc_scope_for<'a>(
-    rel: &str,
-    default_scope: &'a str,
-    config: &crate::config::Config,
-) -> std::borrow::Cow<'a, str> {
-    if !crate::path::is_external_key(rel.as_bytes()) {
-        return std::borrow::Cow::Borrowed(default_scope);
-    }
-    // Longest root wins, and the match is on a path-segment boundary: `/data/foo` must not claim
-    // `/data/foobar/x`.
-    let mut best: Option<String> = None;
-    for raw_root in &config.scan.extra_roots {
-        if let Ok(canonical) = raw_root.canonicalize()
-            && let Some(prefix) = canonical.to_str()
-        {
-            #[cfg(windows)]
-            let prefix = prefix.replace('\\', "/");
-            #[cfg(windows)]
-            let prefix = prefix.as_str();
-            let prefix = prefix.trim_end_matches('/');
-            let inside = rel == prefix || rel.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'));
-            if inside && best.as_ref().is_none_or(|b| prefix.len() > b.len()) {
-                best = Some(prefix.to_string());
-            }
-        }
-    }
-    if let Some(prefix) = best {
-        return std::borrow::Cow::Owned(format!("path:{prefix}"));
-    }
-    std::borrow::Cow::Owned(format!("path:{rel}"))
 }
 
 #[cfg(test)]
