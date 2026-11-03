@@ -53,7 +53,6 @@ use generation::{bump_generation_file, generation_path, read_generation, wipe_on
 use std::path::{Path, PathBuf};
 
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use arrow_array::builder::{
@@ -1107,7 +1106,7 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate, now_micros};
+pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate};
 
 #[cfg(test)]
 #[path = "tests.rs"]

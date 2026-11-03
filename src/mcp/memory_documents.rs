@@ -2,8 +2,8 @@
 
 use rmcp::ErrorData as McpError;
 
+use super::super::types::{DocumentSearchHit, SearchDocumentsParams};
 use super::ServerState;
-use super::types::{DocumentSearchHit, SearchDocumentsParams};
 
 pub(super) const MAX_DOCUMENT_CURSOR_OFFSET: u64 = 10_000;
 

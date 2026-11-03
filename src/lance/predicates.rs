@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub(crate) fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -19,9 +17,4 @@ pub(crate) fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str
         memory_namespace_predicate(scope, visibility, agent_id),
         escape_sql_literal(key),
     )
-}
-
-pub(crate) fn now_micros() -> i64 {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
 }
