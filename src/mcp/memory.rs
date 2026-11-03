@@ -708,8 +708,14 @@ pub(super) async fn run_search_documents(
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
         let facet_sql_for_lane = facet_sql.clone();
+        let mime_for_lane = params.mime_type.clone();
         let hits_raw = tokio::task::spawn_blocking(move || {
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime_for_lane.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
             if !facet_sql_for_lane.is_empty() {
                 predicate.push_str(" AND ");
                 predicate.push_str(&facet_sql_for_lane);

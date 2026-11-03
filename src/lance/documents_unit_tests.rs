@@ -134,6 +134,34 @@ fn facet_lists_are_nullable_arrow_lists() {
     assert_eq!(values.value(0), "termination");
 }
 
+#[test]
+fn absent_facet_lists_are_written_as_null() {
+    let rows = vec![DocumentRow {
+        scope: "repo:x".into(),
+        path: "safe/a.md".into(),
+        chunk_idx: 0,
+        mime_type: "text/markdown".into(),
+        facets: DocumentFacets {
+            keywords: None,
+            entities: None,
+            ..Default::default()
+        },
+        text: "t".into(),
+        text_phrase: "t".into(),
+        heading_path: String::new(),
+        cites: String::new(),
+        byte_start: 0,
+        byte_end: 1,
+        rehydration_ref: None,
+        embedding: Vec::new(),
+    }];
+    let batch = build_documents_batch(384, &rows).expect("build row without facets");
+    for name in ["keywords", "entities"] {
+        let column = batch.column_by_name(name).expect("facet column exists");
+        assert_eq!(column.null_count(), 1, "absent {name} must be a null list");
+    }
+}
+
 /// The nullable column must not become a hole. A row that *claims* a vector of the wrong length
 /// would misalign the index silently, which is worse than an error.
 #[test]
