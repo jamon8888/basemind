@@ -128,7 +128,8 @@ fn facet_lists_are_nullable_arrow_lists() {
         .as_any()
         .downcast_ref::<ListArray>()
         .unwrap();
-    let values = keywords.value(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let values_array = keywords.value(0);
+    let values = values_array.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(values.len(), 2);
     assert_eq!(values.value(0), "termination");
 }

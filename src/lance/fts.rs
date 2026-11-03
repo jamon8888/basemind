@@ -793,7 +793,7 @@ mod tests {
             byte_start: 0,
             byte_end: 1,
             cites: String::new(),
-            facets: super::DocumentFacets::default(),
+            facets: crate::lance::DocumentFacets::default(),
         };
         assert_eq!(hit.identity(), ("safe/contract.md", 7));
     }
