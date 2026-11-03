@@ -126,6 +126,16 @@ pub struct DocumentFacets {
     pub summary: Option<String>,
 }
 
+/// Optional in-store predicates for document retrieval. Unknown values should be normalized to
+/// `None` by the extractor or caller so ingestion and search degrade to an unfiltered lane.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFacetFilter {
+    pub doc_type: Option<String>,
+    pub section: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub doc_date: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub scope: String,
@@ -424,6 +434,18 @@ impl LanceStore {
         limit: usize,
         mime_type_filter: Option<&str>,
     ) -> Result<Vec<DocumentHit>> {
+        self.search_documents_filtered(scope, query, limit, mime_type_filter, None)
+    }
+
+    /// KNN over documents with optional nullable facet predicates evaluated in LanceDB.
+    pub fn search_documents_filtered(
+        &self,
+        scope: &str,
+        query: Vec<f32>,
+        limit: usize,
+        mime_type_filter: Option<&str>,
+        facet_filter: Option<&DocumentFacetFilter>,
+    ) -> Result<Vec<DocumentHit>> {
         if query.len() != usize::from(self.inner.dim) {
             return Err(anyhow!(
                 "query vector dim {} does not match store dim {}",
@@ -440,11 +462,26 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
             let mut q = table.vector_search(query).context("build vector search")?.limit(limit);
-            let scope_clause = format!("scope = '{}'", escape_sql_literal(scope));
-            q = match mime_type_filter {
-                Some(m) => q.only_if(format!("{scope_clause} AND mime_type = '{}'", escape_sql_literal(m))),
-                None => q.only_if(scope_clause),
-            };
+            let mut predicates = vec![format!("scope = '{}'", escape_sql_literal(scope))];
+            if let Some(m) = mime_type_filter {
+                predicates.push(format!("mime_type = '{}'", escape_sql_literal(m)));
+            }
+            if let Some(facets) = facet_filter {
+                for (column, value) in [
+                    ("doc_type", facets.doc_type.as_deref()),
+                    ("section", facets.section.as_deref()),
+                    ("jurisdiction", facets.jurisdiction.as_deref()),
+                    ("doc_date", facets.doc_date.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        predicates.push(format!(
+                            "({column} IS NULL OR {column} = '{}')",
+                            escape_sql_literal(value)
+                        ));
+                    }
+                }
+            }
+            q = q.only_if(predicates.join(" AND "));
             let mut stream = q.execute().await.context("run document search")?;
             let mut hits = Vec::new();
             while let Some(batch) = stream.try_next().await.context("stream next batch")? {
