@@ -29,9 +29,15 @@ def write_zip(path: Path, files: dict[str, str]) -> None:
             # which makes benchmark inputs drift even when their source content
             # is unchanged.
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3  # Unix, independent of the host running the generator.
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             archive.writestr(info, content)
+
+
+def write_text(path: Path, content: str) -> None:
+    """Write UTF-8 bytes without platform-specific newline translation."""
+    path.write_bytes(content.encode("utf-8"))
 
 
 def write_pdf(path: Path) -> None:
@@ -58,8 +64,8 @@ def write_pdf(path: Path) -> None:
 def generate(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     write_pdf(root / "synthetic.pdf")
-    (root / "synthetic-incremental.txt").write_text("Basemind synthetic incremental fixture Alice Paris\n")
-    (root / "synthetic-redaction.txt").write_text(SYNTHETIC_NER_TEXT + "\n")
+    write_text(root / "synthetic-incremental.txt", "Basemind synthetic incremental fixture Alice Paris\n")
+    write_text(root / "synthetic-redaction.txt", SYNTHETIC_NER_TEXT + "\n")
     write_zip(
         root / "synthetic.docx",
         {
@@ -91,7 +97,8 @@ def generate(root: Path) -> Path:
         },
     )
     manifest = root / "synthetic-manifest.txt"
-    manifest.write_text(
+    write_text(
+        manifest,
         "\n".join(
             path.name
             for path in sorted(root.iterdir())
