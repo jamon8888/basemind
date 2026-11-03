@@ -32,7 +32,6 @@ pub mod schema;
 mod store_tests;
 /// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
 /// (`tests/max_lines.rs`).
-/// Test-only inherent methods; out of line by the line cap.
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 
@@ -67,29 +66,16 @@ use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
 #[cfg(feature = "graphrag")]
 use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
-/// On-disk metadata for the lance store. Tracks the vector dim, the
-/// embedding-model identifier, and the Arrow table schema version; a mismatch on
-/// any field wipes the store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LanceMeta {
     dim: u16,
     embedding_model: String,
-    /// Arrow schema version of the `memory` / `documents` tables (see
-    /// [`MEMORY_SCHEMA_VER`]). `#[serde(default)]` makes a pre-0.5 `meta.json` (which
-    /// lacks this field) deserialize as `0`, forcing a wipe on upgrade rather than a
-    /// parse error — the table column set changed, and a stale-arity table would fault
-    /// at batch-build time, not at open.
     #[serde(default)]
     schema_ver: u32,
 }
 
 const META_FILE: &str = "meta.json";
 
-/// Open the existing lance store for read-side tools (the MCP `graph` modes)
-/// without risking the wipe-on-mismatch path: the `(dim, embedding_model)`
-/// identity is read back from `meta.json` instead of taken from config, so a
-/// caller that guesses wrong cannot destroy the store. Returns `None` when no
-/// store exists on disk (nothing was ever scanned with lance enabled).
 #[cfg(feature = "intelligence")]
 pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
     let meta_path = dir.join(META_FILE);
@@ -101,33 +87,19 @@ pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
     LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
 }
 
-/// Schema version of the lance Arrow tables, bound to the release minor exactly like
-/// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. Bump `RELEASE_MINOR` whenever the
-/// `memory` or `documents` table column set changes; the resulting `LanceMeta` mismatch
-/// wipes and rebuilds the lance dir.
 pub const MEMORY_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;
 
-/// One row in the `documents` table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentFacets {
-    /// Caller-curated document type; absent values remain `None`.
     pub doc_type: Option<String>,
-    /// Deterministic section role derived from the heading breadcrumb when recognized.
     pub section: Option<String>,
-    /// Caller-curated jurisdiction code.
     pub jurisdiction: Option<String>,
-    /// Caller-curated ISO-8601 date.
     pub doc_date: Option<String>,
-    /// Extracted keyword values.
     pub keywords: Option<Vec<String>>,
-    /// `category:value` entity values.
     pub entities: Option<Vec<String>>,
-    /// Document-level summary text.
     pub summary: Option<String>,
 }
 
-/// Optional in-store predicates for document retrieval. Unknown values should be normalized to
-/// `None` by the extractor or caller so ingestion and search degrade to an unfiltered lane.
 #[derive(Debug, Clone, Default)]
 pub struct DocumentFacetFilter {
     pub doc_type: Option<String>,
@@ -144,58 +116,40 @@ pub struct DocumentRow {
     pub mime_type: String,
     pub facets: DocumentFacets,
     pub text: String,
-    /// Unmodified copy of the chunk text used by the positional phrase index.
     pub text_phrase: String,
-    /// The Markdown heading breadcrumb this chunk sits under, `""` when it has none.
-    ///
-    /// Carried all the way to the table because the keyword lane indexes it. It used to stop at
-    /// [`crate::extract::doc::DocChunk`]: the extractor computed it, and nothing downstream ever
-    /// read it, so the index built over a column that did not exist.
     pub heading_path: String,
-    /// Newline-separated legal identifiers extracted from this chunk for exact retrieval.
     pub cites: String,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// Vault key for the document's encrypted rehydration map. `None` until
-    /// extraction runs with redaction enabled for the document.
     pub rehydration_ref: Option<String>,
     pub embedding: Vec<f32>,
 }
 
-/// One row in the `memory` table.
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     pub scope: String,
     pub key: String,
     pub value: String,
     pub tags: Vec<String>,
-    /// Memory tier: `"group"` (shared) or `"individual"` (per-agent).
     pub visibility: String,
-    /// Owner of an individual-tier row; empty string for the group tier.
     pub agent_id: String,
     pub embedding: Vec<f32>,
-    /// Microseconds since unix epoch.
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-/// A search hit from the `documents` table.
 #[derive(Debug, Clone)]
 pub struct DocumentHit {
     pub path: String,
     pub chunk_idx: u32,
     pub text: String,
     pub mime_type: String,
-    /// Nullable document-level facets carried with the hit when present in the table.
     pub facets: DocumentFacets,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer). LanceDB returns this
-    /// in the `_distance` column.
     pub distance: f32,
 }
 
-/// A search hit from the `memory` table.
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub key: String,
@@ -204,7 +158,6 @@ pub struct MemoryHit {
     pub distance: f32,
 }
 
-/// One row in the `code_chunks` table.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeRow {
@@ -222,7 +175,6 @@ pub struct CodeRow {
     pub embedding: Vec<f32>,
 }
 
-/// A search hit from the `code_chunks` table — a pointer, not a body.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeChunkHit {
@@ -235,7 +187,6 @@ pub struct CodeChunkHit {
     pub line_end: u32,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer).
     pub distance: f32,
 }
 
@@ -354,8 +305,6 @@ impl LanceStore {
         &self.inner.dir
     }
 
-    /// Replace all documents rows for the given `(scope, path)` pair and insert
-    /// the supplied rows. Used by the scanner during incremental re-extract.
     pub fn replace_document(&self, scope: &str, path: &str, rows: Vec<DocumentRow>) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -389,8 +338,6 @@ impl LanceStore {
         })
     }
 
-    /// Insert / upsert one memory row keyed by `(scope, key)`. Existing rows
-    /// with the same key are removed first.
     pub fn upsert_memory(&self, row: MemoryRow) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -409,8 +356,6 @@ impl LanceStore {
         })
     }
 
-    /// Delete one memory entry by `(scope, visibility, agent_id, key)`. Returns the
-    /// number of rows LanceDB actually deleted (`0` when no row matched the predicate).
     pub fn delete_memory(&self, scope: &str, visibility: &str, agent_id: &str, key: &str) -> Result<u64> {
         self.inner.rt().block_on(async {
             let table = self
@@ -426,7 +371,6 @@ impl LanceStore {
         })
     }
 
-    /// KNN over the documents table for one scope.
     pub fn search_documents(
         &self,
         scope: &str,
@@ -437,7 +381,6 @@ impl LanceStore {
         self.search_documents_filtered(scope, query, limit, mime_type_filter, None)
     }
 
-    /// KNN over documents with optional nullable facet predicates evaluated in LanceDB.
     pub fn search_documents_filtered(
         &self,
         scope: &str,
@@ -491,10 +434,6 @@ impl LanceStore {
         })
     }
 
-    /// Fetch document chunks for specific paths (plain scan, no vector search).
-    ///
-    /// Used by the GraphRAG `rag` mode to pull the chunk text of graph-expanded
-    /// documents that the vector lane did not surface on its own.
     pub fn document_chunks_for_paths(&self, scope: &str, paths: &[String], limit: usize) -> Result<Vec<DocumentHit>> {
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -528,10 +467,6 @@ impl LanceStore {
         })
     }
 
-    /// KNN over the memory table for one `(scope, visibility, agent_id)` namespace.
-    ///
-    /// The `visibility` + `agent_id` predicate is mandatory so an individual search never
-    /// returns another agent's rows and a group search only sees group rows.
     pub fn search_memory(
         &self,
         scope: &str,
@@ -575,9 +510,6 @@ impl LanceStore {
         })
     }
 
-    /// Replace all `code_chunks` rows for a `(scope, path)` pair and insert the supplied rows.
-    /// Delete-then-insert mirrors [`Self::replace_document`] so a re-scan never leaves stale
-    /// chunks behind.
     #[cfg(feature = "code-search")]
     pub fn replace_code_chunks(&self, scope: &str, path: &str, rows: Vec<CodeRow>) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -612,9 +544,6 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row for a `(scope, path)` pair without inserting replacements.
-    /// The scanner's stale-file pass calls this when a file is removed, so a deleted path leaves no
-    /// dangling `search_code` hits. Idempotent — deleting a path with no rows is a no-op.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks(&self, scope: &str, path: &str) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -638,20 +567,15 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row of `paths` in `scope`, batching the paths into `IN (...)`
-    /// predicates so a purge of N files is a handful of deletes rather than N table versions.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::CODE_CHUNKS_TABLE, "path", scope, paths)
     }
 
-    /// Delete every `documents` row of `paths` in `scope`; the batched counterpart of
-    /// [`Self::replace_document`] with no replacement rows.
     pub fn delete_documents_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths)
     }
 
-    /// Delete every `doc_links` row of the given documents (ADR-0008) in bulk.
     #[cfg(feature = "documents")]
     pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
@@ -663,8 +587,6 @@ impl LanceStore {
     }
 
     pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {
-        // Each batch is one delete transaction (a new table version plus a scan of `path`), so a
-        // large purge is dominated by the batch COUNT; 2000 literals keep the predicate small.
         const BATCH: usize = 2_000;
         if paths.is_empty() {
             return Ok(());
@@ -677,9 +599,6 @@ impl LanceStore {
                 .execute()
                 .await
                 .with_context(|| format!("open {table_name} table"))?;
-            // Nothing stored for this scope (the common case on the first scan after an upgrade, or
-            // with embeddings off): skip the N/200 deletes, each of which scans the table and may
-            // commit a table version.
             let in_scope = table
                 .count_rows(Some(format!("scope = '{}'", escape_sql_literal(scope))))
                 .await
@@ -704,8 +623,6 @@ impl LanceStore {
         })
     }
 
-    /// KNN over the `code_chunks` table for one scope. Returns pointer hits (path + span +
-    /// symbol + distance), best-first.
     #[cfg(feature = "code-search")]
     pub fn search_code_chunks(&self, scope: &str, query: Vec<f32>, limit: usize) -> Result<Vec<CodeChunkHit>> {
         if query.len() != usize::from(self.inner.dim) {
@@ -823,10 +740,6 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
-        // An empty `embedding` means the scan ran with `embed = false`: the row is lexical-only and
-        // the vector column is null. A *non-empty* vector of the wrong length is still a bug — that
-        // one would silently misalign the index — so the length check survives for the case that can
-        // actually be wrong.
         if !r.embedding.is_empty() && r.embedding.len() != usize::from(dim) {
             return Err(anyhow!(
                 "documents row embedding dim {} does not match store dim {}",
@@ -847,9 +760,6 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         append_optional(&mut summary, r.facets.summary.as_deref());
         text.append_value(&r.text);
         text_phrase.append_value(&r.text_phrase);
-        // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
-        // so `""` is what "no breadcrumb" reads back as, and the tokenizer sees an empty document
-        // rather than a missing value.
         heading_path.append_value(&r.heading_path);
         cites.append_value(&r.cites);
         byte_start.append_value(r.byte_start);
@@ -859,11 +769,6 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             None => rehydration_ref.append_null(),
         }
         if r.embedding.is_empty() {
-            // `FixedSizeListBuilder::finish` asserts `values.len() == len * list_len`, so a
-            // null slot still owes the child array `dim` values — `append(false)` only writes
-            // the null buffer and does not pad. Without this the lexical-only path panics inside
-            // arrow instead of writing the row. The values are never read: the null buffer is
-            // what marks the slot absent, and `null_count()` is what the test reads.
             embedding.values().append_nulls(dim as usize);
             embedding.append(false);
         } else {
@@ -1184,19 +1089,10 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-/// Single-quote escape for the simple SQL-literal predicates we use.
-///
-/// `pub(crate)` because the documents lexical lane builds its own scope predicate
-/// (`src/mcp/memory.rs`) rather than going through a store method, and must escape
-/// the scope the same way every predicate here does.
 pub(crate) fn escape_sql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Predicate selecting a whole `(scope, visibility, agent_id)` memory namespace.
-///
-/// Used by [`LanceStore::search_memory`] so an individual search can never surface another
-/// agent's rows and a group search only sees group rows.
 fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> String {
     format!(
         "scope = '{}' AND visibility = '{}' AND agent_id = '{}'",
@@ -1206,9 +1102,6 @@ fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> 
     )
 }
 
-/// Predicate selecting exactly one memory row by `(scope, visibility, agent_id, key)`.
-///
-/// Used by [`LanceStore::upsert_memory`] (delete-then-insert) and [`LanceStore::delete_memory`].
 fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str) -> String {
     format!(
         "{} AND key = '{}'",
@@ -1217,8 +1110,6 @@ fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str, key: &str
     )
 }
 
-/// Convenience: current time as microseconds since unix epoch, saturating on
-/// the (effectively impossible) clock-before-epoch case.
 pub fn now_micros() -> i64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)

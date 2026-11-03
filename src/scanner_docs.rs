@@ -747,7 +747,6 @@ fn pending_from_doc(
         text_fallback: doc.text_fallback,
     }
 }
-/// Turn document chunks into LanceDB rows, hoisting per-row constants.
 fn build_doc_rows(
     doc: FileMapDoc,
     rel: &str,
@@ -835,12 +834,6 @@ fn document_facets(
     }
 }
 
-/// Purge the LanceDB `documents` rows AND the `index.doc_files` entries of docs that no longer
-/// exist (or are no longer routed to the doc tier). Serial apply pass; mirrors
-/// `scanner_code::delete_stale_code_chunks`. The tracking entry is dropped unconditionally (the doc
-/// cache metadata must not leak for a removed file); the LanceDB delete is best-effort and never
-/// *creates* the store. External-root docs were written under a per-root scope, so the delete uses
-/// [`doc_scope_for`] to match it.
 pub(crate) fn delete_stale_documents(store: &mut Store, config: &crate::config::Config, scope: &str, stale: &[String]) {
     if stale.is_empty() {
         return;
@@ -969,27 +962,12 @@ pub(crate) fn purge_unembedded_documents(
     applied
 }
 
-/// Stream every pending document batch into LanceDB, one file at a time. Opens the store lazily — if
-/// no batch will emit rows (no embeddings configured) no LanceDB connection is ever made.
-///
-/// For each row-emitting file this re-reads the file's already-persisted `.doc.msgpack` blob, builds
-/// its [`DocumentRow`]s, writes them, and drops them before the next file — so peak embed-write RAM
-/// is one document's rows plus one Arrow batch, independent of corpus size. (The blob is guaranteed
-/// on disk here: every doc that produced a batch was written by `extract_and_persist_doc` or was a
-/// cache hit, both before this post-barrier lane runs.)
-///
-/// Returns the number of files for which rows were written. Errors are logged and skipped on a
-/// per-file basis so one malformed embedding doesn't abort the scan.
 pub(crate) fn flush_document_batches(
     store: &mut Store,
     batches: Vec<PendingDocBatch>,
     embedding_model: &str,
     citations: &crate::config::CitationsConfig,
 ) -> usize {
-    // Rows are emitted for a lexical-only scan too: `embed = false` stores a null vector, it does not
-    // suppress the row. The dimension comes from the configured preset, not from a batch — on a
-    // lexical-only scan no batch carries one, and requiring one here is what used to make the whole
-    // flush a no-op before a single row was built.
     let emit = batches.iter().any(|b| b.emit_rows);
     if !emit {
         return 0;
@@ -1005,9 +983,6 @@ pub(crate) fn flush_document_batches(
             return 0;
         }
     };
-    // Every emitting batch that carries vectors must agree with the preset's dimension. A lexical-only
-    // batch carries none, so the previous "find a batch with a dimension" lookup could not express
-    // this: it both gated the whole flush and skipped the check whenever it found nothing.
     if let Some(actual) = batches
         .iter()
         .filter(|b| b.emit_rows && b.embedding_dim > 0)
@@ -1032,8 +1007,6 @@ pub(crate) fn flush_document_batches(
         }
     };
 
-    // One delete+append commit pair per BATCH_MAX_DOCS documents instead of per document (#76);
-    // rows are still built one document at a time, so peak RAM is one batch's rows.
     let mut pending: PendingBatch<DocumentRow> = PendingBatch::default();
     let flush = |pending: &mut PendingBatch<DocumentRow>, inserted: &mut usize| {
         let items = pending.take();
@@ -1079,14 +1052,6 @@ pub(crate) fn flush_document_batches(
     inserted
 }
 
-/// Build the keyword index over the rows just written, then compact.
-///
-/// Called once per flush, after every batch. Per-file indexing would rebuild the index once per
-/// document, which on a large corpus dwarfs the extraction cost.
-///
-/// Best-effort and warned, not fatal: a missing lexical index degrades the query path to
-/// vector-only, whereas failing the scan would lose the embeddings that *were* just written. An
-/// index that silently did not build is the failure worth watching for, so it is logged at warn.
 pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::config::Config) {
     if !config.documents.enabled {
         return;
@@ -1114,16 +1079,6 @@ pub(crate) fn ensure_document_fts_index(store: &mut Store, config: &crate::confi
     }
 }
 
-/// Choose the LanceDB scope for a document. Repo files keep the scan-wide `default_scope`;
-/// external-root files (absolute key, see [`crate::path::RelPath::is_external`]) are scoped
-/// `path:<extra_root>` so they group under the out-of-repo tree they came from rather than the
-/// repository's own doc scope.
-///
-/// `scope` is a retrieval partition, and every reader must honour it: `search_documents` filters on
-/// it unconditionally (`src/lance/mod.rs`), so a row under `path:<root>` is only returned to a caller
-/// that asks for that scope. An earlier version of this comment claimed "`search_documents` has no
-/// scope filter — so this only partitions storage", which was false and had been for long enough to
-/// justify the write/delete mismatch described on `PendingDocBatch::doc_scope`.
 pub(crate) fn doc_scope_for<'a>(
     rel: &str,
     default_scope: &'a str,
