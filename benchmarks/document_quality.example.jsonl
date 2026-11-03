@@ -2,3 +2,5 @@
 {"query":"Alice Paris","expected_paths":["synthetic.pdf","synthetic.docx","synthetic.pptx","synthetic.xlsx"],"k":10}
 # NER checks are additive to retrieval cases and can appear without a query.
 {"ner":[{"path":"synthetic.docx","required_categories":["person","location"],"required_texts":["Alice","Paris"]}]}
+# The redaction fixture exercises the legal-fr@1 label vocabulary on ordinary text.
+{"ner":[{"path":"synthetic-redaction.txt","required_categories":["person","organization","email","phone_number","iban"],"required_texts":["Alice Martin","Acme Conseil","alice.martin@example.test","+33 6 12 34 56 78","FR7630006000011234567890189"]}]}

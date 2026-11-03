@@ -12,6 +12,14 @@ import argparse
 import zipfile
 from pathlib import Path
 
+SYNTHETIC_NER_TEXT = (
+    "Basemind synthetic legal record. Person: Alice Martin. "
+    "Organization: Acme Conseil. Address: 10 rue de Paris, 75001 Paris. "
+    "Email: alice.martin@example.test. Phone: +33 6 12 34 56 78. "
+    "IBAN: FR7630006000011234567890189. Tax ID: 123456789. "
+    "National ID: 1 85 03 75 123 456 78. Date of birth: 12/03/1985."
+)
+
 
 def write_zip(path: Path, files: dict[str, str]) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -51,13 +59,14 @@ def generate(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     write_pdf(root / "synthetic.pdf")
     (root / "synthetic-incremental.txt").write_text("Basemind synthetic incremental fixture Alice Paris\n")
+    (root / "synthetic-redaction.txt").write_text(SYNTHETIC_NER_TEXT + "\n")
     write_zip(
         root / "synthetic.docx",
         {
             "[Content_Types].xml": '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
             "_rels/.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
             "word/_rels/document.xml.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
-            "word/document.xml": '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Basemind synthetic DOCX Alice Paris</w:t></w:r></w:p></w:body></w:document>',
+            "word/document.xml": f'<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{SYNTHETIC_NER_TEXT}</w:t></w:r></w:p></w:body></w:document>',
         },
     )
     write_zip(
@@ -68,7 +77,7 @@ def generate(root: Path) -> Path:
             "ppt/presentation.xml": '<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldIdLst><p:sldId id="256" r:id="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/></p:sldIdLst></p:presentation>',
             "ppt/_rels/presentation.xml.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>',
             "ppt/slides/_rels/slide1.xml.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
-            "ppt/slides/slide1.xml": '<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><a:t>Basemind synthetic PPTX Alice Paris</a:t></p:spTree></p:cSld></p:sld>',
+            "ppt/slides/slide1.xml": f'<?xml version="1.0"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><a:t>{SYNTHETIC_NER_TEXT}</a:t></p:spTree></p:cSld></p:sld>',
         },
     )
     write_zip(
@@ -78,7 +87,7 @@ def generate(root: Path) -> Path:
             "_rels/.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
             "xl/workbook.xml": '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>',
             "xl/_rels/workbook.xml.rels": '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
-            "xl/worksheets/sheet1.xml": '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Basemind synthetic XLSX Alice Paris</t></is></c></row></sheetData></worksheet>',
+            "xl/worksheets/sheet1.xml": f'<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{SYNTHETIC_NER_TEXT}</t></is></c></row></sheetData></worksheet>',
         },
     )
     manifest = root / "synthetic-manifest.txt"
