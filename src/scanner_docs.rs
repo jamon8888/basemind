@@ -19,7 +19,6 @@
 //!    RAM is one file's rows, independent of corpus size (the streaming write
 //!    that replaced the old "accumulate every file's rows, then write once" pass
 //!    which held multiple GB resident on a large repo).
-
 #![cfg(feature = "documents")]
 
 use std::path::Path;
