@@ -984,23 +984,21 @@ async fn attach_doc_metadata(
     let kw_needle = keywords_contains.map(|s| s.to_lowercase());
 
     hits.retain_mut(|hit| {
-        if let Some(needle) = cat_needle.as_deref() {
-            if !hit
+        if let Some(needle) = cat_needle.as_deref()
+            && !hit
                 .entities
                 .iter()
                 .any(|entity| entity.category.to_lowercase().contains(needle))
-            {
-                return false;
-            }
+        {
+            return false;
         }
-        if let Some(needle) = kw_needle.as_deref() {
-            if !hit
+        if let Some(needle) = kw_needle.as_deref()
+            && !hit
                 .keywords
                 .iter()
                 .any(|keyword| keyword.text.to_lowercase().contains(needle))
-            {
-                return false;
-            }
+        {
+            return false;
         }
         true
     });

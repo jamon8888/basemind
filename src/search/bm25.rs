@@ -72,6 +72,7 @@ fn for_each_token(text: &str, mut f: impl FnMut(&str)) {
 /// Allocates a `String` key only on a token's first occurrence (via `get_mut`-then-`insert`), not on
 /// every repeat — repeats are the common case in code (keywords, an identifier used many times), and
 /// this runs in the scanner's per-file hot loop.
+#[allow(dead_code)]
 pub(crate) fn tokenize_counts(text: &str) -> AHashMap<String, u32> {
     let mut counts: AHashMap<String, u32> = AHashMap::new();
     for_each_token(text, |tok| {
