@@ -92,6 +92,42 @@ fn the_heading_breadcrumb_is_written_to_the_batch() {
     assert_eq!(column.null_count(), 0, "an absent breadcrumb is empty, never null");
 }
 
+#[test]
+fn facet_lists_are_nullable_arrow_lists() {
+    use arrow_array::{Array, ListArray, StringArray};
+    use arrow_schema::DataType;
+    let schema = crate::lance::schema::documents_schema(384);
+    for name in ["keywords", "entities"] {
+        let field = schema.field_with_name(name).expect("facet column exists");
+        assert!(field.is_nullable());
+        assert!(matches!(field.data_type(), DataType::List(_)));
+    }
+    let rows = vec![DocumentRow {
+        scope: "repo:x".into(),
+        path: "safe/a.md".into(),
+        chunk_idx: 0,
+        mime_type: "text/markdown".into(),
+        facets: DocumentFacets {
+            keywords: Some(vec!["termination".into(), "notice".into()]),
+            entities: Some(vec!["PERSON:Acme".into()]),
+            ..Default::default()
+        },
+        text: "t".into(),
+        text_phrase: "t".into(),
+        heading_path: String::new(),
+        cites: String::new(),
+        byte_start: 0,
+        byte_end: 1,
+        rehydration_ref: None,
+        embedding: Vec::new(),
+    }];
+    let batch = build_documents_batch(384, &rows).expect("build facet row");
+    let keywords = batch.column_by_name("keywords").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+    let values = keywords.value(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.value(0), "termination");
+}
+
 /// The nullable column must not become a hole. A row that *claims* a vector of the wrong length
 /// would misalign the index silently, which is worse than an error.
 #[test]
