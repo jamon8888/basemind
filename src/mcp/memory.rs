@@ -966,87 +966,24 @@ pub(super) async fn run_search_documents(
 /// query) — a missing blob is not an error.
 #[cfg(feature = "documents")]
 async fn attach_doc_metadata(
-    state: &ServerState,
+    _state: &ServerState,
     hits: &mut Vec<DocumentSearchHit>,
     entity_category: Option<&str>,
     keywords_contains: Option<&str>,
 ) -> Result<(), McpError> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut unique_paths: Vec<String> = Vec::with_capacity(hits.len());
-    {
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        for h in hits.iter() {
-            if seen.insert(h.path.as_str()) {
-                unique_paths.push(h.path.clone());
-            }
-        }
-    }
-
-    let pairs: Vec<(String, std::path::PathBuf)> = {
-        let store = state.shared.store.read().await;
-        unique_paths
-            .iter()
-            .filter_map(|p| {
-                store
-                    .lookup(p.as_str())
-                    .map(|entry| (p.clone(), store.blob_path_doc_hex(&entry.hash_hex)))
-            })
-            .collect()
-    };
-
-    type DocMeta = (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>);
-    let meta: ahash::AHashMap<String, Arc<DocMeta>> = tokio::task::spawn_blocking(move || {
-        let mut out: ahash::AHashMap<String, Arc<DocMeta>> = ahash::AHashMap::with_capacity(pairs.len());
-        for (path, blob_path) in pairs {
-            if !blob_path.exists() {
-                continue;
-            }
-            let bytes = match std::fs::read(&blob_path) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "read doc blob for metadata attach failed");
-                    continue;
-                }
-            };
-            match rmp_serde::from_slice::<crate::extract::doc::FileMapDoc>(&bytes) {
-                Ok(doc) => {
-                    out.insert(path, Arc::new((doc.keywords, doc.entities, doc.summary)));
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path, error = %e, "decode doc blob for metadata attach failed");
-                }
-            }
-        }
-        out
-    })
-    .await
-    .unwrap_or_default();
-
     let cat_needle = entity_category.map(|s| s.to_lowercase());
     let kw_needle = keywords_contains.map(|s| s.to_lowercase());
 
     hits.retain_mut(|hit| {
-        let meta_arc = meta.get(&hit.path).cloned();
-
         if let Some(needle) = cat_needle.as_deref() {
-            let ents = meta_arc.as_ref().map(|m| m.1.as_slice()).unwrap_or(&[]);
-            if !ents.iter().any(|e| e.category.to_lowercase().contains(needle)) {
+            if !hit.entities.iter().any(|entity| entity.category.to_lowercase().contains(needle)) {
                 return false;
             }
         }
         if let Some(needle) = kw_needle.as_deref() {
-            let kws = meta_arc.as_ref().map(|m| m.0.as_slice()).unwrap_or(&[]);
-            if !kws.iter().any(|k| k.text.to_lowercase().contains(needle)) {
+            if !hit.keywords.iter().any(|keyword| keyword.text.to_lowercase().contains(needle)) {
                 return false;
             }
-        }
-
-        if let Some(m) = meta_arc {
-            hit.keywords = m.0.clone();
-            hit.entities = m.1.clone();
-            hit.summary = m.2.clone();
         }
         true
     });
