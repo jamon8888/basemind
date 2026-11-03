@@ -111,15 +111,20 @@ pub fn index_page(
         } else {
             String::new()
         };
+        let heading_path = crate::extract::doc::heading_path_of(chunk.metadata.heading_context.as_ref());
         rows.push(DocumentRow {
             scope: scope.to_string(),
             path: path.to_string(),
             chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
             mime_type: mime_type.to_string(),
-            facets: Default::default(),
+            facets: crate::lance::DocumentFacets {
+                doc_type: Some("web".to_string()),
+                section: crate::extract::doc::facets::section_from_heading(Some(&heading_path)),
+                ..Default::default()
+            },
             text: chunk.content.clone(),
             text_phrase: chunk.content.clone(),
-            heading_path: crate::extract::doc::heading_path_of(chunk.metadata.heading_context.as_ref()),
+            heading_path,
             cites,
             byte_start,
             byte_end,
