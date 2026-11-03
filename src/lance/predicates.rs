@@ -18,3 +18,10 @@ pub(crate) fn memory_row_predicate(scope: &str, visibility: &str, agent_id: &str
         escape_sql_literal(key),
     )
 }
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[allow(dead_code)]
+pub(crate) fn now_micros() -> i64 {
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
+}

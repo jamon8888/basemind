@@ -1106,7 +1106,8 @@ fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<(
     Ok(())
 }
 
-pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate};
+#[allow(unused_imports)]
+pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate, now_micros};
 
 #[cfg(test)]
 #[path = "tests.rs"]
