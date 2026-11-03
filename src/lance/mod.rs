@@ -176,6 +176,8 @@ pub struct DocumentHit {
     pub chunk_idx: u32,
     pub text: String,
     pub mime_type: String,
+    /// Nullable document-level facets carried with the hit when present in the table.
+    pub facets: DocumentFacets,
     pub byte_start: u32,
     pub byte_end: u32,
     /// L2 distance from the query vector (lower = closer). LanceDB returns this
@@ -1040,6 +1042,21 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
     let distance = batch
         .column_by_name("_distance")
         .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+    };
+    let doc_type = optional_string("doc_type");
+    let section = optional_string("section");
+    let jurisdiction = optional_string("jurisdiction");
+    let doc_date = optional_string("doc_date");
+    let keywords = optional_string("keywords");
+    let entities = optional_string("entities");
+    let summary = optional_string("summary");
+    let optional_value = |array: Option<&StringArray>, i: usize| {
+        array.and_then(|values| (!values.is_null(i)).then(|| values.value(i).to_string()))
+    };
 
     for i in 0..batch.num_rows() {
         out.push(DocumentHit {
@@ -1047,6 +1064,15 @@ fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Resu
             chunk_idx: chunk_idx.value(i),
             text: text.value(i).to_string(),
             mime_type: mime.value(i).to_string(),
+            facets: DocumentFacets {
+                doc_type: optional_value(doc_type, i),
+                section: optional_value(section, i),
+                jurisdiction: optional_value(jurisdiction, i),
+                doc_date: optional_value(doc_date, i),
+                keywords: optional_value(keywords, i),
+                entities: optional_value(entities, i),
+                summary: optional_value(summary, i),
+            },
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
             distance: distance.map(|d| d.value(i)).unwrap_or(0.0),
