@@ -630,6 +630,29 @@ pub(super) async fn run_search_documents(
 
     let limit = params.limit.unwrap_or(10).min(100) as usize;
     let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
+    let facet_filter = crate::lance::DocumentFacetFilter {
+        doc_type: crate::extract::doc::facets::doc_type(params.doc_type.as_deref()),
+        section: crate::extract::doc::facets::section(params.section.as_deref()),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(params.jurisdiction.as_deref()),
+        doc_date: crate::extract::doc::facets::doc_date(params.doc_date.as_deref()),
+    };
+    let facet_sql = {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("doc_type", facet_filter.doc_type.as_deref()),
+            ("section", facet_filter.section.as_deref()),
+            ("jurisdiction", facet_filter.jurisdiction.as_deref()),
+            ("doc_date", facet_filter.doc_date.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!(
+                    "({column} IS NULL OR {column} = '{}')",
+                    crate::lance::escape_sql_literal(value)
+                ));
+            }
+        }
+        clauses.join(" AND ")
+    };
 
     // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
     // reaching for it would embed the query and download a model to answer a question that does
@@ -642,8 +665,13 @@ pub(super) async fn run_search_documents(
         let lance = lance_store_lexical(state).await?;
         let query = params.query.clone();
         let scope_for_lane = scope.clone();
+        let facet_sql_for_lane = facet_sql.clone();
         let hits_raw = tokio::task::spawn_blocking(move || {
-            let predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if !facet_sql_for_lane.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql_for_lane);
+            }
             let phrases = crate::lance::fts::quoted_phrases(&query);
             let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
             let mut merged = Vec::new();
@@ -711,12 +739,17 @@ pub(super) async fn run_search_documents(
         let mime = params.mime_type.clone();
         let scope_for_lane = scope.clone();
         let query = params.query.clone();
+        let facet_filter_for_lane = facet_filter.clone();
         tokio::task::spawn_blocking(move || {
             let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
             if let Some(mime) = mime.as_deref() {
                 predicate.push_str(" AND mime_type = '");
                 predicate.push_str(&crate::lance::escape_sql_literal(mime));
                 predicate.push('\'');
+            }
+            if !facet_sql.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql);
             }
             let mut merged = Vec::with_capacity(limit);
             let mut seen = std::collections::HashSet::new();
@@ -760,7 +793,13 @@ pub(super) async fn run_search_documents(
                 }
             }
             if merged.len() < limit {
-                for hit in lance.search_documents(&scope_for_lane, embedding, limit, mime.as_deref())? {
+                for hit in lance.search_documents_filtered(
+                    &scope_for_lane,
+                    embedding,
+                    limit,
+                    mime.as_deref(),
+                    Some(&facet_filter_for_lane),
+                )? {
                     if seen.insert((hit.path.clone(), hit.chunk_idx)) {
                         merged.push(DocumentSearchHit {
                             path: hit.path,

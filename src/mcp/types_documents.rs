@@ -25,6 +25,18 @@ pub struct SearchDocumentsParams {
     pub format: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
+    /// Optional curated document type facet (`pleading`, `contract`, `memo`, ...).
+    #[serde(default)]
+    pub doc_type: Option<String>,
+    /// Optional section facet derived from a heading breadcrumb.
+    #[serde(default)]
+    pub section: Option<String>,
+    /// Optional jurisdiction facet.
+    #[serde(default)]
+    pub jurisdiction: Option<String>,
+    /// Optional ISO-8601 document date facet (`YYYY-MM-DD`).
+    #[serde(default)]
+    pub doc_date: Option<String>,
     /// Which ingestion scope to search. Defaults to this repo's scope — the one the
     /// scanner's document lane writes under. Web pages are ingested under a **different**
     /// scope (`web:<host>`, echoed back by `web_scrape` / `web_crawl`), so reaching them
