@@ -19,7 +19,6 @@
 //!    RAM is one file's rows, independent of corpus size (the streaming write
 //!    that replaced the old "accumulate every file's rows, then write once" pass
 //!    which held multiple GB resident on a large repo).
-
 #![cfg(feature = "documents")]
 
 use std::path::Path;
@@ -748,14 +747,13 @@ fn pending_from_doc(
         text_fallback: doc.text_fallback,
     }
 }
-
-/// Turn a document's chunks into LanceDB rows. Hoists the per-row constant strings out of the map so
-/// they allocate once instead of once per chunk (a doc can have hundreds of chunks).
-///
-/// Takes `doc` by value to move `chunk.text` and `chunk.embedding` directly into each row —
-/// avoids cloning the chunk text (potentially large) and the embedding vector (`Vec<f32>`,
-/// hundreds of kilobytes per chunk at typical preset dimensions).
-fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
+/// Turn document chunks into LanceDB rows, hoisting per-row constants.
+fn build_doc_rows(
+    doc: FileMapDoc,
+    rel: &str,
+    scope: &str,
+    citations: &crate::config::CitationsConfig,
+) -> Vec<DocumentRow> {
     let scope_owned = scope.to_string();
     let rel_owned = rel.to_string();
     let mime_owned = doc.mime_type;
@@ -763,17 +761,31 @@ fn build_doc_rows(doc: FileMapDoc, rel: &str, scope: &str) -> Vec<DocumentRow> {
     doc.chunks
         .into_iter()
         .enumerate()
-        .map(|(idx, chunk)| DocumentRow {
-            scope: scope_owned.clone(),
-            path: rel_owned.clone(),
-            chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
-            mime_type: mime_owned.clone(),
-            text: chunk.text,
-            heading_path: chunk.heading_path,
-            byte_start: chunk.byte_start,
-            byte_end: chunk.byte_end,
-            rehydration_ref: rehydration_ref.clone(),
-            embedding: chunk.embedding,
+        .map(|(idx, chunk)| {
+            let cites = if citations.extract {
+                chunk
+                    .cites
+                    .lines()
+                    .take(citations.max_per_chunk as usize)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            DocumentRow {
+                scope: scope_owned.clone(),
+                path: rel_owned.clone(),
+                chunk_idx: u32::try_from(idx).unwrap_or(u32::MAX),
+                mime_type: mime_owned.clone(),
+                text: chunk.text.clone(),
+                text_phrase: chunk.text,
+                heading_path: chunk.heading_path,
+                cites,
+                byte_start: chunk.byte_start,
+                byte_end: chunk.byte_end,
+                rehydration_ref: rehydration_ref.clone(),
+                embedding: chunk.embedding,
+            }
         })
         .collect()
 }
@@ -923,7 +935,12 @@ pub(crate) fn purge_unembedded_documents(
 ///
 /// Returns the number of files for which rows were written. Errors are logged and skipped on a
 /// per-file basis so one malformed embedding doesn't abort the scan.
-pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocBatch>, embedding_model: &str) -> usize {
+pub(crate) fn flush_document_batches(
+    store: &mut Store,
+    batches: Vec<PendingDocBatch>,
+    embedding_model: &str,
+    citations: &crate::config::CitationsConfig,
+) -> usize {
     // Rows are emitted for a lexical-only scan too: `embed = false` stores a null vector, it does not
     // suppress the row. The dimension comes from the configured preset, not from a batch — on a
     // lexical-only scan no batch carries one, and requiring one here is what used to make the whole
@@ -1002,7 +1019,7 @@ pub(crate) fn flush_document_batches(store: &mut Store, batches: Vec<PendingDocB
                 continue;
             }
         };
-        let rows = build_doc_rows(doc, &batch.rel_path, &batch.doc_scope);
+        let rows = build_doc_rows(doc, &batch.rel_path, &batch.doc_scope, citations);
         if rows.is_empty() {
             continue;
         }

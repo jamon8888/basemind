@@ -27,7 +27,12 @@ pub(crate) fn flush_doc_batches_if_any(
         }
         let persistence_started = Instant::now();
         crate::scanner_doc_links::flush_doc_links(store, config, &batches);
-        let inserted = flush_document_batches(store, batches, &config.documents.embedding_preset);
+        let inserted = flush_document_batches(
+            store,
+            batches,
+            &config.documents.embedding_preset,
+            &config.documents.citations,
+        );
         crate::scanner_docs::ensure_document_fts_index(store, config);
         metrics.add_persistence(persistence_started.elapsed());
         if inserted > 0 {

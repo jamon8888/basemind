@@ -32,6 +32,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
             text: "hello".to_string(),
             embedding: vec![0.0_f32; 768],
             heading_path: String::new(),
+            cites: String::new(),
         }],
         embedding_model: "balanced".to_string(),
         embedding_dim: 768,
@@ -117,6 +118,7 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
             text: format!("chunk {i}"),
             embedding: vec![0.0_f32; embedding_dim as usize],
             heading_path: String::new(),
+            cites: String::new(),
         })
         .collect();
     FileMapDoc {
@@ -620,7 +622,9 @@ fn seeded_doc_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceSto
             chunk_idx: 0,
             mime_type: "text/plain".to_string(),
             text: "body".to_string(),
+            text_phrase: "body".to_string(),
             heading_path: String::new(),
+            cites: String::new(),
             byte_start: 0,
             byte_end: 4,
             rehydration_ref: None,

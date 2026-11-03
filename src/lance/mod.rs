@@ -115,12 +115,16 @@ pub struct DocumentRow {
     pub chunk_idx: u32,
     pub mime_type: String,
     pub text: String,
+    /// Unmodified copy of the chunk text used by the positional phrase index.
+    pub text_phrase: String,
     /// The Markdown heading breadcrumb this chunk sits under, `""` when it has none.
     ///
     /// Carried all the way to the table because the keyword lane indexes it. It used to stop at
     /// [`crate::extract::doc::DocChunk`]: the extractor computed it, and nothing downstream ever
     /// read it, so the index built over a column that did not exist.
     pub heading_path: String,
+    /// Newline-separated legal identifiers extracted from this chunk for exact retrieval.
+    pub cites: String,
     pub byte_start: u32,
     pub byte_end: u32,
     /// Vault key for the document's encrypted rehydration map. `None` until
@@ -726,7 +730,9 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
     let mut text = StringBuilder::new();
+    let mut text_phrase = StringBuilder::new();
     let mut heading_path = StringBuilder::new();
+    let mut cites = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
     let mut byte_end = UInt32Builder::new();
     let mut rehydration_ref = StringBuilder::new();
@@ -749,10 +755,12 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
         text.append_value(&r.text);
+        text_phrase.append_value(&r.text_phrase);
         // Empty rather than null for a chunk with no heading: the column is declared non-nullable,
         // so `""` is what "no breadcrumb" reads back as, and the tokenizer sees an empty document
         // rather than a missing value.
         heading_path.append_value(&r.heading_path);
+        cites.append_value(&r.cites);
         byte_start.append_value(r.byte_start);
         byte_end.append_value(r.byte_end);
         match &r.rehydration_ref {
@@ -784,7 +792,9 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
             Arc::new(text.finish()),
+            Arc::new(text_phrase.finish()),
             Arc::new(heading_path.finish()),
+            Arc::new(cites.finish()),
             Arc::new(byte_start.finish()),
             Arc::new(byte_end.finish()),
             Arc::new(rehydration_ref.finish()),

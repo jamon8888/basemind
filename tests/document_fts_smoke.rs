@@ -35,9 +35,11 @@ fn row(scope: &str, path: &str, text: &str) -> Vec<DocumentRow> {
         chunk_idx: 0,
         mime_type: "text/markdown".to_string(),
         text: text.to_string(),
+        text_phrase: text.to_string(),
         // No heading on the fixtures that assert on body text: a breadcrumb here would make a
         // heading match indistinguishable from a body match.
         heading_path: String::new(),
+        cites: String::new(),
         byte_start: 0,
         byte_end: text.len() as u32,
         rehydration_ref: None,
