@@ -14,6 +14,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FusionConfig {
+    /// Legacy RRF knobs accepted for backwards-compatible config loading. They were never wired
+    /// into document retrieval and are intentionally omitted from serialization and the schema.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub k: Option<f32>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub weight_exact: Option<f32>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub weight_keyword: Option<f32>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub weight_facet: Option<f32>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub weight_vector: Option<f32>,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub per_document_cap: Option<u32>,
     /// How many times a multi-term query may drop its lowest-idf term before giving up.
     ///
     /// This bounds latency on a query that matches nothing conjunctively. Each relaxation is a
@@ -31,6 +51,12 @@ impl FusionConfig {
 impl Default for FusionConfig {
     fn default() -> Self {
         Self {
+            k: None,
+            weight_exact: None,
+            weight_keyword: None,
+            weight_facet: None,
+            weight_vector: None,
+            per_document_cap: None,
             max_relaxations: Self::default_max_relaxations(),
         }
     }
@@ -55,9 +81,11 @@ pub struct FtsConfig {
     /// N-gram length for the citation (trigram) index. Both bounds are set because Lance's n-gram
     /// tokenizer takes a min and a max; 3/3 is what makes `362` reach `§ 362(a)(1)`.
     #[serde(default = "FtsConfig::default_ngram_min_length")]
+    #[schemars(range(min = 1))]
     pub ngram_min_length: u32,
     /// Upper n-gram length for the citation index. See `ngram_min_length`.
     #[serde(default = "FtsConfig::default_ngram_max_length")]
+    #[schemars(range(min = 1))]
     pub ngram_max_length: u32,
     /// Stemming on the lexical index.
     #[serde(default = "FtsConfig::default_stem")]
@@ -238,6 +266,20 @@ max_characters = 1800
         assert!(
             err.to_string().contains("language"),
             "a bare `language` is rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_fusion_knobs_still_load_but_are_not_shipped() {
+        let cfg: FusionConfig = toml::from_str(
+            "k = 60.0\nweight_exact = 3.0\nweight_keyword = 2.0\nweight_facet = 1.0\nweight_vector = 1.0\nper_document_cap = 3\n",
+        )
+        .expect("legacy fusion settings remain loadable");
+        assert_eq!(cfg.k, Some(60.0));
+        assert_eq!(cfg.per_document_cap, Some(3));
+        assert_eq!(
+            serde_json::to_value(&cfg).expect("serialize config")["k"],
+            serde_json::Value::Null
         );
     }
 }

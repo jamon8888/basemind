@@ -1237,14 +1237,14 @@
           "description": "N-gram length for the citation (trigram) index. Both bounds are set because Lance's n-gram\ntokenizer takes a min and a max; 3/3 is what makes `362` reach `§ 362(a)(1)`.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 3
         },
         "ngram_max_length": {
           "description": "Upper n-gram length for the citation index. See `ngram_min_length`.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 3
         },
         "stem": {

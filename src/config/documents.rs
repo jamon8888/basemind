@@ -544,6 +544,7 @@ fn default_true() -> bool {
 #[serde(rename_all = "kebab-case")]
 pub enum RedactionStrategy {
     #[default]
+    #[serde(alias = "token_replace")]
     TokenReplace,
     Mask,
     Hash,

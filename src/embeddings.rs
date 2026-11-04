@@ -83,7 +83,9 @@ static PASS_GATE: Mutex<()> = Mutex::new(());
 /// batches use the same guard, so the default cold-release policy cannot leave engines resident
 /// indefinitely; daemons that need warm watcher latency can opt into `keep_models_warm`.
 #[must_use = "the engines are released when this guard drops"]
-pub struct EmbedPass;
+pub struct EmbedPass {
+    _private: (),
+}
 
 /// Register the start of an embedding pass; see [`EmbedPass`].
 pub fn begin_embed_pass() -> EmbedPass {
@@ -99,7 +101,7 @@ pub fn begin_embed_pass_with_policy(keep_warm: bool) -> EmbedPass {
     if keep_warm {
         WARM_RETENTION_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
     }
-    EmbedPass
+    EmbedPass { _private: () }
 }
 
 impl Drop for EmbedPass {
@@ -343,8 +345,11 @@ impl SharedEmbedder {
 mod tests {
     use super::*;
 
+    static EMBED_PASS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn embed_pass_guards_nest_and_count_down() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let base = embed_passes_in_flight();
         let first = begin_embed_pass();
         let second = begin_embed_pass();
@@ -359,6 +364,7 @@ mod tests {
 
     #[test]
     fn mixed_pass_policies_retain_in_either_drop_order() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let _cold = begin_embed_pass_with_policy(false);
         let warm = begin_embed_pass_with_policy(true);
         drop(warm);

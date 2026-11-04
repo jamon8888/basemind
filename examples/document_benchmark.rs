@@ -728,6 +728,9 @@ fn main() -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
+        // Incremental watcher work intentionally keeps the engine warm between edits; the guard
+        // still participates in the global pass barrier for overlapping benchmark scans.
+        let _embed_pass = basemind::embeddings::begin_embed_pass_with_policy(true);
         let mut observer = FirstResultObserver::new(started);
         let result = scan_paths_with_observer(
             &root,
