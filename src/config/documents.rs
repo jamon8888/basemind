@@ -172,7 +172,7 @@ pub struct DocumentsConfig {
     /// Response wire format for the document MCP tools.
     #[serde(default)]
     pub output: OutputConfig,
-    /// RRF fusion parameters for multi-lane retrieval (`[documents.fusion]`).
+    /// Lexical retrieval controls (`[documents.fusion]`).
     #[serde(default)]
     pub fusion: FusionConfig,
     /// Tokenizer settings for the lexical index (`[documents.fts]`).
@@ -384,7 +384,7 @@ pub struct NerConfig {
 /// When `enabled = true` (and the `graphrag` feature is compiled), the scanner
 /// builds `graph_entities` and `graph_edges` Lance tables from the NER sidecar
 /// at scan time. The `graph entities` and `graph rag` tool modes become available.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphragConfig {
     /// Master switch — off by default.
@@ -401,6 +401,17 @@ pub struct GraphragConfig {
     /// Hop depth for graph rag expansion (1 or 2).
     #[serde(default = "default_graphrag_hops")]
     pub hops: u8,
+}
+
+impl Default for GraphragConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            labels: default_graphrag_labels(),
+            max_rows: default_graphrag_max_rows(),
+            hops: default_graphrag_hops(),
+        }
+    }
 }
 
 fn default_graphrag_labels() -> Vec<String> {

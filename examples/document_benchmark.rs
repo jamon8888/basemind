@@ -570,7 +570,11 @@ fn main() -> Result<()> {
             "--enable-ner" => enable_ner = true,
             "--ner-model" => {
                 i += 1;
-                ner_model = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.clone());
+                let value = args.get(i).ok_or_else(|| anyhow!("{}", usage()))?;
+                if value.starts_with("--") {
+                    return Err(anyhow!("--ner-model requires a model value"));
+                }
+                ner_model = Some(value.clone());
             }
             "--onnx-provider" => {
                 i += 1;
@@ -656,6 +660,9 @@ fn main() -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
+        // Mirror the production full-pass boundary so --keep-models-warm affects the measured
+        // lifecycle rather than merely appearing in the benchmark's JSON output.
+        let _embed_pass = basemind::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm);
         let mut observer = FirstResultObserver::new(started);
         let result = if manifest_files.is_empty() {
             scan_with_observer(

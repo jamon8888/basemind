@@ -151,12 +151,6 @@
           "format": "json"
         },
         "fusion": {
-          "k": 60.0,
-          "weight_exact": 3.0,
-          "weight_keyword": 2.0,
-          "weight_facet": 1.0,
-          "weight_vector": 1.0,
-          "per_document_cap": 3,
           "max_relaxations": 3
         },
         "fts": {
@@ -181,9 +175,13 @@
         },
         "graphrag": {
           "enabled": false,
-          "labels": [],
-          "max_rows": 0,
-          "hops": 0
+          "labels": [
+            "person",
+            "organization",
+            "location"
+          ],
+          "max_rows": 200,
+          "hops": 2
         },
         "citations": {
           "extract": true,
@@ -723,15 +721,9 @@
           }
         },
         "fusion": {
-          "description": "RRF fusion parameters for multi-lane retrieval (`[documents.fusion]`).",
+          "description": "Lexical retrieval controls (`[documents.fusion]`).",
           "$ref": "#/$defs/FusionConfig",
           "default": {
-            "k": 60.0,
-            "weight_exact": 3.0,
-            "weight_keyword": 2.0,
-            "weight_facet": 1.0,
-            "weight_vector": 1.0,
-            "per_document_cap": 3,
             "max_relaxations": 3
           }
         },
@@ -764,9 +756,13 @@
           "$ref": "#/$defs/GraphragConfig",
           "default": {
             "enabled": false,
-            "labels": [],
-            "max_rows": 0,
-            "hops": 0
+            "labels": [
+              "person",
+              "organization",
+              "location"
+            ],
+            "max_rows": 200,
+            "hops": 2
           }
         },
         "citations": {
@@ -1220,46 +1216,9 @@
       ]
     },
     "FusionConfig": {
-      "description": "`[documents.fusion]` — RRF parameters for multi-lane retrieval.",
+      "description": "`[documents.fusion]` — lexical retrieval controls.",
       "type": "object",
       "properties": {
-        "k": {
-          "description": "RRF rank-damping constant. 60 is the Cormack et al. value and the de-facto default: large\nenough that a lane's top ranks stay close in contribution, so no lane wins on rank-1 alone.",
-          "type": "number",
-          "format": "float",
-          "default": 60.0
-        },
-        "weight_exact": {
-          "description": "Weight for the `exact` lane (identifier / trigram match over `cites`).",
-          "type": "number",
-          "format": "float",
-          "default": 3.0
-        },
-        "weight_keyword": {
-          "description": "Weight for the `keyword` lane (BM25/FTS over `text` + `heading_path`).",
-          "type": "number",
-          "format": "float",
-          "default": 2.0
-        },
-        "weight_facet": {
-          "description": "Weight for the `facet` lane. A facet lane prefilters without scoring, so this scales a rank\nover the surviving set, not a matched score.",
-          "type": "number",
-          "format": "float",
-          "default": 1.0
-        },
-        "weight_vector": {
-          "description": "Weight for the `vector` lane.",
-          "type": "number",
-          "format": "float",
-          "default": 1.0
-        },
-        "per_document_cap": {
-          "description": "Maximum chunks kept from any one document in a fused result. A long filing otherwise\ncontributes several near-identical passages that crowd out other documents.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0,
-          "default": 3
-        },
         "max_relaxations": {
           "description": "How many times a multi-term query may drop its lowest-idf term before giving up.\n\nThis bounds latency on a query that matches nothing conjunctively. Each relaxation is a\nwhole re-run of the FTS query, so this is a latency knob as much as a recall one.",
           "type": "integer",

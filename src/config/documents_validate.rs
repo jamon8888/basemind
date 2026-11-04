@@ -78,6 +78,15 @@ impl DocumentsConfig {
         } else {
             return Err("[documents.keywords] ngram_range must have exactly two entries".to_string());
         }
+        if self.fts.ngram_min_length == 0
+            || self.fts.ngram_max_length == 0
+            || self.fts.ngram_min_length > self.fts.ngram_max_length
+        {
+            return Err(format!(
+                "[documents.fts] ngram_min_length ({}) and ngram_max_length ({}) must satisfy 1 <= min <= max",
+                self.fts.ngram_min_length, self.fts.ngram_max_length
+            ));
+        }
         Ok(())
     }
 }
@@ -180,5 +189,20 @@ mod tests {
             ..Default::default()
         };
         assert!(d.validate().unwrap_err().contains("ngram_range"));
+    }
+
+    #[test]
+    fn rejects_invalid_fts_ngram_bounds() {
+        for (min, max) in [(0, 3), (3, 0), (4, 3)] {
+            let d = DocumentsConfig {
+                fts: crate::config::FtsConfig {
+                    ngram_min_length: min,
+                    ngram_max_length: max,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(d.validate().unwrap_err().contains("ngram_min_length"));
+        }
     }
 }

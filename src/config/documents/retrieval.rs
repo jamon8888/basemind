@@ -10,37 +10,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// `[documents.fusion]` — RRF parameters for multi-lane retrieval.
+/// `[documents.fusion]` — lexical retrieval controls.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FusionConfig {
-    /// RRF rank-damping constant. 60 is the Cormack et al. value and the de-facto default: large
-    /// enough that a lane's top ranks stay close in contribution, so no lane wins on rank-1 alone.
-    #[serde(default = "FusionConfig::default_k")]
-    pub k: f32,
-
-    /// Weight for the `exact` lane (identifier / trigram match over `cites`).
-    #[serde(default = "FusionConfig::default_weight_exact")]
-    pub weight_exact: f32,
-
-    /// Weight for the `keyword` lane (BM25/FTS over `text` + `heading_path`).
-    #[serde(default = "FusionConfig::default_weight_keyword")]
-    pub weight_keyword: f32,
-
-    /// Weight for the `facet` lane. A facet lane prefilters without scoring, so this scales a rank
-    /// over the surviving set, not a matched score.
-    #[serde(default = "FusionConfig::default_weight_facet")]
-    pub weight_facet: f32,
-
-    /// Weight for the `vector` lane.
-    #[serde(default = "FusionConfig::default_weight_vector")]
-    pub weight_vector: f32,
-
-    /// Maximum chunks kept from any one document in a fused result. A long filing otherwise
-    /// contributes several near-identical passages that crowd out other documents.
-    #[serde(default = "FusionConfig::default_per_document_cap")]
-    pub per_document_cap: u32,
-
     /// How many times a multi-term query may drop its lowest-idf term before giving up.
     ///
     /// This bounds latency on a query that matches nothing conjunctively. Each relaxation is a
@@ -50,24 +23,6 @@ pub struct FusionConfig {
 }
 
 impl FusionConfig {
-    fn default_k() -> f32 {
-        60.0
-    }
-    fn default_weight_exact() -> f32 {
-        3.0
-    }
-    fn default_weight_keyword() -> f32 {
-        2.0
-    }
-    fn default_weight_facet() -> f32 {
-        1.0
-    }
-    fn default_weight_vector() -> f32 {
-        1.0
-    }
-    fn default_per_document_cap() -> u32 {
-        3
-    }
     fn default_max_relaxations() -> u32 {
         3
     }
@@ -76,12 +31,6 @@ impl FusionConfig {
 impl Default for FusionConfig {
     fn default() -> Self {
         Self {
-            k: Self::default_k(),
-            weight_exact: Self::default_weight_exact(),
-            weight_keyword: Self::default_weight_keyword(),
-            weight_facet: Self::default_weight_facet(),
-            weight_vector: Self::default_weight_vector(),
-            per_document_cap: Self::default_per_document_cap(),
             max_relaxations: Self::default_max_relaxations(),
         }
     }
@@ -230,22 +179,10 @@ mod tests {
     use super::super::DocumentsConfig;
     use super::{CitationsConfig, FtsConfig, FusionConfig};
 
-    /// The defaults must match the spec's §5 / §7.1 / §10 tables, because they are what a user gets
-    /// with no config at all. If these drift, the documented defaults are a lie.
+    /// The defaults must match the shipped lexical retrieval controls.
     #[test]
     fn defaults_match_the_spec() {
         let fusion = FusionConfig::default();
-        assert_eq!(fusion.k, 60.0);
-        assert_eq!(
-            (
-                fusion.weight_exact,
-                fusion.weight_keyword,
-                fusion.weight_facet,
-                fusion.weight_vector
-            ),
-            (3.0, 2.0, 1.0, 1.0)
-        );
-        assert_eq!(fusion.per_document_cap, 3);
         assert_eq!(fusion.max_relaxations, 3);
 
         let fts = FtsConfig::default();
@@ -278,7 +215,7 @@ max_characters = 1800
         assert!(cfg.enabled);
         assert_eq!(cfg.max_characters, 1800);
         assert_eq!(cfg.fts.max_token_length, 64, "and take the documented defaults");
-        assert_eq!(cfg.fusion.k, 60.0);
+        assert_eq!(cfg.fusion.max_relaxations, 3);
         assert!(cfg.citations.extract);
     }
 
