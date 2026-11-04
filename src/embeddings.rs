@@ -75,8 +75,9 @@ static PASS_GATE: Mutex<()> = Mutex::new(());
 
 /// RAII marker for one full embedding pass in this process. When the LAST concurrent guarded pass
 /// ends, resident engines are released, so a pass for one workspace never frees the model out from
-/// under (or forces a reload for) a pass that is still running for another. Incremental watcher
-/// batches intentionally do not create this guard and retain engines for the next change.
+/// under (or forces a reload for) a pass that is still running for another. Inline incremental
+/// batches use the same guard, so the default cold-release policy cannot leave engines resident
+/// indefinitely; daemons that need warm watcher latency can opt into `keep_models_warm`.
 #[must_use = "the engines are released when this guard drops"]
 pub struct EmbedPass {
     keep_warm: bool,

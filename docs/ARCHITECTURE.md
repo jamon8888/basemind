@@ -714,9 +714,8 @@ daemon's environment. ONNX Runtime memory is bounded in every process (`embeddin
 no memory-pattern planning, no retained CPU arena; intra-op threads are the auto embed-thread count, or
 2 in the daemon). By default the daemon drops resident embedding engines when the last concurrent
 full embedding pass ends; `[resources] keep_models_warm = true` opts into retaining them for
-low-latency repeated scans and queries. Incremental watcher batches intentionally retain engines
-between changes because they are already a warm, long-lived stream rather than independent full
-passes.
+low-latency repeated scans and queries. Incremental Inline batches participate in the same release
+barrier, so the default cold-release policy also applies to watcher-only workloads.
 
 Other bounds that are not `[resources]` keys:
 
