@@ -104,7 +104,7 @@ def generate(root: Path) -> Path:
             for path in sorted(root.iterdir())
             if path.name != manifest.name and path.suffix in {".pdf", ".docx", ".pptx", ".xlsx", ".txt"}
         )
-        + "\n"
+        + "\n",
     )
     return manifest
 
