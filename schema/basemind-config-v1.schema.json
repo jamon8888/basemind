@@ -83,9 +83,9 @@
         "max_abandoned_extractions": 4,
         "markdown_chunk_max_bytes": 1048576,
         "plain_text_chunk_max_bytes": 4194304,
-        "max_characters": 1000,
-        "overlap": 200,
-        "embedding_preset": "balanced",
+        "max_characters": 800,
+        "overlap": 100,
+        "embedding_preset": "multilingual",
         "embed": true,
         "embed_include": [],
         "embed_exclude": [],
@@ -126,6 +126,15 @@
           "enabled": false,
           "strategy": "extractive"
         },
+        "redaction": {
+          "enabled": false,
+          "categories": [],
+          "strategy": "token-replace",
+          "ner": null,
+          "preserve_offsets": true,
+          "custom_terms": [],
+          "custom_patterns": []
+        },
         "ocr": {
           "backend": "tesseract",
           "languages": [
@@ -141,6 +150,45 @@
         "output": {
           "format": "json"
         },
+        "fusion": {
+          "k": 60.0,
+          "weight_exact": 3.0,
+          "weight_keyword": 2.0,
+          "weight_facet": 1.0,
+          "weight_vector": 1.0,
+          "per_document_cap": 3,
+          "max_relaxations": 3
+        },
+        "fts": {
+          "ngram_min_length": 3,
+          "ngram_max_length": 3,
+          "stem": true,
+          "remove_stop_words": true,
+          "ascii_folding": true,
+          "max_token_length": 64,
+          "stemmer_language": "English",
+          "custom_stop_words": [
+            "pursuant",
+            "herein",
+            "hereto",
+            "aforesaid",
+            "wherein",
+            "notwithstanding",
+            "provided that",
+            "hereinafter",
+            "thereunder"
+          ]
+        },
+        "graphrag": {
+          "enabled": false,
+          "labels": [],
+          "max_rows": 0,
+          "hops": 0
+        },
+        "citations": {
+          "extract": true,
+          "max_per_chunk": 64
+        },
         "embed_max_threads": 0
       }
     },
@@ -148,13 +196,14 @@
       "description": "Resource-governance knobs: scanner / embedder thread caps, document\nconcurrency, embed batch size, footprint ceiling, and the document model\nprofile. Bounds basemind's footprint on constrained machines.",
       "$ref": "#/$defs/ResourcesConfig",
       "default": {
-        "scan_threads": 0,
-        "embed_threads": 0,
-        "max_concurrent_documents": 0,
-        "embed_batch_size": 32,
+        "scan_threads": 2,
+        "embed_threads": 2,
+        "max_concurrent_documents": 1,
+        "embed_batch_size": 16,
         "max_footprint_mb": 0,
-        "max_map_cache_mb": 256,
+        "max_map_cache_mb": 128,
         "document_models": "full",
+        "keep_models_warm": false,
         "onnx_provider": "cpu"
       }
     },
@@ -527,19 +576,19 @@
           "type": "integer",
           "format": "uint",
           "minimum": 64,
-          "default": 1000
+          "default": 800
         },
         "overlap": {
           "description": "Overlap between chunks in characters.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 200
+          "default": 100
         },
         "embedding_preset": {
-          "description": "Xberg embedding preset name. Defaults to \"balanced\".\n\nEU/GDPR workspaces should opt into `embedding_preset = \"multilingual\"`\n(multilingual-e5-base, 768-dim) instead. The default stays \"balanced\"\ndeliberately: the preset feeds the LanceDB `(dim, embedding_model,\nschema_ver)` triple, so flipping it wipes and re-embeds every existing\nworkspace index — an opt-in, not a silent migration.",
+          "description": "Xberg embedding preset name. Defaults to \"multilingual\"\n(multilingual-e5-base, 768-dim, 100+ languages).\n\nThe preset feeds the LanceDB `(dim, embedding_model, schema_ver)` triple,\nso changing it wipes and re-embeds every existing workspace index — pick\ndeliberately before indexing. Set `embedding_preset = \"balanced\"` for an\nEnglish-focused 768-dim alternative.",
           "type": "string",
-          "default": "balanced"
+          "default": "multilingual"
         },
         "embed": {
           "description": "Generate embeddings (`true`) or skip vector storage entirely (`false`).",
@@ -638,12 +687,13 @@
           }
         },
         "redaction": {
-          "description": "PII redaction / anonymisation at ingest time. When enabled, xberg's\nredaction processor runs at the Late stage and rewrites every textual field\nwith [TYPE_N] tokens via TokenReplace. The rehydration map is returned via\nthe extraction result and is NOT stored by basemind — use `basemind vault-encrypt`\nto persist it separately.",
+          "description": "PII redaction / anonymisation at ingest time.",
           "$ref": "#/$defs/RedactionConfig",
           "default": {
             "enabled": false,
             "categories": [],
-            "strategy": "token_replace",
+            "strategy": "token-replace",
+            "ner": null,
             "preserve_offsets": true,
             "custom_terms": [],
             "custom_patterns": []
@@ -655,7 +705,13 @@
           "default": {
             "backend": "tesseract",
             "languages": [
-              "eng"
+              "eng",
+              "deu",
+              "fra",
+              "spa",
+              "ita",
+              "nld",
+              "pol"
             ]
           }
         },
@@ -666,53 +722,59 @@
             "format": "json"
           }
         },
+        "fusion": {
+          "description": "RRF fusion parameters for multi-lane retrieval (`[documents.fusion]`).",
+          "$ref": "#/$defs/FusionConfig",
+          "default": {
+            "k": 60.0,
+            "weight_exact": 3.0,
+            "weight_keyword": 2.0,
+            "weight_facet": 1.0,
+            "weight_vector": 1.0,
+            "per_document_cap": 3,
+            "max_relaxations": 3
+          }
+        },
+        "fts": {
+          "description": "Tokenizer settings for the lexical index (`[documents.fts]`).",
+          "$ref": "#/$defs/FtsConfig",
+          "default": {
+            "ngram_min_length": 3,
+            "ngram_max_length": 3,
+            "stem": true,
+            "remove_stop_words": true,
+            "ascii_folding": true,
+            "max_token_length": 64,
+            "stemmer_language": "English",
+            "custom_stop_words": [
+              "pursuant",
+              "herein",
+              "hereto",
+              "aforesaid",
+              "wherein",
+              "notwithstanding",
+              "provided that",
+              "hereinafter",
+              "thereunder"
+            ]
+          }
+        },
         "graphrag": {
-          "description": "GraphRAG entity graph built from the NER sidecar at scan time (spec 0016).",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "description": "Master switch - off by default.",
-              "type": "boolean",
-              "default": false
-            },
-            "labels": {
-              "description": "Labels projected as graph nodes. Numeric/secret labels are excluded by default.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              },
-              "default": [
-                "person",
-                "organization",
-                "location"
-              ]
-            },
-            "max_rows": {
-              "description": "Max rows returned by Cypher queries (server-side budget).",
-              "type": "integer",
-              "minimum": 1,
-              "default": 200
-            },
-            "hops": {
-              "description": "Hop depth for graph rag expansion (1 or 2).",
-              "type": "integer",
-              "enum": [
-                1,
-                2
-              ],
-              "default": 2
-            }
-          },
+          "description": "GraphRAG entity graph (`[graphrag]`).",
+          "$ref": "#/$defs/GraphragConfig",
           "default": {
             "enabled": false,
-            "labels": [
-              "person",
-              "organization",
-              "location"
-            ],
-            "max_rows": 200,
-            "hops": 2
+            "labels": [],
+            "max_rows": 0,
+            "hops": 0
+          }
+        },
+        "citations": {
+          "description": "Identifier extraction for the exact lane (`[documents.citations]`).",
+          "$ref": "#/$defs/CitationsConfig",
+          "default": {
+            "extract": true,
+            "max_per_chunk": 64
           }
         },
         "embed_max_threads": {
@@ -777,9 +839,41 @@
           "format": "uint",
           "minimum": 0,
           "default": 20
+        },
+        "custom_model": {
+          "description": "Custom ONNX cross-encoder (Hugging Face repo) used when no per-call\npreset is given. Lets deployments run models xberg ships no preset\nfor (e.g. `onnx-community/gte-multilingual-reranker-base` int8).\nAn explicit per-call preset always wins over this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CustomRerankerModel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "CustomRerankerModel": {
+      "description": "Custom ONNX cross-encoder resolved from a Hugging Face repo by xberg's\nlazy downloader (same layout convention as its `Custom` embedding models).",
+      "type": "object",
+      "properties": {
+        "model_id": {
+          "description": "Hugging Face repo id, e.g. `\"onnx-community/gte-multilingual-reranker-base\"`.",
+          "type": "string"
+        },
+        "model_file": {
+          "description": "ONNX file within the repo. Defaults to `\"onnx/model.onnx\"`; int8\nvariants use e.g. `\"onnx/model_int8.onnx\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model_id"
+      ]
     },
     "KeywordsConfig": {
       "type": "object",
@@ -798,7 +892,7 @@
           "description": "Maximum keywords to extract per document. Matches xberg's\n`KeywordConfig.max_keywords` default of 10.",
           "type": "integer",
           "format": "uint",
-          "minimum": 1,
+          "minimum": 0,
           "default": 10
         },
         "min_score": {
@@ -921,6 +1015,7 @@
       ]
     },
     "RedactionConfig": {
+      "description": "PII redaction / anonymisation config.\n\nWhen `enabled = true`, xberg's redaction post-processor runs at the Late stage\nof document extraction and rewrites every textual field (content, tables, metadata,\nURIs, form fields, OCR, Djot, etc.) with `[TYPE_N]` tokens via `TokenReplace`.\nThe rehydration map is NOT stored by basemind — it is returned to the caller\nvia `ExtractedDocument.redaction_report`. Use `basemind vault-encrypt` to\nencrypt and persist the map separately.\n\nRequires `xberg/redaction` (enabled in the `documents` feature) and\n`xberg/redaction-rehydrate` (also enabled in the `documents` feature) for the\n`TokenReplace` strategy that enables later rehydration.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -929,7 +1024,7 @@
           "default": false
         },
         "categories": {
-          "description": "PII categories to redact. Empty = all categories supported by the engine.\nAccepted values: email, phone, ssn, credit_card, iban, ip_address, swift_bic,\npostal_code, date_of_birth, person, organization, location.",
+          "description": "PII categories to redact. Empty = all categories supported by the engine.\nAccepted values: `email`, `phone`, `ssn`, `credit_card`, `iban`,\n`ip_address`, `swift_bic`, `postal_code`, `person`, `organization`,\n`location`, `date_of_birth`. Categories suffixed with `_strict` use\nchecksum validation where applicable (e.g. `iban_strict`).",
           "type": "array",
           "items": {
             "type": "string"
@@ -937,21 +1032,29 @@
           "default": []
         },
         "strategy": {
-          "description": "Redaction strategy. token_replace (default) assigns stable [TYPE_N] tokens\nand is reversible. mask replaces with [REDACTED] irreversibly. hash replaces\nwith [HASH:... irreversibly. drop removes the span with no marker.",
+          "description": "Redaction strategy. `token_replace` (default) assigns stable `[TYPE_N]`\ntokens per category and is reversible via the rehydration map. `mask`\nreplaces with `[REDACTED]` irreversibly. `hash` replaces with\n`[HASH:...` irreversibly. `drop` removes the span with no marker.",
           "$ref": "#/$defs/RedactionStrategy",
-          "default": "token_replace"
+          "default": "token-replace"
         },
         "ner": {
-          "description": "NER backend config for PERSON/ORGANIZATION/LOCATION categories.",
-          "$ref": "#/$defs/NerRedactionConfig"
+          "description": "NER backend config for PERSON / ORGANIZATION / LOCATION categories.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NerRedactionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "preserve_offsets": {
-          "description": "Preserve chunk byte ranges after redaction.",
+          "description": "Preserve chunk byte ranges after redaction (default: `true`).",
           "type": "boolean",
           "default": true
         },
         "custom_terms": {
-          "description": "Custom literal terms to redact.",
+          "description": "Custom literal terms to redact. Each hit surfaces as `Custom(<label>)`\nin the redaction report.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/RedactionCustomTerm"
@@ -959,7 +1062,7 @@
           "default": []
         },
         "custom_patterns": {
-          "description": "Custom regex patterns to redact.",
+          "description": "Custom regex patterns to redact. Each hit surfaces as `Custom(<label>)`\nin the redaction report.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/RedactionCustomPattern"
@@ -972,16 +1075,18 @@
     "RedactionStrategy": {
       "type": "string",
       "enum": [
-        "token_replace",
+        "token-replace",
         "mask",
         "hash",
         "drop"
       ]
     },
     "NerRedactionConfig": {
+      "description": "NER backend config for redaction (separate from the extraction-tier NER config).",
       "type": "object",
       "properties": {
         "backend": {
+          "description": "NER backend: `onnx` (local GLiNER) or `llm` (provider API).",
           "$ref": "#/$defs/NerBackend",
           "default": "onnx"
         },
@@ -990,10 +1095,11 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "default": null
         },
         "categories": {
-          "description": "NER categories to detect.",
+          "description": "Categories to detect via NER.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1012,6 +1118,7 @@
       "additionalProperties": false
     },
     "RedactionCustomTerm": {
+      "description": "A literal string to redact, surfaced as `Custom(<label>)` in the report.",
       "type": "object",
       "properties": {
         "label": {
@@ -1023,18 +1130,19 @@
           "type": "string"
         },
         "case_sensitive": {
-          "description": "Case-sensitive match (default: false).",
+          "description": "Case-sensitive match (default: false, i.e. case-insensitive).",
           "type": "boolean",
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "label",
         "value"
-      ],
-      "additionalProperties": false
+      ]
     },
     "RedactionCustomPattern": {
+      "description": "A regex pattern to redact, surfaced as `Custom(<label>)` in the report.",
       "type": "object",
       "properties": {
         "label": {
@@ -1046,16 +1154,16 @@
           "type": "string"
         },
         "case_sensitive": {
-          "description": "Case-sensitive match (default: false).",
+          "description": "Case-sensitive match (default: false, i.e. case-insensitive).",
           "type": "boolean",
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "label",
         "pattern"
-      ],
-      "additionalProperties": false
+      ]
     },
     "OcrConfig": {
       "type": "object",
@@ -1107,43 +1215,219 @@
       "type": "string",
       "enum": [
         "json",
-        "toon"
+        "toon",
+        "markdown"
       ]
+    },
+    "FusionConfig": {
+      "description": "`[documents.fusion]` — RRF parameters for multi-lane retrieval.",
+      "type": "object",
+      "properties": {
+        "k": {
+          "description": "RRF rank-damping constant. 60 is the Cormack et al. value and the de-facto default: large\nenough that a lane's top ranks stay close in contribution, so no lane wins on rank-1 alone.",
+          "type": "number",
+          "format": "float",
+          "default": 60.0
+        },
+        "weight_exact": {
+          "description": "Weight for the `exact` lane (identifier / trigram match over `cites`).",
+          "type": "number",
+          "format": "float",
+          "default": 3.0
+        },
+        "weight_keyword": {
+          "description": "Weight for the `keyword` lane (BM25/FTS over `text` + `heading_path`).",
+          "type": "number",
+          "format": "float",
+          "default": 2.0
+        },
+        "weight_facet": {
+          "description": "Weight for the `facet` lane. A facet lane prefilters without scoring, so this scales a rank\nover the surviving set, not a matched score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "weight_vector": {
+          "description": "Weight for the `vector` lane.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0
+        },
+        "per_document_cap": {
+          "description": "Maximum chunks kept from any one document in a fused result. A long filing otherwise\ncontributes several near-identical passages that crowd out other documents.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        },
+        "max_relaxations": {
+          "description": "How many times a multi-term query may drop its lowest-idf term before giving up.\n\nThis bounds latency on a query that matches nothing conjunctively. Each relaxation is a\nwhole re-run of the FTS query, so this is a latency knob as much as a recall one.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        }
+      },
+      "additionalProperties": false
+    },
+    "FtsConfig": {
+      "description": "`[documents.fts]` — tokenizer settings for the lexical index.\n\nEvery field maps to a real `InvertedIndexParams` field; nothing here is a basemind-level\nsetting masquerading as a tokenizer one. Deliberately absent:\n\n- **`enabled`.** `[documents].enabled` is already the tier's master switch; a nested one\n  would shadow it and make \"the tier is on but the index is off\" expressible.\n- **Cadence keys.** `optimize()` frequency and the unindexed-row warning threshold are build\n  settings, not tokenizer parameters. They do not belong in a table named `fts`.\n- **`language`.** `[documents].language` already exists and is a *detection* table\n  (`auto_detect`, `min_confidence`, `detect_multiple`, `preferred_languages`). Two different\n  `language` keys of different shapes at different depths is a trap, so the stemmer's language\n  is named for what it does.",
+      "type": "object",
+      "properties": {
+        "ngram_min_length": {
+          "description": "N-gram length for the citation (trigram) index. Both bounds are set because Lance's n-gram\ntokenizer takes a min and a max; 3/3 is what makes `362` reach `§ 362(a)(1)`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        },
+        "ngram_max_length": {
+          "description": "Upper n-gram length for the citation index. See `ngram_min_length`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        },
+        "stem": {
+          "description": "Stemming on the lexical index.",
+          "type": "boolean",
+          "default": true
+        },
+        "remove_stop_words": {
+          "description": "Stop-word removal on the lexical index. The citation index overrides this to `false` —\nremoving stop words from a statute reference changes what it means.",
+          "type": "boolean",
+          "default": true
+        },
+        "ascii_folding": {
+          "description": "ASCII folding, so `société` matches `societe`. Matters for the French and Spanish corpora\nthis tier exists for.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_token_length": {
+          "description": "Maximum token length. Lance's default of 40 truncates long French and Spanish tokens, and a\ntruncated token indexes as the wrong term.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 64
+        },
+        "stemmer_language": {
+          "description": "Language whose stemmer and stop-word list apply.",
+          "type": "string",
+          "default": "English"
+        },
+        "custom_stop_words": {
+          "description": "Legal boilerplate added to the stop-word list. These carry no retrieval signal and are\nfrequent enough to dominate a short query.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "pursuant",
+            "herein",
+            "hereto",
+            "aforesaid",
+            "wherein",
+            "notwithstanding",
+            "provided that",
+            "hereinafter",
+            "thereunder"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GraphragConfig": {
+      "description": "GraphRAG entity graph configuration (spec 0016).\n\nWhen `enabled = true` (and the `graphrag` feature is compiled), the scanner\nbuilds `graph_entities` and `graph_edges` Lance tables from the NER sidecar\nat scan time. The `graph entities` and `graph rag` tool modes become available.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch — off by default.",
+          "type": "boolean",
+          "default": false
+        },
+        "labels": {
+          "description": "Labels to project as graph nodes. Default: person, organization, location + custom_labels.\nNumeric/secret labels (email, phone, iban, swift_bic, ip_address, api_key, password,\nssn, credit_card, date_of_birth) are excluded by default.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "person",
+            "organization",
+            "location"
+          ]
+        },
+        "max_rows": {
+          "description": "Max rows returned by Cypher queries (server-side budget).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 200
+        },
+        "hops": {
+          "description": "Hop depth for graph rag expansion (1 or 2).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255,
+          "default": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "CitationsConfig": {
+      "description": "`[documents.citations]` — identifier extraction for the exact lane.",
+      "type": "object",
+      "properties": {
+        "extract": {
+          "description": "Extract normalized identifiers (statute cites, docket numbers, case short names) at ingest.\n\nThe escape hatch for store size: the trigram index over this column is the one most likely\nto dominate the store on a large corpus. Turning it off disables the `exact` lane, not the\nrest of retrieval.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_per_chunk": {
+          "description": "Cap on identifiers stored per chunk. A dense statute-heavy chunk can yield hundreds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 64
+        }
+      },
+      "additionalProperties": false
     },
     "ResourcesConfig": {
       "description": "Top-level `[resources]` table. Every field has `#[serde(default)]` (directly\nor via a default fn) so adding a knob never breaks an older TOML file, and an\nomitted `[resources]` section deserialises to [`ResourcesConfig::default`].\n\n`0` is the \"auto\" sentinel for the thread / concurrency caps: it means \"let\nbasemind pick a bounded fraction of the machine\" rather than \"use zero\nthreads\". This keeps the default config safe on a laptop while letting an\noperator pin an explicit budget on a shared box.\n\n**In the shared daemon these are ceilings, not requests.** The effective value is the smaller of\nthe file's and the daemon's cap (`BASEMIND_DAEMON_MAX_SCAN_THREADS`, `..._MAX_EMBED_THREADS`,\n`..._MAX_EMBED_BATCH`, `..._MAX_CONCURRENT_DOCUMENTS`, `..._MAX_FOOTPRINT_MB`,\n`..._MAX_MAP_CACHE_MB`, and `..._MAX_CANDIDATES` for `[scan] max_candidates`), and a file value\nthat means \"no limit\" (`0`, `\"auto\"`, `\"off\"`) resolves to the cap. The operator raises a cap in\nthe daemon's environment; a repository cannot.",
       "type": "object",
       "properties": {
         "scan_threads": {
-          "description": "Cap on the code-map scanner's rayon pool. `0` (auto) keeps rayon's\ndefault (one worker per logical CPU); a non-zero value pins the pool so\nthe scan can't saturate every core on a shared machine. First scan wins\nfor the process — the pool is built once and its size is then fixed.",
+          "description": "Cap on the code-map scanner's rayon pool. `2` pins the pool to a\nconservative default that leaves headroom on 8 GiB machines; `0` (auto)\nwould use one worker per logical CPU. First scan wins for the process —\nthe pool is built once and its size is then fixed.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 2
         },
         "embed_threads": {
-          "description": "Cap on the ONNX embedding pool. `0` (auto) resolves to\n`max(2, logical_cpus / 4)` via `crate::embeddings::resolve_embed_threads`\n— a bounded fraction of cores so the embedder never pins the machine and\nORT arenas are not replicated across every core. This supersedes the\ndeprecated `[documents].embed_max_threads`; see\n[`ResourcesConfig::effective_embed_threads`] for the precedence.",
+          "description": "Cap on the ONNX embedding pool. `2` pins the pool to a conservative\ndefault that bounds ORT arena replication on 8 GiB machines; `0` (auto)\nwould resolve to `max(2, logical_cpus / 4)`. This supersedes the\ndeprecated `[documents].embed_max_threads`; see\n[`ResourcesConfig::effective_embed_threads`] for the precedence.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 2
         },
         "max_concurrent_documents": {
-          "description": "Upper bound on documents extracted concurrently. `0` (auto) leaves the\ndispatch unbounded. Enforced by a counting semaphore around document\nextraction (`backpressure::acquire_doc_slot`).\n\nComplementary to `max_footprint_mb` rather than redundant with it: a\ndocument extraction's spike (decoded page buffers, OCR bitmaps, an\nembedding batch) lands faster than the footprint sampler can observe it,\nso a memory ceiling alone reacts after the allocation. This bounds how\nmany such spikes can overlap in the first place.",
+          "description": "Upper bound on documents extracted concurrently. `1` ensures only one\nGLiNER/embedding spike can be in-flight at a time on 8 GiB machines; `0`\n(auto) leaves the dispatch unbounded. Enforced by a counting semaphore\naround document extraction (`backpressure::acquire_doc_slot`).\n\nComplementary to `max_footprint_mb` rather than redundant with it: a\ndocument extraction's spike (decoded page buffers, OCR bitmaps, an\nembedding batch) lands faster than the footprint sampler can observe it,\nso a memory ceiling alone reacts after the allocation. This bounds how\nmany such spikes can overlap in the first place.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 1
         },
         "embed_batch_size": {
-          "description": "Number of chunks the embedder submits to ONNX per batch. Larger batches\namortise per-call overhead at the cost of a higher transient memory\nspike; 32 is a safe default across the preset models. Threaded into both\n`SharedEmbedder` (code-search + query paths) and the document extractor's\n`EmbeddingConfig`.",
+          "description": "Number of chunks the embedder submits to ONNX per batch. `16` amortises\nper-call overhead while keeping the transient memory spike low enough\nfor 8 GiB machines; 32 is the previous default. Threaded into both\n`SharedEmbedder` (code-search + query paths) and the document extractor's\n`EmbeddingConfig`.",
           "type": "integer",
           "format": "uint",
           "minimum": 1,
-          "default": 32
+          "default": 16
         },
         "max_footprint_mb": {
-          "description": "Ceiling on process memory footprint, in mebibytes. Accepts a positive\ninteger (an explicit ceiling), `0` or `\"auto\"` (derive one from the\nenvironment — the default), or `\"off\"` (no ceiling at all).\n\nThe best-effort backpressure gate\n([`crate::backpressure::FootprintGate`]) samples\n[`crate::sysres::phys_footprint`] at each admit point and parks the\nworker while the process is over the ceiling, shaving the scan's peak.\nIt stays best-effort: an unreadable sample or a sustained overshoot\nadmits anyway to guarantee forward progress, so the ceiling shapes the\npeak rather than enforcing a hard invariant.\n\n**`0` used to mean \"disabled\" and now means \"auto\".** A config carrying\nthe old default therefore gains a ceiling on upgrade; `\"off\"` restores\nthe previous behaviour. See [`MaxFootprint::auto_ceiling_bytes`] for the\narithmetic.",
+          "description": "Ceiling on process memory footprint, in mebibytes. Accepts a positive\ninteger (an explicit ceiling), `0` or `\"auto\"` (derive one from the\nenvironment — the default), or `\"off\"` (no ceiling at all).\n\nThe best-effort backpressure gate\n([`crate::backpressure::FootprintGate`]) samples\n[`crate::sysres::process_rss`] at each admit point and parks the\nworker while the process is over the ceiling, shaving the scan's peak.\nIt stays best-effort: an unreadable sample or a sustained overshoot\nadmits anyway to guarantee forward progress, so the ceiling shapes the\npeak rather than enforcing a hard invariant.\n\n**`0` used to mean \"disabled\" and now means \"auto\".** A config carrying\nthe old default therefore gains a ceiling on upgrade; `\"off\"` restores\nthe previous behaviour. See [`MaxFootprint::auto_ceiling_bytes`] for the\narithmetic.",
           "$ref": "#/$defs/MaxFootprint",
           "default": 0
         },
@@ -1152,12 +1436,17 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 256
+          "default": 128
         },
         "document_models": {
           "description": "Which model families run during document extraction. `Full` (default)\nruns every configured post-processor; the narrower profiles strip\nenrichment / embeddings to shrink the scan-time footprint on code-centric\nworkspaces. See [`DocumentModelProfile`].",
           "$ref": "#/$defs/DocumentModelProfile",
           "default": "full"
+        },
+        "keep_models_warm": {
+          "description": "Keep ONNX embedding and NER engines resident after an embedding pass.\nThis removes the cold-model reload on the next scan or query at the cost\nof retaining the model weights and runtime arenas in the daemon.",
+          "type": "boolean",
+          "default": false
         },
         "onnx_provider": {
           "description": "ONNX Runtime execution provider for every model basemind loads (embeddings, reranking, layout\ndetection, NER). Defaults to `cpu`: on macOS the `auto` provider routes models through CoreML,\nwhich compiles a fresh graph per input shape and measured 7.6 GB resident for one tiny document\nagainst 0.8 GB on the CPU provider (and 3x slower), so a scan over a document-heavy repository\ngrew without bound. `auto` restores the platform default (CoreML on macOS, CUDA on a Linux\nbuild with GPU support); `coreml`, `cuda` and `tensorrt` pin one.",

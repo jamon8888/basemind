@@ -77,19 +77,29 @@ static PASS_GATE: Mutex<()> = Mutex::new(());
 /// engines are released, so a pass for one workspace never frees the model out from under (or forces a
 /// reload for) a pass that is still running for another.
 #[must_use = "the engines are released when this guard drops"]
-pub struct EmbedPass(());
+pub struct EmbedPass {
+    keep_warm: bool,
+}
 
 /// Register the start of an embedding pass; see [`EmbedPass`].
 pub fn begin_embed_pass() -> EmbedPass {
+    begin_embed_pass_with_policy(false)
+}
+
+/// Register an embedding pass with an explicit model-retention policy.
+/// Keeping engines warm is useful for a long-lived daemon serving repeated
+/// scans/searches; the default remains cold-release for bounded memory.
+pub fn begin_embed_pass_with_policy(keep_warm: bool) -> EmbedPass {
     let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     EMBED_PASSES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    EmbedPass(())
+    EmbedPass { keep_warm }
 }
 
 impl Drop for EmbedPass {
     fn drop(&mut self) {
         let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
-        if EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        let last_pass = EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
+        if last_pass && !self.keep_warm {
             tracing::info!(
                 dropped = release_engines(),
                 "embedding pass finished; released resident embedding engines"

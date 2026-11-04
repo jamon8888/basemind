@@ -485,7 +485,7 @@ fn quality_report(
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--scan-threads N] [--embed-threads N] [--embed-batch-size N] [--max-concurrent-documents N] [--onnx-provider cpu|auto|coreml|cuda|tensorrt] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--scan-threads N] [--embed-threads N] [--embed-batch-size N] [--max-concurrent-documents N] [--keep-models-warm] [--enable-ner] [--ner-model MODEL] [--onnx-provider cpu|auto|coreml|cuda|tensorrt] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -503,6 +503,9 @@ fn main() -> Result<()> {
     let mut embed_threads = None;
     let mut embed_batch_size = None;
     let mut max_concurrent_documents = None;
+    let mut keep_models_warm = false;
+    let mut enable_ner = false;
+    let mut ner_model = None;
     let mut onnx_provider = None;
     let mut i = 1;
     while i < args.len() {
@@ -563,6 +566,12 @@ fn main() -> Result<()> {
                 i += 1;
                 max_concurrent_documents = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?);
             }
+            "--keep-models-warm" => keep_models_warm = true,
+            "--enable-ner" => enable_ner = true,
+            "--ner-model" => {
+                i += 1;
+                ner_model = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.clone());
+            }
             "--onnx-provider" => {
                 i += 1;
                 onnx_provider = Some(match args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.as_str() {
@@ -619,6 +628,9 @@ fn main() -> Result<()> {
     if let Some(value) = max_concurrent_documents {
         config.resources.max_concurrent_documents = value;
     }
+    config.resources.keep_models_warm = keep_models_warm;
+    config.documents.ner.enabled = enable_ner;
+    config.documents.ner.model = ner_model;
     if let Some(value) = onnx_provider {
         config.resources.onnx_provider = value;
     }
@@ -777,7 +789,9 @@ fn main() -> Result<()> {
                 "embed_threads": config.resources.embed_threads,
                 "embed_batch_size": config.resources.embed_batch_size,
                 "max_concurrent_documents": config.resources.max_concurrent_documents,
+                "keep_models_warm": config.resources.keep_models_warm,
                 "ner_enabled": config.documents.ner.enabled,
+                "ner_model_override": config.documents.ner.model,
                 "ner_backend": format!("{:?}", config.documents.ner.backend),
                 "ner_model": config.documents.ner.model,
             },

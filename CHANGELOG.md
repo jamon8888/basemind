@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add `[resources] keep_models_warm` so long-lived daemons can retain ONNX embedding and NER engines
+  between passes, avoiding cold model reloads at the cost of resident memory.
 - Document scans reuse extracted chunks and NER results when only the embedding preset changes;
   cached chunks are re-embedded in place instead of re-running format extraction.
 
