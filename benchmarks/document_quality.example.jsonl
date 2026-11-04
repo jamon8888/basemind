@@ -1,6 +1,6 @@
 # Retrieval cases use paths exactly as they appear in the scan manifest.
 {"query":"Alice Paris","expected_paths":["synthetic.pdf","synthetic.docx","synthetic.pptx","synthetic.xlsx"],"k":10}
 # NER checks are additive to retrieval cases and can appear without a query.
-{"ner":[{"path":"synthetic.docx","required_categories":["person","location"],"required_texts":["Alice Martin","Paris"]}]}
+{"ner":[{"path":"synthetic.docx","required_entities":[{"category":"person","text":"Alice Martin"},{"category":"location","text":"Paris"}]}]}
 # The redaction fixture exercises the default NER categories on ordinary text.
-{"ner":[{"path":"synthetic-redaction.txt","required_categories":["person","organization","email"],"required_texts":["Alice Martin","Acme Conseil","alice.martin@example.test"]}]}
+{"ner":[{"path":"synthetic-redaction.txt","required_entities":[{"category":"person","text":"Alice Martin"},{"category":"organization","text":"Acme Conseil"},{"category":"email","text":"alice.martin@example.test"}]}]}

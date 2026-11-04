@@ -66,6 +66,10 @@ pub fn release_engines() -> usize {
 }
 
 static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Set for the current overlapping-pass period when any participant requested warm retention.
+/// The bit is consumed only when the final pass ends, so a cold pass cannot override a warm pass
+/// merely because it happens to drop last.
+static WARM_RETENTION_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Serializes [`begin_embed_pass`] against the last pass's release. Without it, a new pass could
 /// increment the counter in the window between the final decrement and [`release_engines`], and
@@ -79,9 +83,7 @@ static PASS_GATE: Mutex<()> = Mutex::new(());
 /// batches use the same guard, so the default cold-release policy cannot leave engines resident
 /// indefinitely; daemons that need warm watcher latency can opt into `keep_models_warm`.
 #[must_use = "the engines are released when this guard drops"]
-pub struct EmbedPass {
-    keep_warm: bool,
-}
+pub struct EmbedPass;
 
 /// Register the start of an embedding pass; see [`EmbedPass`].
 pub fn begin_embed_pass() -> EmbedPass {
@@ -94,14 +96,22 @@ pub fn begin_embed_pass() -> EmbedPass {
 pub fn begin_embed_pass_with_policy(keep_warm: bool) -> EmbedPass {
     let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     EMBED_PASSES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    EmbedPass { keep_warm }
+    if keep_warm {
+        WARM_RETENTION_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    EmbedPass
 }
 
 impl Drop for EmbedPass {
     fn drop(&mut self) {
         let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
         let last_pass = EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
-        if last_pass && !self.keep_warm {
+        let retain_engines = if last_pass {
+            WARM_RETENTION_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+        } else {
+            false
+        };
+        if last_pass && !retain_engines {
             tracing::info!(
                 dropped = release_engines(),
                 "embedding pass finished; released resident embedding engines"
@@ -345,6 +355,23 @@ mod tests {
             "a pass is still running after the first ends"
         );
         drop(second);
+    }
+
+    #[test]
+    fn mixed_pass_policies_retain_in_either_drop_order() {
+        let _cold = begin_embed_pass_with_policy(false);
+        let warm = begin_embed_pass_with_policy(true);
+        drop(warm);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        drop(_cold);
+        assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+
+        let warm = begin_embed_pass_with_policy(true);
+        let cold = begin_embed_pass_with_policy(false);
+        drop(cold);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        drop(warm);
+        assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// The scan deadlock: a scan worker holding a document slot blocked on the embed pool via

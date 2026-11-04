@@ -52,6 +52,8 @@ struct QualityCase {
 struct NerExpectation {
     path: String,
     #[serde(default)]
+    required_entities: Vec<RequiredEntity>,
+    #[serde(default)]
     required_categories: Vec<String>,
     #[serde(default)]
     required_texts: Vec<String>,
@@ -59,6 +61,12 @@ struct NerExpectation {
     forbidden_categories: Vec<String>,
     #[serde(default)]
     forbidden_texts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredEntity {
+    category: String,
+    text: String,
 }
 
 struct FirstResultObserver {
@@ -358,7 +366,9 @@ fn quality_report(
             }));
         }
         for expectation in case.ner {
-            ner_required += expectation.required_categories.len() + expectation.required_texts.len();
+            ner_required += expectation.required_entities.len()
+                + expectation.required_categories.len()
+                + expectation.required_texts.len();
             let Some(entry) = store.lookup_doc(&expectation.path) else {
                 continue;
             };
@@ -374,6 +384,16 @@ fn quality_report(
                 .map(|entity| entity.category.to_lowercase())
                 .collect();
             let texts: BTreeSet<String> = doc.entities.iter().map(|entity| entity.text.to_lowercase()).collect();
+            ner_matched += expectation
+                .required_entities
+                .iter()
+                .filter(|expected| {
+                    doc.entities.iter().any(|entity| {
+                        entity.category.eq_ignore_ascii_case(&expected.category)
+                            && entity.text.eq_ignore_ascii_case(&expected.text)
+                    })
+                })
+                .count();
             ner_matched += expectation
                 .required_categories
                 .iter()
