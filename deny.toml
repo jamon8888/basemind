@@ -57,6 +57,9 @@ ignore = [
   # semver-compatible and no upstream xberg release exposes the patched parser yet.
   # Keep this explicit exception until xberg publishes the compatible upgrade.
   "RUSTSEC-2026-0436",
+  # pin-utils is pulled transitively by AWS Smithy HTTP crates used by Lance's cloud backends;
+  # basemind does not depend on pin-utils directly and no compatible upstream removal is available.
+  "RUSTSEC-2026-0441",
 ]
 [licenses]
 allow = [
