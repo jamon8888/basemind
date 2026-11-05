@@ -52,6 +52,8 @@ struct QualityCase {
 struct NerExpectation {
     path: String,
     #[serde(default)]
+    required_entities: Vec<RequiredEntity>,
+    #[serde(default)]
     required_categories: Vec<String>,
     #[serde(default)]
     required_texts: Vec<String>,
@@ -59,6 +61,12 @@ struct NerExpectation {
     forbidden_categories: Vec<String>,
     #[serde(default)]
     forbidden_texts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredEntity {
+    category: String,
+    text: String,
 }
 
 struct FirstResultObserver {
@@ -358,7 +366,9 @@ fn quality_report(
             }));
         }
         for expectation in case.ner {
-            ner_required += expectation.required_categories.len() + expectation.required_texts.len();
+            ner_required += expectation.required_entities.len()
+                + expectation.required_categories.len()
+                + expectation.required_texts.len();
             let Some(entry) = store.lookup_doc(&expectation.path) else {
                 continue;
             };
@@ -374,6 +384,18 @@ fn quality_report(
                 .map(|entity| entity.category.to_lowercase())
                 .collect();
             let texts: BTreeSet<String> = doc.entities.iter().map(|entity| entity.text.to_lowercase()).collect();
+            ner_matched += expectation
+                .required_entities
+                .iter()
+                .filter(|expected| {
+                    let expected_category = expected.category.to_lowercase();
+                    let expected_text = expected.text.to_lowercase();
+                    doc.entities.iter().any(|entity| {
+                        entity.category.to_lowercase() == expected_category
+                            && entity.text.to_lowercase() == expected_text
+                    })
+                })
+                .count();
             ner_matched += expectation
                 .required_categories
                 .iter()
@@ -485,7 +507,7 @@ fn quality_report(
 }
 
 fn usage() -> &'static str {
-    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--scan-threads N] [--embed-threads N] [--embed-batch-size N] [--max-concurrent-documents N] [--onnx-provider cpu|auto|coreml|cuda|tensorrt] [--mode cold|warm|incremental|all]"
+    "usage: document_benchmark <root> [--manifest FILE] [--synthetic-manifest FILE] [--incremental-file PATH] [--mutate-incremental] [--quality-manifest FILE] [--quality-baseline FILE] [--quality-tolerance FRACTION] [--scan-threads N] [--embed-threads N] [--embed-batch-size N] [--max-concurrent-documents N] [--keep-models-warm] [--enable-ner] [--ner-model MODEL] [--onnx-provider cpu|auto|coreml|cuda|tensorrt] [--mode cold|warm|incremental|all]"
 }
 
 fn main() -> Result<()> {
@@ -503,6 +525,9 @@ fn main() -> Result<()> {
     let mut embed_threads = None;
     let mut embed_batch_size = None;
     let mut max_concurrent_documents = None;
+    let mut keep_models_warm = false;
+    let mut enable_ner = false;
+    let mut ner_model = None;
     let mut onnx_provider = None;
     let mut i = 1;
     while i < args.len() {
@@ -563,6 +588,16 @@ fn main() -> Result<()> {
                 i += 1;
                 max_concurrent_documents = Some(args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.parse::<usize>()?);
             }
+            "--keep-models-warm" => keep_models_warm = true,
+            "--enable-ner" => enable_ner = true,
+            "--ner-model" => {
+                i += 1;
+                let value = args.get(i).ok_or_else(|| anyhow!("{}", usage()))?;
+                if value.starts_with("--") {
+                    return Err(anyhow!("--ner-model requires a model value"));
+                }
+                ner_model = Some(value.clone());
+            }
             "--onnx-provider" => {
                 i += 1;
                 onnx_provider = Some(match args.get(i).ok_or_else(|| anyhow!("{}", usage()))?.as_str() {
@@ -619,6 +654,9 @@ fn main() -> Result<()> {
     if let Some(value) = max_concurrent_documents {
         config.resources.max_concurrent_documents = value;
     }
+    config.resources.keep_models_warm = keep_models_warm;
+    config.documents.ner.enabled = enable_ner;
+    config.documents.ner.model = ner_model;
     if let Some(value) = onnx_provider {
         config.resources.onnx_provider = value;
     }
@@ -644,6 +682,9 @@ fn main() -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
+        // Mirror the production full-pass boundary so --keep-models-warm affects the measured
+        // lifecycle rather than merely appearing in the benchmark's JSON output.
+        let embed_pass = basemind::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm);
         let mut observer = FirstResultObserver::new(started);
         let result = if manifest_files.is_empty() {
             scan_with_observer(
@@ -667,6 +708,7 @@ fn main() -> Result<()> {
             )
         }
         .map_err(|error| anyhow!("{label} scan: {error}"))?;
+        drop(embed_pass);
         let mut value = json_report(
             label,
             &result,
@@ -689,6 +731,9 @@ fn main() -> Result<()> {
         let started = Instant::now();
         let rss_before = basemind::sysres::sample().current_bytes;
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
+        // Incremental watcher work intentionally keeps the engine warm between edits; the guard
+        // still participates in the global pass barrier for overlapping benchmark scans.
+        let _embed_pass = basemind::embeddings::begin_embed_pass_with_policy(true);
         let mut observer = FirstResultObserver::new(started);
         let result = scan_paths_with_observer(
             &root,
@@ -777,7 +822,9 @@ fn main() -> Result<()> {
                 "embed_threads": config.resources.embed_threads,
                 "embed_batch_size": config.resources.embed_batch_size,
                 "max_concurrent_documents": config.resources.max_concurrent_documents,
+                "keep_models_warm": config.resources.keep_models_warm,
                 "ner_enabled": config.documents.ner.enabled,
+                "ner_model_override": config.documents.ner.model,
                 "ner_backend": format!("{:?}", config.documents.ner.backend),
                 "ner_model": config.documents.ner.model,
             },

@@ -290,6 +290,10 @@ mod tests {
     use crate::scanner::{EmbedMode, ScanSource, scan};
     use crate::store::{Store, init_isolated_cache};
     use std::process::Command;
+    use std::sync::Mutex;
+
+    // `init_isolated_cache` redirects process-global state, so fixture tests must not overlap.
+    static STORE_SEED_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -336,6 +340,9 @@ mod tests {
 
     #[test]
     fn seeded_view_reflushes_identical_files_from_cache_and_reextracts_modified() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         std::fs::write(wt.join("b.rs"), "pub fn b() { let _x = 1; }\n").expect("modify");
 
@@ -383,6 +390,9 @@ mod tests {
 
     #[test]
     fn schema_mismatched_source_falls_back_to_cold_view() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let view = workspace_cache_dir(&main).join(VIEWS_DIR).join(VIEW_WORKING);
         let path = view.join(INDEX_FILE);
@@ -400,6 +410,9 @@ mod tests {
 
     #[test]
     fn source_held_by_a_writer_is_not_cloned() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -418,6 +431,9 @@ mod tests {
 
     #[test]
     fn seeded_index_records_sentinel_policy_so_lance_is_rebuilt() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let main_policy = {
             let m = Store::open(&main, VIEW_WORKING).expect("open main");
@@ -444,6 +460,9 @@ mod tests {
 
     #[test]
     fn stale_seed_tmp_is_swept_even_when_view_is_populated() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, _wt) = fixture();
         let dir = workspace_cache_dir(&main);
         std::fs::create_dir_all(dir.join(SEED_TMP_DIR).join("junk")).unwrap();

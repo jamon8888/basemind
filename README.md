@@ -955,6 +955,9 @@ max_map_cache_mb = 256
 # | auto | coreml | cuda | tensorrt. `auto` restores the platform default (CoreML on macOS), which
 # measured 7.6 GB resident for one tiny document against 0.8 GB on cpu.
 onnx_provider = "cpu"
+# Keep ONNX embeddings and NER models resident between daemon passes. This reduces cold-start
+# latency for repeated scans/queries at the cost of keeping model weights in memory.
+keep_models_warm = false
 ```
 
 **Overrides.** Only the `documents.*` and `llm.*` keys can be overridden, by a CLI flag or its

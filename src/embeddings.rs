@@ -62,10 +62,18 @@ pub fn bound_ort_memory(intra_threads: usize) {
 /// Drop every resident embedding engine so its ONNX session, weights and arena are freed. The next
 /// embedding reloads the model. Returns how many engines were dropped.
 pub fn release_engines() -> usize {
+    #[cfg(test)]
+    ENGINE_RELEASE_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     xberg::clear_engine_caches()
 }
 
 static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Set for the current overlapping-pass period when any participant requested warm retention.
+/// The bit is consumed only when the final pass ends, so a cold pass cannot override a warm pass
+/// merely because it happens to drop last.
+static WARM_RETENTION_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ENGINE_RELEASE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Serializes [`begin_embed_pass`] against the last pass's release. Without it, a new pass could
 /// increment the counter in the window between the final decrement and [`release_engines`], and
@@ -73,23 +81,43 @@ static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// (and the release), never across the embedding work itself.
 static PASS_GATE: Mutex<()> = Mutex::new(());
 
-/// RAII marker for one embedding pass in this process. When the LAST concurrent pass ends, resident
-/// engines are released, so a pass for one workspace never frees the model out from under (or forces a
-/// reload for) a pass that is still running for another.
+/// RAII marker for one full embedding pass in this process. When the LAST concurrent guarded pass
+/// ends, resident engines are released, so a pass for one workspace never frees the model out from
+/// under (or forces a reload for) a pass that is still running for another. Inline incremental
+/// batches use the same guard, so the default cold-release policy cannot leave engines resident
+/// indefinitely; daemons that need warm watcher latency can opt into `keep_models_warm`.
 #[must_use = "the engines are released when this guard drops"]
-pub struct EmbedPass(());
+pub struct EmbedPass {
+    _private: (),
+}
 
 /// Register the start of an embedding pass; see [`EmbedPass`].
 pub fn begin_embed_pass() -> EmbedPass {
+    begin_embed_pass_with_policy(false)
+}
+
+/// Register an embedding pass with an explicit model-retention policy.
+/// Keeping engines warm is useful for a long-lived daemon serving repeated
+/// scans/searches; the default remains cold-release for bounded memory.
+pub fn begin_embed_pass_with_policy(keep_warm: bool) -> EmbedPass {
     let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     EMBED_PASSES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    EmbedPass(())
+    if keep_warm {
+        WARM_RETENTION_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    EmbedPass { _private: () }
 }
 
 impl Drop for EmbedPass {
     fn drop(&mut self) {
         let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
-        if EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        let last_pass = EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
+        let retain_engines = if last_pass {
+            WARM_RETENTION_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+        } else {
+            false
+        };
+        if last_pass && !retain_engines {
             tracing::info!(
                 dropped = release_engines(),
                 "embedding pass finished; released resident embedding engines"
@@ -321,8 +349,11 @@ impl SharedEmbedder {
 mod tests {
     use super::*;
 
+    static EMBED_PASS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn embed_pass_guards_nest_and_count_down() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let base = embed_passes_in_flight();
         let first = begin_embed_pass();
         let second = begin_embed_pass();
@@ -333,6 +364,48 @@ mod tests {
             "a pass is still running after the first ends"
         );
         drop(second);
+    }
+
+    #[test]
+    fn mixed_pass_policies_retain_in_either_drop_order() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let base_passes = embed_passes_in_flight();
+        let base_releases = ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire);
+        let _cold = begin_embed_pass_with_policy(false);
+        let warm = begin_embed_pass_with_policy(true);
+        drop(warm);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        drop(_cold);
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
+
+        let warm = begin_embed_pass_with_policy(true);
+        let cold = begin_embed_pass_with_policy(false);
+        drop(cold);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        drop(warm);
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
     }
 
     /// The scan deadlock: a scan worker holding a document slot blocked on the embed pool via

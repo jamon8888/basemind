@@ -109,6 +109,11 @@ pub struct ResourcesConfig {
     /// workspaces. See [`DocumentModelProfile`].
     #[serde(default)]
     pub document_models: DocumentModelProfile,
+    /// Keep ONNX embedding and NER engines resident after an embedding pass.
+    /// This removes the cold-model reload on the next scan or query at the cost
+    /// of retaining the model weights and runtime arenas in the daemon.
+    #[serde(default)]
+    pub keep_models_warm: bool,
     /// ONNX Runtime execution provider for every model basemind loads (embeddings, reranking, layout
     /// detection, NER). Defaults to `cpu`: on macOS the `auto` provider routes models through CoreML,
     /// which compiles a fresh graph per input shape and measured 7.6 GB resident for one tiny document
@@ -181,6 +186,7 @@ impl Default for ResourcesConfig {
             max_footprint_mb: MaxFootprint::default(),
             max_map_cache_mb: Self::default_max_map_cache_mb(),
             document_models: DocumentModelProfile::default(),
+            keep_models_warm: false,
             onnx_provider: OnnxProvider::default(),
         }
     }
@@ -378,6 +384,7 @@ mod tests {
         assert_eq!(cfg.max_footprint_mb, MaxFootprint::Mebibytes(0));
         assert_eq!(cfg.max_map_cache_mb, 128);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
+        assert!(!cfg.keep_models_warm);
     }
 
     #[test]
@@ -386,9 +393,11 @@ mod tests {
     }
 
     #[test]
-    fn resources_toml_roundtrips_embed_batch_size_override() {
-        let cfg: ResourcesConfig = toml::from_str("embed_batch_size = 8\n").expect("parse [resources] body");
+    fn resources_toml_roundtrips_overrides() {
+        let cfg: ResourcesConfig =
+            toml::from_str("embed_batch_size = 8\nkeep_models_warm = true\n").expect("parse [resources] body");
         assert_eq!(cfg.embed_batch_size, 8);
+        assert!(cfg.keep_models_warm);
         assert_eq!(cfg.scan_threads, 2);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }

@@ -389,10 +389,11 @@ impl WorkspacePool {
         if cancel.is_cancelled() {
             return Ok((ScanStats::default(), true));
         }
-        // The daemon owns the embedding engine for forwarded and hosted passes alike: release it when
-        // the last concurrent full Inline pass ends. Incremental passes keep it warm for searches.
+        // The daemon owns the embedding engine for forwarded and hosted passes alike. Incremental
+        // batches retain it for the next edit; full passes release it unless warm models are opted in.
         #[cfg(feature = "intelligence")]
-        let _embed_pass = (matches!(mode, EmbedMode::Inline) && !incremental).then(crate::embeddings::begin_embed_pass);
+        let _embed_pass = matches!(mode, EmbedMode::Inline)
+            .then(|| crate::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm || incremental));
         let report = if incremental {
             let paths = paths.as_deref().unwrap_or_default();
             scanner::scan_paths_with_cancel(&entry.root, &mut store, &config, paths, mode, cancel)?

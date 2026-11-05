@@ -697,22 +697,25 @@ basemind's footprint on a constrained machine:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `scan_threads` | `0` (auto: rayon's per-core default) | Cap on the code-map scanner's rayon pool. |
-| `embed_threads` | `0` (auto: `max(2, logical_cpus / 4)`) | Cap on the ONNX embedding pool. |
-| `embed_batch_size` | `32` | Chunks submitted to ONNX per batch. |
-| `max_concurrent_documents` | `0` (unbounded) | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Document extraction then passes `FootprintGate::admit_exclusive`: over `max_footprint_mb` only one document runs at a time, and a document whose header-derived estimate (`src/extract/doc_cost.rs`) exceeds the whole ceiling is skipped as too large. Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
+| `scan_threads` | `2` | Cap on the code-map scanner's rayon pool. |
+| `embed_threads` | `2` | Cap on the ONNX embedding pool. |
+| `embed_batch_size` | `16` | Chunks submitted to ONNX per batch. |
+| `max_concurrent_documents` | `1` | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Document extraction then passes `FootprintGate::admit_exclusive`: over `max_footprint_mb` only one document runs at a time, and a document whose header-derived estimate (`src/extract/doc_cost.rs`) exceeds the whole ceiling is skipped as too large. Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
 | `document_models` | `full` | Model families document extraction runs: `full` \| `code_only` (embeddings only, no keywords/NER/summarization/OCR) \| `none` (metadata + keyword search only). |
+| `keep_models_warm` | `false` | Keep ONNX embedding/NER engines resident after a pass. Enable for a long-lived daemon to avoid cold model reloads; it trades memory for latency. |
 | `onnx_provider` | `cpu` | ONNX execution provider for embeddings, reranker, layout and NER: `cpu` \| `auto` \| `coreml` \| `cuda` \| `tensorrt`. `auto` on macOS means CoreML, which compiles per input shape and measured 7.6 GB for one tiny document vs 0.8 GB on CPU. |
 | `max_footprint_mb` | `0` (auto) | Ceiling on process memory footprint. A positive integer is an explicit mebibyte ceiling; `0` or `"auto"` derives one from the environment; `"off"` disables the gate. |
-| `max_map_cache_mb` | `256` | Byte budget for the MCP read stack's decoded-outline cache (`src/mcp/l1_cache.rs`), per workspace. `0` = unbounded. A miss costs one blob read and never changes an answer. The code-graph memo is charged at half this value, and a read-only session's projected call / implementation indexes are charged against it too. |
+| `max_map_cache_mb` | `128` | Byte budget for the MCP read stack's decoded-outline cache (`src/mcp/l1_cache.rs`), per workspace. `0` = unbounded. A miss costs one blob read and never changes an answer. The code-graph memo is charged at half this value, and a read-only session's projected call / implementation indexes are charged against it too. |
 
 In the shared daemon these values are ceilings, not settings: `src/config/daemon.rs` applies
 `min(file, cap)` to each (and to `[scan]` / `[documents]` / `[crawl]` limits), with `0` / `"auto"` /
 `"off"` resolving to the cap, and the operator raises a cap through `BASEMIND_DAEMON_MAX_*` in the
 daemon's environment. ONNX Runtime memory is bounded in every process (`embeddings::bound_ort_memory`:
 no memory-pattern planning, no retained CPU arena; intra-op threads are the auto embed-thread count, or
-2 in the daemon), and the daemon drops resident embedding engines when the last concurrent embedding
-pass ends.
+2 in the daemon). By default the daemon drops resident embedding engines when the last concurrent
+full embedding pass ends; `[resources] keep_models_warm = true` opts into retaining them for
+low-latency repeated full scans and queries. Incremental Inline batches retain engines between edits
+for watcher latency, while still using the release barrier for overlapping work.
 
 Other bounds that are not `[resources]` keys:
 

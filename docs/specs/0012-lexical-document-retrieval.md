@@ -500,12 +500,6 @@ best-effort boost on top of it. Where they disagree, `heading_path` wins.
 
 ```toml
 [documents.fusion]
-k = 60.0
-weight_exact = 3.0
-weight_keyword = 2.0
-weight_facet = 1.0
-weight_vector = 1.0
-per_document_cap = 3
 max_relaxations = 3
 
 [documents.fts]
