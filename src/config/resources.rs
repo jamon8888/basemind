@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn resources_toml_roundtrips_embed_batch_size_override() {
+    fn resources_toml_roundtrips_overrides() {
         let cfg: ResourcesConfig =
             toml::from_str("embed_batch_size = 8\nkeep_models_warm = true\n").expect("parse [resources] body");
         assert_eq!(cfg.embed_batch_size, 8);

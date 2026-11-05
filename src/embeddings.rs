@@ -62,6 +62,8 @@ pub fn bound_ort_memory(intra_threads: usize) {
 /// Drop every resident embedding engine so its ONNX session, weights and arena are freed. The next
 /// embedding reloads the model. Returns how many engines were dropped.
 pub fn release_engines() -> usize {
+    #[cfg(test)]
+    ENGINE_RELEASE_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     xberg::clear_engine_caches()
 }
 
@@ -70,6 +72,8 @@ static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// The bit is consumed only when the final pass ends, so a cold pass cannot override a warm pass
 /// merely because it happens to drop last.
 static WARM_RETENTION_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ENGINE_RELEASE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Serializes [`begin_embed_pass`] against the last pass's release. Without it, a new pass could
 /// increment the counter in the window between the final decrement and [`release_engines`], and
@@ -365,19 +369,43 @@ mod tests {
     #[test]
     fn mixed_pass_policies_retain_in_either_drop_order() {
         let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let base_passes = embed_passes_in_flight();
+        let base_releases = ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire);
         let _cold = begin_embed_pass_with_policy(false);
         let warm = begin_embed_pass_with_policy(true);
         drop(warm);
         assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
         drop(_cold);
-        assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
 
         let warm = begin_embed_pass_with_policy(true);
         let cold = begin_embed_pass_with_policy(false);
         drop(cold);
         assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
         drop(warm);
-        assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
     }
 
     /// The scan deadlock: a scan worker holding a document slot blocked on the embed pool via
