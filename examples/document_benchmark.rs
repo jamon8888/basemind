@@ -388,9 +388,11 @@ fn quality_report(
                 .required_entities
                 .iter()
                 .filter(|expected| {
+                    let expected_category = expected.category.to_lowercase();
+                    let expected_text = expected.text.to_lowercase();
                     doc.entities.iter().any(|entity| {
-                        entity.category.eq_ignore_ascii_case(&expected.category)
-                            && entity.text.eq_ignore_ascii_case(&expected.text)
+                        entity.category.to_lowercase() == expected_category
+                            && entity.text.to_lowercase() == expected_text
                     })
                 })
                 .count();
@@ -682,7 +684,7 @@ fn main() -> Result<()> {
         let peak_rss_before = basemind::sysres::sample().peak_bytes;
         // Mirror the production full-pass boundary so --keep-models-warm affects the measured
         // lifecycle rather than merely appearing in the benchmark's JSON output.
-        let _embed_pass = basemind::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm);
+        let embed_pass = basemind::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm);
         let mut observer = FirstResultObserver::new(started);
         let result = if manifest_files.is_empty() {
             scan_with_observer(
@@ -706,6 +708,7 @@ fn main() -> Result<()> {
             )
         }
         .map_err(|error| anyhow!("{label} scan: {error}"))?;
+        drop(embed_pass);
         let mut value = json_report(
             label,
             &result,
