@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `hacienda-legal` focus release for legal client folders: a `--features hacienda-legal` build (documents + memory + `ner-candle` + `graphrag`, no comms/shells/crawl/code-intel) shipped as `basemind-hacienda-legal-<triple>` release assets, with a drop-in client-folder preset at `examples/basemind-hacienda-legal.toml` (ingestion-time `token-replace` redaction, legal NER labels, multilingual retrieval lanes, GraphRAG) and a new "Legal workspaces" docs page covering the redact → `vault encrypt` → caller-persisted blob → `vault decrypt`/`find` rehydration flow.
 - The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
 - Document search supports opaque continuation cursors, with durable generation invalidation when the Lance index is rebuilt.
 

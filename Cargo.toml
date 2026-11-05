@@ -148,6 +148,23 @@ full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-s
 #   only exists in a build with this feature.
 # Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
 hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
+
+# Focus release for legal client-folder deployments ("hacienda-legal"), shipped as
+# `basemind-hacienda-legal-<triple>` release assets:
+# - documents: xberg ingestion (PDF/Office/HTML/email/images + OCR), chunking, the
+#   LanceDB store, `memory mode=documents` retrieval (exact/FTS/vector lanes +
+#   fusion + rerank), ingest-time NER/keywords/summaries, and redaction with
+#   caller-owned rehydration maps (`redact_text` + `vault`).
+# - memory: durable agent memory over the same Lance store.
+# - ner-candle: GLiNER2 Candle NER backend for redact_text person/org/location
+#   (transitively includes documents).
+# - graphrag: entity graph (`graph entities`) built from the NER sidecar at scan
+#   time. NOTE: the GraphRAG *query* surface is partially implemented — see
+#   docs/agents/features.md#incomplete-and-proposed-work.
+# Deliberately excluded: comms (clients like Claude Code spawn `basemind serve`
+# over stdio per workspace; the daemon is the `hacienda` feature's job), shells,
+# crawl, code-intel and code-search — a client folder is documents, not code.
+hacienda-legal = ["documents", "memory", "ner-candle", "graphrag"]
 graphrag = ["documents", "dep:lance-graph", "dep:arrow-select", "dep:arrow-ipc", "dep:arrow56"]
 test-support = ["dep:tempfile"]
 

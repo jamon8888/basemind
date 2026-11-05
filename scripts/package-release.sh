@@ -3,12 +3,18 @@ set -euo pipefail
 
 # NOTE: the archive contents are at the ROOT (no leading staging-dir component) so
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <target-triple>" >&2
+# Optional second argument names a release VARIANT (e.g. "hacienda-legal"): the archive is
+# then `basemind-<variant>-<triple>.tar.gz` instead of `basemind-<triple>.tar.gz`. The
+# binary inside is still `basemind` — the variant only distinguishes the feature-built
+# archive on the release page.
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 <target-triple> [variant]" >&2
   exit 1
 fi
 
 TRIPLE="$1"
+VARIANT="${2:-}"
+NAME="basemind${VARIANT:+-$VARIANT}"
 
 case "$TRIPLE" in
 x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
@@ -89,8 +95,8 @@ linux)
     # shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
   done
-  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  tar czf "${NAME}-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created ${NAME}-${TRIPLE}.tar.gz"
   ;;
 
 macos)
@@ -200,8 +206,8 @@ macos)
     echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
   fi
 
-  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  tar czf "${NAME}-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created ${NAME}-${TRIPLE}.tar.gz"
   ;;
 
 windows)
@@ -227,13 +233,13 @@ windows)
   done
 
   (cd "$STAGING_DIR" && {
-    7z a -tzip "../basemind-${TRIPLE}.zip" . >/dev/null 2>&1 ||
-      zip -q -r "../basemind-${TRIPLE}.zip" . ||
-      powershell -Command "Compress-Archive -Path '*' -DestinationPath '../basemind-${TRIPLE}.zip' -Force"
+    7z a -tzip "../${NAME}-${TRIPLE}.zip" . >/dev/null 2>&1 ||
+      zip -q -r "../${NAME}-${TRIPLE}.zip" . ||
+      powershell -Command "Compress-Archive -Path '*' -DestinationPath '../${NAME}-${TRIPLE}.zip' -Force"
   })
-  echo "✓ Created basemind-${TRIPLE}.zip"
+  echo "✓ Created ${NAME}-${TRIPLE}.zip"
   ;;
 esac
 
 rm -rf "$STAGING_DIR"
-echo "✓ Release package ready: basemind-${TRIPLE}.$([ "$SYSTEM" = "windows" ] && echo "zip" || echo "tar.gz")"
+echo "✓ Release package ready: ${NAME}-${TRIPLE}.$([ "$SYSTEM" = "windows" ] && echo "zip" || echo "tar.gz")"

@@ -1,0 +1,141 @@
+# basemind `hacienda-legal` focus-release preset — legal client folders.
+#
+# Drop this file at the root of a client folder as `basemind.toml` (the name basemind
+# discovers), then run a `hacienda-legal` build (release asset `basemind-hacienda-legal-<triple>`,
+# or `cargo install basemind --features hacienda-legal`):
+#
+#   basemind scan                 # ingest: PDF/Office/HTML/email/scans -> LanceDB
+#   basemind serve                # stdio MCP for Claude Code & co.
+#
+# In the client: `memory` mode `documents` searches the folder (exact + keyword/FTS +
+# vector lanes, fused and reranked); `redact_text` redacts PII and returns the
+# rehydration map; `vault` encrypts/decrypts that map with a passphrase.
+# basemind never persists the rehydration map itself (ADR-0015) — the caller owns
+# the encrypted blob and the passphrase.
+
+"$schema" = "v1"
+
+[documents]
+# Document RAG tier: PDF / Office / HTML / email / images (OCR), plus prose/config/data
+# files. On by default in every `documents` build; spelled out here so the preset is
+# self-contained.
+enabled = true
+# Vector lane. ON: semantic search pays off on contracts and scanned exhibits.
+# Set `false` for a lexical-only (exact + keyword/FTS) store — no model download.
+embed = true
+# Multilingual e5-base: contracts and correspondence are rarely English-only.
+# Changing the preset wipes and re-embeds the whole index — pick once, before the
+# first scan of a matter.
+embedding_preset = "multilingual"
+# Whole client folder is in scope; archives stay closed so one .zip cannot explode
+# into thousands of embeds (flip `extract_archives` only deliberately).
+include = []
+exclude = []
+extract_archives = false
+
+[documents.language]
+# Detect the language per document (whatlang) so chunking and stemming follow the text.
+auto_detect = true
+min_confidence = 0.8
+
+[documents.ocr]
+# Tesseract language packs for scanned exhibits and ID documents: English plus the
+# six EU national-ID languages, matching the default floor.
+languages = ["eng", "deu", "fra", "spa", "ita", "nld", "pol"]
+
+[documents.ner]
+# Ingest-time NER (GLiNER via ONNX; the `ner-candle` build additionally offers the
+# Candle backend through `redact_text`'s `ner_model_dir`). Feeds the
+# `entity_category` filter on document search and the GraphRAG entity graph below.
+enabled = true
+backend = "onnx"
+categories = ["person", "organization", "location", "email", "phone", "date", "money"]
+# Zero-shot labels tuned for legal corpora — docket numbers, case names, courts,
+# statutes, parties, matter references surface as first-class entities.
+custom_labels = [
+  "docket number",
+  "case name",
+  "court",
+  "statute citation",
+  "party",
+  "matter number",
+]
+
+[documents.keywords]
+# YAKE keywords per document — the `keywords_contains` filter on document search.
+enabled = true
+algorithm = "yake"
+max_keywords = 15
+
+[documents.summarization]
+# Extractive (TextRank, no LLM) per-document summary, surfaced on search hits.
+enabled = true
+strategy = "extractive"
+
+[documents.reranker]
+# Cross-encoder reranking over the vector lane's top_k. Multilingual preset per the
+# PII/GDPR spec; costs a model download on first use.
+enabled = true
+preset = "bge-reranker-v2-m3"
+top_k = 20
+
+[documents.redaction]
+# Ingestion-time PII redaction. `token-replace` rewrites each hit as a stable
+# `[TYPE_N]` token and hands the token→original rehydration map to the CALLER —
+# basemind does not store it (ADR-0015). The gateway persists it encrypted
+# (`vault encrypt`) and rehydrates on demand (`vault decrypt`).
+enabled = true
+strategy = "token-replace"
+categories = [
+  "email",
+  "phone",
+  "ssn",
+  "credit_card",
+  "iban",
+  "swift_bic",
+  "ip_address",
+  "postal_code",
+  "date_of_birth",
+  "person",
+  "organization",
+  "location",
+]
+preserve_offsets = true
+
+[documents.redaction.ner]
+# NER backend for the person/organization/location categories above.
+backend = "onnx"
+categories = ["person", "organization", "location"]
+
+[documents.fts]
+# Lexical index: stemming + stop-word removal + ASCII folding (société == societe),
+# 64-char tokens so long French/Spanish terms are not truncated into wrong terms.
+stem = true
+remove_stop_words = true
+ascii_folding = true
+max_token_length = 64
+# Legal boilerplate on top of the stop-word list (defaults already include
+# pursuant/herein/hereto/aforesaid/wherein/notwithstanding/provided that/...).
+custom_stop_words = ["pursuant", "herein", "hereto", "aforesaid", "wherein", "notwithstanding", "provided that", "hereinafter", "thereunder"]
+
+[documents.fusion]
+# Multi-term queries may drop their lowest-idf term up to 3 times before giving up.
+max_relaxations = 3
+
+[documents.citations]
+# Exact lane: statute cites (§ 362(a)(1)), docket numbers, case short names are
+# extracted at ingest and trigram-indexed for exact lookup.
+extract = true
+max_per_chunk = 64
+
+[documents.graphrag]
+# Entity graph built from the NER sidecar at scan time (`graph entities` mode).
+# NOTE: the GraphRAG *query* surface (`graph rag`) is partially implemented —
+# see docs/agents/features.md.
+enabled = true
+labels = ["person", "organization", "location"]
+max_rows = 200
+hops = 2
+
+[documents.output]
+format = "json"

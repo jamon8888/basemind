@@ -29,6 +29,7 @@ unavailable; advertised modes alone do not prove that an operation can run.
 | `ner-candle` | Documents plus Candle GLiNER2 NER and model-tokenizer support. |
 | `full` | Documents, memory, crawl, comms, shells, code intelligence, code search and Candle NER. **Does not include `graphrag`.** |
 | `hacienda` | Documents, memory, code search, Candle NER and comms for gateway integration. |
+| `hacienda-legal` | Legal focus release: documents (ingestion, RAG retrieval, redaction + `vault` rehydration), memory, Candle NER and graphrag — **no** comms/shells/crawl/code-intel/code-search. Ships as `basemind-hacienda-legal-<triple>` release assets; clients spawn `basemind serve` over stdio. Config preset: `examples/basemind-hacienda-legal.toml`. |
 | `graphrag` | Optional entity graph dependencies and partially implemented query surface; see limitations below. |
 | `ort-dynamic` | Dynamic ONNX Runtime loading through xberg when that dependency is enabled. |
 | `test-support` | Test helper dependency support. |

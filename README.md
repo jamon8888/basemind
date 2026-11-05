@@ -315,6 +315,7 @@ The MCP and CLI paths need `basemind` available on your system. (The plugin does
 | pip | `pip install basemind` | everything |
 | cargo | `cargo install basemind --locked` | code + git only (the CLI; `basemind serve` needs `--features comms`) |
 | cargo (full) | `cargo install basemind --features full --locked` | everything |
+| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | legal focus release: document ingestion/RAG + NER + rehydration vault + memory + graphrag, no comms/shells/crawl/code-intel — shipped as `basemind-hacienda-legal-<triple>` release assets, preset at `examples/basemind-hacienda-legal.toml` |
 | GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything |
 
 <!-- markdownlint-enable MD013 -->
