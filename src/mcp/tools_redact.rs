@@ -560,6 +560,7 @@ struct TrimmedPdfText {
     offsets: Vec<usize>,
 }
 
+/// Trim PDF column padding while retaining a byte-boundary map to the extracted source.
 fn trim_pdf_line_padding_with_map(text: &str) -> TrimmedPdfText {
     let mut normalized = String::with_capacity(text.len());
     let mut offsets = vec![0];
@@ -609,6 +610,7 @@ fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
         .collect()
 }
 
+/// Decide whether a high-recall engine finding is safe to discard in this legal context.
 fn is_false_positive_pattern(
     original: &str,
     finding: &xberg::types::redaction::RedactionFinding,
@@ -637,6 +639,7 @@ fn is_false_positive_pattern(
     }
 }
 
+/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
 fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
     let mut context_start = start.saturating_sub(80).min(text.len());
     while context_start > 0 && !text.is_char_boundary(context_start) {
@@ -649,6 +652,7 @@ fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize
     (context_start, context_end)
 }
 
+/// Detect the nearby reference/date cues that distinguish eight-digit references from phones.
 fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {

@@ -89,6 +89,7 @@ fn main() {
     }
 }
 
+/// Find a locally installed, hash-verified language file before using the network fallback.
 fn local_tessdata_path(language: &str) -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Some(prefix) = std::env::var_os("TESSDATA_PREFIX") {
