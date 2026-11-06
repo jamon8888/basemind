@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 use xberg::types::{HeadingContext, HeadingLevel};
 
