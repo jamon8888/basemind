@@ -5,6 +5,17 @@ project. Ordinary crates.io dependencies are tracked in `Cargo.toml` / `Cargo.lo
 `deny.toml`; this file covers code and data files that were **copied into the repository** — either
 rule data or workspace crates under `crates/` that basemind now maintains as forks.
 
+## Tesseract language data
+
+Document-feature builds download and embed the pinned `tessdata_fast` files used by the bundled
+Tesseract OCR backend.
+
+- **Source**: <https://github.com/tesseract-ocr/tessdata_fast>
+- **Revision**: `87416418657359cb625c412a48b6e1d6d41c29bd`
+- **License**: Apache-2.0
+- **Languages**: `eng`, `deu`, `fra`, `spa`, `ita`, `nld`, `pol`
+- **Purpose**: Make the default document OCR language set available offline, including French.
+
 ## stack-graphs name-binding rules (`.tsg`)
 
 Tree-sitter-graph (`.tsg`) name-resolution rule files driving basemind's precise, scope- and
