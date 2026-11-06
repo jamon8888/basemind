@@ -14,10 +14,8 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
-use super::schema::{
-    EntityKeySource, GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema,
-};
-use super::{escape_sql_literal, now_micros};
+use super::escape_sql_literal;
+use super::schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
 /// Configuration for the graphrag feature (mirrors `[graphrag]` in basemind.toml).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,17 +160,15 @@ pub fn entity_node_id(key: &EntityNodeKey) -> String {
 /// authoritative class (`<anchor:Class_N>`); the NER label is only a noisy span
 /// classification and must not split one token into multiple ks2 nodes.
 fn graph_label(entity: &DocEntitySidecar) -> String {
-    if entity.is_gateway_token {
-        if let Some(token) = entity.gateway_token.as_deref().or(Some(entity.literal.as_str())) {
-            if let Some(class) = token
-                .strip_prefix('<')
-                .and_then(|value| value.strip_suffix('>'))
-                .and_then(|value| value.split_once(':').map(|(_, class)| class))
-                .map(|class| class.rsplit_once('_').map(|(class, _)| class).unwrap_or(class))
-            {
-                return class.to_ascii_lowercase();
-            }
-        }
+    if entity.is_gateway_token
+        && let Some(token) = entity.gateway_token.as_deref().or(Some(entity.literal.as_str()))
+        && let Some(class) = token
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .and_then(|value| value.split_once(':').map(|(_, class)| class))
+            .map(|class| class.rsplit_once('_').map(|(class, _)| class).unwrap_or(class))
+    {
+        return class.to_ascii_lowercase();
     }
     entity.label.clone()
 }
@@ -264,7 +260,7 @@ pub fn build_graph_from_entities(
         if !allowed.contains(&label) {
             continue;
         }
-        let (key_source, normalized_literal, document_path, gateway_token) = if ent.is_gateway_token {
+        let (key_source, normalized_literal, _document_path, gateway_token) = if ent.is_gateway_token {
             (
                 2u8,
                 String::new(),
@@ -572,7 +568,7 @@ pub fn upsert_graph_edges(connection: &Connection, runtime: &Runtime, rows: &[Gr
                 .push(r);
         }
 
-        for ((scope, doc_path_val, chunk_idx), chunk_rows) in by_chunk {
+        for ((scope, doc_path_val, chunk_idx), _chunk_rows) in by_chunk {
             let predicate = format!(
                 "scope = '{}' AND doc_path = '{}' AND chunk_idx = {}",
                 escape_sql_literal(&scope),

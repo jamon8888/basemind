@@ -50,7 +50,7 @@ pub(crate) fn ensure_tessdata() -> Result<PathBuf, String> {
 }
 
 fn ensure_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == bytes.len() as u64) {
+    if std::fs::read(path).is_ok_and(|cached| cached == bytes) {
         return Ok(());
     }
 
@@ -58,7 +58,7 @@ fn ensure_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(&temporary, bytes)
         .map_err(|error| format!("write temporary OCR data {}: {error}", temporary.display()))?;
     if let Err(error) = std::fs::rename(&temporary, path)
-        && !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == bytes.len() as u64)
+        && !std::fs::read(path).is_ok_and(|cached| cached == bytes)
     {
         return Err(format!("install OCR data {}: {error}", path.display()));
     }

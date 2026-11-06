@@ -883,8 +883,8 @@ fn sorted_adjacency(map: AHashMap<String, AHashSet<String>>) -> AHashMap<String,
 #[cfg(feature = "graphrag")]
 pub(super) async fn run_graph_entities(
     shared: &SharedReadStack,
-    idx: Option<&crate::index::IndexDb>,
-    cache: &MapCache,
+    _idx: Option<&crate::index::IndexDb>,
+    _cache: &MapCache,
     basemind_dir: &std::path::Path,
     params: super::types_graph::GraphEntitiesParams,
     notice: Option<super::types::LifecycleNotice>,

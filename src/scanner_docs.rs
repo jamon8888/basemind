@@ -469,10 +469,7 @@ pub(crate) fn extract_and_persist_doc(
             // to one store are independent and safe to hold in parallel.
             let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
             if let Some(lance) = lance {
-                use crate::lance::graphrag::{
-                    DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges,
-                    upsert_graph_entities,
-                };
+                use crate::lance::graphrag::{DocEntitySidecar, GraphragConfig, build_graph_from_entities};
 
                 let mut doc_entities: Vec<DocEntitySidecar> = cached
                     .entities
@@ -591,9 +588,7 @@ pub(crate) fn extract_and_persist_doc(
         // immutable here, and the graph must survive `embed = false` on a fresh workspace.
         let lance = lance_or_open_fallback(store, &cfg.embedding_preset);
         if let Some(lance) = lance {
-            use crate::lance::graphrag::{
-                DocEntitySidecar, GraphragConfig, build_graph_from_entities, upsert_graph_edges, upsert_graph_entities,
-            };
+            use crate::lance::graphrag::{DocEntitySidecar, GraphragConfig, build_graph_from_entities};
 
             // Convert FileMapDoc entities to DocEntitySidecar format
             let mut doc_entities: Vec<DocEntitySidecar> = doc

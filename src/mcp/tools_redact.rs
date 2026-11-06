@@ -547,7 +547,7 @@ fn trim_pdf_line_padding(text: &str) -> String {
 
 fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
     let regex = regex::Regex::new(
-        r"\b[12][ \t]?\d{2}[ \t]?(?:0[1-9]|1[0-2])[ \t]?(?:\d{2}|2[AB])[ \t]?\d{3}[ \t]?\d{3}[ \t]?\d{2}\b",
+        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
     )
     .expect("the static French NIR regex must compile");
     regex

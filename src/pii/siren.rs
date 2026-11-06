@@ -62,7 +62,7 @@ pub fn validate_fr_vat(value: &str) -> bool {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_uppercase();
-    if compact.len() != 13 || !compact.starts_with("FR") {
+    if compact.len() != 13 || !compact.is_ascii() || !compact.starts_with("FR") {
         return false;
     }
     let key = &compact[2..4];
