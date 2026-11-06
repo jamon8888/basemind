@@ -24,6 +24,7 @@ use xberg::extractors::security::SecurityLimits;
 use xberg::{ExtractInput, extract};
 
 use super::doc_guard::{self, ChunkCutovers, DeadlineError, DocPhase};
+use super::ocr_assets;
 use super::{ExtractError, SCHEMA_VER};
 use crate::config::{
     DocLanguageConfig, DocumentModelProfile, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
@@ -268,6 +269,8 @@ pub struct DocConfig {
     pub embedding_preset: Option<String>,
     pub embed: bool,
     pub language: DocLanguageConfig,
+    /// Tesseract language packs used by xberg's OCR backend.
+    pub ocr_languages: Vec<String>,
     pub keywords: KeywordsConfig,
     pub ner: NerConfig,
     /// Summarisation knobs (`enabled`, `strategy`, `max_tokens`).
@@ -317,6 +320,10 @@ impl Default for DocConfig {
             embedding_preset: Some("balanced".to_string()),
             embed: true,
             language: DocLanguageConfig::default(),
+            ocr_languages: ["eng", "deu", "fra", "spa", "ita", "nld", "pol"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             keywords: KeywordsConfig::default(),
             ner: NerConfig::default(),
             summarization: SummarizationConfig::default(),
@@ -333,7 +340,7 @@ impl Default for DocConfig {
 }
 
 impl DocConfig {
-    fn to_xberg(&self) -> ExtractionConfig {
+    fn to_xberg(&self, tessdata_path: Option<&Path>) -> ExtractionConfig {
         let strip_enrichment = matches!(
             self.document_models,
             DocumentModelProfile::CodeOnly | DocumentModelProfile::None_
@@ -374,6 +381,11 @@ impl DocConfig {
             max_files_in_archive: self.max_archive_entries,
             ..SecurityLimits::default()
         };
+        let ocr = (!strip_enrichment).then(|| xberg::core::config::OcrConfig {
+            language: self.ocr_languages.clone(),
+            tessdata_path: tessdata_path.map(Path::to_path_buf),
+            ..Default::default()
+        });
         ExtractionConfig {
             use_cache: false,
             chunking: Some(chunking),
@@ -381,6 +393,7 @@ impl DocConfig {
             keywords,
             ner,
             summarization,
+            ocr,
             redaction: self.redaction.to_xberg(),
             disable_ocr: strip_enrichment,
             acceleration: crate::embeddings::acceleration(self.onnx_provider),
@@ -683,7 +696,15 @@ pub(crate) fn extract_doc_with_metrics(
     config: &DocConfig,
     metrics: Option<&crate::scan_metrics::ScanStageMetrics>,
 ) -> Result<FileMapDoc, ExtractError> {
-    let mut krz_config = config.to_xberg();
+    let tessdata_path = if matches!(
+        config.document_models,
+        DocumentModelProfile::CodeOnly | DocumentModelProfile::None_
+    ) {
+        None
+    } else {
+        Some(ocr_assets::ensure_tessdata().map_err(ExtractError::Document)?)
+    };
+    let mut krz_config = config.to_xberg(tessdata_path.as_deref());
 
     // When redaction is enabled with TokenReplace, we need to capture the
     // rehydration map. Disable xberg's built-in redaction and run it ourselves

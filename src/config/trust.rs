@@ -135,7 +135,6 @@ const INERT_FIELDS: &[&str] = &[
     "comms.workspace_root",
     "shells.keep_on_exit",
     "documents.ocr.backend",
-    "documents.ocr.languages",
     "documents.language.preferred_languages",
 ];
 

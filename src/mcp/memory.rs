@@ -160,6 +160,7 @@ pub(super) async fn lance_store_lexical(state: &ServerState) -> Result<Arc<crate
 ///
 /// Named rather than inlined because that closure must be `'static`; building the term list and
 /// the scope predicate inside it keeps the borrowed config out of the captured environment.
+#[cfg(feature = "documents")]
 fn basemind_lexical(
     lance: &crate::lance::LanceStore,
     terms: &[String],
@@ -1070,7 +1071,9 @@ pub(super) async fn run_search_documents(
 }
 
 #[path = "memory_documents.rs"]
+#[cfg(feature = "documents")]
 mod document_helpers;
+#[cfg(feature = "documents")]
 use document_helpers::{
     MAX_DOCUMENT_CURSOR_OFFSET, attach_doc_metadata, document_cursor_offset, document_query_fingerprint,
 };

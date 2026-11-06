@@ -549,7 +549,9 @@ mod tests {
     #[cfg(feature = "intelligence")]
     #[test]
     fn lance_evictable_tables_match_the_schema_constants() {
-        use crate::lance::schema::{CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE, MEMORY_TABLE};
+        #[cfg(feature = "code-search")]
+        use crate::lance::schema::CODE_CHUNKS_TABLE;
+        use crate::lance::schema::{DOC_LINKS_TABLE, DOCUMENTS_TABLE, MEMORY_TABLE};
 
         let mut expected = vec![DOCUMENTS_TABLE];
         #[cfg(feature = "documents")]

@@ -182,8 +182,10 @@ max_chunks_per_document = 2000
 | `embed_include` / `embed_exclude` | array of globs | Embedding scope, only consulted when `embed = true`: with a non-empty `embed_include` only matching documents are embedded; `embed_exclude` beats it. Both only narrow what `include` / `exclude` already index. Excluded documents stay extracted and keyword-searchable. Changing either removes the vector rows of newly excluded files on the next scan. |
 
 The `[documents]` tree also carries sub-tables for reranking, keywords, NER, summarization, and OCR
-(`[documents.reranker]`, `[documents.keywords]`, and so on). `[documents.ocr] backend` / `languages`
-and `[documents.language] preferred_languages` are reserved: they parse but have no effect yet. See the
+(`[documents.reranker]`, `[documents.keywords]`, and so on). `[documents.ocr] languages` selects
+Tesseract language packs; document-feature builds bundle English, French, German, Spanish, Italian,
+Dutch, and Polish by default. `[documents.ocr] backend` and `[documents.language] preferred_languages`
+remain reserved. See the
 [JSON Schema](https://github.com/Goldziher/basemind/blob/main/schema/basemind-config-v1.schema.json)
 for the exhaustive field set.
 
@@ -467,8 +469,8 @@ git directly.
 These parse but nothing reads them yet; setting one to a non-default value logs a warning:
 `[watch] live_l2`, `[cache] file_map_lru`, `[memory] enabled` / `scope_strategy` /
 `default_visibility`, `[comms] enabled` / `idle_timeout_secs` / `max_messages_per_room` /
-`retention_secs` / `max_rooms` / `workspace_root`, `[shells] keep_on_exit`, `[documents.ocr] backend` /
-`languages`, and `[documents.language] preferred_languages`. (`[mcp] transport` is also unread, but
+`retention_secs` / `max_rooms` / `workspace_root`, `[shells] keep_on_exit`, `[documents.ocr] backend`,
+and `[documents.language] preferred_languages`. (`[mcp] transport` is also unread, but
 `stdio` is its only value.)
 
 ### Config changes

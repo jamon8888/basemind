@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document-feature builds now bundle the configured default Tesseract language packs, including
+  French, so first OCR use is ready offline instead of downloading language data.
 - Add `[resources] keep_models_warm` so long-lived daemons can retain ONNX embedding and NER engines
   between passes, avoiding cold model reloads at the cost of resident memory.
 - Document scans reuse extracted chunks and NER results when only the embedding preset changes;

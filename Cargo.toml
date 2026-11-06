@@ -63,6 +63,10 @@ path = "src/lib.rs"
 name = "basemind"
 path = "src/main.rs"
 
+[build-dependencies]
+sha2 = "0.11"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
+
 [features]
 default = []
 

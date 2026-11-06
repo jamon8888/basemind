@@ -125,9 +125,9 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmC
     let tag = if cutovers == (defaults.markdown_chunk_max_bytes, defaults.plain_text_chunk_max_bytes) {
         // Bump this when extraction preprocessing or cache-key inputs change; this invalidates
         // cached OCR and embeddings produced before provider identity became part of the key.
-        "doc/3".to_string()
+        "doc/4".to_string()
     } else {
-        format!("doc/3/cutover={},{}", cutovers.0, cutovers.1)
+        format!("doc/4/cutover={},{}", cutovers.0, cutovers.1)
     };
     digest_of(
         &tag,
@@ -137,13 +137,14 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmC
             cfg.max_chunks_per_document,
             cfg.max_pages,
             cfg.extract_archives,
-            // Only the knobs that reach the extractor: `preferred_languages` and `[ocr]` are
-            // reserved, so editing them must not re-extract every document.
+            // Only the knobs that reach the extractor: `preferred_languages` and `[ocr] backend`
+            // remain reserved, while the OCR language list is live.
             (
                 cfg.language.auto_detect,
                 cfg.language.min_confidence.to_bits(),
                 cfg.language.detect_multiple,
             ),
+            &cfg.ocr.languages,
             &cfg.keywords,
             &cfg.ner,
             &cfg.summarization,
@@ -212,13 +213,16 @@ mod tests {
 
         let mut reserved = base.clone();
         reserved.language.preferred_languages = vec!["fra".into()];
-        reserved.ocr.languages = vec!["deu".into()];
         reserved.ocr.backend = crate::config::documents::OcrBackend::Paddle;
         assert_eq!(
             digest(&base),
             digest(&reserved),
             "reserved keys must not invalidate documents"
         );
+
+        let mut live = base.clone();
+        live.ocr.languages = vec!["fra".into()];
+        assert_ne!(digest(&base), digest(&live), "OCR languages must invalidate documents");
 
         let mut live = base.clone();
         live.language.detect_multiple = !live.language.detect_multiple;

@@ -1045,7 +1045,9 @@ required). `admin status` reports `config_stamp` (`<bytes>B@<unix seconds>`) to 
 logs a warning: `[watch] live_l2`, `[cache] file_map_lru`, `[mcp] transport`, `[memory] enabled` /
 `scope_strategy` / `default_visibility`, `[comms] enabled` / `idle_timeout_secs` /
 `max_messages_per_room` / `retention_secs` / `max_rooms` / `workspace_root`, `[shells] keep_on_exit`,
-`[documents.ocr] backend` / `languages`, and `[documents.language] preferred_languages`.
+`[documents.ocr] backend`, and `[documents.language] preferred_languages`. The OCR `languages`
+list is live; document-feature builds bundle English, French, German, Spanish, Italian, Dutch,
+and Polish Tesseract data by default.
 
 **Config changes take effect on the next scan.** Cached chunks and documents carry a fingerprint of
 the settings that shape them (`[code_search]` `max_characters` / `overlap` / `max_chunks_per_file`;

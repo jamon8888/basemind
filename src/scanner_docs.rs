@@ -169,6 +169,7 @@ pub(crate) fn doc_config_from(
         embedding_preset: Some(cfg.embedding_preset.clone()),
         embed,
         language: cfg.language.clone(),
+        ocr_languages: cfg.ocr.languages.clone(),
         keywords: cfg.keywords.clone(),
         ner: cfg.ner.clone(),
         summarization: cfg.summarization.clone(),
