@@ -556,6 +556,16 @@ fn pdf_line_padding_is_removed_without_collapsing_content() {
     assert_eq!(normalized, "Aurore Valcourt\nB signe.\n");
 }
 
+#[test]
+fn pdf_line_padding_keeps_source_offsets_for_detections() {
+    let original = "Name                                      \nBIC ABCDUS33XXX\n";
+    let trimmed = super::trim_pdf_line_padding_with_map(original);
+    let start = trimmed.text.find("ABCDUS33XXX").expect("BIC in trimmed text");
+    let end = start + "ABCDUS33XXX".len();
+    assert_eq!(&original[trimmed.offsets[start]..trimmed.offsets[end]], "ABCDUS33XXX");
+    assert_eq!(trimmed.text, "Name\nBIC ABCDUS33XXX\n");
+}
+
 /// The AI Act citation pattern matches the regulation's own number and
 /// nothing else: prose that merely names the act, and every other EU
 /// regulation, must survive untouched.

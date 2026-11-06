@@ -308,6 +308,15 @@ fn split_segment_to_budget(
     )))
 }
 
+/// Return a UTF-8 boundary up to `chars` characters before `end`.
+fn overlap_start(text: &str, end: usize, chars: usize) -> usize {
+    text[..end]
+        .char_indices()
+        .rev()
+        .nth(chars.saturating_sub(1))
+        .map_or(0, |(offset, _)| offset)
+}
+
 /// Plan windows using only the model token budget and the fixed overlap.
 /// Planning stops (not fails) at the first position where even one token-sized
 /// segment does not fit: `cut_off` marks it and honest truncation is reported.
@@ -317,11 +326,12 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
     let mut pieces = segments(text);
     let mut windows = Vec::new();
     let mut index = 0usize;
+    let mut window_start = pieces.first().map_or(0, |piece| piece.b0);
     while index < pieces.len() {
         // Token count is monotone as segments are appended, so binary search
         // avoids re-tokenizing every shorter prefix of dense text.
         let last = pieces.len() - 1;
-        let slice_at = |end: usize| text.get(pieces[index].b0..pieces[end].b1).unwrap_or("");
+        let slice_at = |end: usize| text.get(window_start..pieces[end].b1).unwrap_or("");
         let mut fitting_last = None;
         let mut low = index;
         let mut high = last;
@@ -338,6 +348,13 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             }
         }
         let Some(last) = fitting_last else {
+            // Forced splits can make the next window start inside the previous
+            // oversized word. If that overlap itself consumes the budget, drop
+            // only the overlap and retry before splitting again.
+            if window_start != pieces[index].b0 {
+                window_start = pieces[index].b0;
+                continue;
+            }
             // A single URL or identifier can be longer than the model budget.
             // Split it using the same tokenizer instead of applying a hidden
             // character ceiling or silently dropping the tail.
@@ -357,7 +374,7 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             };
         };
         windows.push(Window {
-            start: pieces[index].b0,
+            start: window_start,
             end: pieces[last].b1,
         });
         if last + 1 >= pieces.len() {
@@ -370,6 +387,12 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         let mut next = index + 1;
         while next <= last && pieces[next].c0 < target {
             next += 1;
+        }
+        window_start = pieces[next].b0;
+        if window_start >= pieces[last].b1 {
+            // A forced character split has no whole-word segment to snap back
+            // to. Re-read the configured overlap directly at a char boundary.
+            window_start = overlap_start(text, pieces[last].b1, OVERLAP_CHARS);
         }
         index = next;
     }

@@ -45,6 +45,7 @@ const TESSDATA: &[(&str, u64, &str)] = &[
 fn main() {
     println!("cargo:rerun-if-changed=schema/basemind-config-v1.schema.json");
     println!("cargo:rerun-if-changed=src/queries");
+    println!("cargo:rerun-if-env-changed=TESSDATA_PREFIX");
 
     // Keep the default/code-only builds free of OCR data. Full document builds embed the
     // language packs into the binary so first use never depends on a network download.
@@ -60,26 +61,59 @@ fn main() {
             .map(|bytes| verify(&bytes, expected_size, expected_sha256).is_ok())
             .unwrap_or(false);
         if !valid {
-            let url = format!(
-                "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/{TESSDATA_FAST_REVISION}/{language}.traineddata"
-            );
-            let response = ureq::get(&url)
-                .call()
-                .unwrap_or_else(|error| panic!("download {language}.traineddata from {url}: {error}"));
-            let bytes = response
-                .into_body()
-                .with_config()
-                .limit(expected_size.saturating_add(1))
-                .read_to_vec()
-                .unwrap_or_else(|error| panic!("read {language}.traineddata from {url}: {error}"));
-            verify(&bytes, expected_size, expected_sha256)
-                .unwrap_or_else(|error| panic!("invalid {language}.traineddata from {url}: {error}"));
-            fs::write(&path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+            if let Some(local) = local_tessdata_path(language) {
+                fs::copy(&local, &path).unwrap_or_else(|error| {
+                    panic!("copy local {language}.traineddata from {}: {error}", local.display())
+                });
+            } else {
+                let url = format!(
+                    "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/{TESSDATA_FAST_REVISION}/{language}.traineddata"
+                );
+                let response = ureq::get(&url)
+                    .call()
+                    .unwrap_or_else(|error| panic!("download {language}.traineddata from {url}: {error}"));
+                let bytes = response
+                    .into_body()
+                    .with_config()
+                    .limit(expected_size.saturating_add(1))
+                    .read_to_vec()
+                    .unwrap_or_else(|error| panic!("read {language}.traineddata from {url}: {error}"));
+                verify(&bytes, expected_size, expected_sha256)
+                    .unwrap_or_else(|error| panic!("invalid {language}.traineddata from {url}: {error}"));
+                fs::write(&path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+            }
         }
 
         let variable = format!("BASEMIND_BUNDLED_TESSDATA_{}", language.to_ascii_uppercase());
         println!("cargo:rustc-env={variable}={}", path.display());
     }
+}
+
+fn local_tessdata_path(language: &str) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(prefix) = std::env::var_os("TESSDATA_PREFIX") {
+        let prefix = std::path::PathBuf::from(prefix);
+        candidates.push(prefix.join(format!("{language}.traineddata")));
+        candidates.push(prefix.join("tessdata").join(format!("{language}.traineddata")));
+    }
+    let manifest_dir = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    candidates.extend([
+        manifest_dir.join("tessdata").join(format!("{language}.traineddata")),
+        std::path::PathBuf::from("/usr/share/tesseract-ocr/5/tessdata").join(format!("{language}.traineddata")),
+        std::path::PathBuf::from("/usr/share/tessdata").join(format!("{language}.traineddata")),
+        std::path::PathBuf::from("/opt/homebrew/share/tessdata").join(format!("{language}.traineddata")),
+        std::path::PathBuf::from("/usr/local/share/tessdata").join(format!("{language}.traineddata")),
+    ]);
+    candidates.into_iter().find(|candidate| {
+        fs::read(candidate)
+            .map(|bytes| {
+                TESSDATA
+                    .iter()
+                    .find(|entry| entry.0 == language)
+                    .is_some_and(|(_, size, sha)| verify(&bytes, *size, sha).is_ok())
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn verify(bytes: &[u8], expected_size: u64, expected_sha256: &str) -> Result<(), String> {

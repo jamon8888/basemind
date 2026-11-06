@@ -434,6 +434,11 @@ jobs:
             features: hacienda-legal
             variant: hacienda-legal
     runs-on: ${{ matrix.os }}
+    # The legal focus artifact is an optional release variant. A broken optional
+    # build must not prevent the required full-feature archives or their checksums
+    # from completing, but keeping it in this matrix makes checksums wait for the
+    # variant upload attempt before promoting the release.
+    continue-on-error: ${{ matrix.variant == 'hacienda-legal' }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -468,7 +473,7 @@ jobs:
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.triple }}
+          key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}
 
       - name: Discard incomplete xberg Tesseract source cache
         shell: bash
@@ -553,6 +558,8 @@ jobs:
     if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.image }}
+    # Optional focus archives are allowed to fail without blocking the required release assets.
+    continue-on-error: ${{ matrix.variant == 'hacienda-legal' }}
     strategy:
       fail-fast: false
       matrix:

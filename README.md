@@ -313,9 +313,10 @@ The MCP and CLI paths need `basemind` available on your system. (The plugin does
 | Homebrew | `brew install Goldziher/tap/basemind` | everything |
 | npm | `pnpm add -g basemind` | everything |
 | pip | `pip install basemind` | everything |
-| cargo | `cargo install basemind --locked` | code + git only (the CLI; `basemind serve` needs `--features comms`) |
+| cargo | `cargo install basemind --locked` | code + git only with direct stdio MCP transport |
 | cargo (full) | `cargo install basemind --features full --locked` | everything |
-| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | legal focus release: document ingestion/RAG + NER + rehydration vault + memory + graphrag, no comms/shells/crawl/code-intel — shipped as `basemind-hacienda-legal-<triple>` release assets, preset at `examples/basemind-hacienda-legal.toml` |
+| cargo (Intel macOS) | `ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib cargo install basemind --features intel-macos --locked` | everything with the dynamic x86_64 ONNX Runtime |
+| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | legal focus release: document ingestion/RAG + NER + rehydration vault + memory + graphrag, direct stdio MCP transport, no comms broker/shells/crawl/code-intel — shipped as `basemind-hacienda-legal-<triple>` release assets, preset at `examples/basemind-hacienda-legal.toml` |
 | GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything |
 
 <!-- markdownlint-enable MD013 -->
@@ -323,7 +324,8 @@ The MCP and CLI paths need `basemind` available on your system. (The plugin does
 The Homebrew / npm / pip / GitHub downloads include the full feature set — documents, OCR, search,
 web crawl, shared memory, agent comms, and agent shells — so the first run downloads the models it
 needs. The plain `cargo install` builds the code-map and git tools only: the one-shot CLI works, but
-`basemind serve` relays to the daemon and so needs the `comms` feature (`--features full` has it).
+`basemind serve` relays to the daemon in a `comms`/`full` build; non-comms profiles serve the
+same MCP protocol directly over stdio without the broker.
 
 ### Get started
 
@@ -1229,7 +1231,7 @@ Every command takes `--as-agent <ID>` to act as a named sub-identity.
 | `doctor` | Check root, config, index, grammars, pre-commit hook and daemon; exits 1 on a failed check. |
 | `completions <shell>` / `man` | Print a shell completion script (`bash`, `zsh`, `fish`, `elvish`, `powershell`) / the man page (roff) to stdout. |
 | `watch` | Keep the index fresh as files change (no server). |
-| `serve` | Stdio MCP entry point: ensures the daemon and relays to it (needs `--features comms`). The daemon keeps the index fresh by default. |
+| `serve` | Stdio MCP entry point: relays through the daemon in `comms` builds; non-comms profiles serve directly. |
 | `daemon ensure` | Ensure the daemon and its HTTP transport are up and print the MCP URL (needs `--features comms`). |
 | `statusline` | One-line summary of the daemon's active workspaces for a shell prompt; prints nothing when no daemon runs. |
 | `init [--config-dir .config\|.config/basemind --rules-target --settings-target --print]` | Re-runnable onboarding: write `basemind.toml` (at the root or under the `.config/` convention), select capabilities, inject usage rules. |

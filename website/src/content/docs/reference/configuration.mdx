@@ -538,11 +538,19 @@ ONNX Runtime). Opt into the rest:
 | `code-intel` | Scope- and import-resolved JS/TS `code` tool modes `references` / `definition` (oxc). | yes |
 | `full` | `documents` + `memory` + `crawl` + `comms` + `shells` + `code-intel` + `code-search`. | — |
 
+On Intel macOS, use `intel-macos` instead of `full`. It selects the same capabilities but loads
+the x86_64 ONNX Runtime dylib dynamically, because the static Intel runtime artifact is not
+available. Set `ORT_DYLIB_PATH` to that dylib before building or testing.
+
 ### Installation Examples
 
 ```bash
 # Everything (documents, memory, code-search, comms, shells)
 cargo install basemind --features full --locked
+
+# Everything on an Intel Mac (requires an x86_64 ONNX Runtime dylib)
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+  cargo install basemind --features intel-macos --locked
 
 # Code + git only (smallest build)
 cargo install basemind --locked

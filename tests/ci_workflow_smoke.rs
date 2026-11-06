@@ -121,3 +121,15 @@ fn no_unverified_linker_or_cache_tool_is_reintroduced_silently() {
         );
     }
 }
+
+/// Intel macOS must exercise the dynamic ONNX Runtime profile. `macos-14` is the ARM64 leg;
+/// putting plain `full` on an Intel runner asks ort-sys for the unavailable static x86_64 runtime.
+#[test]
+fn intel_macos_uses_the_dynamic_runtime_profile() {
+    let workflow = workflow();
+    let test = test_job(&workflow);
+    assert!(
+        test.contains("os: macos-15-intel") && test.contains("features: \"intel-macos\""),
+        "CI must keep a native Intel macOS leg on the `intel-macos` feature profile"
+    );
+}

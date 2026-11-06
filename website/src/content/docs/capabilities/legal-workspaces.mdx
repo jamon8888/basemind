@@ -12,8 +12,8 @@ import { Aside, Badge, Code } from '@astrojs/starlight/components';
 
 `hacienda-legal` is a focus release of basemind for lawyers' client folders: a build
 that contains the document stack — ingestion, RAG retrieval, NER, redaction with a
-rehydration vault — plus shared memory and the entity graph, and nothing else. Clients
-like Claude Code spawn it per workspace over stdio, so the comms daemon, shells, web
+rehydration vault — plus shared memory and the entity graph, and nothing else. Its
+`basemind serve` command provides the MCP stdio transport directly, so the comms daemon, shells, web
 crawl, and the code-intelligence engines are all left out, which keeps the binary and
 the model downloads smaller.
 

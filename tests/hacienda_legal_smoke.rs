@@ -65,24 +65,19 @@ fn run_scan(root: &Path) {
     let cfg = basemind::config::load(root).expect("load basemind.toml");
     assert!(!cfg.documents.embed, "this test runs the lexical-only lane on purpose");
     assert!(cfg.documents.redaction.enabled, "ingestion-time redaction is the point");
-    let _ = basemind::lang::ensure_grammars().expect("grammar bootstrap");
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut store = basemind::store::Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
-            basemind::scanner::scan(
-                root,
-                &mut store,
-                &cfg,
-                basemind::scanner::ScanSource::WorkingTree,
-                basemind::scanner::EmbedMode::Inline,
-            )
-            .expect("scan");
-        });
-    });
+    let output = Command::new(env!("CARGO_BIN_EXE_basemind"))
+        .args(["--root", root.to_str().expect("workspace path"), "scan"])
+        .output()
+        .expect("basemind scan CLI");
+    assert!(
+        output.status.success(),
+        "the legal workspace must scan through the shipped CLI: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 async fn client(root: &Path) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let transport = basemind::mcp::serve_in_memory(root, "working")
+    let transport = basemind::mcp::serve_in_memory_lean(root, "working", false)
         .await
         .expect("in-memory serve");
     ().serve(transport).await.expect("rmcp handshake")
@@ -124,10 +119,16 @@ async fn the_focus_surface_advertises_documents_and_rehydration_only() {
     for expected in ["memory", "vault", "redact_text", "admin", "code", "git", "graph"] {
         assert!(names.contains(&expected), "{expected} must be advertised: {names:?}");
     }
-    for excluded in ["web", "agents", "workspace", "shell"] {
-        assert!(
-            !names.contains(&excluded),
-            "{excluded} must NOT be advertised in the hacienda-legal build: {names:?}"
+    for (domain, enabled) in [
+        ("web", cfg!(feature = "crawl")),
+        ("agents", cfg!(feature = "comms")),
+        ("workspace", cfg!(feature = "comms")),
+        ("shell", cfg!(feature = "shells")),
+    ] {
+        assert_eq!(
+            names.contains(&domain),
+            enabled,
+            "feature/domain mismatch for {domain}: {names:?}"
         );
     }
 
@@ -137,8 +138,17 @@ async fn the_focus_surface_advertises_documents_and_rehydration_only() {
         .collect();
     assert!(domains.contains(&"vault"), "vault domain advertised: {domains:?}");
     assert!(domains.contains(&"memory"), "memory domain advertised: {domains:?}");
-    for excluded in ["web", "agents", "workspace", "shell"] {
-        assert!(!domains.contains(&excluded), "{excluded} must be absent: {domains:?}");
+    for (domain, enabled) in [
+        ("web", cfg!(feature = "crawl")),
+        ("agents", cfg!(feature = "comms")),
+        ("workspace", cfg!(feature = "comms")),
+        ("shell", cfg!(feature = "shells")),
+    ] {
+        assert_eq!(
+            domains.contains(&domain),
+            enabled,
+            "feature/domain mismatch for {domain}: {domains:?}"
+        );
     }
 }
 
@@ -182,6 +192,18 @@ async fn ingest_search_redact_and_rehydrate_end_to_end() {
         !redacted_text.contains("alice.smith@example.com"),
         "the email must be tokenised away: {redacted_text}"
     );
+    assert!(
+        redacted_text.starts_with("Reach "),
+        "surrounding contact text must remain: {redacted_text}"
+    );
+    assert!(
+        redacted_text.ends_with(" about the lease."),
+        "surrounding contact text must remain: {redacted_text}"
+    );
+    assert!(
+        !redacted_text.contains("+33 6 12 34 56 78"),
+        "the phone must be tokenised away: {redacted_text}"
+    );
     let map = redacted["rehydration_map"]
         .as_object()
         .expect("rehydration_map object")
@@ -221,7 +243,6 @@ async fn ingest_search_redact_and_rehydrate_end_to_end() {
         .expect("decrypted map")
         .clone()
         .into_iter()
-        .map(|(k, v)| (k, v))
         .collect();
     assert_eq!(
         round_tripped, map,

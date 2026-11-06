@@ -696,13 +696,16 @@ pub(crate) fn extract_doc_with_metrics(
     config: &DocConfig,
     metrics: Option<&crate::scan_metrics::ScanStageMetrics>,
 ) -> Result<FileMapDoc, ExtractError> {
-    let tessdata_path = if matches!(
-        config.document_models,
-        DocumentModelProfile::CodeOnly | DocumentModelProfile::None_
-    ) {
-        None
-    } else {
+    let tessdata_path = if !matches!(mime_type, Some(mime) if mime.starts_with("text/"))
+        && !matches!(
+            config.document_models,
+            DocumentModelProfile::CodeOnly | DocumentModelProfile::None_
+        )
+        && ocr_assets::can_bundle_languages(&config.ocr_languages)
+    {
         Some(ocr_assets::ensure_tessdata().map_err(ExtractError::Document)?)
+    } else {
+        None
     };
     let mut krz_config = config.to_xberg(tessdata_path.as_deref());
 

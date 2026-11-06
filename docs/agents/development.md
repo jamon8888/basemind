@@ -45,6 +45,13 @@ ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
   cargo test --features documents,ort-dynamic --lib
 ```
 
+For the complete feature set, use the convenience profile:
+
+```sh
+ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+  cargo test --features intel-macos --lib
+```
+
 That same `documents,ort-dynamic` feature substitution applies to the
 feature-specific commands above (and to `full` when checking the Intel target):
 the plain `documents`/`full` variants ask `ort-sys` for a static ONNX Runtime

@@ -5,7 +5,9 @@
 
 use xberg::types::entity::{Entity, EntityCategory};
 
-use super::{NerBudget, OVERLAP_CHARS, SEP_TEXT_TOKEN, merge_window_entities, plan_windows, schema_items};
+use super::{
+    NerBudget, OVERLAP_CHARS, SEP_TEXT_TOKEN, merge_window_entities, plan_windows, schema_items, window_token_count,
+};
 
 /// A tokenizer that costs one token per character: a BPE whose vocabulary is
 /// the printable ASCII set with no merges — every word tokenizes to its own
@@ -137,16 +139,36 @@ fn dense_text_shrinks_windows_to_the_token_budget() {
 #[test]
 fn an_oversized_word_is_split_by_the_token_budget() {
     let mut text = "Alice Smith met Bob Jones in Paris near Acme Corp. ".repeat(30);
+    let url_start = text.len();
     text.push_str("https://very-long-unreadable.example.org/");
     text.push_str(&"a".repeat(500));
+    let url_end = text.len();
     text.push_str(" and the end");
-    let plan = plan_windows(&text, &budget_with_text_chars(320)).expect("the prose head still plans");
+    let budget = budget_with_text_chars(320);
+    let plan = plan_windows(&text, &budget).expect("the prose head still plans");
     assert_eq!(plan.cut_off, None, "the token budget covers the whole text");
     assert_eq!(
         plan.windows.last().map(|window| window.end),
         Some(text.len()),
         "the long word's tail is covered"
     );
+    let url_windows: Vec<_> = plan
+        .windows
+        .iter()
+        .filter(|window| window.end > url_start && window.start < url_end)
+        .collect();
+    assert!(!url_windows.is_empty(), "the oversized URL must be read");
+    let mut covered_to = url_start;
+    for window in url_windows {
+        let slice = text.get(window.start..window.end).expect("window is UTF-8 aligned");
+        assert!(
+            window_token_count(&budget.tokenizer, slice).expect("token counting succeeds") <= budget.tokens_for_text,
+            "window {window:?} exceeds the text-token budget"
+        );
+        assert!(window.start <= covered_to, "window gap before {window:?}");
+        covered_to = covered_to.max(window.end.min(url_end));
+    }
+    assert_eq!(covered_to, url_end, "the oversized URL is covered without gaps");
 }
 
 /// A budget the very first window cannot fit fails outright: nothing can run,

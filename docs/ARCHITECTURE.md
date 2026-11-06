@@ -4,9 +4,9 @@ basemind is a single Rust crate that builds one binary (`basemind`) and exposes
 its internals as a library. `basemind scan` indexes a workspace under an exclusive
 writer lock. The daemon (`basemind comms daemon`, auto-spawned; singleton per user)
 owns its active workspace writers and hosts the MCP router over shared read
-stacks. `basemind serve` is a thin stdio relay that ensures the daemon and pumps
-bytes to it; HTTP-native clients can dial its opt-in HTTP frontend directly.
-`serve` requires `comms`. One-shot query commands use the same helpers through
+stacks. In `comms` builds, `basemind serve` is a thin stdio relay to the daemon;
+non-comms builds serve directly over stdio without the broker. HTTP-native
+clients can dial the daemon's opt-in HTTP frontend directly. One-shot query commands use the same helpers through
 `cli/context.rs`: local reads when possible, or index/memory forwarding when the
 daemon owns the store. `rescan` forwards to a running daemon; `scan` reports a
 writer collision rather than silently opening a second writer.

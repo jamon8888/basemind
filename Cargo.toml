@@ -153,6 +153,11 @@ full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-s
 # Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
 hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
 
+# Intel macOS has no static ONNX Runtime artifact in the current ort/xberg release. Keep this
+# convenience profile separate from `full`: ARM macOS and Linux should continue using their
+# normal bundled-runtime profile, while Intel builds load an x86_64 dylib at runtime.
+intel-macos = ["full", "ort-dynamic"]
+
 # Focus release for legal client-folder deployments ("hacienda-legal"), shipped as
 # `basemind-hacienda-legal-<triple>` release assets:
 # - documents: xberg ingestion (PDF/Office/HTML/email/images + OCR), chunking, the
@@ -165,8 +170,8 @@ hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
 # - graphrag: entity graph (`graph entities`) built from the NER sidecar at scan
 #   time. NOTE: the GraphRAG *query* surface is partially implemented — see
 #   docs/agents/features.md#incomplete-and-proposed-work.
-# Deliberately excluded: comms (clients like Claude Code spawn `basemind serve`
-# over stdio per workspace; the daemon is the `hacienda` feature's job), shells,
+# Deliberately excluded: the comms broker/daemon and its agents/workspace domains; `serve` uses
+# rmcp's direct stdio transport in this profile. Also excluded are shells,
 # crawl, code-intel and code-search — a client folder is documents, not code.
 hacienda-legal = ["documents", "memory", "ner-candle", "graphrag"]
 graphrag = ["documents", "dep:lance-graph", "dep:arrow-select", "dep:arrow-ipc", "dep:arrow56"]
@@ -242,7 +247,7 @@ oxc_syntax = { version = "0.154.0", optional = true }
 rayon = "1"
 regex = "1.13.1"
 regex-syntax = "0.8"
-rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "schemars", "transport-async-rw"] }
+rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "schemars", "transport-async-rw", "transport-io"] }
 rmp-serde = "1"
 rmux-client = { version = "0.10", default-features = false, optional = true }
 rmux-sdk = { version = "0.10", default-features = false, optional = true }
