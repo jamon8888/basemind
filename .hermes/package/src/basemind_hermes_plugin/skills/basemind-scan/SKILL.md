@@ -9,8 +9,22 @@ description: >-
 
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:0f2cc34ae8970652066484ed94f3f2a965201654a29fdf3aa9318d2631422c39
-Source-Hash: blake3:39a85033d262d9f6044d1b25327804f8a0bf95e7263b2cfe4d56f5569ca128d7
+Content-Hash: blake3:b9f8cc400fdcc6c86449127ae8349b3846ebe6b865d958490699eaefb59ca5d5
+Source-Hash: blake3:b96764c6a3abaec704dffd3abf56607bc3114b4b29a212e60ff7d6e43ca5e678
+Schema-Version: v1
+-->
+
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:4c7261a3b285c75599ed9a9c6501523c65d98ebca512be2bac6696b80e51de45
+Source-Hash: blake3:aa3fdcfda21e2102d900287f385f78de45def44813de651b4666209c45fafc67
+Schema-Version: v1
+-->
+
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:6a2da891a9f4c927e817d6507b8118afe9d9140a9473177ead3e43fae3ae468f
+Source-Hash: blake3:378e61c2bd27ae140e75d818f27005fac54d22d0ad24de4163a71e8572a15c72
 Schema-Version: v1
 -->
 

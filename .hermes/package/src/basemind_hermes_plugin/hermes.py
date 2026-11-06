@@ -1,6 +1,6 @@
 # AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-# Content-Hash: blake3:a08a5ade4f6382ce3ba5a71c55a8697845fb9825eca0c2b5150c53cf1b9e1e56
-# Source-Hash: blake3:39a85033d262d9f6044d1b25327804f8a0bf95e7263b2cfe4d56f5569ca128d7
+# Content-Hash: blake3:e95b092f0698f0a21146f9152c333f578c743fe5cfb8792f1e30afe08affb70e
+# Source-Hash: blake3:b96764c6a3abaec704dffd3abf56607bc3114b4b29a212e60ff7d6e43ca5e678
 # Schema-Version: v1
 
 """Hermes Agent plugin registration for basemind.
@@ -44,6 +44,7 @@ _DISCIPLINE = (
     "reading source. Default workflow: use code mode outline before opening a file (then read only "
     "the span you need); code mode symbols instead of grep for a definition; code modes references "
     "and callers instead of grepping call sites; code mode grep instead of shelling out to ripgrep; "
+    "memory mode documents for markdown, config, data and PDF files (the code map holds code only); "
     "admin mode rescan after edits instead of reconnecting. Do not re-read a file basemind already "
     "mapped."
 )

@@ -6,8 +6,8 @@ argument-hint: [today|1h|24h|all]
 
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:de8ef18a77f3c93ea82270ed4f99190e5e326150572aa185c5b5496f7b5c4df9
-Source-Hash: blake3:39a85033d262d9f6044d1b25327804f8a0bf95e7263b2cfe4d56f5569ca128d7
+Content-Hash: blake3:c47d154dd9d313414be41e3d1209cf759e8d145ddf4a2861a173f887deddd90e
+Source-Hash: blake3:b96764c6a3abaec704dffd3abf56607bc3114b4b29a212e60ff7d6e43ca5e678
 Schema-Version: v1
 -->
 
@@ -25,7 +25,7 @@ RAM usage.
 
 Invoke `/bm-stats` (default window `today`) or `/bm-stats <today|1h|24h|all>`. Window: $ARGUMENTS
 
-1. **Resource footprint.** MCP `admin { mode: "cache_stats" }`, or CLI `basemind admin cache-stats` (add `--json` to
+1. **Resource footprint.** MCP `admin { mode: "cache_stats" }`, or CLI `basemind cache stats` (add `--json` to
    parse). Report: `total_bytes` (matches `du`), the per-component breakdown (blobs / views /
    git-history / lance / git-cache / telemetry / other), and process RAM (`rss_bytes` +
    `peak_rss_bytes`). If `blob_accounting_ok` is `false`, note that orphan accounting was skipped
