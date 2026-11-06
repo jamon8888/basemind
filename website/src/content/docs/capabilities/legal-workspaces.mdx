@@ -1,0 +1,112 @@
+---
+title: Legal workspaces (hacienda-legal)
+description: >-
+  The documents-only focus release for legal client folders — ingestion, RAG search,
+  NER, and caller-owned rehydration of redacted PII — as a smaller binary and a
+  drop-in client-folder config.
+---
+
+import { Aside, Badge, Code } from '@astrojs/starlight/components';
+
+<Badge text="--features hacienda-legal" />
+
+`hacienda-legal` is a focus release of basemind for lawyers' client folders: a build
+that contains the document stack — ingestion, RAG retrieval, NER, redaction with a
+rehydration vault — plus shared memory and the entity graph, and nothing else. Its
+`basemind serve` command provides the MCP stdio transport directly, so the comms daemon, shells, web
+crawl, and the code-intelligence engines are all left out, which keeps the binary and
+the model downloads smaller.
+
+## Install
+
+| Channel | Command | Includes |
+|---|---|---|
+| GitHub releases | `basemind-hacienda-legal-<triple>.tar.gz` / `.zip` from [releases](https://github.com/Goldziher/basemind/releases) | documents + rehydration vault + memory + NER + graphrag |
+| cargo | `cargo install basemind --features hacienda-legal --locked` | same |
+
+The plain `basemind-<triple>` assets and `--features full` remain the everything build;
+`hacienda-legal` assets are additional archives on the same release.
+
+## Set up a client folder
+
+1. Copy the shipped preset into the client folder as its config:
+
+   <Code code={`cp examples/basemind-hacienda-legal.toml /path/to/client-folder/basemind.toml`} lang="bash" />
+
+   The preset turns on: document ingestion (PDF / Office / HTML / email / scanned images
+   via OCR), multilingual embeddings, the exact/keyword/vector retrieval lanes with
+   reranking, ingest-time NER (person, organization, location + legal labels like docket
+   number and statute citation), extractive summaries, statute/docket citation indexing,
+   the GraphRAG entity graph, and ingestion-time PII redaction with the reversible
+   `token-replace` strategy.
+
+2. Ingest once (then keep it fresh with `basemind watch` or let `serve` auto-rescan):
+
+   <Code code={`basemind --root /path/to/client-folder scan`} lang="bash" />
+
+3. Point your agent at it over stdio, e.g. in Claude Code's MCP settings:
+
+   <Code code={`{
+  "mcpServers": {
+    "client-folder": {
+      "command": "basemind",
+      "args": ["--root", "/path/to/client-folder", "serve"]
+    }
+  }
+}`} lang="json" />
+
+## Search the folder (RAG)
+
+In the client, call `memory` with `mode: "documents"`:
+
+<Code code={`{ "mode": "documents", "query": "termination cure period non-payment", "limit": 10 }`} lang="json" />
+
+Hits come from the fused exact + keyword/FTS + vector lanes, reranked by the
+cross-encoder, with `mime_type`, `entity_category`, and `keywords_contains` filters.
+Set `embed = false` in `basemind.toml` for a lexical-only store with no model download.
+
+## Redaction and rehydration
+
+With `[documents.redaction]` enabled (the preset does), scan-time extraction rewrites
+each PII hit as a stable `[TYPE_N]` token. **basemind never persists the token→original
+map** — it is returned to the caller (see
+[ADR-0015](/reference/architecture/), privacy gateway boundary), so the clear text of a
+party's name or IBAN never rests in the index:
+
+- `redact_text` on arbitrary text (or a `file_path`) returns `redacted_text`,
+  `rehydration_map` (token → original), and the `detections`. With the `ner-candle`
+  build, pass `ner_model_dir` + `ner_profile` (e.g. `legal-fr@1`) for GLiNER2 NER over
+  person/organization/location; `require_ner = true` fails closed instead of degrading
+  to pattern-only.
+- `vault` manages the encrypted map in memory: `encrypt` a `rehydration_map` with a
+  passphrase into a base64 `encrypted_blob`, persist that blob yourself (basemind stores
+  nothing), and later `decrypt`, `find` (search by token or original), `forget`
+  (remove a subject), or `inspect` it. The CLI twin is `basemind vault <mode>`.
+
+<Code code={`{ "mode": "encrypt", "map": { "[EMAIL_0]": "alice.smith@example.com" }, "passphrase": "…" }`} lang="json" />
+
+For a firm-wide gateway that writes a redacted `safe/` mirror and holds the vault
+itself, run the protected-workspace flow — the `safe/` mirror withholds `redact_text`
+and `vault` from ordinary agents and only the gateway (marked via its environment) sees
+the true values.
+
+<Aside type="caution">
+The GraphRAG **query** surface (`graph` mode `rag`) is partially implemented; entity
+ingestion (`graph` mode `entities`) works when `[documents.graphrag] enabled = true`.
+See the feature catalog for the current status.
+</Aside>
+
+## What is in / out
+
+| In `hacienda-legal` | Not included |
+|---|---|
+| Document ingestion: PDF, Office, HTML, email, images + OCR, prose/config/data | `comms` daemon / broker / HTTP frontend |
+| `memory` mode `documents` retrieval (exact, FTS, vector, fusion, rerank) | `shells` detached terminals |
+| `redact_text` + `vault` rehydration maps | `crawl` web ingestion |
+| Ingest-time NER (ONNX + Candle GLiNER2), keywords, summaries | `code-search` semantic code search |
+| Memory notes (`memory` put/get/search, governance) | `code-intel` JS/Python/Java resolution |
+| GraphRAG entity graph (`graph entities`) | |
+
+Code-map and git tools (`code`, `git`, `graph`, `admin`) are part of every build and
+stay available — a client folder occasionally contains scripts, and they cost nothing
+when unused.

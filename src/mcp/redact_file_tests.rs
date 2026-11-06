@@ -502,6 +502,71 @@ async fn phone_patterns_leave_dates_and_amounts_alone() {
     }
 }
 
+#[tokio::test]
+async fn legal_reference_numbers_are_not_redacted_as_phones() {
+    let text = "Jugement du 12 février 2026, annonce 20260219-AAA-0042. \
+                Facture F-2026-0012 du 9 janvier 2026. Période 2024-2025. \
+                Contact : 06 12 34 56 78.";
+    let payload = json_of(&run_redact(text_params(text)).await.expect("redact_text succeeds"));
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    for kept in ["20260219-AAA-0042", "F-2026-0012", "2024-2025"] {
+        assert!(redacted.contains(kept), "{kept} must stay: {redacted}");
+    }
+    assert!(
+        !redacted.contains("06 12 34 56 78"),
+        "the real phone must be redacted: {redacted}"
+    );
+}
+
+#[tokio::test]
+async fn uppercase_prose_is_not_redacted_as_a_swift_code_without_context() {
+    let text = "ATTESTATION D'EMPLOYEUR\n\nLa présente attestation est établie à la demande.";
+    let payload = json_of(&run_redact(text_params(text)).await.expect("redact_text succeeds"));
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(redacted.contains("ATTESTATION"), "ordinary prose must stay: {redacted}");
+    assert!(
+        !payload["detections"]
+            .as_array()
+            .expect("detections")
+            .iter()
+            .any(|d| d["category"] == "swift_bic")
+    );
+}
+
+#[tokio::test]
+async fn a_valid_spaced_french_nir_redacts_as_one_national_id() {
+    let nir = "1 85 07 15 100 000 58";
+    let text = format!("Numéro de sécurité sociale : **{nir}**.");
+    let payload = json_of(&run_redact(text_params(&text)).await.expect("redact_text succeeds"));
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains(nir), "the complete NIR must be redacted: {redacted}");
+    let detections = payload["detections"].as_array().expect("detections");
+    assert!(
+        detections
+            .iter()
+            .any(|d| d["category"] == "national_id_number" && d["text"] == nir),
+        "the complete NIR should be one detection: {detections:?}"
+    );
+}
+
+#[test]
+fn pdf_line_padding_is_removed_without_collapsing_content() {
+    let normalized =
+        super::trim_pdf_line_padding_with_map("Aurore Valcourt                                      \nB signe.  \n")
+            .text;
+    assert_eq!(normalized, "Aurore Valcourt\nB signe.\n");
+}
+
+#[test]
+fn pdf_line_padding_keeps_source_offsets_for_detections() {
+    let original = "Name                                      \nBIC ABCDUS33XXX\n";
+    let trimmed = super::trim_pdf_line_padding_with_map(original);
+    let start = trimmed.text.find("ABCDUS33XXX").expect("BIC in trimmed text");
+    let end = start + "ABCDUS33XXX".len();
+    assert_eq!(&original[trimmed.offsets[start]..trimmed.offsets[end]], "ABCDUS33XXX");
+    assert_eq!(trimmed.text, "Name\nBIC ABCDUS33XXX\n");
+}
+
 /// The AI Act citation pattern matches the regulation's own number and
 /// nothing else: prose that merely names the act, and every other EU
 /// regulation, must survive untouched.

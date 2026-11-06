@@ -1165,12 +1165,12 @@
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value); OCR runs with xberg's defaults.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value). Tesseract remains the document-tier OCR backend for now.",
           "$ref": "#/$defs/OcrBackend",
           "default": "tesseract"
         },
         "languages": {
-          "description": "Tesseract / PaddleOCR language packs (ISO 639-3 codes like `\"eng\"`).\nDefaults to English plus the six EU national-ID languages (DE, FR, ES,\nIT, NL, PL) so ID documents OCR correctly before PII detection.",
+          "description": "Tesseract / PaddleOCR language packs (ISO 639-3 codes like `\"eng\"`). These are passed to\nthe document OCR backend. The default document build bundles English plus the six EU\nnational-ID languages (DE, FR, ES, IT, NL, PL), so OCR is ready offline.",
           "type": "array",
           "items": {
             "type": "string"

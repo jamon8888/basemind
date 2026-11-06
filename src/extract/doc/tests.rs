@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 use xberg::types::{HeadingContext, HeadingLevel};
 
@@ -25,33 +27,37 @@ fn doc_config_all_enrichment_on(profile: DocumentModelProfile) -> DocConfig {
 #[test]
 fn to_xberg_full_profile_keeps_enrichment_and_ocr() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::Full);
-    let x = cfg.to_xberg();
+    let x = cfg.to_xberg(None);
     assert!(x.keywords.is_some(), "Full keeps keyword extraction");
     assert!(x.ner.is_some(), "Full keeps NER");
     assert!(x.summarization.is_some(), "Full keeps summarisation");
     assert!(!x.disable_ocr, "Full leaves OCR enabled");
+    assert_eq!(x.ocr.as_ref().unwrap().language, cfg.ocr_languages);
+    assert!(x.ocr.as_ref().unwrap().tessdata_path.is_none());
     assert!(x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none());
 }
 
 #[test]
 fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
-    let x = cfg.to_xberg();
+    let x = cfg.to_xberg(None);
     assert!(x.keywords.is_none(), "CodeOnly forces keywords off");
     assert!(x.ner.is_none(), "CodeOnly forces NER off");
     assert!(x.summarization.is_none(), "CodeOnly forces summarisation off");
     assert!(x.disable_ocr, "CodeOnly disables OCR");
+    assert!(x.ocr.is_none(), "CodeOnly does not configure OCR");
     assert!(x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none());
 }
 
 #[test]
 fn to_xberg_none_profile_strips_everything_including_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::None_);
-    let x = cfg.to_xberg();
+    let x = cfg.to_xberg(None);
     assert!(x.keywords.is_none(), "None strips keywords");
     assert!(x.ner.is_none(), "None strips NER");
     assert!(x.summarization.is_none(), "None strips summarisation");
     assert!(x.disable_ocr, "None disables OCR");
+    assert!(x.ocr.is_none(), "None does not configure OCR");
     assert!(
         x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none(),
         "None skips embeddings entirely even when embed = true"
@@ -65,7 +71,7 @@ fn to_xberg_defers_embedding_to_basemind() {
         embed_batch_size: 8,
         ..DocConfig::default()
     };
-    let x = cfg.to_xberg();
+    let x = cfg.to_xberg(None);
     assert!(
         x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none(),
         "basemind must embed the breadcrumbed retrieval view after extraction"
@@ -80,7 +86,7 @@ fn to_xberg_bounds_pages_timeout_and_disables_duplicate_cache() {
         ..doc_config_all_enrichment_on(DocumentModelProfile::Full)
     };
 
-    let xberg = cfg.to_xberg();
+    let xberg = cfg.to_xberg(None);
     let security = xberg.security_limits.expect("security limits configured");
     let chunking = xberg.chunking.expect("chunking configured");
 

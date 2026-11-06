@@ -854,12 +854,48 @@ fn cmd_serve(root: &std::path::Path, view: &str) -> Result<()> {
     }
     #[cfg(not(all(feature = "comms", any(unix, windows))))]
     {
-        let _ = root;
-        anyhow::bail!(
-            "`basemind serve` needs the comms daemon to host the MCP server; rebuild with \
-             `--features comms` (the stdio MCP server is served by relaying to that daemon)."
-        )
+        try_serve_in_process(root, view)
     }
+}
+
+/// Run the legal/minimal profile's MCP server directly over stdio. Full builds use the daemon
+/// relay above; keeping this fallback independent of `comms` gives document-focused release
+/// binaries a real transport without pulling in the broker, agents, or workspace domains.
+#[cfg(not(all(feature = "comms", any(unix, windows))))]
+fn try_serve_in_process(root: &std::path::Path, view: &str) -> Result<()> {
+    use rmcp::ServiceExt;
+
+    let (store, read_only) = match Store::open_with_holder(root, view, LockHolder::Serve) {
+        Ok(store) => (store, false),
+        Err(error) if error.is_lock_contention() => (Store::open_read_only(root, view)?, true),
+        Err(error) => return Err(anyhow::Error::new(error).context("open store")),
+    };
+    let config = Arc::new(config::load_or_default_logged(root));
+    let repo = basemind::git::Repo::discover(root).ok().map(Arc::new);
+    let git_cache = Arc::new(
+        basemind::git_cache::GitCache::open(&basemind::store::workspace_cache_dir(root), 1024, false)
+            .context("open git cache")?,
+    );
+    let server = basemind::mcp::BasemindServer::new_with_options(
+        store,
+        root.to_path_buf(),
+        config,
+        repo,
+        git_cache,
+        basemind::mcp::ServerOptions {
+            read_only,
+            ..basemind::mcp::ServerOptions::default()
+        },
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async {
+        let running = server
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("MCP stdio handshake")?;
+        running.waiting().await.context("MCP stdio server")?;
+        Ok(())
+    })
 }
 
 /// Keep the MCP host's stdio pipes alive across daemon replacement. The protocol-aware relay tracks

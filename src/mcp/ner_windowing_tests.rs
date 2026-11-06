@@ -5,7 +5,9 @@
 
 use xberg::types::entity::{Entity, EntityCategory};
 
-use super::{NerBudget, SEP_TEXT_TOKEN, WINDOW_CHARS, merge_window_entities, plan_windows, schema_items};
+use super::{
+    NerBudget, OVERLAP_CHARS, SEP_TEXT_TOKEN, merge_window_entities, plan_windows, schema_items, window_token_count,
+};
 
 /// A tokenizer that costs one token per character: a BPE whose vocabulary is
 /// the printable ASCII set with no merges — every word tokenizes to its own
@@ -50,30 +52,34 @@ fn entity(category: EntityCategory, text: &str, start: u32, end: u32, confidence
     }
 }
 
-/// A plain ~20 000-character prose body plans into more than one window; every
-/// window stays within the caller's gate (`WINDOW_CHARS` characters); each
-/// neighbour re-reads the tail instead of skipping it; nothing is truncated.
+/// A generous token budget permits a window larger than the former 400-character
+/// mirror cap; the model budget, not a second character ceiling, is authoritative.
 #[test]
-fn plans_prose_into_bounded_overlapping_windows() {
+fn token_budget_allows_windows_larger_than_four_hundred_characters() {
     let text = "Alice Smith met Bob Jones in Paris near Acme Corp. ".repeat(400);
     let plan = plan_windows(&text, &budget_with_text_chars(usize::MAX / 2)).expect("plans a plain body");
+    assert_eq!(plan.windows.len(), 1, "the generous budget fits the whole body");
+    let count = text[plan.windows[0].start..plan.windows[0].end].chars().count();
+    assert!(
+        count > 400,
+        "the token budget, not a character cap, chose {count} chars"
+    );
+    assert_eq!(plan.windows[0].start, 0);
+    assert_eq!(plan.windows[0].end, text.len());
+    assert_eq!(plan.cut_off, None);
+}
+
+/// A budget-sized prose body still uses overlapping windows, and every
+/// neighbour re-reads the fixed overlap instead of skipping text.
+#[test]
+fn budget_sized_windows_keep_the_overlap() {
+    let text = "Alice Smith met Bob Jones in Paris near Acme Corp. ".repeat(400);
+    let plan = plan_windows(&text, &budget_with_text_chars(220)).expect("plans a plain body");
     assert!(
         plan.windows.len() > 10,
         "many windows for ~20k chars: {}",
         plan.windows.len()
     );
-    for window in &plan.windows {
-        let count = text
-            .get(window.start..window.end)
-            .expect("window cut on char boundaries")
-            .chars()
-            .count();
-        // The caller's gate reads window sizes in characters.
-        assert!(
-            count <= WINDOW_CHARS,
-            "window {window:?} is {count} chars, past the cap"
-        );
-    }
     for pair in plan.windows.windows(2) {
         assert!(
             pair[1].start < pair[0].end,
@@ -81,6 +87,10 @@ fn plans_prose_into_bounded_overlapping_windows() {
         );
         assert!(pair[1].start > pair[0].start, "each window must move on: {pair:?}");
     }
+    assert!(
+        plan.windows[0].end - plan.windows[1].start >= OVERLAP_CHARS,
+        "the configured overlap must remain in force"
+    );
     assert_eq!(plan.cut_off, None, "a budget this generous keeps every window");
 }
 
@@ -119,38 +129,46 @@ fn dense_text_shrinks_windows_to_the_token_budget() {
             slice.split_whitespace().count() <= 2,
             "window {window:?} reads {slice:?} past the budget"
         );
-        // …and stays an honest report about the characters it does read.
-        assert!(slice.chars().count() <= WINDOW_CHARS);
     }
     assert_eq!(plan.cut_off, None);
 }
 
-/// The forced-truncation case: a budget that one overgrown word blows leaves
-/// the windows before it runnable, and marks where reading would have to
-/// stop, so the caller can claim only partial coverage — `ner_truncated`,
-/// never a silent cut.
+/// A giant URL is split at character boundaries only as far as the tokenizer
+/// budget requires; it is not truncated merely because it exceeds the old
+/// character cap.
 #[test]
-fn a_budget_that_cannot_cover_a_window_stops_with_cut_off() {
-    // A 900-character URL: one splitter match, so one piece over the char cap
-    // splits it — and a 400-character piece costs ~400 tokens the budget
-    // cannot pay.
+fn an_oversized_word_is_split_by_the_token_budget() {
     let mut text = "Alice Smith met Bob Jones in Paris near Acme Corp. ".repeat(30);
+    let url_start = text.len();
     text.push_str("https://very-long-unreadable.example.org/");
     text.push_str(&"a".repeat(500));
+    let url_end = text.len();
     text.push_str(" and the end");
-    let plan = plan_windows(&text, &budget_with_text_chars(320)).expect("the prose head still plans");
-    let cut = plan
-        .cut_off
-        .expect("a 400-character piece cannot fit: planning stops, not fails");
-    assert!(
-        plan.windows.iter().all(|window| window.start < cut),
-        "windows stay before {cut}"
+    let budget = budget_with_text_chars(320);
+    let plan = plan_windows(&text, &budget).expect("the prose head still plans");
+    assert_eq!(plan.cut_off, None, "the token budget covers the whole text");
+    assert_eq!(
+        plan.windows.last().map(|window| window.end),
+        Some(text.len()),
+        "the long word's tail is covered"
     );
-    assert!(
-        plan.windows.len() > 1,
-        "the prose head was planned: {}",
-        plan.windows.len()
-    );
+    let url_windows: Vec<_> = plan
+        .windows
+        .iter()
+        .filter(|window| window.end > url_start && window.start < url_end)
+        .collect();
+    assert!(!url_windows.is_empty(), "the oversized URL must be read");
+    let mut covered_to = url_start;
+    for window in url_windows {
+        let slice = text.get(window.start..window.end).expect("window is UTF-8 aligned");
+        assert!(
+            window_token_count(&budget.tokenizer, slice).expect("token counting succeeds") <= budget.tokens_for_text,
+            "window {window:?} exceeds the text-token budget"
+        );
+        assert!(window.start <= covered_to, "window gap before {window:?}");
+        covered_to = covered_to.max(window.end.min(url_end));
+    }
+    assert_eq!(covered_to, url_end, "the oversized URL is covered without gaps");
 }
 
 /// A budget the very first window cannot fit fails outright: nothing can run,

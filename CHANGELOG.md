@@ -12,11 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `hacienda-legal` focus release for legal client folders: a `--features hacienda-legal` build (documents + memory + `ner-candle` + `graphrag`, no comms/shells/crawl/code-intel) shipped as `basemind-hacienda-legal-<triple>` release assets, with a drop-in client-folder preset at `examples/basemind-hacienda-legal.toml` (ingestion-time `token-replace` redaction, legal NER labels, multilingual retrieval lanes, GraphRAG) and a new "Legal workspaces" docs page covering the redact → `vault encrypt` → caller-persisted blob → `vault decrypt`/`find` rehydration flow.
 - The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
 - Document search supports opaque continuation cursors, with durable generation invalidation when the Lance index is rebuilt.
 
 ### Changed
 
+- Document-feature builds now bundle the configured default Tesseract language packs, including
+  French, so first OCR use is ready offline instead of downloading language data.
 - Add `[resources] keep_models_warm` so long-lived daemons can retain ONNX embedding and NER engines
   between passes, avoiding cold model reloads at the cost of resident memory.
 - Document scans reuse extracted chunks and NER results when only the embedding preset changes;
@@ -38,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dictionary filter, making partial OCR loss visible to indexing and diagnostics.
 - Large linear-chunked documents now retain explicit Roman and dotted-Arabic section
   breadcrumbs (including their citation numbers) for lexical and dense retrieval.
+- Intel macOS builds now have an explicit `intel-macos` profile and a native Intel CI leg,
+  so they use the dynamic x86_64 ONNX Runtime path instead of the unavailable static artifact.
 
 ## [0.36.0] - 2026-10-31
 

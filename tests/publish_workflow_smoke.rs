@@ -209,3 +209,14 @@ fn publish_is_never_cancelled_mid_flight() {
         "publish concurrency must set cancel-in-progress: false",
     );
 }
+
+/// The release workflow publishes the issue's reduced `hacienda` target as well
+/// as the legal focus target, with the Intel leg using the dynamic ORT profile.
+#[test]
+fn reduced_feature_variants_are_published_without_blocking_full() {
+    let workflow = workflow();
+    assert!(workflow.contains("features: hacienda\n            variant: hacienda"));
+    assert!(workflow.contains("features: hacienda,ort-dynamic\n            variant: hacienda"));
+    assert!(workflow.contains("continue-on-error: ${{ matrix.variant != '' }}"));
+    assert!(workflow.contains("key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}"));
+}

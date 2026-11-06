@@ -7,14 +7,14 @@
 //!
 //! The planner in this module lets every character reach the encoder:
 //!
-//! - windows are cut at word boundaries, `WINDOW_CHARS` at most, each with
-//!   `OVERLAP_CHARS` carried into the next window, so a mention cut at a
-//!   boundary is found whole (again) in the next window;
+//! - windows are cut at word boundaries, with `OVERLAP_CHARS` carried into the
+//!   next window, so a mention cut at a boundary is found whole (again) in the
+//!   next window;
 //! - the token budget — the encoder's real limit (its config's
 //!   `max_position_embeddings`) minus the schema prompt counted in the
-//!   model's own `tokenizer.json`, minus a margin — shrinks a window before
-//!   the character cap does, which is what token-dense text needs (numbers,
-//!   e-mail addresses, identifiers tokenize into far more words than prose);
+//!   model's own `tokenizer.json`, minus a margin — is the only window-size
+//!   limit, which is what token-dense text needs (numbers, e-mail addresses,
+//!   identifiers tokenize into far more words than prose);
 //! - when no window fits the budget at some position, planning stops there
 //!   and the caller reports `ner_truncated`; `require_ner` then fails the
 //!   call;
@@ -35,11 +35,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use regex::Regex;
 use xberg::types::entity::{Entity, EntityCategory};
 
-/// Mirror of the app-side windowing gate (hacienda-cowork #74): that caller
-/// proves coverage only when `ner_window_chars` is at most the window size it
-/// windows with itself, so a larger window here would make long documents
-/// unmirrored, not more thoroughly read.
-pub(crate) const WINDOW_CHARS: usize = 400;
 /// Characters the next window carries back, so a mention cut at the boundary
 /// is re-read whole.
 pub(crate) const OVERLAP_CHARS: usize = 100;
@@ -197,8 +192,8 @@ pub(crate) fn load_budget(model_dir: &str, labels: &[String]) -> Result<Arc<NerB
 }
 
 /// One piece the text splits into: a whole word with its byte and character
-/// extents. Pieces are the only cut points, so no window slice ends inside a
-/// word (except an outgrown one, below).
+/// extents. Pieces are the only cut points during ordinary planning; a piece
+/// that cannot fit the model's token budget is split at a character boundary.
 struct Segment {
     b0: usize,
     b1: usize,
@@ -206,11 +201,9 @@ struct Segment {
     c1: usize,
 }
 
-/// Split `text` into cut-point segments: whole words normally. A single word
-/// longer than `WINDOW_CHARS` (a giant URL, a digit run with no separators)
-/// splits inside itself at character boundaries — windowing never needs a
-/// special case for it — and text without a single word (pure whitespace)
-/// gets plain `WINDOW_CHARS` segments.
+/// Split `text` into whole-word cut-point segments. Oversized words are kept as
+/// one piece here and split later using the actual tokenizer budget; keeping
+/// that decision in the planner avoids reintroducing a second character cap.
 fn segments(text: &str) -> Vec<Segment> {
     let regex = word_regex();
     let mut result = Vec::new();
@@ -229,54 +222,23 @@ fn segments(text: &str) -> Vec<Segment> {
         let c1 = c0 + span.chars().count();
         char_at = c1;
         byte = hit.end();
-        // One word can outgrow the cap: give it cut points of its own so the
-        // windowing walk can pass it.
-        if c1 - c0 <= WINDOW_CHARS {
-            result.push(Segment {
-                b0: hit.start(),
-                b1: hit.end(),
-                c0,
-                c1,
-            });
-        } else {
-            let mut starts = vec![0usize];
-            // `step_by` re-emits offset 0 first: the pieces are [0, k), [k,
-            // 2k), … each at most `WINDOW_CHARS` characters.
-            starts.extend(span.char_indices().step_by(WINDOW_CHARS).map(|(b, _)| b).skip(1));
-            for (i, &start) in starts.iter().enumerate() {
-                let end = starts.get(i + 1).copied().unwrap_or(span.len());
-                result.push(Segment {
-                    b0: hit.start() + start,
-                    b1: hit.start() + end,
-                    c0: c0 + span[..start].chars().count(),
-                    c1: c0 + span[..end].chars().count(),
-                });
-            }
-        }
+        result.push(Segment {
+            b0: hit.start(),
+            b1: hit.end(),
+            c0,
+            c1,
+        });
     }
     if result.is_empty() && !text.is_empty() {
-        // No words at all (whitespace): cut at char boundaries so the walk
-        // still covers the text; the backend reads each window, finds nothing,
-        // and every window stays within the cap.
-        let (mut byte, mut char_at) = (0usize, 0usize);
-        while byte < text.len() {
-            // `nth(WINDOW_CHARS)` yields the byte offset where the 401st
-            // character starts: exactly `WINDOW_CHARS` characters per piece,
-            // on a char boundary; the last piece takes whatever remains.
-            let piece_end = text[byte..]
-                .char_indices()
-                .nth(WINDOW_CHARS)
-                .map_or(text.len(), |(offset, _)| byte + offset);
-            let piece_chars = text[byte..piece_end].chars().count();
-            result.push(Segment {
-                b0: byte,
-                b1: piece_end,
-                c0: char_at,
-                c1: char_at + piece_chars,
-            });
-            char_at += piece_chars;
-            byte = piece_end;
-        }
+        // No words at all (whitespace): keep the complete run as one piece.
+        // If its token budget is unexpectedly too small, the planner splits it
+        // at character boundaries just like an oversized word.
+        result.push(Segment {
+            b0: 0,
+            b1: text.len(),
+            c0: 0,
+            c1: text.chars().count(),
+        });
     }
     result
 }
@@ -293,26 +255,83 @@ fn window_token_count(tokenizer: &tokenizers::Tokenizer, slice: &str) -> Result<
     encoded_token_count(tokenizer, &words)
 }
 
-/// Plan the windows: walk the segments filling each window to the character
-/// cap, shrinking it to the token budget (never below one segment), and
-/// carrying `OVERLAP_CHARS` back into the next window. Planning stops (not
-/// fails) at the first position where even one segment does not fit the
-/// budget: `cut_off` marks it and honest truncation is reported. Fails only
-/// when the very first window cannot fit, because then nothing can run.
+/// Split one segment into the largest prefix that fits the token budget and a
+/// remainder. This is used only for a single oversized word/whitespace run;
+/// ordinary windows remain whole-word aligned.
+fn split_segment_to_budget(
+    text: &str,
+    segment: &Segment,
+    tokenizer: &tokenizers::Tokenizer,
+    tokens_for_text: usize,
+) -> Result<Option<(Segment, Segment)>, String> {
+    let boundaries: Vec<usize> = text[segment.b0..segment.b1]
+        .char_indices()
+        .map(|(offset, _)| segment.b0 + offset)
+        .chain(std::iter::once(segment.b1))
+        .collect();
+    if boundaries.len() <= 2 {
+        return Ok(None);
+    }
+    let mut low = 1usize;
+    let mut high = boundaries.len() - 1;
+    let mut fitting_chars = 0usize;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let prefix = text.get(segment.b0..boundaries[mid]).unwrap_or_default();
+        if window_token_count(tokenizer, prefix)? <= tokens_for_text {
+            fitting_chars = mid;
+            low = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if fitting_chars == 0 || fitting_chars >= boundaries.len() - 1 {
+        return Ok(None);
+    }
+    let split_byte = boundaries[fitting_chars];
+    let split_chars = fitting_chars;
+    Ok(Some((
+        Segment {
+            b0: segment.b0,
+            b1: split_byte,
+            c0: segment.c0,
+            c1: segment.c0 + split_chars,
+        },
+        Segment {
+            b0: split_byte,
+            b1: segment.b1,
+            c0: segment.c0 + split_chars,
+            c1: segment.c1,
+        },
+    )))
+}
+
+/// Return a UTF-8 boundary up to `chars` characters before `end`.
+fn overlap_start(text: &str, end: usize, chars: usize) -> usize {
+    text[..end]
+        .char_indices()
+        .rev()
+        .nth(chars.saturating_sub(1))
+        .map_or(0, |(offset, _)| offset)
+}
+
+/// Plan windows using only the model token budget and the fixed overlap.
+/// Planning stops (not fails) at the first position where even one token-sized
+/// segment does not fit: `cut_off` marks it and honest truncation is reported.
+/// It fails only when the very first window cannot fit, because then nothing
+/// can run.
 pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan, String> {
-    let pieces = segments(text);
+    let mut pieces = segments(text);
     let mut windows = Vec::new();
     let mut index = 0usize;
+    let mut window_start = pieces.first().map_or(0, |piece| piece.b0);
     while index < pieces.len() {
-        // Fill to the char cap …
-        let mut last = index;
-        while last + 1 < pieces.len() && pieces[last + 1].c1 - pieces[index].c0 <= WINDOW_CHARS {
-            last += 1;
-        }
-        // … then to the token budget. Token count is monotone as segments are
-        // appended, so binary search avoids re-tokenizing every shorter prefix
-        // of dense text during planning.
-        let slice_at = |end: usize| text.get(pieces[index].b0..pieces[end].b1).unwrap_or("");
+        // Token count is monotone as segments are appended, so binary search
+        // avoids re-tokenizing every shorter prefix of dense text.
+        let last = pieces.len() - 1;
+        let slice_at = |end: usize| text.get(window_start..pieces[end].b1).unwrap_or("");
         let mut fitting_last = None;
         let mut low = index;
         let mut high = last;
@@ -329,6 +348,22 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             }
         }
         let Some(last) = fitting_last else {
+            // Forced splits can make the next window start inside the previous
+            // oversized word. If that overlap itself consumes the budget, drop
+            // only the overlap and retry before splitting again.
+            if window_start != pieces[index].b0 {
+                window_start = pieces[index].b0;
+                continue;
+            }
+            // A single URL or identifier can be longer than the model budget.
+            // Split it using the same tokenizer instead of applying a hidden
+            // character ceiling or silently dropping the tail.
+            if let Some((first, rest)) =
+                split_segment_to_budget(text, &pieces[index], &budget.tokenizer, budget.tokens_for_text)?
+            {
+                pieces.splice(index..=index, [first, rest]);
+                continue;
+            }
             return if windows.is_empty() {
                 Err("even the first window does not fit the token budget".to_string())
             } else {
@@ -339,7 +374,7 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             };
         };
         windows.push(Window {
-            start: pieces[index].b0,
+            start: window_start,
             end: pieces[last].b1,
         });
         if last + 1 >= pieces.len() {
@@ -352,6 +387,12 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         let mut next = index + 1;
         while next <= last && pieces[next].c0 < target {
             next += 1;
+        }
+        window_start = pieces[next].b0;
+        if window_start >= pieces[last].b1 {
+            // A forced character split has no whole-word segment to snap back
+            // to. Re-read the configured overlap directly at a char boundary.
+            window_start = overlap_start(text, pieces[last].b1, OVERLAP_CHARS);
         }
         index = next;
     }

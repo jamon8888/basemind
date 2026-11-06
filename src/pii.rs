@@ -23,7 +23,7 @@ pub use pipeline::{
     passes_threshold, risk_for_label, validate_db_connection_string, validate_e164, validate_jwt,
 };
 pub use pseudonym::{Applied, Pseudonym, apply as apply_pseudonyms, apply_with_counts as apply_pseudonyms_with_counts};
-pub use siren::{TAX_ID_LABEL, is_fr_company_id, validate_fr_siren, validate_fr_siret};
+pub use siren::{TAX_ID_LABEL, is_fr_company_id, is_fr_tax_id, validate_fr_siren, validate_fr_siret, validate_fr_vat};
 #[cfg(feature = "documents")]
 pub use tax_id::{is_tax_id, relabel_by_map, relabel_in_text, rename_tokens, tax_id_category};
 pub use validators::{

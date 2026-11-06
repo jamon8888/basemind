@@ -23,7 +23,7 @@ basemind scan (or incremental watch)
       ├─ Daemon writes content-addressed msgpack blobs
       └─ Daemon writes Fjall LSM index (sole Fjall writer per machine)
   ↓
-basemind serve (stdio relay to the daemon)
+basemind serve (stdio relay in comms builds; direct stdio in hacienda-legal)
   ├─ Daemon hosts the MCP server and the read stack for every session
   ├─ Index scans (references, callers, implementations) run in the daemon
   ├─ N sessions per repo share one index; none opens Fjall itself

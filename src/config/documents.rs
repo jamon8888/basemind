@@ -692,12 +692,12 @@ impl RedactionConfig {
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
     /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
-    /// non-default value); OCR runs with xberg's defaults.
+    /// non-default value). Tesseract remains the document-tier OCR backend for now.
     #[serde(default)]
     pub backend: OcrBackend,
-    /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`).
-    /// Defaults to English plus the six EU national-ID languages (DE, FR, ES,
-    /// IT, NL, PL) so ID documents OCR correctly before PII detection.
+    /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`). These are passed to
+    /// the document OCR backend. The default document build bundles English plus the six EU
+    /// national-ID languages (DE, FR, ES, IT, NL, PL), so OCR is ready offline.
     #[serde(default = "OcrConfig::default_languages")]
     pub languages: Vec<String>,
 }

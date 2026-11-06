@@ -409,16 +409,46 @@ jobs:
         include:
           - triple: aarch64-apple-darwin
             os: macos-latest
+          # Reduced focus releases ship as separate optional assets; they are not in the
+          # required full-feature asset set, so promotion never waits on them.
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: hacienda
+            variant: hacienda
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: hacienda-legal
+            variant: hacienda-legal
           - triple: x86_64-apple-darwin
             os: macos-15-intel
             features: full,ort-dynamic
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: hacienda,ort-dynamic
+            variant: hacienda
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: hacienda-legal,ort-dynamic
+            variant: hacienda-legal
           - triple: x86_64-pc-windows-msvc
             # Pinned to windows-2022 (VS2022 / MSVC 14.4x). `windows-latest` rolled to a VS18 /
             # MSVC 14.51 image that fails to compile xberg-libwpd's vendored C++
             # (`make_shared<WP6SubDocument>`); 14.4x — the toolchain that shipped every prior
             # release — compiles it. Revisit when the newer MSVC (or upstream libwpd) handles it.
             os: windows-2022
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            features: hacienda
+            variant: hacienda
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            features: hacienda-legal
+            variant: hacienda-legal
     runs-on: ${{ matrix.os }}
+    # Focus artifacts are optional release variants. A broken optional build must
+    # not prevent required full-feature archives or checksums, but checksums still
+    # wait for every matrix leg's upload attempt.
+    continue-on-error: ${{ matrix.variant != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -453,7 +483,7 @@ jobs:
       - name: Setup cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.triple }}
+          key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}
 
       - name: Discard incomplete xberg Tesseract source cache
         shell: bash
@@ -476,7 +506,7 @@ jobs:
 
       - name: Package release
         shell: bash
-        run: ./scripts/package-release.sh ${{ matrix.triple }}
+        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
 
       - name: Smoke-test packaged Intel binary (ONNX Runtime loads)
         if: matrix.triple == 'x86_64-apple-darwin'
@@ -484,7 +514,9 @@ jobs:
         run: |
           set -euo pipefail
           dir="$(mktemp -d)"
-          tar xzf "basemind-x86_64-apple-darwin.tar.gz" -C "$dir"
+          variant="${{ matrix.variant }}"
+          archive="basemind-${variant:+$variant-}x86_64-apple-darwin.tar.gz"
+          tar xzf "$archive" -C "$dir"
           # Binary + its otool-discovered lib/ closure load, and the ad-hoc signature is
           # valid (a bad install_name_tool rewrite would get the process SIGKILLed).
           "$dir/basemind" --version
@@ -517,12 +549,13 @@ jobs:
         run: |
           set -euo pipefail
           triple="${{ matrix.triple }}"
+          variant="${{ matrix.variant }}"
 
           if [ "$triple" = "x86_64-pc-windows-msvc" ]; then
-            archive="basemind-${triple}.zip"
+            archive="basemind-${variant:+$variant-}${triple}.zip"
             content_type="application/zip"
           else
-            archive="basemind-${triple}.tar.gz"
+            archive="basemind-${variant:+$variant-}${triple}.tar.gz"
             content_type="application/gzip"
           fi
 
@@ -535,6 +568,8 @@ jobs:
     if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.image }}
+    # Optional focus archives are allowed to fail without blocking the required release assets.
+    continue-on-error: ${{ matrix.variant != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -549,6 +584,35 @@ jobs:
             image: quay.io/pypa/manylinux_2_28_aarch64:latest
             protoc_arch: linux-aarch_64
             rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+          # Reduced focus releases are separate optional assets (not in the required set).
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
+            protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            features: hacienda
+            variant: hacienda
+          - triple: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+            protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+            features: hacienda
+            variant: hacienda
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
+            protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            features: hacienda-legal
+            variant: hacienda-legal
+          - triple: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+            protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+            features: hacienda-legal
+            variant: hacienda-legal
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -670,7 +734,7 @@ jobs:
           gcc -O2 -fPIC -c scripts/glibc228_compat.c -o "$shim_obj"
           rustflags_var="CARGO_TARGET_$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
           export "${rustflags_var}=-C link-arg=${shim_obj}"
-          cargo build --release --features full --bin basemind --target "$TRIPLE"
+          cargo build --release --features "${{ matrix.features || 'full' }}" --bin basemind --target "$TRIPLE"
 
       - name: Verify glibc floor (<= 2.28)
         shell: bash
@@ -688,7 +752,7 @@ jobs:
 
       - name: Package release
         shell: bash
-        run: ./scripts/package-release.sh ${{ matrix.triple }}
+        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
 
       - name: Verify release state before upload
         shell: bash
@@ -707,9 +771,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          variant="${{ matrix.variant }}"
           bash .github/scripts/release-asset.sh upload \
             "${{ needs.create_release.outputs.release_id }}" \
-            "basemind-${{ matrix.triple }}.tar.gz" application/gzip
+            "basemind-${variant:+$variant-}${{ matrix.triple }}.tar.gz" application/gzip
 
   build-linux-noavx2:
     name: Build Linux no-AVX2 binary (x86_64, SSE2 baseline)

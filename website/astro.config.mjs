@@ -87,6 +87,7 @@ export default defineConfig({
             { label: "Code intelligence", slug: "capabilities/code-intelligence" },
             { label: "Git intelligence", slug: "capabilities/git-intelligence" },
             { label: "Document search", slug: "capabilities/document-search" },
+            { label: "Legal workspaces (hacienda-legal)", slug: "capabilities/legal-workspaces" },
             { label: "Semantic code search", slug: "capabilities/code-search" },
             { label: "Web crawl", slug: "capabilities/web-crawl" },
             { label: "Agent shells", slug: "capabilities/agent-shells" },

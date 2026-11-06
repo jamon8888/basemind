@@ -50,6 +50,38 @@ pub fn is_fr_company_id(value: &str) -> bool {
     validate_fr_siren(value) || validate_fr_siret(value)
 }
 
+/// Validates the numeric form of a French intra-community VAT number.
+///
+/// France prefixes the nine-digit SIREN with `FR` and a two-digit key. The
+/// key is `12 + 3 × (SIREN mod 97)`, reduced modulo 97. The alphanumeric key
+/// variants used by some legacy registrations cannot be verified by this
+/// arithmetic form and are conservatively rejected here.
+pub fn validate_fr_vat(value: &str) -> bool {
+    let compact: String = value
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if compact.len() != 13 || !compact.is_ascii() || !compact.starts_with("FR") {
+        return false;
+    }
+    let key = &compact[2..4];
+    let siren = &compact[4..];
+    if !key.bytes().all(|byte| byte.is_ascii_digit()) || !validate_fr_siren(siren) {
+        return false;
+    }
+    let Ok(siren_value) = siren.parse::<u64>() else {
+        return false;
+    };
+    let expected = (12 + 3 * (siren_value % 97)) % 97;
+    key.parse::<u64>().ok() == Some(expected)
+}
+
+/// True when a model `tax_id` span has a verifiable French company/tax shape.
+pub fn is_fr_tax_id(value: &str) -> bool {
+    is_fr_company_id(value) || validate_fr_vat(value)
+}
+
 /// The digits of `value`, with the separators French documents use removed, or `None` when
 /// `value` holds anything else.
 ///
@@ -141,5 +173,19 @@ mod tests {
     fn an_empty_value_is_not_an_identifier() {
         assert!(!is_fr_company_id(""));
         assert!(!is_fr_company_id("   "));
+    }
+
+    #[test]
+    fn a_numeric_french_vat_number_passes() {
+        assert!(validate_fr_vat("FR96552100554"));
+        assert!(!validate_fr_vat("FR96552100555"));
+    }
+
+    #[test]
+    fn a_tax_id_accepts_siren_siret_or_vat() {
+        assert!(is_fr_tax_id("552100554"));
+        assert!(is_fr_tax_id("55210055400013"));
+        assert!(is_fr_tax_id("FR96552100554"));
+        assert!(!is_fr_tax_id("F-2025-1142"));
     }
 }

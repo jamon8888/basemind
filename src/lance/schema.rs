@@ -182,7 +182,7 @@ pub enum EntityKeySource {
 /// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty otherwise)
 /// - `gateway_token`    UTF-8     stable gateway token from passerelle (only for GatewayToken; empty otherwise)
 /// - `entity_id`        UTF-8     stable node id handed to lance-graph's Cypher engine (`ks<discriminant>|<label>|<key part>`);
-///                                edges join on this column, so it must stay derivation-stable across rebuilds
+///   edges join on this column, so it must stay derivation-stable across rebuilds
 /// - `mention_count`    UInt32    number of mentions aggregated into this node
 /// - `first_seen_chunk` UInt32    chunk_idx of first mention (for ordering)
 /// - `last_seen_chunk`  UInt32    chunk_idx of last mention
