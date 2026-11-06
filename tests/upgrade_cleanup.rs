@@ -4,7 +4,7 @@
 //! Plain `#[test]` only — `scanner::scan` is synchronous and opening LanceDB inside a tokio runtime
 //! panics. Each test runs against the process-isolated cache, never the developer's.
 
-#![cfg(feature = "documents")]
+#![cfg(all(feature = "documents", feature = "code-search"))]
 
 use std::fs;
 use std::path::Path;

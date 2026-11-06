@@ -552,7 +552,8 @@ async fn a_valid_spaced_french_nir_redacts_as_one_national_id() {
 #[test]
 fn pdf_line_padding_is_removed_without_collapsing_content() {
     let normalized =
-        super::trim_pdf_line_padding("Aurore Valcourt                                      \nB signe.  \n");
+        super::trim_pdf_line_padding_with_map("Aurore Valcourt                                      \nB signe.  \n")
+            .text;
     assert_eq!(normalized, "Aurore Valcourt\nB signe.\n");
 }
 
