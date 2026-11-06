@@ -409,9 +409,12 @@ jobs:
         include:
           - triple: aarch64-apple-darwin
             os: macos-latest
-          # hacienda-legal focus release (documents + rehydration vault + memory + NER +
-          # graphrag) ships as a separate asset `basemind-hacienda-legal-<triple>`; it is
-          # NOT in the required asset set, so promotion never waits on it.
+          # Reduced focus releases ship as separate optional assets; they are not in the
+          # required full-feature asset set, so promotion never waits on them.
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: hacienda
+            variant: hacienda
           - triple: aarch64-apple-darwin
             os: macos-latest
             features: hacienda-legal
@@ -419,6 +422,10 @@ jobs:
           - triple: x86_64-apple-darwin
             os: macos-15-intel
             features: full,ort-dynamic
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: hacienda,ort-dynamic
+            variant: hacienda
           - triple: x86_64-apple-darwin
             os: macos-15-intel
             features: hacienda-legal,ort-dynamic
@@ -431,14 +438,17 @@ jobs:
             os: windows-2022
           - triple: x86_64-pc-windows-msvc
             os: windows-2022
+            features: hacienda
+            variant: hacienda
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
             features: hacienda-legal
             variant: hacienda-legal
     runs-on: ${{ matrix.os }}
-    # The legal focus artifact is an optional release variant. A broken optional
-    # build must not prevent the required full-feature archives or their checksums
-    # from completing, but keeping it in this matrix makes checksums wait for the
-    # variant upload attempt before promoting the release.
-    continue-on-error: ${{ matrix.variant == 'hacienda-legal' }}
+    # Focus artifacts are optional release variants. A broken optional build must
+    # not prevent required full-feature archives or checksums, but checksums still
+    # wait for every matrix leg's upload attempt.
+    continue-on-error: ${{ matrix.variant != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -559,7 +569,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.image }}
     # Optional focus archives are allowed to fail without blocking the required release assets.
-    continue-on-error: ${{ matrix.variant == 'hacienda-legal' }}
+    continue-on-error: ${{ matrix.variant != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -574,8 +584,21 @@ jobs:
             image: quay.io/pypa/manylinux_2_28_aarch64:latest
             protoc_arch: linux-aarch_64
             rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
-          # hacienda-legal focus release as separate `basemind-hacienda-legal-<triple>`
-          # assets (not in the required set, so promotion never waits on them).
+          # Reduced focus releases are separate optional assets (not in the required set).
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
+            protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            features: hacienda
+            variant: hacienda
+          - triple: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+            protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+            features: hacienda
+            variant: hacienda
           - triple: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             image: quay.io/pypa/manylinux_2_28_x86_64:latest
