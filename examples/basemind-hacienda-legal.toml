@@ -116,7 +116,17 @@ ascii_folding = true
 max_token_length = 64
 # Legal boilerplate on top of the stop-word list (defaults already include
 # pursuant/herein/hereto/aforesaid/wherein/notwithstanding/provided that/...).
-custom_stop_words = ["pursuant", "herein", "hereto", "aforesaid", "wherein", "notwithstanding", "provided that", "hereinafter", "thereunder"]
+custom_stop_words = [
+  "pursuant",
+  "herein",
+  "hereto",
+  "aforesaid",
+  "wherein",
+  "notwithstanding",
+  "provided that",
+  "hereinafter",
+  "thereunder",
+]
 
 [documents.fusion]
 # Multi-term queries may drop their lowest-idf term up to 3 times before giving up.
