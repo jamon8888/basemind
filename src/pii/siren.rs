@@ -177,15 +177,15 @@ mod tests {
 
     #[test]
     fn a_numeric_french_vat_number_passes() {
-        assert!(validate_fr_vat("FR48330302181"));
-        assert!(!validate_fr_vat("FR48330302182"));
+        assert!(validate_fr_vat("FR96552100554"));
+        assert!(!validate_fr_vat("FR96552100555"));
     }
 
     #[test]
     fn a_tax_id_accepts_siren_siret_or_vat() {
         assert!(is_fr_tax_id("552100554"));
         assert!(is_fr_tax_id("55210055400013"));
-        assert!(is_fr_tax_id("FR48330302181"));
+        assert!(is_fr_tax_id("FR96552100554"));
         assert!(!is_fr_tax_id("F-2025-1142"));
     }
 }
