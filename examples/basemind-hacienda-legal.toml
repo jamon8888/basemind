@@ -52,14 +52,7 @@ backend = "onnx"
 categories = ["person", "organization", "location", "email", "phone", "date", "money"]
 # Zero-shot labels tuned for legal corpora — docket numbers, case names, courts,
 # statutes, parties, matter references surface as first-class entities.
-custom_labels = [
-  "docket number",
-  "case name",
-  "court",
-  "statute citation",
-  "party",
-  "matter number",
-]
+custom_labels = ["docket number", "case name", "court", "statute citation", "party", "matter number"]
 
 [documents.keywords]
 # YAKE keywords per document — the `keywords_contains` filter on document search.
