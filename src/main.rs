@@ -893,7 +893,8 @@ fn try_serve_in_process(root: &std::path::Path, view: &str) -> Result<()> {
             .serve(rmcp::transport::stdio())
             .await
             .context("MCP stdio handshake")?;
-        running.waiting().await.context("MCP stdio server")
+        running.waiting().await.context("MCP stdio server")?;
+        Ok(())
     })
 }
 
