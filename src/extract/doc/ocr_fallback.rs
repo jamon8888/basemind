@@ -90,6 +90,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
                 .collect::<ahash::AHashSet<_>>()
         })
         .collect::<Vec<_>>();
+    let mut appended_lines = vec![ahash::AHashSet::new(); fallback.results.len()];
     for (index, original) in original.results.iter().enumerate() {
         let fallback_index = index.min(fallback.results.len() - 1);
         let fallback = &mut fallback.results[fallback_index];
@@ -102,7 +103,11 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
                 .chain(original.tables.iter().flat_map(|table| table.markdown.lines()))
             {
                 let line = line.trim();
-                if !line.is_empty() && !existing_lines[fallback_index].contains(line) && seen.insert(line) {
+                if !line.is_empty()
+                    && !existing_lines[fallback_index].contains(line)
+                    && !appended_lines[fallback_index].contains(line)
+                    && seen.insert(line)
+                {
                     missing.push(line);
                 }
             }
@@ -111,6 +116,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
         if missing.is_empty() {
             continue;
         }
+        appended_lines[fallback_index].extend(missing.iter().cloned());
         if !fallback.content.is_empty() {
             fallback.content.push_str("\n\n");
         }

@@ -130,6 +130,30 @@ fn plain_text_retry_reconciles_each_result_and_keeps_short_lines() {
 }
 
 #[test]
+fn plain_text_retry_deduplicates_lines_when_results_merge() {
+    let mut original_first = xberg::types::ExtractedDocument::default();
+    original_first.content = "Shared\nFirst".into();
+    let mut original_second = xberg::types::ExtractedDocument::default();
+    original_second.content = "Shared\nSecond".into();
+    let original = xberg::ExtractionResult {
+        results: vec![original_first, original_second],
+        ..xberg::ExtractionResult::default()
+    };
+
+    let mut fallback_document = xberg::types::ExtractedDocument::default();
+    fallback_document.content = "Fallback".into();
+    let mut fallback = xberg::ExtractionResult::single(fallback_document);
+    super::preserve_original_ocr_text(&original, &mut fallback);
+
+    let shared_count = fallback.results[0]
+        .content
+        .lines()
+        .filter(|line| *line == "Shared")
+        .count();
+    assert_eq!(shared_count, 1);
+}
+
+#[test]
 fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
     let x = cfg.to_xberg(None);
