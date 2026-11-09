@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use xberg::LanguageDetectionConfig;
 use xberg::core::config::processing::{ChunkerType, ChunkingConfig};
 use xberg::core::config::{ConcurrencyConfig, ExtractionConfig};
+use xberg::extract;
 use xberg::extractors::security::SecurityLimits;
-use xberg::{ExtractInput, extract};
 
 use super::doc_guard::{self, ChunkCutovers, DeadlineError, DocPhase};
 use super::ocr_assets;
@@ -33,7 +33,9 @@ use numbered_headings::{collect_numbered_headings, numbered_heading_path};
 mod chunking;
 pub(crate) mod citations;
 pub(crate) mod facets;
+mod input;
 mod metadata;
+mod ocr_fallback;
 #[cfg(test)]
 pub(crate) use chunking::dense_retrieval_text;
 #[cfg(feature = "crawl")]
@@ -41,6 +43,7 @@ pub(crate) use chunking::heading_path_of;
 use chunking::prepare_doc_chunk;
 pub(crate) use metadata::hash_redaction_config;
 use metadata::{entity_category_str, keyword_algorithm_str, map_language_confidences, metadata_pairs};
+use ocr_fallback::{dictionary_filter_warnings, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings};
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
@@ -620,135 +623,7 @@ fn run_guarded_with_budget(
     })?
 }
 
-/// Build the OCR retry configuration used when xberg reports that its dictionary filter removed
-/// lines without finding a valid dictionary word. Normal documents keep xberg's markdown/table
-/// path; only the affected document retries through plain text.
-fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<ExtractionConfig> {
-    let mut fallback = config.clone();
-    let ocr = fallback.ocr.as_mut()?;
-    let tesseract = ocr
-        .tesseract_config
-        .get_or_insert_with(xberg::types::TesseractConfig::default);
-    tesseract.output_format = "text".to_string();
-    tesseract.enable_table_detection = false;
-    Some(fallback)
-}
-
-const TESSERACT_DICT_INVALID_WORD_RATIO_KEY: &str = "tesseract_dict_invalid_word_ratio";
-
-fn dictionary_filter_has_no_signal(result: &xberg::types::ExtractedDocument) -> bool {
-    result
-        .metadata
-        .additional
-        .get(TESSERACT_DICT_INVALID_WORD_RATIO_KEY)
-        .and_then(serde_json::Value::as_f64)
-        .is_some_and(|ratio| ratio >= 1.0)
-}
-
-/// Return the warnings that prove xberg's lossy dictionary filter ran. They are copied onto a
-/// successful plain-text retry so Basemind's telemetry still records the original loss signal.
-fn dictionary_filter_warnings(
-    outcome: &xberg::Result<xberg::ExtractionResult>,
-) -> Option<Vec<xberg::types::ProcessingWarning>> {
-    let extraction = outcome.as_ref().ok()?;
-    let result = extraction.results.last()?;
-    if !dictionary_filter_has_no_signal(result) {
-        return None;
-    }
-    let warnings = result
-        .processing_warnings
-        .iter()
-        .filter(|warning| ocr_signal::dictionary_filtered_line_count(std::slice::from_ref(*warning)).is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    (!warnings.is_empty()).then_some(warnings)
-}
-
-fn preserve_dictionary_filter_warnings(
-    extraction: &mut xberg::ExtractionResult,
-    warnings: Vec<xberg::types::ProcessingWarning>,
-) {
-    if let Some(result) = extraction.results.last_mut() {
-        result.processing_warnings.extend(warnings);
-    }
-}
-
-/// xberg 1.3.x converts images with alpha directly to RGB, which turns transparent
-/// pixels black before OCR. Compose supported raster images over white at the boundary
-/// so OCR sees the same page a human sees. The work runs inside `run_guarded`'s deadline.
-fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> Result<ExtractInput, ExtractError> {
-    if !matches!(
-        mime_type,
-        Some("image/png" | "image/webp" | "image/gif" | "image/tiff" | "image/bmp" | "image/x-portable-pixmap")
-    ) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-
-    let bytes =
-        std::fs::read(path).map_err(|error| ExtractError::Document(format!("read PNG {}: {error}", path.display())))?;
-    if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-    let decoded = image::load_from_memory(&bytes)
-        .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?;
-    let rgba = decoded.to_rgba8();
-    if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-
-    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
-    for (x, y, pixel) in rgba.enumerate_pixels() {
-        let alpha = u32::from(pixel[3]);
-        let dst = rgb.get_pixel_mut(x, y);
-        for channel in 0..3 {
-            dst[channel] = ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha)) / 255) as u8;
-        }
-    }
-    let mut normalized = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(rgb)
-        .write_to(&mut normalized, image::ImageFormat::Png)
-        .map_err(|error| ExtractError::Document(format!("encode normalized image {}: {error}", path.display())))?;
-    Ok(ExtractInput::from_bytes(
-        normalized.into_inner(),
-        "image/png",
-        path.file_name().map(|name| name.to_string_lossy().into_owned()),
-    ))
-}
-
-/// Inspect only the PNG header/chunks to avoid decoding ordinary opaque RGB PNGs.
-fn png_may_have_alpha(bytes: &[u8]) -> bool {
-    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 29 || &bytes[..8] != SIGNATURE {
-        return true;
-    }
-    let color_type = bytes[25];
-    if matches!(color_type, 4 | 6) {
-        return true;
-    }
-    // Palette PNGs can carry transparency in a tRNS chunk.
-    let mut offset = 8usize;
-    while offset.saturating_add(12) <= bytes.len() {
-        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        let chunk_end = match offset.checked_add(12).and_then(|value| value.checked_add(length)) {
-            Some(value) if value <= bytes.len() => value,
-            _ => return true,
-        };
-        if &bytes[offset + 4..offset + 8] == b"tRNS" {
-            return true;
-        }
-        if &bytes[offset + 4..offset + 8] == b"IEND" {
-            break;
-        }
-        offset = chunk_end;
-    }
-    false
-}
+use input::prepare_extraction_input;
 
 pub use super::doc_metrics::extract_doc;
 
