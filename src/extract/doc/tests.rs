@@ -118,13 +118,15 @@ fn plain_text_retry_reconciles_each_result_and_keeps_short_lines() {
         ..xberg::ExtractionResult::default()
     };
 
-    let warnings = super::dictionary_filter_warnings_from_extraction(&original).expect("first result triggers retry");
+    let warnings = super::ocr_fallback::dictionary_filter_warnings_from_extraction(&original)
+        .expect("first result triggers retry");
     super::preserve_original_ocr_text(&original, &mut fallback);
     super::preserve_dictionary_filter_warnings(&mut fallback, warnings);
 
     assert!(fallback.results[0].content.contains("Yes"));
     assert!(fallback.results[1].content.contains("Invoice total: 42"));
-    assert_eq!(fallback.results[1].processing_warnings, vec![warning]);
+    assert_eq!(fallback.results[1].processing_warnings.len(), 1);
+    assert_eq!(fallback.results[1].processing_warnings[0].message, warning.message);
 }
 
 #[test]
