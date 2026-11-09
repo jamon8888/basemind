@@ -60,6 +60,7 @@ fn is_legal_reference_shape(value: &str) -> bool {
 }
 
 /// Decide whether a `legal-fr@2` model span is a known false positive.
+#[cfg(test)]
 pub(super) fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: usize, label: &str) -> bool {
     should_skip_legal_fr_v2_ner_span_with_categories(text, start, end, label, false)
 }
