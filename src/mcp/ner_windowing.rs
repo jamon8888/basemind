@@ -358,8 +358,13 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             // A single URL or identifier can be longer than the model budget.
             // Split it using the same tokenizer instead of applying a hidden
             // character ceiling or silently dropping the tail.
-            if let Some((first, rest)) =
-                split_segment_to_budget(text, &pieces[index], &budget.tokenizer, budget.tokens_for_text)?
+            // Only split genuinely oversized identifiers/URLs. A normal word
+            // that cannot fit is not a runnable window; splitting `Alice` into
+            // one-character windows would make a hopeless budget look valid
+            // and would not match the backend's word-oriented input.
+            if pieces[index].c1.saturating_sub(pieces[index].c0) > OVERLAP_CHARS
+                && let Some((first, rest)) =
+                    split_segment_to_budget(text, &pieces[index], &budget.tokenizer, budget.tokens_for_text)?
             {
                 pieces.splice(index..=index, [first, rest]);
                 continue;
@@ -373,9 +378,14 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
                 })
             };
         };
+        let window_end = if last + 1 >= pieces.len() {
+            text.len()
+        } else {
+            pieces[last].b1
+        };
         windows.push(Window {
             start: window_start,
-            end: pieces[last].b1,
+            end: window_end,
         });
         if last + 1 >= pieces.len() {
             break;
@@ -385,7 +395,7 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
         // whole words in the overlap), or, when no pair fits, right after it.
         let target = pieces[last].c1.saturating_sub(OVERLAP_CHARS);
         let mut next = index + 1;
-        while next <= last && pieces[next].c0 < target {
+        while next <= last && pieces[next].c1 <= target {
             next += 1;
         }
         window_start = pieces[next].b0;

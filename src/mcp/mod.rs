@@ -108,6 +108,8 @@ mod tools_graph;
 mod tools_memory;
 #[cfg(feature = "documents")]
 mod tools_redact;
+#[cfg(feature = "documents")]
+mod tools_redact_timeout;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod tools_registry;
 #[cfg(all(feature = "shells", any(unix, windows)))]

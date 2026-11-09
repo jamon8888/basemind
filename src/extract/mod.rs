@@ -87,7 +87,9 @@ pub const SCHEMA_VER: u16 = crate::version::RELEASE_MINOR;
 ///
 /// History:
 /// - 1: symbol `signature` stops at the grammar's body field (`extract::l1::header_text`).
-pub const EXTRACT_EPOCH: u16 = 1;
+/// - 2: document extraction adds a plain-text OCR retry when the Tesseract dictionary filter
+///   removed all lines; forces one-time re-extraction of all previously extracted files.
+pub const EXTRACT_EPOCH: u16 = 2;
 
 #[derive(Debug, Error)]
 pub enum ExtractError {
