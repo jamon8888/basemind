@@ -435,7 +435,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = ner_profile.name == "legal-fr@1";
+    let legal_fr_filters = matches!(ner_profile.name.as_str(), "full@1" | "legal-fr@1" | "legal-fr@2");
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
