@@ -768,37 +768,23 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
         return false;
     };
-    const DATE_WORD_CUES: &[&str] = &[
-        "date",
-        "dated",
-        "janvier",
-        "février",
-        "mars",
-        "avril",
-        "mai",
-        "juin",
-        "juillet",
-        "août",
-        "septembre",
-        "octobre",
-        "novembre",
-        "décembre",
-        "january",
-        "february",
-        "march",
-        "april",
-        "june",
-        "july",
-        "august",
-        "september",
-        "october",
-        "november",
-        "december",
-    ];
-    context
+    const DATE_WORD_CUES: &[&str] = &["date", "dated"];
+    let explicit_word_cue = context
         .split_whitespace()
         .map(|word| word.trim_matches(|c: char| !c.is_alphabetic()))
-        .any(|word| DATE_WORD_CUES.contains(&word))
+        .any(|word| DATE_WORD_CUES.contains(&word));
+    if explicit_word_cue {
+        return true;
+    }
+    static TEXT_DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
+    TEXT_DATE_CUE
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)\b\d{1,2}\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}\b",
+            )
+            .expect("text date cue regex")
+        })
+        .is_match(&context)
 }
 
 fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
@@ -1212,6 +1198,19 @@ mod false_positive_filter_tests {
             dated_start,
             dated_start + 8,
             "20260219"
+        ));
+        let month_only = "En janvier, dossier 61234567";
+        let month_only_start = month_only.find("61234567").unwrap();
+        assert!(!has_explicit_date_cue(
+            month_only,
+            month_only_start,
+            month_only_start + 8
+        ));
+        assert!(!is_legal_reference_finding(
+            month_only,
+            month_only_start,
+            month_only_start + 8,
+            "61234567"
         ));
     }
 }
