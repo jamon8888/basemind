@@ -39,7 +39,10 @@ async fn extract_file_with_deadline(
     match tokio::time::timeout(remaining, extract(input, config)).await {
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(error)) => Err(format!("xberg extract failed: {error}")),
-        Err(_) => Err("xberg file extraction exceeded its 120 second deadline".to_string()),
+        Err(_) => Err(format!(
+            "xberg file extraction exceeded its {} second deadline",
+            FILE_EXTRACTION_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -274,7 +277,9 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
-                let original = extraction.clone();
+                // Keep the original and fallback passes inside one request budget so a retry
+                // cannot double the CPU time charged to a redaction request.
+                let original = std::mem::take(&mut extraction);
                 extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
                     Ok(fallback) if fallback.results.is_empty() => {
                         tracing::warn!(
