@@ -691,7 +691,6 @@ pub(crate) fn extract_doc_with_metrics(
     if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
         && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
     {
-        let original = outcome.as_ref().ok().cloned();
         let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
         if remaining.is_zero() {
             return Err(ExtractError::DocDeferred(format!(
@@ -699,6 +698,10 @@ pub(crate) fn extract_doc_with_metrics(
                 path.display()
             )));
         } else {
+            let original = match outcome {
+                Ok(original) => original,
+                Err(error) => return Err(error),
+            };
             tracing::warn!(
                 path = %path.display(),
                 remaining_secs = remaining.as_secs_f64(),
@@ -719,9 +722,7 @@ pub(crate) fn extract_doc_with_metrics(
                     )));
                 }
                 Ok(Ok(mut fallback)) => {
-                    if let Some(original) = &original {
-                        preserve_original_ocr_text(original, &mut fallback);
-                    }
+                    preserve_original_ocr_text(&original, &mut fallback);
                     preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                     outcome = Ok(fallback);
                 }
