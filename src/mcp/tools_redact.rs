@@ -245,17 +245,16 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
-            let shared_started = Instant::now();
-            let deadline = shared_started + FILE_EXTRACTION_TIMEOUT;
-            let mut extraction =
-                extract_file_with_deadline(input.clone(), &extraction_config, shared_started, deadline)
-                    .await
-                    .map_err(|error| McpError::internal_error(error, None))?;
+            let budget_start = Instant::now();
+            let deadline = budget_start + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
+                .await
+                .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
                 let original = std::mem::take(&mut extraction);
-                extraction = match extract_file_with_deadline(input, &fallback_config, shared_started, deadline).await {
+                extraction = match extract_file_with_deadline(input, &fallback_config, budget_start, deadline).await {
                     Ok(fallback)
                         if fallback.results.is_empty()
                             || fallback
@@ -429,13 +428,13 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
     let mut redacted_text = content_doc.content;
 
-    // xberg's built-in phone/BIC regexes intentionally favour recall. Both
-    // profiles use the same conservative boundary for obvious date and
+    // xberg's built-in phone/BIC regexes intentionally favour recall. The
+    // legal profile uses a conservative boundary for obvious date and
     // prose-shaped matches; rebuild the content from the original after
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = matches!(ner_profile.name.as_str(), "full@1" | "legal-fr@1");
+    let legal_fr_filters = ner_profile.name == "legal-fr@1";
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
@@ -720,25 +719,25 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
 
 fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    text.get(context_start..context_end)
-        .map(str::to_lowercase)
-        .is_some_and(|context| {
-            [
-                "phone",
-                "telephone",
-                "téléphone",
-                "tel.",
-                "tél.",
-                "mobile",
-                "cell",
-                "contact",
-                "call",
-                "whatsapp",
-                "fax",
-            ]
-            .iter()
-            .any(|cue| context.contains(cue))
-        })
+    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
+        return false;
+    };
+    const PHONE_CUES: &[&str] = &[
+        "phone",
+        "telephone",
+        "téléphone",
+        "tel",
+        "tél",
+        "mobile",
+        "cell",
+        "contact",
+        "call",
+        "whatsapp",
+        "fax",
+    ];
+    context
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| PHONE_CUES.contains(&word))
 }
 
 fn is_legal_reference_shape(value: &str) -> bool {
@@ -1177,18 +1176,19 @@ async fn run_ner_windowed(model_dir: Option<&str>, _text: &str, _profile: &NerPr
 
 #[cfg(test)]
 mod false_positive_filter_tests {
-    use super::{has_explicit_date_cue, is_legal_reference_finding};
+    use super::{has_explicit_date_cue, has_phone_context, is_false_positive_pattern, is_legal_reference_finding};
+    use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
     #[test]
     fn ambiguous_eight_digit_phone_is_not_treated_as_a_reference() {
         let ambiguous = "Dossier 61234567";
         let ambiguous_start = ambiguous.find("61234567").unwrap();
-        for profile in ["full@1", "legal-fr@1"] {
-            let legal_fr_filters = matches!(profile, "full@1" | "legal-fr@1");
+        for (profile, legal_fr_filters) in [("full@1", false), ("legal-fr@1", true)] {
             assert!(
                 !(legal_fr_filters
                     && is_legal_reference_finding(ambiguous, ambiguous_start, ambiguous_start + 8, "61234567"))
             );
+            assert_eq!(profile == "legal-fr@1", legal_fr_filters);
         }
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
@@ -1211,6 +1211,26 @@ mod false_positive_filter_tests {
             month_only_start,
             month_only_start + 8,
             "61234567"
+        ));
+
+        let phone_context = "Date 20260219, téléphone 61234567";
+        let phone_start = phone_context.find("61234567").unwrap();
+        let phone_finding = RedactionFinding {
+            start: phone_start as u32,
+            end: (phone_start + 8) as u32,
+            category: PiiCategory::Phone,
+            strategy: RedactionStrategy::Mask,
+            replacement_token: "[PHONE_1]".to_string(),
+        };
+        assert!(has_phone_context(phone_context, phone_start, phone_start + 8));
+        assert!(!is_false_positive_pattern(phone_context, &phone_finding, true));
+
+        let substring_context = "Date 20260219, cellule 61234567";
+        let substring_start = substring_context.find("61234567").unwrap();
+        assert!(!has_phone_context(
+            substring_context,
+            substring_start,
+            substring_start + 8
         ));
     }
 }
