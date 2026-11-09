@@ -1199,15 +1199,10 @@ mod false_positive_filter_tests {
         let ambiguous_start = ambiguous.find("61234567").unwrap();
         for profile in ["full@1", "legal-fr@1"] {
             let legal_fr_filters = matches!(profile, "full@1" | "legal-fr@1");
-            assert!(!(
-                legal_fr_filters
-                    && is_legal_reference_finding(
-                        ambiguous,
-                        ambiguous_start,
-                        ambiguous_start + 8,
-                        "61234567"
-                    )
-            ));
+            assert!(
+                !(legal_fr_filters
+                    && is_legal_reference_finding(ambiguous, ambiguous_start, ambiguous_start + 8, "61234567"))
+            );
         }
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
