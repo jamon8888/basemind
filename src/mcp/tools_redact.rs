@@ -31,7 +31,7 @@ use xberg::{ExtractInput, ExtractedDocument};
 mod redact_legal_fr;
 #[cfg(test)]
 use redact_legal_fr::should_skip_legal_fr_v2_ner_value;
-use redact_legal_fr::{is_false_positive_pattern, should_skip_legal_fr_v2_ner_span};
+use redact_legal_fr::{is_false_positive_pattern, should_skip_legal_fr_v2_ner_span_with_categories};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -366,7 +366,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .iter()
         .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
         .collect();
-    let legal_fr_policy = LegalFrPolicy::for_profile(&ner_profile);
+    let preserve_document_dates = args.categories.iter().any(|category| category == "document_date");
+    let legal_fr_policy = LegalFrPolicy::for_profile(&ner_profile, preserve_document_dates);
     let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
         .iter()
         .map(|term| (term.label.clone(), term.value.clone()))
@@ -379,7 +380,13 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             continue;
         }
         if legal_fr_policy.v2
-            && should_skip_legal_fr_v2_ner_span(&original, entity.start as usize, entity.end as usize, &label)
+            && should_skip_legal_fr_v2_ner_span_with_categories(
+                &original,
+                entity.start as usize,
+                entity.end as usize,
+                &label,
+                legal_fr_policy.preserve_document_dates,
+            )
         {
             continue;
         }
@@ -444,8 +451,15 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    findings
-        .retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_policy.filters, legal_fr_policy.v2));
+    findings.retain(|finding| {
+        !is_false_positive_pattern(
+            &original,
+            finding,
+            legal_fr_policy.filters,
+            legal_fr_policy.v2,
+            legal_fr_policy.preserve_document_dates,
+        )
+    });
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
         rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
@@ -806,13 +820,15 @@ struct NerProfile {
 struct LegalFrPolicy {
     filters: bool,
     v2: bool,
+    preserve_document_dates: bool,
 }
 
 impl LegalFrPolicy {
-    fn for_profile(profile: &NerProfile) -> Self {
+    fn for_profile(profile: &NerProfile, preserve_document_dates: bool) -> Self {
         Self {
             filters: matches!(profile.name.as_str(), "legal-fr@1" | "legal-fr@2"),
             v2: profile.name == "legal-fr@2",
+            preserve_document_dates,
         }
     }
 }

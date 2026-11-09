@@ -188,6 +188,13 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
         act_start + "1 janvier 2026".len(),
         "date_of_birth"
     ));
+    assert!(!super::should_skip_legal_fr_v2_ner_span_with_categories(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "document_date",
+        true
+    ));
     assert!(!super::should_skip_legal_fr_v2_ner_value(
         "Résidence Les Hortensias",
         "named_place"

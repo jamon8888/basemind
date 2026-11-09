@@ -8,6 +8,7 @@ pub(super) fn is_false_positive_pattern(
     finding: &xberg::types::redaction::RedactionFinding,
     legal_fr_filters: bool,
     legal_fr_v2: bool,
+    preserve_document_dates: bool,
 ) -> bool {
     let start = finding.start as usize;
     let end = finding.end as usize;
@@ -16,7 +17,9 @@ pub(super) fn is_false_positive_pattern(
     };
     match &finding.category {
         xberg::types::redaction::PiiCategory::Custom(label)
-            if legal_fr_v2 && matches!(label.as_str(), "date_of_birth" | "document_date") =>
+            if legal_fr_v2
+                && !preserve_document_dates
+                && matches!(label.as_str(), "date_of_birth" | "document_date") =>
         {
             // NER custom patterns are global, so remove only the occurrence
             // that is clearly an act date after xberg has matched it.
@@ -33,7 +36,7 @@ pub(super) fn is_false_positive_pattern(
         xberg::types::redaction::PiiCategory::SwiftBic => {
             // All-letter BIC-shaped words need a nearby banking cue. This
             // avoids masking ordinary uppercase prose such as ATTESTATION.
-            value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
+            legal_fr_filters && value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
         }
         _ => false,
     }
@@ -46,11 +49,6 @@ fn is_legacy_legal_reference_shape(value: &str) -> bool {
 
 /// Legal-fr@2 also recognizes year references such as `2026-221`.
 fn is_legal_reference_shape(value: &str) -> bool {
-    let compact_date = value.chars().count() == 8
-        && value.chars().all(|c| c.is_ascii_digit())
-        && value
-            .get(..4)
-            .is_some_and(|year| matches!(year.as_bytes().first(), Some(b'1' | b'2')));
     let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
         year.len() == 4
             && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
@@ -58,11 +56,21 @@ fn is_legal_reference_shape(value: &str) -> bool {
             && suffix.len() == 3
             && suffix.chars().all(|c| c.is_ascii_digit())
     });
-    is_legacy_legal_reference_shape(value) || compact_date || year_reference
+    is_legacy_legal_reference_shape(value) || year_reference
 }
 
 /// Decide whether a `legal-fr@2` model span is a known false positive.
 pub(super) fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: usize, label: &str) -> bool {
+    should_skip_legal_fr_v2_ner_span_with_categories(text, start, end, label, false)
+}
+
+pub(super) fn should_skip_legal_fr_v2_ner_span_with_categories(
+    text: &str,
+    start: usize,
+    end: usize,
+    label: &str,
+    preserve_document_dates: bool,
+) -> bool {
     let Some(value) = text.get(start..end) else {
         return false;
     };
@@ -73,7 +81,7 @@ pub(super) fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: us
             GENERIC_LEGAL_ORGANIZATIONS.contains(&normalized.as_str())
         }
         "iban" => !is_plausible_iban(value),
-        "date_of_birth" | "document_date" => is_act_date_context(text, start, end),
+        "date_of_birth" | "document_date" => !preserve_document_dates && is_act_date_context(text, start, end),
         _ => false,
     }
 }
@@ -145,7 +153,6 @@ fn normalize_geography_value(value: &str) -> String {
     let cleaned = value
         .to_lowercase()
         .replace('’', "'")
-        .replace("l’", "l ")
         .replace("l'", "l ")
         .chars()
         .map(|c| {
@@ -230,15 +237,36 @@ fn is_act_date_context(text: &str, start: usize, end: usize) -> bool {
 fn has_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
     // This is a byte bound, so leave room for multi-byte French characters.
     const MAX_CUE_DISTANCE: usize = 32;
-    let (context_start, _) = aligned_context_bounds(text, start, end);
-    let context = context_lowercase(text, start, end);
-    context.match_indices(cue).any(|(relative_start, _)| {
+    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let context = text.get(context_start..context_end).unwrap_or_default();
+    context.char_indices().any(|(relative_start, _)| {
+        let Some(cue_len) = case_insensitive_match_len(context, relative_start, cue) else {
+            return false;
+        };
         let cue_start = context_start + relative_start;
-        let cue_end = cue_start + cue.len();
+        let cue_end = cue_start + cue_len;
+        let before = context[..relative_start].chars().next_back();
+        let after = context[relative_start + cue_len..].chars().next();
+        if before.is_some_and(is_word_char) || after.is_some_and(is_word_char) {
+            return false;
+        }
         (cue_start < end && cue_end > start)
             || (cue_end <= start && start - cue_end <= MAX_CUE_DISTANCE)
             || (cue_start >= end && cue_start - end <= MAX_CUE_DISTANCE)
     })
+}
+
+/// Return the original byte length of a case-insensitive cue at a UTF-8 boundary.
+/// Keeping the match on the original text avoids offsets drifting when Unicode
+/// lowercasing expands a character.
+fn case_insensitive_match_len(text: &str, start: usize, cue: &str) -> Option<usize> {
+    let mut chars = text[start..].char_indices();
+    let mut end = start;
+    for _ in cue.chars() {
+        let (offset, character) = chars.next()?;
+        end = start + offset + character.len_utf8();
+    }
+    (text.get(start..end)?.to_lowercase() == cue).then_some(end - start)
 }
 
 /// Read the bounded, UTF-8-aligned context around a model span.
