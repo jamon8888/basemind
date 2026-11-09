@@ -7,7 +7,11 @@ use image::ImageDecoder;
 use xberg::ExtractInput;
 
 /// Compose supported raster images over white before OCR so transparent pixels stay visible.
-pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> Result<ExtractInput, ExtractError> {
+pub(super) fn prepare_extraction_input(
+    path: &Path,
+    mime_type: Option<&str>,
+    max_content_size: usize,
+) -> Result<ExtractInput, ExtractError> {
     if !matches!(
         mime_type,
         Some("image/png" | "image/webp" | "image/gif" | "image/tiff" | "image/bmp" | "image/x-portable-pixmap")
@@ -15,8 +19,7 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
         return Ok(uri_input(path, mime_type));
     }
 
-    let max_content_size =
-        u64::try_from(xberg::extractors::security::SecurityLimits::default().max_content_size).unwrap_or(u64::MAX);
+    let max_content_size = u64::try_from(max_content_size).unwrap_or(u64::MAX);
     let raw_size = std::fs::metadata(path)
         .map_err(|error| ExtractError::Document(format!("read image metadata {}: {error}", path.display())))?
         .len();
@@ -55,10 +58,6 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
     let rgba = image::DynamicImage::from_decoder(decoder)
         .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?
         .to_rgba8();
-    if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
-        return Ok(uri_input(path, mime_type));
-    }
-
     let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
     for (x, y, pixel) in rgba.enumerate_pixels() {
         let alpha = u32::from(pixel[3]);

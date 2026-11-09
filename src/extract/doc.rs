@@ -595,8 +595,12 @@ fn run_guarded_with_budget(
 ) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
     let ledger = doc_guard::AbandonedThreads::global();
     let extraction_path = path.clone();
+    let max_content_size = krz_config.security_limits.as_ref().map_or_else(
+        || SecurityLimits::default().max_content_size,
+        |limits| limits.max_content_size,
+    );
     doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
-        prepare_extraction_input(&extraction_path, mime_type.as_deref())
+        prepare_extraction_input(&extraction_path, mime_type.as_deref(), max_content_size)
             .map(|input| runtime.block_on(extract(input, &krz_config)))
     })
     .map_err(|error| match error {

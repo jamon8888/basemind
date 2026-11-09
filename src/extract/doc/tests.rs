@@ -319,7 +319,12 @@ fn transparent_png_is_composited_over_white_before_ocr() {
         .expect("encode transparent PNG");
     std::fs::write(file.path(), png).expect("write transparent PNG");
 
-    let input = super::prepare_extraction_input(file.path(), Some("image/png")).expect("normalize PNG");
+    let input = super::prepare_extraction_input(
+        file.path(),
+        Some("image/png"),
+        xberg::extractors::security::SecurityLimits::default().max_content_size,
+    )
+    .expect("normalize PNG");
     let bytes = input.bytes.expect("normalized input uses bytes");
     let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
         .expect("decode normalized PNG")
@@ -343,7 +348,11 @@ fn oversized_png_is_rejected_before_rgba_allocation() {
     png.extend_from_slice(&0xae426082u32.to_be_bytes());
     std::fs::write(file.path(), png).expect("write oversized PNG header");
 
-    let error =
-        super::prepare_extraction_input(file.path(), Some("image/png")).expect_err("oversized image must be rejected");
+    let error = super::prepare_extraction_input(
+        file.path(),
+        Some("image/png"),
+        xberg::extractors::security::SecurityLimits::default().max_content_size,
+    )
+    .expect_err("oversized image must be rejected");
     assert!(error.to_string().contains("too large to normalize safely"));
 }
