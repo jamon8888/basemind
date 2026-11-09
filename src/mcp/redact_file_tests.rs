@@ -173,6 +173,21 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
         start + date.len(),
         "date_of_birth"
     ));
+    let mixed_dates = "Jean Dupont (3 septembre 1980). Contrat signé le 1 janvier 2026.";
+    let birth_start = mixed_dates.find("3 septembre 1980").expect("birth date is present");
+    let act_start = mixed_dates.find("1 janvier 2026").expect("act date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        birth_start,
+        birth_start + "3 septembre 1980".len(),
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "date_of_birth"
+    ));
     assert!(!super::should_skip_legal_fr_v2_ner_value(
         "Résidence Les Hortensias",
         "named_place"
@@ -181,7 +196,8 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
 
 #[tokio::test]
 async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
-    let text = "annonce 20260219-AAA-0042. Référence devis : 2026-221. Contact : 06 12 34 56 78.";
+    let text =
+        "annonce 20260219-AAA-0042. Référence devis : 2026-221. Référence : 20-123-456. Contact : 06 12 34 56 78.";
     let payload = json_of(
         &run_redact(RedactTextParams {
             ner_profile: Some("legal-fr@2".to_string()),
@@ -196,7 +212,26 @@ async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
         "reference must stay: {redacted}"
     );
     assert!(redacted.contains("2026-221"), "reference must stay: {redacted}");
+    assert!(
+        redacted.contains("20-123-456"),
+        "legacy reference must stay: {redacted}"
+    );
     assert!(!redacted.contains("06 12 34 56 78"), "phone must redact: {redacted}");
+}
+
+#[tokio::test]
+async fn legal_fr_v2_phone_context_overrides_invoice_reference_cue() {
+    let text = "Facture 42. Téléphone Danemark : 32345678.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains("32345678"), "phone must redact: {redacted}");
 }
 
 /// A `ner_model_dir` pointing at nothing must never fail the call:

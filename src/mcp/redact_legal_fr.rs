@@ -15,6 +15,13 @@ pub(super) fn is_false_positive_pattern(
         return false;
     };
     match &finding.category {
+        xberg::types::redaction::PiiCategory::Custom(label)
+            if legal_fr_v2 && matches!(label.as_str(), "date_of_birth" | "document_date") =>
+        {
+            // NER custom patterns are global, so remove only the occurrence
+            // that is clearly an act date after xberg has matched it.
+            is_act_date_context(original, start, end)
+        }
         xberg::types::redaction::PiiCategory::Phone => {
             let reference_shape = if legal_fr_v2 {
                 is_legal_reference_shape(value)
@@ -39,7 +46,7 @@ fn is_legacy_legal_reference_shape(value: &str) -> bool {
 
 /// Legal-fr@2 also recognizes year references such as `2026-221`.
 fn is_legal_reference_shape(value: &str) -> bool {
-    let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
+    let compact_date = value.chars().count() == 8 && value.chars().all(|c| c.is_ascii_digit());
     let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
         year.len() == 4
             && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
@@ -47,7 +54,7 @@ fn is_legal_reference_shape(value: &str) -> bool {
             && (3..=4).contains(&suffix.len())
             && suffix.chars().all(|c| c.is_ascii_digit())
     });
-    compact_date || year_reference
+    is_legacy_legal_reference_shape(value) || compact_date || year_reference
 }
 
 /// Decide whether a `legal-fr@2` model span is a known false positive.
@@ -62,7 +69,7 @@ pub(super) fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: us
             GENERIC_LEGAL_ORGANIZATIONS.contains(&normalized.as_str())
         }
         "iban" => !is_plausible_iban(value),
-        "date_of_birth" => is_act_date_context(text, start, end),
+        "date_of_birth" | "document_date" => is_act_date_context(text, start, end),
         _ => false,
     }
 }
@@ -117,6 +124,8 @@ fn is_broad_geography(value: &str) -> bool {
         "états membres",
         "pays membres",
     ];
+    // Keep this an exact allowlist: broad scope terms are readable, while a
+    // private place that merely contains one of those words remains redacted.
     let normalized = normalize_geography_value(value);
     BROAD_GEOGRAPHY.contains(&normalized.as_str())
         || (normalized.starts_with("grand ") && normalized.contains("région"))
@@ -131,6 +140,7 @@ fn normalize_ner_value(value: &str) -> String {
 fn normalize_geography_value(value: &str) -> String {
     let cleaned = value
         .to_lowercase()
+        .replace('’', "'")
         .replace("l’", "l ")
         .replace("l'", "l ")
         .chars()
@@ -142,35 +152,39 @@ fn normalize_geography_value(value: &str) -> String {
             }
         })
         .collect::<String>();
-    let mut words: Vec<&str> = cleaned.split_whitespace().collect();
-    while words.first().is_some_and(|word| {
-        matches!(
-            *word,
-            "a" | "à" | "au" | "aux" | "dans" | "de" | "des" | "du" | "en" | "l" | "la" | "le" | "les"
-        )
-    }) {
-        words.remove(0);
-    }
-    words.join(" ")
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    let first = words
+        .iter()
+        .position(|word| {
+            matches!(
+                *word,
+                "a" | "à" | "au" | "aux" | "dans" | "de" | "des" | "du" | "en" | "l" | "la" | "le" | "les"
+            )
+        })
+        .unwrap_or(words.len());
+    words[first..].join(" ")
 }
 
 /// Keep malformed but account-shaped IBAN findings redacted for safety.
 fn is_plausible_iban(value: &str) -> bool {
-    let compact = value.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    if !(12..=34).contains(&compact.len()) {
-        return false;
-    }
+    let compact = value
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
     let mut chars = compact.chars();
-    let country = (chars.next(), chars.next());
-    country.0.is_some_and(|c| c.is_ascii_alphabetic())
-        && country.1.is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.clone().all(|c| c.is_ascii_alphanumeric())
+    let (Some(first), Some(second)) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && second.is_ascii_alphabetic()
+        // This is deliberately looser than IBAN validation: a malformed
+        // account-shaped NER span must still be redacted, not leaked.
         && chars.filter(|c| c.is_ascii_digit()).count() >= 2
 }
 
 /// Return whether the surrounding text explicitly describes a birth date.
 fn has_birth_context(text: &str, start: usize, end: usize) -> bool {
-    let context = context_lowercase(text, start, end);
     [
         "date de naissance",
         "lieu de naissance",
@@ -182,12 +196,11 @@ fn has_birth_context(text: &str, start: usize, end: usize) -> bool {
         "born",
     ]
     .iter()
-    .any(|cue| context.contains(cue))
+    .any(|cue| has_cue_near_span(text, start, end, cue))
 }
 
 /// Return whether a date is being used as an act/document date rather than a DOB.
 fn is_act_date_context(text: &str, start: usize, end: usize) -> bool {
-    let context = context_lowercase(text, start, end);
     if has_birth_context(text, start, end) {
         return false;
     }
@@ -204,7 +217,23 @@ fn is_act_date_context(text: &str, start: usize, end: usize) -> bool {
         "entrée en vigueur",
     ]
     .iter()
-    .any(|cue| context.contains(cue))
+    .any(|cue| has_cue_near_span(text, start, end, cue))
+}
+
+/// Match a cue at the candidate occurrence, not merely somewhere in its
+/// bounded context window. This prevents one date from borrowing another
+/// date's birth/act label in the same paragraph.
+fn has_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
+    const MAX_CUE_DISTANCE: usize = 16;
+    let (context_start, _) = aligned_context_bounds(text, start, end);
+    let context = context_lowercase(text, start, end);
+    context.match_indices(cue).any(|(relative_start, _)| {
+        let cue_start = context_start + relative_start;
+        let cue_end = cue_start + cue.len();
+        (cue_start < end && cue_end > start)
+            || (cue_end <= start && start - cue_end <= MAX_CUE_DISTANCE)
+            || (cue_start >= end && cue_start - end <= MAX_CUE_DISTANCE)
+    })
 }
 
 /// Read the bounded, UTF-8-aligned context around a model span.
@@ -231,13 +260,16 @@ fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize
 /// Detect the nearby reference/date cues that distinguish references from phones.
 fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
     let context = context_lowercase(text, start, end);
+    // An explicit phone cue wins over generic document/reference words such
+    // as "facture"; otherwise a real phone in an invoice can be kept readable.
+    if has_phone_context(text, start, end) {
+        return false;
+    }
     const REFERENCE_CUES: &[&str] = &[
         "ref",
         "reference",
         "référence",
         "dossier",
-        "case",
-        "matter",
         "n°",
         "no.",
         "annonce",
@@ -254,6 +286,12 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
     DATE_CUE
         .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
         .is_match(&context)
+}
+
+fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
+    ["téléphone", "telephone", "mobile", "portable", "tel"]
+        .iter()
+        .any(|cue| has_cue_near_span(text, start, end, cue))
 }
 
 /// Match a cue as a word instead of matching it inside another word.
@@ -273,7 +311,7 @@ fn is_word_char(c: char) -> bool {
 /// Keep all-letter BIC-shaped prose unless banking context is nearby.
 fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
     let context = context_lowercase(text, start, end);
-    ["bic", "swift", "iban"]
+    ["bic", "bic8", "bic11", "swift", "iban"]
         .iter()
         .any(|cue| contains_word_cue(&context, cue))
 }
