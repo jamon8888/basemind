@@ -765,9 +765,32 @@ fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str)
         return false;
     }
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        return has_explicit_date_cue(text, start, end);
+        return is_valid_compact_date(value) && has_explicit_date_cue(text, start, end);
     }
     has_reference_or_date_cue(text, start, end)
+}
+
+fn is_valid_compact_date(value: &str) -> bool {
+    if value.len() != 8 || !value.chars().all(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(year) = value[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = value[4..6].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = value[6..8].parse::<u32>() else {
+        return false;
+    };
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
@@ -1193,12 +1216,15 @@ mod false_positive_filter_tests {
     fn ambiguous_eight_digit_phone_is_not_treated_as_a_reference() {
         let ambiguous = "Dossier 61234567";
         let ambiguous_start = ambiguous.find("61234567").unwrap();
-        for (profile, legal_fr_filters) in [("full@1", false), (LEGAL_FR_PROFILE, true)] {
-            assert!(
-                !(legal_fr_filters
-                    && is_legal_reference_finding(ambiguous, ambiguous_start, ambiguous_start + 8, "61234567"))
-            );
-            assert_eq!(profile == LEGAL_FR_PROFILE, legal_fr_filters);
+        for legal_fr_filters in [false, true] {
+            let finding = RedactionFinding {
+                start: ambiguous_start as u32,
+                end: (ambiguous_start + 8) as u32,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[PHONE_1]".to_string(),
+            };
+            assert!(!is_false_positive_pattern(ambiguous, &finding, legal_fr_filters));
         }
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
@@ -1209,6 +1235,30 @@ mod false_positive_filter_tests {
             dated_start + 8,
             "20260219"
         ));
+        let unrelated_date = "Jugement du 12 février 2026, dossier 61234567";
+        let unrelated_date_start = unrelated_date.find("61234567").unwrap();
+        let unrelated_date_finding = RedactionFinding {
+            start: unrelated_date_start as u32,
+            end: (unrelated_date_start + 8) as u32,
+            category: PiiCategory::Phone,
+            strategy: RedactionStrategy::Mask,
+            replacement_token: "[PHONE_1]".to_string(),
+        };
+        assert!(!is_legal_reference_finding(
+            unrelated_date,
+            unrelated_date_start,
+            unrelated_date_start + 8,
+            "61234567"
+        ));
+        assert!(!is_false_positive_pattern(
+            unrelated_date,
+            &unrelated_date_finding,
+            true
+        ));
+        assert_eq!(
+            rebuild_redacted_text(unrelated_date, &[unrelated_date_finding]),
+            "Jugement du 12 février 2026, dossier [PHONE_1]"
+        );
         let month_only = "En janvier, dossier 61234567";
         let month_only_start = month_only.find("61234567").unwrap();
         assert!(!has_explicit_date_cue(
