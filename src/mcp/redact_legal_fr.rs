@@ -229,13 +229,23 @@ fn is_act_date_context(text: &str, start: usize, end: usize) -> bool {
         "entrée en vigueur",
     ]
     .iter()
-    .any(|cue| has_cue_near_span(text, start, end, cue))
+    .any(|cue| has_preceding_cue_near_span(text, start, end, cue))
 }
 
 /// Match a cue at the candidate occurrence, not merely somewhere in its
 /// bounded context window. This prevents one date from borrowing another
 /// date's birth/act label in the same paragraph.
 fn has_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
+    has_cue_near_span_in_direction(text, start, end, cue, true)
+}
+
+/// Match a cue immediately before a span, without borrowing context from a
+/// later candidate in the same sentence.
+fn has_preceding_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
+    has_cue_near_span_in_direction(text, start, end, cue, false)
+}
+
+fn has_cue_near_span_in_direction(text: &str, start: usize, end: usize, cue: &str, allow_following_cue: bool) -> bool {
     // This is a byte bound, so leave room for multi-byte French characters.
     const MAX_CUE_DISTANCE: usize = 32;
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
@@ -253,7 +263,7 @@ fn has_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
         }
         (cue_start < end && cue_end > start)
             || (cue_end <= start && start - cue_end <= MAX_CUE_DISTANCE)
-            || (cue_start >= end && cue_start - end <= MAX_CUE_DISTANCE)
+            || (allow_following_cue && cue_start >= end && cue_start - end <= MAX_CUE_DISTANCE)
     })
 }
 
