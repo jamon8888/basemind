@@ -576,7 +576,7 @@ fn run_guarded(
     let mime_type = mime_type.map(str::to_owned);
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
-    run_guarded_with_budget(path, mime_type, krz_config, config, runtime, budget)
+    run_guarded_with_budget(path, mime_type, krz_config, config, runtime.handle().clone(), budget)
 }
 
 fn run_guarded_with_budget(
@@ -648,7 +648,7 @@ fn dictionary_filter_has_no_signal(result: &xberg::types::ExtractedDocument) -> 
 /// Return the warnings that prove xberg's lossy dictionary filter ran. They are copied onto a
 /// successful plain-text retry so Basemind's telemetry still records the original loss signal.
 fn dictionary_filter_warnings(
-    outcome: &Result<xberg::Result<xberg::ExtractionResult>, ExtractError>,
+    outcome: &xberg::Result<xberg::ExtractionResult>,
 ) -> Option<Vec<xberg::types::ProcessingWarning>> {
     let extraction = outcome.as_ref().ok()?;
     let result = extraction.results.last()?;
@@ -668,7 +668,9 @@ fn preserve_dictionary_filter_warnings(
     extraction: &mut xberg::Result<xberg::ExtractionResult>,
     warnings: Vec<xberg::types::ProcessingWarning>,
 ) {
-    if let Some(result) = extraction.results.last_mut() {
+    if let Ok(extraction) = extraction
+        && let Some(result) = extraction.results.last_mut()
+    {
         result.processing_warnings.extend(warnings);
     }
 }
@@ -830,17 +832,22 @@ pub(crate) fn extract_doc_with_metrics(
                 mime_type.map(str::to_owned),
                 fallback_config,
                 config,
-                extraction_runtime()?,
+                extraction_runtime()?.handle().clone(),
                 remaining,
             ) {
-                Ok(fallback) if fallback.results.is_empty() => tracing::warn!(
+                Ok(Ok(fallback)) if fallback.results.is_empty() => tracing::warn!(
                     path = %path.display(),
                     "plain-text OCR retry returned no extracted document; retaining the original OCR result"
                 ),
-                Ok(mut fallback) => {
+                Ok(Ok(mut fallback)) => {
                     preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                     outcome = Ok(fallback);
                 }
+                Ok(Err(error)) => tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "plain-text OCR retry failed; retaining the original OCR result"
+                ),
                 Err(ExtractError::DocDeferred(reason)) => return Err(ExtractError::DocDeferred(reason)),
                 Err(error) => tracing::warn!(
                     path = %path.display(),
@@ -873,7 +880,7 @@ pub(crate) fn extract_doc_with_metrics(
                 Some("text/plain".to_string()),
                 krz_config,
                 config,
-                extraction_runtime()?,
+                extraction_runtime()?.handle().clone(),
                 remaining,
             )? {
                 Ok(result) => {
