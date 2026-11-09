@@ -1,7 +1,5 @@
 //! Narrow OCR retry for xberg's lossy dictionary filter.
 
-use std::collections::HashSet;
-
 use super::ocr_signal;
 use xberg::core::config::ExtractionConfig;
 
@@ -69,18 +67,27 @@ pub(crate) fn preserve_dictionary_filter_warnings(
 /// Keep text that the structured OCR pass recovered when the plain-text retry omits it (for
 /// example, numeric cells that were present only in the table-aware output).
 pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fallback: &mut xberg::ExtractionResult) {
+    if fallback.results.is_empty() {
+        return;
+    }
+    if fallback.results.len() < original.results.len() {
+        tracing::warn!(
+            original_results = original.results.len(),
+            fallback_results = fallback.results.len(),
+            "plain-text OCR retry produced fewer results; merging remaining structured OCR text into the last result"
+        );
+    }
     for (index, original) in original.results.iter().enumerate() {
-        let Some(fallback) = fallback.results.get_mut(index) else {
-            break;
-        };
+        let fallback_index = index.min(fallback.results.len() - 1);
+        let fallback = &mut fallback.results[fallback_index];
         let missing = {
             let existing_lines = fallback
                 .content
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
-                .collect::<HashSet<_>>();
-            let mut seen = HashSet::new();
+                .collect::<ahash::AHashSet<_>>();
+            let mut seen = ahash::AHashSet::new();
             let mut missing = Vec::new();
             for line in original
                 .content
@@ -100,6 +107,15 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
         if !fallback.content.is_empty() {
             fallback.content.push_str("\n\n");
         }
-        fallback.content.push_str(&missing.join("\n"));
+        let recovered = missing.join("\n");
+        fallback.content.push_str(&recovered);
+        let content_len = fallback.content.len();
+        if let Some(chunk) = fallback.chunks.as_mut().and_then(Vec::last_mut) {
+            if !chunk.content.is_empty() {
+                chunk.content.push_str("\n\n");
+            }
+            chunk.content.push_str(&recovered);
+            chunk.metadata.byte_end = content_len;
+        }
     }
 }

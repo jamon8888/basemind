@@ -15,6 +15,17 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
         return Ok(uri_input(path, mime_type));
     }
 
+    let max_content_size =
+        u64::try_from(xberg::extractors::security::SecurityLimits::default().max_content_size).unwrap_or(u64::MAX);
+    let raw_size = std::fs::metadata(path)
+        .map_err(|error| ExtractError::Document(format!("read image metadata {}: {error}", path.display())))?
+        .len();
+    if raw_size > max_content_size {
+        return Err(ExtractError::Document(format!(
+            "image {} is too large to normalize safely ({raw_size} source bytes; max {max_content_size})",
+            path.display()
+        )));
+    }
     let bytes = std::fs::read(path)
         .map_err(|error| ExtractError::Document(format!("read image {}: {error}", path.display())))?;
     if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
@@ -35,8 +46,6 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
     let rgba_bytes = pixels
         .checked_mul(4)
         .ok_or_else(|| ExtractError::Document(format!("image {} allocation size overflow", path.display())))?;
-    let max_content_size =
-        u64::try_from(xberg::extractors::security::SecurityLimits::default().max_content_size).unwrap_or(u64::MAX);
     if rgba_bytes > max_content_size {
         return Err(ExtractError::Document(format!(
             "image {} is too large to normalize safely ({rgba_bytes} decoded bytes; max {max_content_size})",
@@ -58,6 +67,7 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
             dst[channel] = ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha)) / 255) as u8;
         }
     }
+    drop(rgba);
     let mut normalized = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(rgb)
         .write_to(&mut normalized, image::ImageFormat::Png)

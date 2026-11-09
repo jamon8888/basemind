@@ -19,17 +19,15 @@ use serde::{Deserialize, Serialize};
 
 use super::BasemindServer;
 use super::helpers::record_call;
-use xberg::text::redaction;
-use xberg::{ExtractInput, ExtractedDocument, extract};
-
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 use crate::extract::doc::ocr_fallback::{
     dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
     preserve_original_ocr_text,
 };
+use xberg::text::redaction;
+use xberg::{ExtractInput, ExtractedDocument, extract};
 
 const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
-
 async fn extract_file_with_deadline(
     input: ExtractInput,
     config: &xberg::core::config::ExtractionConfig,
@@ -38,10 +36,10 @@ async fn extract_file_with_deadline(
     let remaining = deadline.saturating_duration_since(Instant::now());
     match tokio::time::timeout(remaining, extract(input, config)).await {
         Ok(Ok(extraction)) => Ok(extraction),
-        Ok(Err(error)) => Err(format!("xberg extract failed: {error}")),
+        Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
         Err(_) => Err(format!(
-            "xberg file extraction exceeded its {:?} deadline",
-            FILE_EXTRACTION_TIMEOUT
+            "xberg file extraction timed out after {:?} (of {:?} total budget)",
+            remaining, FILE_EXTRACTION_TIMEOUT
         )),
     }
 }
@@ -98,7 +96,6 @@ pub struct RedactTextParams {
     #[serde(default)]
     pub require_ner: bool,
 }
-
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
@@ -129,7 +126,6 @@ impl BasemindServer {
         result
     }
 }
-
 impl BasemindServer {
     pub(crate) async fn redact_text_cli(&self, p: RedactTextParams) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
@@ -152,14 +148,12 @@ const MAX_FILE_BYTES: u64 = 64 << 20; // 64 MiB
 /// partially handled.
 const MAX_PSEUDONYM_ENTRIES: usize = 64;
 const MAX_PSEUDONYM_VALUE_CHARS: usize = 512;
-
 fn oversized_err(len: usize) -> McpError {
     McpError::internal_error(
         format!("redact_text input too large: {len} bytes (max {MAX_BYTES})"),
         None,
     )
 }
-
 /// Where the text to redact comes from.
 enum Source {
     /// A file xberg extracts (any format).
@@ -276,7 +270,13 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             {
                 let original = std::mem::take(&mut extraction);
                 extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
-                    Ok(fallback) if fallback.results.is_empty() => {
+                    Ok(fallback)
+                        if fallback.results.is_empty()
+                            || fallback
+                                .results
+                                .last()
+                                .is_some_and(|result| result.content.trim().is_empty()) =>
+                    {
                         tracing::warn!(
                             "plain-text OCR retry returned no document; refusing to redact incomplete file content"
                         );
@@ -293,7 +293,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                     Err(error) => {
                         tracing::warn!(%error, "plain-text OCR retry failed; refusing to redact incomplete file content");
                         return Err(McpError::internal_error(
-                            format!("{error} after dictionary filtering; refusing to redact incomplete file content"),
+                            "xberg plain-text OCR retry failed after dictionary filtering; refusing to redact incomplete file content",
                             None,
                         ));
                     }

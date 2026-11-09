@@ -715,7 +715,13 @@ pub(crate) fn extract_doc_with_metrics(
                 extraction_runtime()?.handle().clone(),
                 remaining,
             ) {
-                Ok(Ok(fallback)) if fallback.results.is_empty() => {
+                Ok(Ok(fallback))
+                    if fallback.results.is_empty()
+                        || fallback
+                            .results
+                            .last()
+                            .is_some_and(|result| result.content.trim().is_empty()) =>
+                {
                     return Err(ExtractError::DocDeferred(format!(
                         "plain-text OCR retry for {} returned no extracted document",
                         path.display()
@@ -768,15 +774,20 @@ pub(crate) fn extract_doc_with_metrics(
                 config,
                 extraction_runtime()?.handle().clone(),
                 remaining,
-            )? {
-                Ok(result) => {
+            ) {
+                Ok(Ok(result)) => {
                     outcome = Ok(result);
                     text_fallback = true;
                 }
-                Err(retry_error) => tracing::warn!(
+                Ok(Err(retry_error)) => tracing::warn!(
                     path = %path.display(),
                     error = %retry_error,
                     "text/plain retry also failed; reporting the original error"
+                ),
+                Err(guard_error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %guard_error,
+                    "text/plain retry guard failed; reporting the original error"
                 ),
             }
         }
