@@ -51,6 +51,30 @@ fn dictionary_filter_retry_switches_only_the_affected_document_to_plain_ocr() {
 }
 
 #[test]
+fn dictionary_filter_retry_requires_a_page_with_no_valid_dictionary_words() {
+    let warning = xberg::types::ProcessingWarning {
+        source: "tesseract".into(),
+        message: "Tesseract removed 33 OCR line(s) because their dictionary-checkable words were mostly not real words"
+            .into(),
+    };
+    let mut document = xberg::types::ExtractedDocument::default();
+    document.processing_warnings.push(warning.clone());
+    document
+        .metadata
+        .additional
+        .insert("tesseract_dict_invalid_word_ratio".into(), serde_json::json!(1.0));
+    let outcome = Ok(xberg::ExtractionResult::single(document.clone()));
+    assert!(super::dictionary_filter_warnings(&outcome).is_some());
+
+    document
+        .metadata
+        .additional
+        .insert("tesseract_dict_invalid_word_ratio".into(), serde_json::json!(0.75));
+    let outcome = Ok(xberg::ExtractionResult::single(document));
+    assert!(super::dictionary_filter_warnings(&outcome).is_none());
+}
+
+#[test]
 fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
     let x = cfg.to_xberg(None);

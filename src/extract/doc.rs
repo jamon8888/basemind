@@ -10,7 +10,7 @@
 //! vector inline so the scanner can stage it for LanceDB insert without a second
 //! pass through the embedding engine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -576,6 +576,17 @@ fn run_guarded(
     let mime_type = mime_type.map(str::to_owned);
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
+    run_guarded_with_budget(path, mime_type, krz_config, config, runtime, budget)
+}
+
+fn run_guarded_with_budget(
+    path: PathBuf,
+    mime_type: Option<String>,
+    krz_config: ExtractionConfig,
+    config: &DocConfig,
+    runtime: tokio::runtime::Handle,
+    budget: std::time::Duration,
+) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
     let ledger = doc_guard::AbandonedThreads::global();
     let extraction_path = path.clone();
     doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
@@ -610,8 +621,8 @@ fn run_guarded(
 }
 
 /// Build the OCR retry configuration used when xberg reports that its dictionary filter removed
-/// lines. Normal documents keep xberg's markdown/table path; only the affected document retries
-/// through plain text, which bypasses the filter without imposing a global table regression.
+/// lines without finding a valid dictionary word. Normal documents keep xberg's markdown/table
+/// path; only the affected document retries through plain text.
 fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<ExtractionConfig> {
     let mut fallback = config.clone();
     let ocr = fallback.ocr.as_mut()?;
@@ -623,6 +634,17 @@ fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<Extractio
     Some(fallback)
 }
 
+const TESSERACT_DICT_INVALID_WORD_RATIO_KEY: &str = "tesseract_dict_invalid_word_ratio";
+
+fn dictionary_filter_has_no_signal(result: &xberg::types::ExtractedDocument) -> bool {
+    result
+        .metadata
+        .additional
+        .get(TESSERACT_DICT_INVALID_WORD_RATIO_KEY)
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|ratio| ratio >= 1.0)
+}
+
 /// Return the warnings that prove xberg's lossy dictionary filter ran. They are copied onto a
 /// successful plain-text retry so Basemind's telemetry still records the original loss signal.
 fn dictionary_filter_warnings(
@@ -630,6 +652,9 @@ fn dictionary_filter_warnings(
 ) -> Option<Vec<xberg::types::ProcessingWarning>> {
     let extraction = outcome.as_ref().ok()?;
     let result = extraction.results.first()?;
+    if !dictionary_filter_has_no_signal(result) {
+        return None;
+    }
     let warnings = result
         .processing_warnings
         .iter()
@@ -783,24 +808,41 @@ pub(crate) fn extract_doc_with_metrics(
         })?;
     }
     let extraction_started = std::time::Instant::now();
+    let extraction_budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
     let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
     if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
         && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
     {
-        tracing::warn!(
-            path = %path.display(),
-            "xberg dictionary filtering removed OCR lines; retrying with plain-text OCR"
-        );
-        match run_guarded(path, mime_type, fallback_config, config) {
-            Ok(mut fallback) => {
-                preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
-                outcome = Ok(fallback);
-            }
-            Err(error) => tracing::warn!(
+        let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
                 path = %path.display(),
-                error = %error,
-                "plain-text OCR retry failed; retaining the original OCR result"
-            ),
+                "xberg dictionary filtering removed OCR lines, but no extraction budget remains for the plain-text retry"
+            );
+        } else {
+            tracing::warn!(
+                path = %path.display(),
+                remaining_secs = remaining.as_secs_f64(),
+                "xberg dictionary filtering removed OCR lines without a valid dictionary signal; retrying with plain-text OCR"
+            );
+            match run_guarded_with_budget(
+                path.to_path_buf(),
+                mime_type.map(str::to_owned),
+                fallback_config,
+                config,
+                extraction_runtime()?,
+                remaining,
+            ) {
+                Ok(mut fallback) => {
+                    preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
+                    outcome = Ok(fallback);
+                }
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "plain-text OCR retry failed; retaining the original OCR result"
+                ),
+            }
         }
     }
     let mut text_fallback = false;
@@ -814,16 +856,31 @@ pub(crate) fn extract_doc_with_metrics(
             "structured document extraction failed; retrying as text/plain with linear chunking"
         );
         krz_config.chunking = None;
-        match run_guarded(path, Some("text/plain"), krz_config, config)? {
-            Ok(result) => {
-                outcome = Ok(result);
-                text_fallback = true;
-            }
-            Err(retry_error) => tracing::warn!(
+        let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
                 path = %path.display(),
-                error = %retry_error,
-                "text/plain retry also failed; reporting the original error"
-            ),
+                "structured document extraction failed, but no extraction budget remains for the text/plain retry"
+            );
+        } else {
+            match run_guarded_with_budget(
+                path.to_path_buf(),
+                Some("text/plain".to_string()),
+                krz_config,
+                config,
+                extraction_runtime()?,
+                remaining,
+            )? {
+                Ok(result) => {
+                    outcome = Ok(result);
+                    text_fallback = true;
+                }
+                Err(retry_error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %retry_error,
+                    "text/plain retry also failed; reporting the original error"
+                ),
+            }
         }
     }
     if let Some(metrics) = metrics {
