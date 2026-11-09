@@ -77,7 +77,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
             "plain-text OCR retry produced fewer results; merging remaining structured OCR text into the last result"
         );
     }
-    let mut existing_lines = fallback
+    let existing_lines = fallback
         .results
         .iter()
         .map(|result| {
@@ -94,6 +94,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
         let fallback_index = index.min(fallback.results.len() - 1);
         let fallback = &mut fallback.results[fallback_index];
         let missing = {
+            let mut seen = ahash::AHashSet::new();
             let mut missing = Vec::new();
             for line in original
                 .content
@@ -101,7 +102,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
                 .chain(original.tables.iter().flat_map(|table| table.markdown.lines()))
             {
                 let line = line.trim();
-                if !line.is_empty() && existing_lines[fallback_index].insert(line.to_owned()) {
+                if !line.is_empty() && !existing_lines[fallback_index].contains(line) && seen.insert(line) {
                     missing.push(line);
                 }
             }
