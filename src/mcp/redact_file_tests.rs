@@ -133,6 +133,8 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
         "grand Sud-Ouest",
         "named_place"
     ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
     assert!(super::should_skip_legal_fr_v2_ner_value(
         "France métropolitaine",
         "named_place"
@@ -147,7 +149,28 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
         "iban"
     ));
     assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1X 2004 1010 0505 0001 3M02 606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
         "date de naissance : 3 septembre 1980",
+        "date_of_birth"
+    ));
+    let date = "3 septembre 1980";
+    let text = format!("depuis le {date}");
+    let start = text.find(date).expect("date is present");
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
+        "date_of_birth"
+    ));
+    let text = format!("{date} sans contexte de naissance");
+    let start = text.find(date).expect("date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
         "date_of_birth"
     ));
     assert!(!super::should_skip_legal_fr_v2_ner_value(
@@ -158,7 +181,7 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
 
 #[tokio::test]
 async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
-    let text = "annonce 20260219-AAA-0042. Référence devis : 2026-221.";
+    let text = "annonce 20260219-AAA-0042. Référence devis : 2026-221. Contact : 06 12 34 56 78.";
     let payload = json_of(
         &run_redact(RedactTextParams {
             ner_profile: Some("legal-fr@2".to_string()),
@@ -173,6 +196,7 @@ async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
         "reference must stay: {redacted}"
     );
     assert!(redacted.contains("2026-221"), "reference must stay: {redacted}");
+    assert!(!redacted.contains("06 12 34 56 78"), "phone must redact: {redacted}");
 }
 
 /// A `ner_model_dir` pointing at nothing must never fail the call:

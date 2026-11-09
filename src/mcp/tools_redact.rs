@@ -8,7 +8,6 @@
 //! caller can store the map and send redacted text onward.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -22,6 +21,10 @@ use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument, extract};
 
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
+
+#[path = "redact_legal_fr.rs"]
+mod redact_legal_fr;
+use redact_legal_fr::{is_false_positive_pattern, should_skip_legal_fr_v2_ner_span};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -406,7 +409,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // its caller-owned token map.
     let before_filter = findings.len();
     let legal_fr_filters = matches!(ner_profile.name.as_str(), "legal-fr@1" | "legal-fr@2");
-    findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
+    findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters, legal_fr_v2));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
         rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
@@ -614,172 +617,6 @@ fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
             case_sensitive: true,
         })
         .collect()
-}
-
-/// Decide whether a high-recall engine finding is safe to discard in this legal context.
-fn is_false_positive_pattern(
-    original: &str,
-    finding: &xberg::types::redaction::RedactionFinding,
-    legal_fr_filters: bool,
-) -> bool {
-    let start = finding.start as usize;
-    let end = finding.end as usize;
-    let Some(value) = original.get(start..end) else {
-        return false;
-    };
-    match &finding.category {
-        xberg::types::redaction::PiiCategory::Phone => {
-            // French phones have ten national digits; an eight-digit run is a
-            // reference/date pair in this gateway's legal corpus, not a phone.
-            legal_fr_filters && is_legal_reference_shape(value) && has_reference_or_date_cue(original, start, end)
-        }
-        xberg::types::redaction::PiiCategory::SwiftBic => {
-            // All-letter BIC-shaped words need a nearby banking cue. This
-            // avoids masking ordinary uppercase prose such as ATTESTATION.
-            value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
-        }
-        _ => false,
-    }
-}
-
-fn is_legal_reference_shape(value: &str) -> bool {
-    let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
-    let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
-        year.len() == 4
-            && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
-            && year.chars().all(|c| c.is_ascii_digit())
-            && (3..=4).contains(&suffix.len())
-            && suffix.chars().all(|c| c.is_ascii_digit())
-    });
-    compact_date || year_reference
-}
-
-/// Decide whether a `legal-fr@2` model span is a known false positive. The
-/// profile is deliberately conservative: broad geographic scope remains
-/// readable, while named private places are sent through the model as the
-/// narrower `named_place` label.
-fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: usize, label: &str) -> bool {
-    let Some(value) = text.get(start..end) else {
-        return false;
-    };
-    let normalized = normalize_ner_value(value);
-    match label {
-        "named_place" => is_broad_geography(&normalized),
-        "organization" => GENERIC_LEGAL_ORGANIZATIONS.contains(&normalized.as_str()),
-        "iban" => !crate::pii::validate_iban(value),
-        "date_of_birth" => !has_birth_context(text, start, end),
-        _ => false,
-    }
-}
-
-/// Test-facing shorthand for a span whose value is the complete input.
-#[cfg(test)]
-fn should_skip_legal_fr_v2_ner_value(value: &str, label: &str) -> bool {
-    should_skip_legal_fr_v2_ner_span(value, 0, value.len(), label)
-}
-
-const GENERIC_LEGAL_ORGANIZATIONS: &[&str] = &["sécurité sociale", "ma société", "siège social", "employeur"];
-
-/// Geography that describes a broad legal scope, not a private named place.
-/// Keep this list explicit: treating every one-word model span as a country or
-/// region would let a private site name pass through the gateway.
-fn is_broad_geography(value: &str) -> bool {
-    const BROAD_GEOGRAPHY: &[&str] = &[
-        "europe",
-        "union européenne",
-        "france métropolitaine",
-        "grand sud-ouest",
-        "sud-ouest",
-        "france",
-        "allemagne",
-        "angleterre",
-        "belgique",
-        "espagne",
-        "italie",
-        "pays-bas",
-        "portugal",
-        "suisse",
-        "royaume-uni",
-        "afrique",
-        "asie",
-        "amérique",
-        "océanie",
-    ];
-    BROAD_GEOGRAPHY.contains(&value)
-}
-
-fn normalize_ner_value(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-}
-
-fn has_birth_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    [
-        "date de naissance",
-        "lieu de naissance",
-        "né le",
-        "née le",
-        "né(e)",
-        "naissance",
-        "birth",
-        "born",
-    ]
-    .iter()
-    .any(|cue| context.contains(cue))
-}
-
-/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
-fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut context_start = start.saturating_sub(80).min(text.len());
-    while context_start > 0 && !text.is_char_boundary(context_start) {
-        context_start -= 1;
-    }
-    let mut context_end = end.saturating_add(80).min(text.len());
-    while context_end < text.len() && !text.is_char_boundary(context_end) {
-        context_end += 1;
-    }
-    (context_start, context_end)
-}
-
-/// Detect the nearby reference/date cues that distinguish eight-digit references from phones.
-fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    const REFERENCE_CUES: &[&str] = &[
-        "ref",
-        "reference",
-        "référence",
-        "dossier",
-        "case",
-        "matter",
-        "n°",
-        "no.",
-        "annonce",
-        "bodacc",
-        "facture",
-        "devis",
-        "publié",
-        "période",
-    ];
-    if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
-        return true;
-    }
-    static DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
-    DATE_CUE
-        .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
-        .is_match(&context)
-}
-
-fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    text.get(context_start..context_end)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|context| ["bic", "swift", "iban"].iter().any(|cue| context.contains(cue)))
 }
 
 fn rebuild_redacted_text(original: &str, findings: &[xberg::types::redaction::RedactionFinding]) -> String {
