@@ -662,8 +662,7 @@ fn is_false_positive_pattern(
             // French phones have ten national digits; an eight-digit run with
             // a reference/date shape is not a phone unless phone context says so.
             legal_fr_filters
-                && is_legal_reference_shape(value)
-                && has_reference_or_date_cue(original, start, end)
+                && is_legal_reference_finding(original, start, end, value)
                 && !has_phone_context(original, start, end)
         }
         xberg::types::redaction::PiiCategory::SwiftBic => {
@@ -752,6 +751,54 @@ fn is_legal_reference_shape(value: &str) -> bool {
             && suffix.chars().all(|c| c.is_ascii_digit())
     });
     compact_date || year_reference
+}
+
+fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str) -> bool {
+    if !is_legal_reference_shape(value) {
+        return false;
+    }
+    if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
+        return has_explicit_date_cue(text, start, end);
+    }
+    has_reference_or_date_cue(text, start, end)
+}
+
+fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
+    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
+        return false;
+    };
+    const DATE_WORD_CUES: &[&str] = &[
+        "date",
+        "dated",
+        "janvier",
+        "février",
+        "mars",
+        "avril",
+        "mai",
+        "juin",
+        "juillet",
+        "août",
+        "septembre",
+        "octobre",
+        "novembre",
+        "décembre",
+        "january",
+        "february",
+        "march",
+        "april",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    context
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphabetic()))
+        .any(|word| DATE_WORD_CUES.contains(&word))
 }
 
 fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
@@ -1140,6 +1187,38 @@ async fn run_ner_windowed(model_dir: Option<&str>, _text: &str, _profile: &NerPr
         tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
     }
     Err("built without the ner-candle feature".to_string())
+}
+
+#[cfg(test)]
+mod false_positive_filter_tests {
+    use super::{has_explicit_date_cue, is_legal_reference_finding};
+
+    #[test]
+    fn ambiguous_eight_digit_phone_is_not_treated_as_a_reference() {
+        let ambiguous = "Dossier 61234567";
+        let ambiguous_start = ambiguous.find("61234567").unwrap();
+        for profile in ["full@1", "legal-fr@1"] {
+            let legal_fr_filters = matches!(profile, "full@1" | "legal-fr@1");
+            assert!(!(
+                legal_fr_filters
+                    && is_legal_reference_finding(
+                        ambiguous,
+                        ambiguous_start,
+                        ambiguous_start + 8,
+                        "61234567"
+                    )
+            ));
+        }
+        let dated = "Jugement du 12 février 2026, annonce 20260219";
+        let dated_start = dated.find("20260219").unwrap();
+        assert!(has_explicit_date_cue(dated, dated_start, dated_start + 8));
+        assert!(is_legal_reference_finding(
+            dated,
+            dated_start,
+            dated_start + 8,
+            "20260219"
+        ));
+    }
 }
 
 #[cfg(test)]
