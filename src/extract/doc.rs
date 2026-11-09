@@ -10,15 +10,15 @@
 //! vector inline so the scanner can stage it for LanceDB insert without a second
 //! pass through the embedding engine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use xberg::LanguageDetectionConfig;
 use xberg::core::config::processing::{ChunkerType, ChunkingConfig};
 use xberg::core::config::{ConcurrencyConfig, ExtractionConfig};
+use xberg::extract;
 use xberg::extractors::security::SecurityLimits;
-use xberg::{ExtractInput, extract};
 
 use super::doc_guard::{self, ChunkCutovers, DeadlineError, DocPhase};
 use super::ocr_assets;
@@ -33,7 +33,9 @@ use numbered_headings::{collect_numbered_headings, numbered_heading_path};
 mod chunking;
 pub(crate) mod citations;
 pub(crate) mod facets;
+mod input;
 mod metadata;
+pub(crate) mod ocr_fallback;
 #[cfg(test)]
 pub(crate) use chunking::dense_retrieval_text;
 #[cfg(feature = "crawl")]
@@ -41,6 +43,10 @@ pub(crate) use chunking::heading_path_of;
 use chunking::prepare_doc_chunk;
 pub(crate) use metadata::hash_redaction_config;
 use metadata::{entity_category_str, keyword_algorithm_str, map_language_confidences, metadata_pairs};
+use ocr_fallback::{
+    dictionary_filter_warnings, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
+    preserve_original_ocr_text,
+};
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
@@ -564,8 +570,8 @@ fn extraction_runtime() -> Result<&'static tokio::runtime::Runtime, ExtractError
     .map_err(|message| ExtractError::Document(message.clone()))
 }
 
-/// One guarded xberg call. It runs on its own thread under the wall-clock budget, so the text/plain
-/// retry in [`extract_doc`] is bounded exactly like the first attempt.
+/// One guarded xberg call. It runs on its own thread under the wall-clock budget, so OCR retries
+/// are bounded exactly like the first attempt.
 fn run_guarded(
     path: &Path,
     mime_type: Option<&str>,
@@ -576,10 +582,25 @@ fn run_guarded(
     let mime_type = mime_type.map(str::to_owned);
     let runtime = extraction_runtime()?;
     let budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
+    run_guarded_with_budget(path, mime_type, krz_config, config, runtime.handle().clone(), budget)
+}
+
+fn run_guarded_with_budget(
+    path: PathBuf,
+    mime_type: Option<String>,
+    krz_config: ExtractionConfig,
+    config: &DocConfig,
+    runtime: tokio::runtime::Handle,
+    budget: std::time::Duration,
+) -> Result<xberg::Result<xberg::ExtractionResult>, ExtractError> {
     let ledger = doc_guard::AbandonedThreads::global();
     let extraction_path = path.clone();
+    let max_content_size = krz_config.security_limits.as_ref().map_or_else(
+        || SecurityLimits::default().max_content_size,
+        |limits| limits.max_content_size,
+    );
     doc_guard::run_with_deadline(ledger, config.max_abandoned_extractions, budget, move || {
-        prepare_extraction_input(&extraction_path, mime_type.as_deref())
+        prepare_extraction_input(&extraction_path, mime_type.as_deref(), max_content_size)
             .map(|input| runtime.block_on(extract(input, &krz_config)))
     })
     .map_err(|error| match error {
@@ -609,82 +630,7 @@ fn run_guarded(
     })?
 }
 
-/// xberg 1.3.x converts images with alpha directly to RGB, which turns transparent
-/// pixels black before OCR. Compose supported raster images over white at the boundary
-/// so OCR sees the same page a human sees. The work runs inside `run_guarded`'s deadline.
-fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> Result<ExtractInput, ExtractError> {
-    if !matches!(
-        mime_type,
-        Some("image/png" | "image/webp" | "image/gif" | "image/tiff" | "image/bmp" | "image/x-portable-pixmap")
-    ) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-
-    let bytes =
-        std::fs::read(path).map_err(|error| ExtractError::Document(format!("read PNG {}: {error}", path.display())))?;
-    if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-    let decoded = image::load_from_memory(&bytes)
-        .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?;
-    let rgba = decoded.to_rgba8();
-    if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
-        let mut input = ExtractInput::from_uri(path.to_string_lossy().into_owned());
-        input.mime_type = mime_type.map(str::to_string);
-        return Ok(input);
-    }
-
-    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
-    for (x, y, pixel) in rgba.enumerate_pixels() {
-        let alpha = u32::from(pixel[3]);
-        let dst = rgb.get_pixel_mut(x, y);
-        for channel in 0..3 {
-            dst[channel] = ((u32::from(pixel[channel]) * alpha + 255 * (255 - alpha)) / 255) as u8;
-        }
-    }
-    let mut normalized = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(rgb)
-        .write_to(&mut normalized, image::ImageFormat::Png)
-        .map_err(|error| ExtractError::Document(format!("encode normalized image {}: {error}", path.display())))?;
-    Ok(ExtractInput::from_bytes(
-        normalized.into_inner(),
-        "image/png",
-        path.file_name().map(|name| name.to_string_lossy().into_owned()),
-    ))
-}
-
-/// Inspect only the PNG header/chunks to avoid decoding ordinary opaque RGB PNGs.
-fn png_may_have_alpha(bytes: &[u8]) -> bool {
-    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if bytes.len() < 29 || &bytes[..8] != SIGNATURE {
-        return true;
-    }
-    let color_type = bytes[25];
-    if matches!(color_type, 4 | 6) {
-        return true;
-    }
-    // Palette PNGs can carry transparency in a tRNS chunk.
-    let mut offset = 8usize;
-    while offset.saturating_add(12) <= bytes.len() {
-        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-        let chunk_end = match offset.checked_add(12).and_then(|value| value.checked_add(length)) {
-            Some(value) if value <= bytes.len() => value,
-            _ => return true,
-        };
-        if &bytes[offset + 4..offset + 8] == b"tRNS" {
-            return true;
-        }
-        if &bytes[offset + 4..offset + 8] == b"IEND" {
-            break;
-        }
-        offset = chunk_end;
-    }
-    false
-}
+use input::prepare_extraction_input;
 
 pub use super::doc_metrics::extract_doc;
 
@@ -744,7 +690,69 @@ pub(crate) fn extract_doc_with_metrics(
         })?;
     }
     let extraction_started = std::time::Instant::now();
+    let extraction_budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
     let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
+    if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
+        && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
+    {
+        let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
+        if remaining.is_zero() {
+            return Err(ExtractError::DocDeferred(format!(
+                "plain-text OCR retry for {} has no extraction budget remaining",
+                path.display()
+            )));
+        } else {
+            let original = match outcome {
+                Ok(original) => original,
+                Err(error) => return Err(ExtractError::Document(error.to_string())),
+            };
+            tracing::warn!(
+                path = %path.display(),
+                remaining_secs = remaining.as_secs_f64(),
+                "xberg dictionary filtering removed OCR lines without a valid dictionary signal; retrying with plain-text OCR"
+            );
+            match run_guarded_with_budget(
+                path.to_path_buf(),
+                mime_type.map(str::to_owned),
+                fallback_config,
+                config,
+                extraction_runtime()?.handle().clone(),
+                remaining,
+            ) {
+                Ok(Ok(fallback))
+                    if fallback.results.is_empty()
+                        || fallback
+                            .results
+                            .last()
+                            .is_some_and(|result| result.content.trim().is_empty()) =>
+                {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} returned no extracted document",
+                        path.display()
+                    )));
+                }
+                Ok(Ok(mut fallback)) => {
+                    preserve_original_ocr_text(&original, &mut fallback);
+                    preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
+                    outcome = Ok(fallback);
+                }
+                Ok(Err(error)) => {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} failed: {error}",
+                        path.display()
+                    )));
+                }
+                Err(ExtractError::DocDeferred(reason)) => return Err(ExtractError::DocDeferred(reason)),
+                Err(error @ ExtractError::DocTimeout(_)) => return Err(error),
+                Err(error) => {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} failed: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
     let mut text_fallback = false;
     if let Err(error) = &outcome
         && super::doc_fallback::should_retry_as_text(mime_type, error)
@@ -756,16 +764,36 @@ pub(crate) fn extract_doc_with_metrics(
             "structured document extraction failed; retrying as text/plain with linear chunking"
         );
         krz_config.chunking = None;
-        match run_guarded(path, Some("text/plain"), krz_config, config)? {
-            Ok(result) => {
-                outcome = Ok(result);
-                text_fallback = true;
-            }
-            Err(retry_error) => tracing::warn!(
+        let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
+        if remaining.is_zero() {
+            tracing::warn!(
                 path = %path.display(),
-                error = %retry_error,
-                "text/plain retry also failed; reporting the original error"
-            ),
+                "structured document extraction failed, but no extraction budget remains for the text/plain retry"
+            );
+        } else {
+            match run_guarded_with_budget(
+                path.to_path_buf(),
+                Some("text/plain".to_string()),
+                krz_config,
+                config,
+                extraction_runtime()?.handle().clone(),
+                remaining,
+            ) {
+                Ok(Ok(result)) => {
+                    outcome = Ok(result);
+                    text_fallback = true;
+                }
+                Ok(Err(retry_error)) => tracing::warn!(
+                    path = %path.display(),
+                    error = %retry_error,
+                    "text/plain retry also failed; reporting the original error"
+                ),
+                Err(guard_error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %guard_error,
+                    "text/plain retry guard failed; reporting the original error"
+                ),
+            }
         }
     }
     if let Some(metrics) = metrics {

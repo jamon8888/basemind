@@ -8,6 +8,8 @@
 //! caller can store the map and send redacted text onward.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -17,10 +19,14 @@ use serde::{Deserialize, Serialize};
 
 use super::BasemindServer;
 use super::helpers::record_call;
-use xberg::text::redaction;
-use xberg::{ExtractInput, ExtractedDocument, extract};
-
+use super::tools_redact_timeout::{FILE_EXTRACTION_TIMEOUT, extract_file_with_deadline};
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
+use crate::extract::doc::ocr_fallback::{
+    dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
+    preserve_original_ocr_text,
+};
+use xberg::text::redaction;
+use xberg::{ExtractInput, ExtractedDocument};
 
 #[path = "redact_legal_fr.rs"]
 mod redact_legal_fr;
@@ -80,7 +86,6 @@ pub struct RedactTextParams {
     #[serde(default)]
     pub require_ner: bool,
 }
-
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
     #[tool(
@@ -111,7 +116,6 @@ impl BasemindServer {
         result
     }
 }
-
 impl BasemindServer {
     pub(crate) async fn redact_text_cli(&self, p: RedactTextParams) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
@@ -134,14 +138,12 @@ const MAX_FILE_BYTES: u64 = 64 << 20; // 64 MiB
 /// partially handled.
 const MAX_PSEUDONYM_ENTRIES: usize = 64;
 const MAX_PSEUDONYM_VALUE_CHARS: usize = 512;
-
 fn oversized_err(len: usize) -> McpError {
     McpError::internal_error(
         format!("redact_text input too large: {len} bytes (max {MAX_BYTES})"),
         None,
     )
 }
-
 /// Where the text to redact comes from.
 enum Source {
     /// A file xberg extracts (any format).
@@ -195,7 +197,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             Source::Inline(args.text)
         }
     };
-
     let strategy = match args.strategy.as_deref() {
         None | Some("token-replace") => RedactionStrategy::TokenReplace,
         Some("mask") => RedactionStrategy::Mask,
@@ -208,7 +209,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             ));
         }
     };
-
     let custom_terms: Vec<RedactionCustomTerm> = args
         .custom_terms
         .into_iter()
@@ -224,7 +224,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             }
         })
         .collect();
-
     let mut custom_patterns: Vec<RedactionCustomPattern> = args
         .custom_patterns
         .into_iter()
@@ -251,9 +250,45 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
 
     let mut doc = match source {
         Source::File(input) => {
-            let mut extraction = extract(*input, &extraction_config)
+            let input = *input;
+            let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, deadline)
                 .await
-                .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
+                .map_err(|error| McpError::internal_error(error, None))?;
+            if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
+                && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
+            {
+                let original = std::mem::take(&mut extraction);
+                extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
+                    Ok(fallback)
+                        if fallback.results.is_empty()
+                            || fallback
+                                .results
+                                .last()
+                                .is_some_and(|result| result.content.trim().is_empty()) =>
+                    {
+                        tracing::warn!(
+                            "plain-text OCR retry returned no document; refusing to redact incomplete file content"
+                        );
+                        return Err(McpError::internal_error(
+                            "xberg plain-text OCR retry returned no document after dictionary filtering",
+                            None,
+                        ));
+                    }
+                    Ok(mut fallback) => {
+                        preserve_original_ocr_text(&original, &mut fallback);
+                        preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
+                        fallback
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "plain-text OCR retry failed; refusing to redact incomplete file content");
+                        return Err(McpError::internal_error(
+                            "xberg plain-text OCR retry failed after dictionary filtering; refusing to redact incomplete file content",
+                            None,
+                        ));
+                    }
+                };
+            }
             extraction
                 .results
                 .pop()

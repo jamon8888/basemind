@@ -60,12 +60,13 @@ ignore = [
   # pin-utils is pulled transitively by AWS Smithy HTTP crates used by Lance's cloud backends;
   # basemind does not depend on pin-utils directly and no compatible upstream removal is available.
   "RUSTSEC-2026-0441",
-  # astral-tl is transitive through crawlberg/html-to-markdown-rs and xberg. Astral has
-  # deprecated the crate, and no safe upgrade is available until those upstream dependencies
-  # migrate to astral-html.
+  # astral-tl is pulled transitively by crawlberg and xberg's HTML parser; the advisory has no
+  # safe upgrade is available until those upstream dependencies migrate; replacing that parser
+  # is an upstream crawlberg/xberg change.
   "RUSTSEC-2026-0444",
-  # xberg 1.3.10 still depends on rusqlite 0.40/libsqlite3-sys 0.38.2. The patched
-  # libsqlite3-sys 0.39 line requires rusqlite 0.41, which xberg has not adopted yet.
+  # xberg 1.3.9 pins rusqlite 0.40/libsqlite3-sys 0.38; the patched SQLite bundle requires
+  # rusqlite 0.41 and therefore an xberg release that widens this dependency. Revisit before
+  # 2027-01-01, or sooner when xberg widens rusqlite.
   "RUSTSEC-2026-0459",
 ]
 [licenses]
