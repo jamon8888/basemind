@@ -694,10 +694,10 @@ pub(crate) fn extract_doc_with_metrics(
         let original = outcome.as_ref().ok().cloned();
         let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
         if remaining.is_zero() {
-            tracing::warn!(
-                path = %path.display(),
-                "xberg dictionary filtering removed OCR lines, but no extraction budget remains for the plain-text retry"
-            );
+            return Err(ExtractError::DocDeferred(format!(
+                "plain-text OCR retry for {} has no extraction budget remaining",
+                path.display()
+            )));
         } else {
             tracing::warn!(
                 path = %path.display(),
@@ -712,10 +712,12 @@ pub(crate) fn extract_doc_with_metrics(
                 extraction_runtime()?.handle().clone(),
                 remaining,
             ) {
-                Ok(Ok(fallback)) if fallback.results.is_empty() => tracing::warn!(
-                    path = %path.display(),
-                    "plain-text OCR retry returned no extracted document; retaining the original OCR result"
-                ),
+                Ok(Ok(fallback)) if fallback.results.is_empty() => {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} returned no extracted document",
+                        path.display()
+                    )));
+                }
                 Ok(Ok(mut fallback)) => {
                     if let Some(original) = &original {
                         preserve_original_ocr_text(original, &mut fallback);
@@ -723,17 +725,20 @@ pub(crate) fn extract_doc_with_metrics(
                     preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                     outcome = Ok(fallback);
                 }
-                Ok(Err(error)) => tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "plain-text OCR retry failed; retaining the original OCR result"
-                ),
+                Ok(Err(error)) => {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} failed: {error}",
+                        path.display()
+                    )));
+                }
                 Err(ExtractError::DocDeferred(reason)) => return Err(ExtractError::DocDeferred(reason)),
-                Err(error) => tracing::warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "plain-text OCR retry failed; retaining the original OCR result"
-                ),
+                Err(error @ ExtractError::DocTimeout(_)) => return Err(error),
+                Err(error) => {
+                    return Err(ExtractError::DocDeferred(format!(
+                        "plain-text OCR retry for {} failed: {error}",
+                        path.display()
+                    )));
+                }
             }
         }
     }
