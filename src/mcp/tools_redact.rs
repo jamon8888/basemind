@@ -34,13 +34,20 @@ async fn extract_file_with_deadline(
     deadline: Instant,
 ) -> Result<xberg::ExtractionResult, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("xberg file extraction shared deadline exhausted before extraction".to_string());
+    }
     match tokio::time::timeout(remaining, extract(input, config)).await {
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
-        Err(_) => Err(format!(
-            "xberg file extraction timed out after {:?} (of {:?} total budget)",
-            remaining, FILE_EXTRACTION_TIMEOUT
-        )),
+        Err(_) => {
+            let elapsed = FILE_EXTRACTION_TIMEOUT
+                .saturating_sub(deadline.saturating_duration_since(Instant::now()));
+            Err(format!(
+                "xberg file extraction timed out after {:?} of {:?} shared budget",
+                elapsed, FILE_EXTRACTION_TIMEOUT
+            ))
+        }
     }
 }
 
