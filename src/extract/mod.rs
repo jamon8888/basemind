@@ -87,7 +87,8 @@ pub const SCHEMA_VER: u16 = crate::version::RELEASE_MINOR;
 ///
 /// History:
 /// - 1: symbol `signature` stops at the grammar's body field (`extract::l1::header_text`).
-pub const EXTRACT_EPOCH: u16 = 1;
+/// - 2: documents re-extract when OCR dictionary filtering reports no valid-word signal.
+pub const EXTRACT_EPOCH: u16 = 2;
 
 #[derive(Debug, Error)]
 pub enum ExtractError {

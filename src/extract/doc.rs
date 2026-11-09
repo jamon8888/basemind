@@ -651,7 +651,7 @@ fn dictionary_filter_warnings(
     outcome: &Result<xberg::Result<xberg::ExtractionResult>, ExtractError>,
 ) -> Option<Vec<xberg::types::ProcessingWarning>> {
     let extraction = outcome.as_ref().ok()?;
-    let result = extraction.results.first()?;
+    let result = extraction.results.last()?;
     if !dictionary_filter_has_no_signal(result) {
         return None;
     }
@@ -668,7 +668,7 @@ fn preserve_dictionary_filter_warnings(
     extraction: &mut xberg::Result<xberg::ExtractionResult>,
     warnings: Vec<xberg::types::ProcessingWarning>,
 ) {
-    if let Some(result) = extraction.results.first_mut() {
+    if let Some(result) = extraction.results.last_mut() {
         result.processing_warnings.extend(warnings);
     }
 }
@@ -833,10 +833,15 @@ pub(crate) fn extract_doc_with_metrics(
                 extraction_runtime()?,
                 remaining,
             ) {
+                Ok(fallback) if fallback.results.is_empty() => tracing::warn!(
+                    path = %path.display(),
+                    "plain-text OCR retry returned no extracted document; retaining the original OCR result"
+                ),
                 Ok(mut fallback) => {
                     preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                     outcome = Ok(fallback);
                 }
+                Err(ExtractError::DocDeferred(reason)) => return Err(ExtractError::DocDeferred(reason)),
                 Err(error) => tracing::warn!(
                     path = %path.display(),
                     error = %error,
