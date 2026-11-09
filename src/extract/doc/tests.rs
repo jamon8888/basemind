@@ -89,6 +89,45 @@ fn plain_text_retry_preserves_lines_recovered_by_structured_ocr() {
 }
 
 #[test]
+fn plain_text_retry_reconciles_each_result_and_keeps_short_lines() {
+    let warning = xberg::types::ProcessingWarning {
+        source: "tesseract".into(),
+        message: "Tesseract removed 1 OCR line(s) because their dictionary-checkable words were mostly not real words"
+            .into(),
+    };
+    let mut original_first = xberg::types::ExtractedDocument::default();
+    original_first.content = "Yes".into();
+    original_first.processing_warnings.push(warning.clone());
+    original_first
+        .metadata
+        .additional
+        .insert("tesseract_dict_invalid_word_ratio".into(), serde_json::json!(1.0));
+    let mut original_second = xberg::types::ExtractedDocument::default();
+    original_second.content = "Invoice total: 42".into();
+    let original = xberg::ExtractionResult {
+        results: vec![original_first, original_second],
+        ..xberg::ExtractionResult::default()
+    };
+
+    let mut fallback_first = xberg::types::ExtractedDocument::default();
+    fallback_first.content = "Yesterday".into();
+    let mut fallback_second = xberg::types::ExtractedDocument::default();
+    fallback_second.content = "Invoice".into();
+    let mut fallback = xberg::ExtractionResult {
+        results: vec![fallback_first, fallback_second],
+        ..xberg::ExtractionResult::default()
+    };
+
+    let warnings = super::dictionary_filter_warnings_from_extraction(&original).expect("first result triggers retry");
+    super::preserve_original_ocr_text(&original, &mut fallback);
+    super::preserve_dictionary_filter_warnings(&mut fallback, warnings);
+
+    assert!(fallback.results[0].content.contains("Yes"));
+    assert!(fallback.results[1].content.contains("Invoice total: 42"));
+    assert_eq!(fallback.results[1].processing_warnings, vec![warning]);
+}
+
+#[test]
 fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
     let x = cfg.to_xberg(None);

@@ -15,8 +15,8 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
         return Ok(uri_input(path, mime_type));
     }
 
-    let bytes =
-        std::fs::read(path).map_err(|error| ExtractError::Document(format!("read PNG {}: {error}", path.display())))?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| ExtractError::Document(format!("read image {}: {error}", path.display())))?;
     if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
         return Ok(uri_input(path, mime_type));
     }
@@ -43,7 +43,7 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
             path.display()
         )));
     }
-    let rgba = image::load_from_memory(&bytes)
+    let rgba = image::DynamicImage::from_decoder(decoder)
         .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?
         .to_rgba8();
     if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {

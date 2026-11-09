@@ -1,5 +1,7 @@
 //! Narrow OCR retry for xberg's lossy dictionary filter.
 
+use std::collections::HashSet;
+
 use super::ocr_signal;
 use xberg::core::config::ExtractionConfig;
 
@@ -40,15 +42,17 @@ pub(crate) fn dictionary_filter_warnings(
 pub(crate) fn dictionary_filter_warnings_from_extraction(
     extraction: &xberg::ExtractionResult,
 ) -> Option<Vec<xberg::types::ProcessingWarning>> {
-    let result = extraction.results.last()?;
-    if !has_no_dictionary_signal(result) {
-        return None;
-    }
-    let warnings = result
-        .processing_warnings
+    let warnings = extraction
+        .results
         .iter()
-        .filter(|warning| ocr_signal::dictionary_filtered_line_count(std::slice::from_ref(*warning)).is_some())
-        .cloned()
+        .filter(|result| has_no_dictionary_signal(result))
+        .flat_map(|result| {
+            result
+                .processing_warnings
+                .iter()
+                .filter(|warning| ocr_signal::dictionary_filtered_line_count(std::slice::from_ref(*warning)).is_some())
+                .cloned()
+        })
         .collect::<Vec<_>>();
     (!warnings.is_empty()).then_some(warnings)
 }
@@ -65,25 +69,37 @@ pub(crate) fn preserve_dictionary_filter_warnings(
 /// Keep text that the structured OCR pass recovered when the plain-text retry omits it (for
 /// example, numeric cells that were present only in the table-aware output).
 pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fallback: &mut xberg::ExtractionResult) {
-    let (Some(original), Some(fallback)) = (original.results.last(), fallback.results.last_mut()) else {
-        return;
-    };
-    let mut missing = Vec::new();
-    for line in original
-        .content
-        .lines()
-        .chain(original.tables.iter().flat_map(|table| table.markdown.lines()))
-    {
-        let line = line.trim();
-        if !line.is_empty() && !fallback.content.contains(line) && !missing.contains(&line) {
-            missing.push(line);
+    for (index, original) in original.results.iter().enumerate() {
+        let Some(fallback) = fallback.results.get_mut(index) else {
+            break;
+        };
+        let missing = {
+            let existing_lines = fallback
+                .content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            let mut missing = Vec::new();
+            for line in original
+                .content
+                .lines()
+                .chain(original.tables.iter().flat_map(|table| table.markdown.lines()))
+            {
+                let line = line.trim();
+                if !line.is_empty() && !existing_lines.contains(line) && seen.insert(line) {
+                    missing.push(line);
+                }
+            }
+            missing
+        };
+        if missing.is_empty() {
+            continue;
         }
+        if !fallback.content.is_empty() {
+            fallback.content.push_str("\n\n");
+        }
+        fallback.content.push_str(&missing.join("\n"));
     }
-    if missing.is_empty() {
-        return;
-    }
-    if !fallback.content.is_empty() {
-        fallback.content.push_str("\n\n");
-    }
-    fallback.content.push_str(&missing.join("\n"));
 }

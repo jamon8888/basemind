@@ -65,6 +65,7 @@ ignore = [
   "RUSTSEC-2026-0444",
   # xberg 1.3.9 pins rusqlite 0.40, which pins bundled libsqlite3-sys 0.38; the patched SQLite
   # bundle requires rusqlite 0.41 and therefore an xberg release that widens this dependency.
+  # Revisit this suppression when xberg widens rusqlite or when the next xberg dependency audit runs.
   "RUSTSEC-2026-0459",
 ]
 [licenses]
