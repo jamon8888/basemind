@@ -30,6 +30,8 @@ use xberg::{ExtractInput, ExtractedDocument};
 #[path = "redact_legal_fr.rs"]
 mod redact_legal_fr;
 #[cfg(test)]
+use redact_legal_fr::should_skip_legal_fr_v2_ner_span;
+#[cfg(test)]
 use redact_legal_fr::should_skip_legal_fr_v2_ner_value;
 use redact_legal_fr::{is_false_positive_pattern, should_skip_legal_fr_v2_ner_span_with_categories};
 
