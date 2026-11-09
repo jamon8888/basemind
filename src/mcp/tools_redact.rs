@@ -429,8 +429,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut rehydration_map: std::collections::BTreeMap<String, String> = map.into_iter().collect();
     let mut redacted_text = content_doc.content;
 
-    // xberg's built-in phone/BIC regexes intentionally favour recall. The
-    // legal gateway needs the same conservative boundary for obvious date and
+    // xberg's built-in phone/BIC regexes intentionally favour recall. Both
+    // profiles use the same conservative boundary for obvious date and
     // prose-shaped matches; rebuild the content from the original after
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
@@ -659,12 +659,12 @@ fn is_false_positive_pattern(
     };
     match &finding.category {
         xberg::types::redaction::PiiCategory::Phone => {
-            // French phones have ten national digits; an eight-digit run is a
-            // reference/year pair in this gateway's legal corpus, not a phone.
+            // French phones have ten national digits; an eight-digit run with
+            // a reference/date shape is not a phone unless phone context says so.
             legal_fr_filters
-                && value.chars().filter(|c| c.is_ascii_digit()).count() == 8
-                && value.chars().all(|c| c.is_ascii_digit() || c == '-')
+                && is_legal_reference_shape(value)
                 && has_reference_or_date_cue(original, start, end)
+                && !has_phone_context(original, start, end)
         }
         xberg::types::redaction::PiiCategory::SwiftBic => {
             // All-letter BIC-shaped words need a nearby banking cue. This
@@ -717,6 +717,41 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
     DATE_CUE
         .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
         .is_match(&context)
+}
+
+fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
+    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    text.get(context_start..context_end)
+        .map(str::to_lowercase)
+        .is_some_and(|context| {
+            [
+                "phone",
+                "telephone",
+                "téléphone",
+                "tel.",
+                "tél.",
+                "mobile",
+                "cell",
+                "contact",
+                "call",
+                "whatsapp",
+                "fax",
+            ]
+            .iter()
+            .any(|cue| context.contains(cue))
+        })
+}
+
+fn is_legal_reference_shape(value: &str) -> bool {
+    let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
+    let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
+        year.len() == 4
+            && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
+            && year.chars().all(|c| c.is_ascii_digit())
+            && (3..=4).contains(&suffix.len())
+            && suffix.chars().all(|c| c.is_ascii_digit())
+    });
+    compact_date || year_reference
 }
 
 fn has_bic_context(text: &str, start: usize, end: usize) -> bool {

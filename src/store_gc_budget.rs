@@ -553,7 +553,7 @@ mod tests {
 
         // `LANCE_EVICTABLE_TABLES` is intentionally feature-independent: a
         // thinner binary may need to evict tables written by a richer binary.
-        let expected = vec![
+        let mut expected = vec![
             DOCUMENTS_TABLE,
             DOC_LINKS_TABLE,
             "code_chunks",
