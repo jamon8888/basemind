@@ -8,7 +8,6 @@
 //! caller can store the map and send redacted text onward.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;

@@ -39,7 +39,7 @@ pub(super) fn prepare_extraction_input(
         .map_err(|error| ExtractError::Document(format!("identify image {}: {error}", path.display())))?
         .into_decoder()
         .map_err(|error| ExtractError::Document(format!("read image metadata {}: {error}", path.display())))?;
-    if !decoder.color_type().has_alpha {
+    if !decoder.color_type().has_alpha() {
         return Ok(uri_input(path, mime_type));
     }
     let (width, height) = decoder.dimensions();
