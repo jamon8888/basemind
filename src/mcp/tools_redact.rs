@@ -434,7 +434,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = ner_profile.name == "legal-fr@1";
+    let legal_fr_filters = ner_profile.name == LEGAL_FR_PROFILE;
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
@@ -726,18 +726,26 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         "phone",
         "telephone",
         "téléphone",
-        "tel",
-        "tél",
         "mobile",
-        "cell",
         "contact",
         "call",
         "whatsapp",
         "fax",
     ];
-    context
+    let has_explicit_phone_word = context
         .split(|character: char| !character.is_alphanumeric())
-        .any(|word| PHONE_CUES.contains(&word))
+        .any(|word| PHONE_CUES.contains(&word));
+    if has_explicit_phone_word {
+        return true;
+    }
+    text.get(..start)
+        .and_then(|prefix| {
+            prefix
+                .split(|character: char| !character.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .next_back()
+        })
+        .is_some_and(|word| matches!(word, "tel" | "tél" | "cell"))
 }
 
 fn is_legal_reference_shape(value: &str) -> bool {
@@ -939,6 +947,8 @@ struct NerProfile {
     name: String,
     labels: Vec<String>,
 }
+
+const LEGAL_FR_PROFILE: &str = "legal-fr@1";
 
 const LEGAL_FR_LABELS: &[&str] = &[
     "full_name",
@@ -1183,12 +1193,12 @@ mod false_positive_filter_tests {
     fn ambiguous_eight_digit_phone_is_not_treated_as_a_reference() {
         let ambiguous = "Dossier 61234567";
         let ambiguous_start = ambiguous.find("61234567").unwrap();
-        for (profile, legal_fr_filters) in [("full@1", false), ("legal-fr@1", true)] {
+        for (profile, legal_fr_filters) in [("full@1", false), (LEGAL_FR_PROFILE, true)] {
             assert!(
                 !(legal_fr_filters
                     && is_legal_reference_finding(ambiguous, ambiguous_start, ambiguous_start + 8, "61234567"))
             );
-            assert_eq!(profile == "legal-fr@1", legal_fr_filters);
+            assert_eq!(profile == LEGAL_FR_PROFILE, legal_fr_filters);
         }
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
@@ -1231,6 +1241,21 @@ mod false_positive_filter_tests {
             substring_context,
             substring_start,
             substring_start + 8
+        ));
+
+        let adjacent_abbreviation = "Date 20260219, tel: 61234567";
+        let adjacent_start = adjacent_abbreviation.find("61234567").unwrap();
+        assert!(has_phone_context(
+            adjacent_abbreviation,
+            adjacent_start,
+            adjacent_start + 8
+        ));
+        let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
+        let unrelated_start = unrelated_short_word.find("61234567").unwrap();
+        assert!(!has_phone_context(
+            unrelated_short_word,
+            unrelated_start,
+            unrelated_start + 8
         ));
     }
 }
