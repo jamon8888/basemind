@@ -35,7 +35,7 @@ pub(crate) mod citations;
 pub(crate) mod facets;
 mod input;
 mod metadata;
-mod ocr_fallback;
+pub(crate) mod ocr_fallback;
 #[cfg(test)]
 pub(crate) use chunking::dense_retrieval_text;
 #[cfg(feature = "crawl")]

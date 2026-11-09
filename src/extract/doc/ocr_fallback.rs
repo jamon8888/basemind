@@ -6,9 +6,9 @@ use xberg::core::config::ExtractionConfig;
 /// Build the OCR retry configuration used when xberg reports that its dictionary filter removed
 /// lines without finding a valid dictionary word. Normal documents keep xberg's markdown/table
 /// path; only the affected document retries through plain text.
-pub(super) fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<ExtractionConfig> {
+pub(crate) fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<ExtractionConfig> {
     let mut fallback = config.clone();
-    let ocr = fallback.ocr.as_mut()?;
+    let ocr = fallback.ocr.get_or_insert_with(Default::default);
     let tesseract = ocr
         .tesseract_config
         .get_or_insert_with(xberg::types::TesseractConfig::default);
@@ -30,10 +30,16 @@ fn has_no_dictionary_signal(result: &xberg::types::ExtractedDocument) -> bool {
 
 /// Return warnings proving xberg's lossy dictionary filter ran. They are copied onto a
 /// successful plain-text retry so Basemind's telemetry retains the original loss signal.
-pub(super) fn dictionary_filter_warnings(
+pub(crate) fn dictionary_filter_warnings(
     outcome: &xberg::Result<xberg::ExtractionResult>,
 ) -> Option<Vec<xberg::types::ProcessingWarning>> {
     let extraction = outcome.as_ref().ok()?;
+    dictionary_filter_warnings_from_extraction(extraction)
+}
+
+pub(crate) fn dictionary_filter_warnings_from_extraction(
+    extraction: &xberg::ExtractionResult,
+) -> Option<Vec<xberg::types::ProcessingWarning>> {
     let result = extraction.results.last()?;
     if !has_no_dictionary_signal(result) {
         return None;
@@ -47,7 +53,7 @@ pub(super) fn dictionary_filter_warnings(
     (!warnings.is_empty()).then_some(warnings)
 }
 
-pub(super) fn preserve_dictionary_filter_warnings(
+pub(crate) fn preserve_dictionary_filter_warnings(
     extraction: &mut xberg::ExtractionResult,
     warnings: Vec<xberg::types::ProcessingWarning>,
 ) {

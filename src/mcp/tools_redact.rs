@@ -22,6 +22,9 @@ use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument, extract};
 
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
+use crate::extract::doc::ocr_fallback::{
+    dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
+};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -246,9 +249,32 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
 
     let mut doc = match source {
         Source::File(input) => {
-            let mut extraction = extract(*input, &extraction_config)
+            let input = *input;
+            let mut extraction = extract(input.clone(), &extraction_config)
                 .await
                 .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
+            if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
+                && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
+            {
+                extraction = match extract(input, &fallback_config).await {
+                    Ok(fallback) if fallback.results.is_empty() => {
+                        return Err(McpError::internal_error(
+                            "xberg plain-text OCR retry returned no document after dictionary filtering",
+                            None,
+                        ));
+                    }
+                    Ok(mut fallback) => {
+                        preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
+                        fallback
+                    }
+                    Err(error) => {
+                        return Err(McpError::internal_error(
+                            format!("xberg plain-text OCR retry failed after dictionary filtering: {error}"),
+                            None,
+                        ));
+                    }
+                };
+            }
             extraction
                 .results
                 .pop()

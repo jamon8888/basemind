@@ -19,6 +19,25 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
     if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
         return Ok(uri_input(path, mime_type));
     }
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|error| ExtractError::Document(format!("identify image {}: {error}", path.display())))?
+        .into_dimensions()
+        .map_err(|error| ExtractError::Document(format!("read image dimensions {}: {error}", path.display())))?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| ExtractError::Document(format!("image {} dimensions overflow", path.display())))?;
+    let rgba_bytes = pixels
+        .checked_mul(4)
+        .ok_or_else(|| ExtractError::Document(format!("image {} allocation size overflow", path.display())))?;
+    let max_content_size =
+        u64::try_from(xberg::extractors::security::SecurityLimits::default().max_content_size).unwrap_or(u64::MAX);
+    if rgba_bytes > max_content_size {
+        return Err(ExtractError::Document(format!(
+            "image {} is too large to normalize safely ({rgba_bytes} decoded bytes; max {max_content_size})",
+            path.display()
+        )));
+    }
     let rgba = image::load_from_memory(&bytes)
         .map_err(|error| ExtractError::Document(format!("decode image {}: {error}", path.display())))?
         .to_rgba8();

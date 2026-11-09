@@ -271,3 +271,17 @@ fn transparent_png_is_composited_over_white_before_ocr() {
         .to_rgb8();
     assert_eq!(decoded.get_pixel(0, 0).0, [255, 255, 255]);
 }
+
+#[test]
+fn oversized_png_is_rejected_before_rgba_allocation() {
+    let file = tempfile::NamedTempFile::with_suffix(".png").expect("temp PNG");
+    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    png.extend_from_slice(&200_000u32.to_be_bytes());
+    png.extend_from_slice(&200_000u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0]);
+    std::fs::write(file.path(), png).expect("write oversized PNG header");
+
+    let error =
+        super::prepare_extraction_input(file.path(), Some("image/png")).expect_err("oversized image must be rejected");
+    assert!(error.to_string().contains("too large to normalize safely"));
+}
