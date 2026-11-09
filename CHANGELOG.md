@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   breadcrumbs (including their citation numbers) for lexical and dense retrieval.
 - Intel macOS builds now have an explicit `intel-macos` profile and a native Intel CI leg,
   so they use the dynamic x86_64 ONNX Runtime path instead of the unavailable static artifact.
+- File-redaction timeout diagnostics now report cumulative shared-budget usage and the current
+  extraction attempt duration.
 
 ## [0.36.0] - 2026-10-31
 

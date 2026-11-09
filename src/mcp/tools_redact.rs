@@ -245,15 +245,17 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
-            let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
-            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, deadline)
-                .await
-                .map_err(|error| McpError::internal_error(error, None))?;
+            let shared_started = Instant::now();
+            let deadline = shared_started + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction =
+                extract_file_with_deadline(input.clone(), &extraction_config, shared_started, deadline)
+                    .await
+                    .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
                 let original = std::mem::take(&mut extraction);
-                extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
+                extraction = match extract_file_with_deadline(input, &fallback_config, shared_started, deadline).await {
                     Ok(fallback)
                         if fallback.results.is_empty()
                             || fallback

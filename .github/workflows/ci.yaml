@@ -222,7 +222,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -248,7 +248,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Issue #62 was reported from a daemon under a systemd `MemoryMax`, and the whole class was
       # invisible to the matrix above because no leg there ever runs under a memory cgroup. A scope
@@ -311,7 +311,7 @@ jobs:
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: run harden.sh
         run: ./scripts/harden.sh
