@@ -717,6 +717,12 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
         "matter",
         "n°",
         "no.",
+        "annonce",
+        "bodacc",
+        "facture",
+        "devis",
+        "publié",
+        "période",
     ];
     if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
         return true;
