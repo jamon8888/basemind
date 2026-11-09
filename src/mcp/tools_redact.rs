@@ -1208,7 +1208,10 @@ async fn run_ner_windowed(model_dir: Option<&str>, _text: &str, _profile: &NerPr
 
 #[cfg(test)]
 mod false_positive_filter_tests {
-    use super::{has_explicit_date_cue, has_phone_context, is_false_positive_pattern, is_legal_reference_finding};
+    use super::{
+        has_explicit_date_cue, has_phone_context, is_false_positive_pattern, is_legal_reference_finding,
+        rebuild_redacted_text,
+    };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
     #[test]
