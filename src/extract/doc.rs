@@ -43,7 +43,10 @@ pub(crate) use chunking::heading_path_of;
 use chunking::prepare_doc_chunk;
 pub(crate) use metadata::hash_redaction_config;
 use metadata::{entity_category_str, keyword_algorithm_str, map_language_confidences, metadata_pairs};
-use ocr_fallback::{dictionary_filter_warnings, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings};
+use ocr_fallback::{
+    dictionary_filter_warnings, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
+    preserve_original_ocr_text,
+};
 
 /// Per-file document extraction result. Mirrors the shape of `FileMapL1` —
 /// `schema_ver` for migration, plus the structured xberg output we care
@@ -688,6 +691,7 @@ pub(crate) fn extract_doc_with_metrics(
     if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
         && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
     {
+        let original = outcome.as_ref().ok().cloned();
         let remaining = extraction_budget.saturating_sub(extraction_started.elapsed());
         if remaining.is_zero() {
             tracing::warn!(
@@ -713,6 +717,9 @@ pub(crate) fn extract_doc_with_metrics(
                     "plain-text OCR retry returned no extracted document; retaining the original OCR result"
                 ),
                 Ok(Ok(mut fallback)) => {
+                    if let Some(original) = &original {
+                        preserve_original_ocr_text(original, &mut fallback);
+                    }
                     preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                     outcome = Ok(fallback);
                 }

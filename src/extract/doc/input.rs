@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use super::ExtractError;
+use image::ImageDecoder;
 use xberg::ExtractInput;
 
 /// Compose supported raster images over white before OCR so transparent pixels stay visible.
@@ -19,11 +20,15 @@ pub(super) fn prepare_extraction_input(path: &Path, mime_type: Option<&str>) -> 
     if mime_type == Some("image/png") && !png_may_have_alpha(&bytes) {
         return Ok(uri_input(path, mime_type));
     }
-    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+    let decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()
         .map_err(|error| ExtractError::Document(format!("identify image {}: {error}", path.display())))?
-        .into_dimensions()
-        .map_err(|error| ExtractError::Document(format!("read image dimensions {}: {error}", path.display())))?;
+        .into_decoder()
+        .map_err(|error| ExtractError::Document(format!("read image metadata {}: {error}", path.display())))?;
+    if !decoder.color_type().has_alpha() {
+        return Ok(uri_input(path, mime_type));
+    }
+    let (width, height) = decoder.dimensions();
     let pixels = u64::from(width)
         .checked_mul(u64::from(height))
         .ok_or_else(|| ExtractError::Document(format!("image {} dimensions overflow", path.display())))?;

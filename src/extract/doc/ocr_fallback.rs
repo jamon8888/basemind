@@ -61,3 +61,29 @@ pub(crate) fn preserve_dictionary_filter_warnings(
         result.processing_warnings.extend(warnings);
     }
 }
+
+/// Keep text that the structured OCR pass recovered when the plain-text retry omits it (for
+/// example, numeric cells that were present only in the table-aware output).
+pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fallback: &mut xberg::ExtractionResult) {
+    let (Some(original), Some(fallback)) = (original.results.last(), fallback.results.last_mut()) else {
+        return;
+    };
+    let mut missing = Vec::new();
+    for line in original
+        .content
+        .lines()
+        .chain(original.tables.iter().flat_map(|table| table.markdown.lines()))
+    {
+        let line = line.trim();
+        if !line.is_empty() && !fallback.content.contains(line) && !missing.contains(&line) {
+            missing.push(line);
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    if !fallback.content.is_empty() {
+        fallback.content.push_str("\n\n");
+    }
+    fallback.content.push_str(&missing.join("\n"));
+}

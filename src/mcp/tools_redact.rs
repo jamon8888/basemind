@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -24,7 +25,26 @@ use xberg::{ExtractInput, ExtractedDocument, extract};
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 use crate::extract::doc::ocr_fallback::{
     dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
+    preserve_original_ocr_text,
 };
+
+const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn extract_file_with_deadline(
+    input: ExtractInput,
+    config: &xberg::core::config::ExtractionConfig,
+    deadline: Instant,
+) -> Result<xberg::ExtractionResult, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("xberg file extraction exceeded its 120 second deadline".to_string());
+    }
+    match tokio::time::timeout(remaining, extract(input, config)).await {
+        Ok(Ok(extraction)) => Ok(extraction),
+        Ok(Err(error)) => Err(format!("xberg extract failed: {error}")),
+        Err(_) => Err("xberg file extraction exceeded its 120 second deadline".to_string()),
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -250,26 +270,33 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
-            let mut extraction = extract(input.clone(), &extraction_config)
+            let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, deadline)
                 .await
-                .map_err(|e| McpError::internal_error(format!("xberg extract failed: {e}"), None))?;
+                .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
-                extraction = match extract(input, &fallback_config).await {
+                let original = extraction.clone();
+                extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
                     Ok(fallback) if fallback.results.is_empty() => {
+                        tracing::warn!(
+                            "plain-text OCR retry returned no document; refusing to redact incomplete file content"
+                        );
                         return Err(McpError::internal_error(
                             "xberg plain-text OCR retry returned no document after dictionary filtering",
                             None,
                         ));
                     }
                     Ok(mut fallback) => {
+                        preserve_original_ocr_text(&original, &mut fallback);
                         preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                         fallback
                     }
                     Err(error) => {
+                        tracing::warn!(%error, "plain-text OCR retry failed; refusing to redact incomplete file content");
                         return Err(McpError::internal_error(
-                            format!("xberg plain-text OCR retry failed after dictionary filtering: {error}"),
+                            format!("{error} after dictionary filtering; refusing to redact incomplete file content"),
                             None,
                         ));
                     }

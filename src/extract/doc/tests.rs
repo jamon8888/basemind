@@ -75,6 +75,20 @@ fn dictionary_filter_retry_requires_a_page_with_no_valid_dictionary_words() {
 }
 
 #[test]
+fn plain_text_retry_preserves_lines_recovered_by_structured_ocr() {
+    let mut original = xberg::types::ExtractedDocument::default();
+    original.content = "Name\nInvoice total: 42".into();
+    let mut fallback = xberg::types::ExtractedDocument::default();
+    fallback.content = "Name".into();
+
+    let original = xberg::ExtractionResult::single(original);
+    let mut fallback = xberg::ExtractionResult::single(fallback);
+    super::preserve_original_ocr_text(&original, &mut fallback);
+
+    assert!(fallback.results[0].content.contains("Invoice total: 42"));
+}
+
+#[test]
 fn to_xberg_code_only_strips_enrichment_disables_ocr_keeps_embeddings() {
     let cfg = doc_config_all_enrichment_on(DocumentModelProfile::CodeOnly);
     let x = cfg.to_xberg(None);
@@ -279,6 +293,13 @@ fn oversized_png_is_rejected_before_rgba_allocation() {
     png.extend_from_slice(&200_000u32.to_be_bytes());
     png.extend_from_slice(&200_000u32.to_be_bytes());
     png.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png.extend_from_slice(&0xf93b880au32.to_be_bytes());
+    png.extend_from_slice(&0u32.to_be_bytes());
+    png.extend_from_slice(b"IDAT");
+    png.extend_from_slice(&0x35af061eu32.to_be_bytes());
+    png.extend_from_slice(&0u32.to_be_bytes());
+    png.extend_from_slice(b"IEND");
+    png.extend_from_slice(&0xae426082u32.to_be_bytes());
     std::fs::write(file.path(), png).expect("write oversized PNG header");
 
     let error =
