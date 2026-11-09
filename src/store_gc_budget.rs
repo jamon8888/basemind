@@ -57,13 +57,7 @@ const LANCE_WORKSPACE_DIR: &str = "lance";
 /// evicted either, so the workspace never returns under budget and the leak has no symptom until
 /// someone goes looking for it. `lance_evictable_tables_match_the_schema_constants` closes that gap:
 /// it fails the build if this list and the real table names diverge.
-const LANCE_EVICTABLE_TABLES: &[&str] = &[
-    "documents",
-    "doc_links",
-    "code_chunks",
-    "graph_entities",
-    "graph_edges",
-];
+const LANCE_EVICTABLE_TABLES: &[&str] = &["documents", "doc_links", "code_chunks", "graph_entities", "graph_edges"];
 
 /// Filename of the persisted last-GC state, in the machine-global cache root (next to `blobs/`
 /// and `workspaces/`).
