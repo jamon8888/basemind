@@ -700,7 +700,7 @@ pub(crate) fn extract_doc_with_metrics(
         } else {
             let original = match outcome {
                 Ok(original) => original,
-                Err(error) => return Err(error),
+                Err(error) => return Err(ExtractError::Document(error.to_string())),
             };
             tracing::warn!(
                 path = %path.display(),
