@@ -161,7 +161,7 @@ fn normalize_geography_value(value: &str) -> String {
         .iter()
         .take_while(|word| {
             matches!(
-                *word,
+                **word,
                 "a" | "à" | "au" | "aux" | "dans" | "de" | "des" | "du" | "en" | "l" | "la" | "le" | "les"
             )
         })
