@@ -332,7 +332,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .iter()
         .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
         .collect();
-    let legal_fr_v2 = ner_profile.name == "legal-fr@2";
+    let legal_fr_policy = LegalFrPolicy::for_profile(&ner_profile);
     let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
         .iter()
         .map(|term| (term.label.clone(), term.value.clone()))
@@ -344,7 +344,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
             continue;
         }
-        if legal_fr_v2
+        if legal_fr_policy.v2
             && should_skip_legal_fr_v2_ner_span(&original, entity.start as usize, entity.end as usize, &label)
         {
             continue;
@@ -410,8 +410,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = matches!(ner_profile.name.as_str(), "legal-fr@1" | "legal-fr@2");
-    findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters, legal_fr_v2));
+    findings
+        .retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_policy.filters, legal_fr_policy.v2));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
         rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
@@ -766,6 +766,21 @@ const MIN_NER_SPAN_CHARS: usize = 3;
 struct NerProfile {
     name: String,
     labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegalFrPolicy {
+    filters: bool,
+    v2: bool,
+}
+
+impl LegalFrPolicy {
+    fn for_profile(profile: &NerProfile) -> Self {
+        Self {
+            filters: profile.name.starts_with("legal-fr@"),
+            v2: profile.name == "legal-fr@2",
+        }
+    }
 }
 
 const LEGAL_FR_LABELS: &[&str] = &[

@@ -51,7 +51,7 @@ fn is_legal_reference_shape(value: &str) -> bool {
         year.len() == 4
             && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
             && year.chars().all(|c| c.is_ascii_digit())
-            && (3..=4).contains(&suffix.len())
+            && suffix.len() == 3
             && suffix.chars().all(|c| c.is_ascii_digit())
     });
     is_legacy_legal_reference_shape(value) || compact_date || year_reference
@@ -155,13 +155,13 @@ fn normalize_geography_value(value: &str) -> String {
     let words: Vec<&str> = cleaned.split_whitespace().collect();
     let first = words
         .iter()
-        .position(|word| {
+        .take_while(|word| {
             matches!(
                 *word,
                 "a" | "à" | "au" | "aux" | "dans" | "de" | "des" | "du" | "en" | "l" | "la" | "le" | "les"
             )
         })
-        .unwrap_or(words.len());
+        .count();
     words[first..].join(" ")
 }
 
