@@ -57,15 +57,15 @@ pub struct RedactTextParams {
     pub pseudonyms: Vec<Vec<String>>,
     /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
     /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
-    /// every entry in `GLI_NER2_PII_LABELS` plus `AI_ACT_NER_LABELS` for
-    /// redaction; a missing or unloadable model degrades to pattern-only
-    /// redaction instead of failing.
+    /// every entry in the resolved profile for redaction; a missing or
+    /// unloadable model degrades to pattern-only redaction instead of failing.
     #[serde(default)]
     pub ner_model_dir: Option<String>,
     /// Named, versioned NER label profile. `full@1` preserves the historical
-    /// label set; `legal-fr@1` sends only the labels needed by the French legal
-    /// gateway. The resolved profile and ordered labels are returned in the
-    /// response so callers can reproduce coverage and latency measurements.
+    /// label set; `legal-fr@1` is the original French legal profile and
+    /// `legal-fr@2` adds named private places plus document dates. The resolved
+    /// profile and ordered labels are returned so callers can reproduce
+    /// coverage and latency measurements.
     #[serde(default)]
     pub ner_profile: Option<String>,
     /// Fail with an error when NER did not run (no `ner_model_dir`, model
@@ -327,6 +327,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .iter()
         .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
         .collect();
+    let legal_fr_v2 = ner_profile.name == "legal-fr@2";
     let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
         .iter()
         .map(|term| (term.label.clone(), term.value.clone()))
@@ -336,6 +337,11 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             continue;
         };
         if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
+            continue;
+        }
+        if legal_fr_v2
+            && should_skip_legal_fr_v2_ner_span(&original, entity.start as usize, entity.end as usize, &label)
+        {
             continue;
         }
         if label == "tax_id" && !crate::pii::is_fr_tax_id(&entity.text) {
@@ -399,7 +405,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = ner_profile.name == "legal-fr@1";
+    let legal_fr_filters = matches!(ner_profile.name.as_str(), "legal-fr@1" | "legal-fr@2");
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
@@ -624,11 +630,8 @@ fn is_false_positive_pattern(
     match &finding.category {
         xberg::types::redaction::PiiCategory::Phone => {
             // French phones have ten national digits; an eight-digit run is a
-            // reference/year pair in this gateway's legal corpus, not a phone.
-            legal_fr_filters
-                && value.chars().filter(|c| c.is_ascii_digit()).count() == 8
-                && value.chars().all(|c| c.is_ascii_digit() || c == '-')
-                && has_reference_or_date_cue(original, start, end)
+            // reference/date pair in this gateway's legal corpus, not a phone.
+            legal_fr_filters && is_legal_reference_shape(value) && has_reference_or_date_cue(original, start, end)
         }
         xberg::types::redaction::PiiCategory::SwiftBic => {
             // All-letter BIC-shaped words need a nearby banking cue. This
@@ -637,6 +640,95 @@ fn is_false_positive_pattern(
         }
         _ => false,
     }
+}
+
+fn is_legal_reference_shape(value: &str) -> bool {
+    let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
+    let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
+        year.len() == 4
+            && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
+            && year.chars().all(|c| c.is_ascii_digit())
+            && (3..=4).contains(&suffix.len())
+            && suffix.chars().all(|c| c.is_ascii_digit())
+    });
+    compact_date || year_reference
+}
+
+/// Decide whether a `legal-fr@2` model span is a known false positive. The
+/// profile is deliberately conservative: broad geographic scope remains
+/// readable, while named private places are sent through the model as the
+/// narrower `named_place` label.
+fn should_skip_legal_fr_v2_ner_span(text: &str, start: usize, end: usize, label: &str) -> bool {
+    let Some(value) = text.get(start..end) else {
+        return false;
+    };
+    let normalized = normalize_ner_value(value);
+    match label {
+        "named_place" => is_broad_geography(&normalized),
+        "organization" => GENERIC_LEGAL_ORGANIZATIONS.contains(&normalized.as_str()),
+        "iban" => !crate::pii::validate_iban(value),
+        "date_of_birth" => !has_birth_context(text, start, end),
+        _ => false,
+    }
+}
+
+/// Test-facing shorthand for a span whose value is the complete input.
+#[cfg(test)]
+fn should_skip_legal_fr_v2_ner_value(value: &str, label: &str) -> bool {
+    should_skip_legal_fr_v2_ner_span(value, 0, value.len(), label)
+}
+
+const GENERIC_LEGAL_ORGANIZATIONS: &[&str] = &["sécurité sociale", "ma société", "siège social", "employeur"];
+
+/// Geography that describes a broad legal scope, not a private named place.
+/// Keep this list explicit: treating every one-word model span as a country or
+/// region would let a private site name pass through the gateway.
+fn is_broad_geography(value: &str) -> bool {
+    const BROAD_GEOGRAPHY: &[&str] = &[
+        "europe",
+        "union européenne",
+        "france métropolitaine",
+        "grand sud-ouest",
+        "sud-ouest",
+        "france",
+        "allemagne",
+        "angleterre",
+        "belgique",
+        "espagne",
+        "italie",
+        "pays-bas",
+        "portugal",
+        "suisse",
+        "royaume-uni",
+        "afrique",
+        "asie",
+        "amérique",
+        "océanie",
+    ];
+    BROAD_GEOGRAPHY.contains(&value)
+}
+
+fn normalize_ner_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn has_birth_context(text: &str, start: usize, end: usize) -> bool {
+    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
+        return false;
+    };
+    [
+        "date de naissance",
+        "lieu de naissance",
+        "né le",
+        "née le",
+        "né(e)",
+        "naissance",
+        "birth",
+        "born",
+    ]
+    .iter()
+    .any(|cue| context.contains(cue))
 }
 
 /// Expand a byte window to valid UTF-8 boundaries before it is sliced.
@@ -667,6 +759,12 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
         "matter",
         "n°",
         "no.",
+        "annonce",
+        "bodacc",
+        "facture",
+        "devis",
+        "publié",
+        "période",
     ];
     if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
         return true;
@@ -860,8 +958,19 @@ fn resolve_ner_profile(requested: Option<&str>) -> Result<NerProfile, String> {
             labels
         }
         "legal-fr@1" => LEGAL_FR_LABELS.iter().map(|label| (*label).to_string()).collect(),
+        "legal-fr@2" => {
+            let mut labels: Vec<String> = LEGAL_FR_LABELS.iter().map(|label| (*label).to_string()).collect();
+            labels.extend(
+                ["named_place", "document_date"]
+                    .iter()
+                    .map(|label| (*label).to_string()),
+            );
+            labels
+        }
         other => {
-            return Err(format!("unknown NER profile {other}; expected full@1 or legal-fr@1"));
+            return Err(format!(
+                "unknown NER profile {other}; expected full@1, legal-fr@1 or legal-fr@2"
+            ));
         }
     };
     Ok(NerProfile {

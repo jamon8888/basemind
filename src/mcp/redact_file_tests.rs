@@ -78,6 +78,103 @@ async fn ner_profile_metadata_reports_effective_labels_without_model() {
     );
 }
 
+#[tokio::test]
+async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@2".to_string()),
+        ..text_params("Résidence Les Hortensias, le 3 septembre 2026")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], "legal-fr@2");
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth",
+            "named_place",
+            "document_date"
+        ])
+    );
+}
+
+#[test]
+fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "sécurité sociale",
+        "organization"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "depuis le 1er janvier deux mil vingt-quatre",
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "Union européenne",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "grand Sud-Ouest",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "France métropolitaine",
+        "named_place"
+    ));
+
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "DISTRIBUTION LORMARIN SAS",
+        "organization"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1420041010050500013M02606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "date de naissance : 3 septembre 1980",
+        "date_of_birth"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "Résidence Les Hortensias",
+        "named_place"
+    ));
+}
+
+#[tokio::test]
+async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
+    let text = "annonce 20260219-AAA-0042. Référence devis : 2026-221.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        redacted.contains("20260219-AAA-0042"),
+        "reference must stay: {redacted}"
+    );
+    assert!(redacted.contains("2026-221"), "reference must stay: {redacted}");
+}
+
 /// A `ner_model_dir` pointing at nothing must never fail the call:
 /// NER degrades to pattern-only redaction and the response stays intact.
 #[tokio::test]
