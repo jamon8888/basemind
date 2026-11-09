@@ -326,6 +326,15 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 wiremock = "0.6"
 
+# Keep local debug and test artifacts small enough to link quickly. CI already uses this setting
+# through CARGO_PROFILE_{DEV,TEST}_DEBUG; making it the manifest default keeps local checks on the
+# same fast path without dropping panic locations or changing optimized release builds.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
 # ~keep `version::build_id` streams the whole executable (~1.3 GB in a debug build) through blake3;
 # ~keep unoptimized that takes 10+ s and tripped the comms request timeouts in debug test runs.
 [profile.dev.package.blake3]
