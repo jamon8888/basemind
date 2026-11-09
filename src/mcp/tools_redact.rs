@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
@@ -19,36 +19,14 @@ use serde::{Deserialize, Serialize};
 
 use super::BasemindServer;
 use super::helpers::record_call;
+use super::tools_redact_timeout::{FILE_EXTRACTION_TIMEOUT, extract_file_with_deadline};
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 use crate::extract::doc::ocr_fallback::{
     dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
     preserve_original_ocr_text,
 };
 use xberg::text::redaction;
-use xberg::{ExtractInput, ExtractedDocument, extract};
-
-const FILE_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
-async fn extract_file_with_deadline(
-    input: ExtractInput,
-    config: &xberg::core::config::ExtractionConfig,
-    deadline: Instant,
-) -> Result<xberg::ExtractionResult, String> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err("xberg file extraction shared deadline exhausted before extraction".to_string());
-    }
-    match tokio::time::timeout(remaining, extract(input, config)).await {
-        Ok(Ok(extraction)) => Ok(extraction),
-        Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
-        Err(_) => {
-            let elapsed = FILE_EXTRACTION_TIMEOUT.saturating_sub(deadline.saturating_duration_since(Instant::now()));
-            Err(format!(
-                "xberg file extraction timed out after {:?} of {:?} shared budget",
-                elapsed, FILE_EXTRACTION_TIMEOUT
-            ))
-        }
-    }
-}
+use xberg::{ExtractInput, ExtractedDocument};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
