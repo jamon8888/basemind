@@ -665,12 +665,10 @@ fn dictionary_filter_warnings(
 }
 
 fn preserve_dictionary_filter_warnings(
-    extraction: &mut xberg::Result<xberg::ExtractionResult>,
+    extraction: &mut xberg::ExtractionResult,
     warnings: Vec<xberg::types::ProcessingWarning>,
 ) {
-    if let Ok(extraction) = extraction
-        && let Some(result) = extraction.results.last_mut()
-    {
+    if let Some(result) = extraction.results.last_mut() {
         result.processing_warnings.extend(warnings);
     }
 }
