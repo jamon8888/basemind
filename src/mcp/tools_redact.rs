@@ -36,9 +36,6 @@ async fn extract_file_with_deadline(
     deadline: Instant,
 ) -> Result<xberg::ExtractionResult, String> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err("xberg file extraction exceeded its 120 second deadline".to_string());
-    }
     match tokio::time::timeout(remaining, extract(input, config)).await {
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(error)) => Err(format!("xberg extract failed: {error}")),
