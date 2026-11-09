@@ -46,7 +46,11 @@ fn is_legacy_legal_reference_shape(value: &str) -> bool {
 
 /// Legal-fr@2 also recognizes year references such as `2026-221`.
 fn is_legal_reference_shape(value: &str) -> bool {
-    let compact_date = value.chars().count() == 8 && value.chars().all(|c| c.is_ascii_digit());
+    let compact_date = value.chars().count() == 8
+        && value.chars().all(|c| c.is_ascii_digit())
+        && value
+            .get(..4)
+            .is_some_and(|year| matches!(year.as_bytes().first(), Some(b'1' | b'2')));
     let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
         year.len() == 4
             && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
@@ -224,7 +228,8 @@ fn is_act_date_context(text: &str, start: usize, end: usize) -> bool {
 /// bounded context window. This prevents one date from borrowing another
 /// date's birth/act label in the same paragraph.
 fn has_cue_near_span(text: &str, start: usize, end: usize, cue: &str) -> bool {
-    const MAX_CUE_DISTANCE: usize = 16;
+    // This is a byte bound, so leave room for multi-byte French characters.
+    const MAX_CUE_DISTANCE: usize = 32;
     let (context_start, _) = aligned_context_bounds(text, start, end);
     let context = context_lowercase(text, start, end);
     context.match_indices(cue).any(|(relative_start, _)| {

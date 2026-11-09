@@ -777,7 +777,7 @@ struct LegalFrPolicy {
 impl LegalFrPolicy {
     fn for_profile(profile: &NerProfile) -> Self {
         Self {
-            filters: profile.name.starts_with("legal-fr@"),
+            filters: matches!(profile.name.as_str(), "legal-fr@1" | "legal-fr@2"),
             v2: profile.name == "legal-fr@2",
         }
     }
