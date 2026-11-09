@@ -9,6 +9,7 @@ pub(super) async fn extract_file_with_deadline(
     config: &xberg::core::config::ExtractionConfig,
     deadline: Instant,
 ) -> Result<xberg::ExtractionResult, String> {
+    let started = Instant::now();
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err("xberg file extraction shared deadline exhausted before extraction".to_string());
@@ -16,12 +17,10 @@ pub(super) async fn extract_file_with_deadline(
     match tokio::time::timeout(remaining, xberg::extract(input, config)).await {
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
-        Err(_) => {
-            let elapsed = FILE_EXTRACTION_TIMEOUT.saturating_sub(deadline.saturating_duration_since(Instant::now()));
-            Err(format!(
-                "xberg file extraction timed out after {:?} of {:?} shared budget",
-                elapsed, FILE_EXTRACTION_TIMEOUT
-            ))
-        }
+        Err(_) => Err(format!(
+            "xberg file extraction timed out after {:?} of {:?} shared budget",
+            started.elapsed(),
+            FILE_EXTRACTION_TIMEOUT
+        )),
     }
 }

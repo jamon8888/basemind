@@ -167,7 +167,7 @@ jobs:
       # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
       # ~keep that the step is present.
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.os }}-${{ matrix.features }}
           # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME.
