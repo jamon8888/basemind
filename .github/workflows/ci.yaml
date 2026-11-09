@@ -171,7 +171,7 @@ jobs:
         with:
           # ~keep v2 invalidates the pre-existing target cache, whose ort-sys build-script output
           # points at a runtime archive that was never cached by the old, incorrect path below.
-          key: ort-cache-v2-${{ matrix.os }}-${{ matrix.features }}
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v2
           # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME at
           # ~/.cache/ort.pyke.io/dfbin/<target>/<hash>.
           # ~keep Caching target/ without this directory lets clippy pass (it does not link a final
