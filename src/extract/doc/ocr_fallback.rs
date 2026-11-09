@@ -110,7 +110,7 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
         let recovered = missing.join("\n");
         fallback.content.push_str(&recovered);
         let content_len = fallback.content.len();
-        if let Some(chunk) = fallback.chunks.as_mut().and_then(Vec::last_mut) {
+        if let Some(chunk) = fallback.chunks.as_mut().and_then(|chunks| chunks.last_mut()) {
             if !chunk.content.is_empty() {
                 chunk.content.push_str("\n\n");
             }
