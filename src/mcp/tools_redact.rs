@@ -41,8 +41,7 @@ async fn extract_file_with_deadline(
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
         Err(_) => {
-            let elapsed = FILE_EXTRACTION_TIMEOUT
-                .saturating_sub(deadline.saturating_duration_since(Instant::now()));
+            let elapsed = FILE_EXTRACTION_TIMEOUT.saturating_sub(deadline.saturating_duration_since(Instant::now()));
             Err(format!(
                 "xberg file extraction timed out after {:?} of {:?} shared budget",
                 elapsed, FILE_EXTRACTION_TIMEOUT

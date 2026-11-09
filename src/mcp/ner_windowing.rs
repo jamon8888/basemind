@@ -363,12 +363,8 @@ pub(crate) fn plan_windows(text: &str, budget: &NerBudget) -> Result<WindowPlan,
             // one-character windows would make a hopeless budget look valid
             // and would not match the backend's word-oriented input.
             if pieces[index].c1.saturating_sub(pieces[index].c0) > OVERLAP_CHARS
-                && let Some((first, rest)) = split_segment_to_budget(
-                    text,
-                    &pieces[index],
-                    &budget.tokenizer,
-                    budget.tokens_for_text,
-                )?
+                && let Some((first, rest)) =
+                    split_segment_to_budget(text, &pieces[index], &budget.tokenizer, budget.tokens_for_text)?
             {
                 pieces.splice(index..=index, [first, rest]);
                 continue;
