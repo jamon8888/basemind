@@ -742,8 +742,7 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         .and_then(|prefix| {
             prefix
                 .split(|character: char| !character.is_alphanumeric())
-                .filter(|word| !word.is_empty())
-                .next_back()
+                .rfind(|word| !word.is_empty())
         })
         .is_some_and(|word| matches!(word, "tel" | "tél" | "cell"))
 }
