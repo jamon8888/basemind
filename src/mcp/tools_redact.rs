@@ -40,8 +40,8 @@ async fn extract_file_with_deadline(
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(error)) => Err(format!("xberg extract failed: {error}")),
         Err(_) => Err(format!(
-            "xberg file extraction exceeded its {} second deadline",
-            FILE_EXTRACTION_TIMEOUT.as_secs()
+            "xberg file extraction exceeded its {:?} deadline",
+            FILE_EXTRACTION_TIMEOUT
         )),
     }
 }
@@ -213,7 +213,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             Source::Inline(args.text)
         }
     };
-
     let strategy = match args.strategy.as_deref() {
         None | Some("token-replace") => RedactionStrategy::TokenReplace,
         Some("mask") => RedactionStrategy::Mask,
@@ -226,7 +225,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             ));
         }
     };
-
     let custom_terms: Vec<RedactionCustomTerm> = args
         .custom_terms
         .into_iter()
@@ -242,7 +240,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             }
         })
         .collect();
-
     let mut custom_patterns: Vec<RedactionCustomPattern> = args
         .custom_patterns
         .into_iter()
@@ -277,8 +274,6 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
-                // Keep the original and fallback passes inside one request budget so a retry
-                // cannot double the CPU time charged to a redaction request.
                 let original = std::mem::take(&mut extraction);
                 extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
                     Ok(fallback) if fallback.results.is_empty() => {
