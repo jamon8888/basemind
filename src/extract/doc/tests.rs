@@ -34,7 +34,20 @@ fn to_xberg_full_profile_keeps_enrichment_and_ocr() {
     assert!(!x.disable_ocr, "Full leaves OCR enabled");
     assert_eq!(x.ocr.as_ref().unwrap().language, cfg.ocr_languages);
     assert!(x.ocr.as_ref().unwrap().tessdata_path.is_none());
+    assert!(
+        x.ocr.as_ref().unwrap().tesseract_config.is_none(),
+        "healthy OCR keeps xberg's normal markdown/table path"
+    );
     assert!(x.chunking.as_ref().and_then(|c| c.embedding.as_ref()).is_none());
+}
+
+#[test]
+fn dictionary_filter_retry_switches_only_the_affected_document_to_plain_ocr() {
+    let cfg = doc_config_all_enrichment_on(DocumentModelProfile::Full).to_xberg(None);
+    let fallback = super::plain_text_ocr_fallback_config(&cfg).expect("OCR must be configured");
+    let tesseract = fallback.ocr.unwrap().tesseract_config.unwrap();
+    assert_eq!(tesseract.output_format, "text");
+    assert!(!tesseract.enable_table_detection);
 }
 
 #[test]

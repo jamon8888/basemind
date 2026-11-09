@@ -564,8 +564,8 @@ fn extraction_runtime() -> Result<&'static tokio::runtime::Runtime, ExtractError
     .map_err(|message| ExtractError::Document(message.clone()))
 }
 
-/// One guarded xberg call. It runs on its own thread under the wall-clock budget, so the text/plain
-/// retry in [`extract_doc`] is bounded exactly like the first attempt.
+/// One guarded xberg call. It runs on its own thread under the wall-clock budget, so OCR retries
+/// are bounded exactly like the first attempt.
 fn run_guarded(
     path: &Path,
     mime_type: Option<&str>,
@@ -607,6 +607,45 @@ fn run_guarded(
         }
         DeadlineError::Failed(message) => ExtractError::Document(message),
     })?
+}
+
+/// Build the OCR retry configuration used when xberg reports that its dictionary filter removed
+/// lines. Normal documents keep xberg's markdown/table path; only the affected document retries
+/// through plain text, which bypasses the filter without imposing a global table regression.
+fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Option<ExtractionConfig> {
+    let mut fallback = config.clone();
+    let ocr = fallback.ocr.as_mut()?;
+    let tesseract = ocr
+        .tesseract_config
+        .get_or_insert_with(xberg::types::TesseractConfig::default);
+    tesseract.output_format = "text".to_string();
+    tesseract.enable_table_detection = false;
+    Some(fallback)
+}
+
+/// Return the warnings that prove xberg's lossy dictionary filter ran. They are copied onto a
+/// successful plain-text retry so Basemind's telemetry still records the original loss signal.
+fn dictionary_filter_warnings(
+    outcome: &Result<xberg::Result<xberg::ExtractionResult>, ExtractError>,
+) -> Option<Vec<xberg::types::ProcessingWarning>> {
+    let extraction = outcome.as_ref().ok()?;
+    let result = extraction.results.first()?;
+    let warnings = result
+        .processing_warnings
+        .iter()
+        .filter(|warning| ocr_signal::dictionary_filtered_line_count(std::slice::from_ref(*warning)).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    (!warnings.is_empty()).then_some(warnings)
+}
+
+fn preserve_dictionary_filter_warnings(
+    extraction: &mut xberg::Result<xberg::ExtractionResult>,
+    warnings: Vec<xberg::types::ProcessingWarning>,
+) {
+    if let Some(result) = extraction.results.first_mut() {
+        result.processing_warnings.extend(warnings);
+    }
 }
 
 /// xberg 1.3.x converts images with alpha directly to RGB, which turns transparent
@@ -745,6 +784,25 @@ pub(crate) fn extract_doc_with_metrics(
     }
     let extraction_started = std::time::Instant::now();
     let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
+    if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
+        && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            "xberg dictionary filtering removed OCR lines; retrying with plain-text OCR"
+        );
+        match run_guarded(path, mime_type, fallback_config, config) {
+            Ok(mut fallback) => {
+                preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
+                outcome = Ok(fallback);
+            }
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "plain-text OCR retry failed; retaining the original OCR result"
+            ),
+        }
+    }
     let mut text_fallback = false;
     if let Err(error) = &outcome
         && super::doc_fallback::should_retry_as_text(mime_type, error)

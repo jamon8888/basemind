@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OCR no longer loses real text when Tesseract's dictionary signal is unavailable: document OCR
+  retries with xberg's plain-text path only when the normal hOCR pass reports dictionary-filtered
+  lines, preserving structured table OCR for healthy documents.
 - The document benchmark verifier now validates every emitted skip/defer counter and runtime
   setting, plus non-negative timing, throughput, RSS, and first-result telemetry; incomplete or
   malformed reports can no longer pass release gates.
