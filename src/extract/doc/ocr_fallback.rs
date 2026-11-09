@@ -122,6 +122,11 @@ pub(crate) fn preserve_original_ocr_text(original: &xberg::ExtractionResult, fal
             }
             chunk.content.push_str(&recovered);
             chunk.metadata.byte_end = content_len;
+        } else {
+            tracing::warn!(
+                recovered_bytes = recovered.len(),
+                "plain-text OCR retry recovered text without chunk metadata; document content retains it"
+            );
         }
     }
 }
