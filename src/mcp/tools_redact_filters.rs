@@ -31,8 +31,11 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>,
         )
         .expect("the static French NIR regex must compile")
     });
-    let mut patterns: Vec<_> = regex
-        .find_iter(text)
+    let max_candidates_to_scan = MAX_VALID_FR_NIR_PATTERNS * 10;
+    let candidates: Vec<_> = regex.find_iter(text).take(max_candidates_to_scan + 1).collect();
+    let candidate_scan_truncated = candidates.len() > max_candidates_to_scan;
+    let mut patterns: Vec<_> = candidates
+        .into_iter()
         .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
         // Bound regex compilation and matching work for untrusted documents. Take one extra
         // candidate so truncation is observable instead of silently dropping PII.
@@ -43,7 +46,7 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>,
             case_sensitive: true,
         })
         .collect();
-    let truncated = patterns.len() > MAX_VALID_FR_NIR_PATTERNS;
+    let truncated = candidate_scan_truncated || patterns.len() > MAX_VALID_FR_NIR_PATTERNS;
     if truncated {
         tracing::warn!(
             max_patterns = MAX_VALID_FR_NIR_PATTERNS,

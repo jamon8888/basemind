@@ -442,8 +442,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
-        rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
     }
+    // Overlapping findings can be skipped while rebuilding the text. Do not return map entries
+    // for tokens that are absent from the actual redacted payload.
+    rehydration_map.retain(|token, _| redacted_text.contains(token));
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
     // phone number. The legal caller acts on the label, so it has to be `tax_id`.
