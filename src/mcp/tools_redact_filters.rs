@@ -74,7 +74,6 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         "case",
         "matter",
         "n°",
-        "no",
         "annonce",
         "bodacc",
         "facture",
@@ -82,18 +81,19 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         "publié",
         "période",
     ];
-    context
+    let has_reference_word = context
         .split(|character: char| !character.is_alphanumeric() && character != '°')
         .filter(|word| !word.is_empty())
-        .any(|word| REFERENCE_CUES.contains(&word))
+        .any(|word| REFERENCE_CUES.contains(&word));
+    let has_no_abbreviation = context.split_whitespace().any(|word| {
+        word.trim_matches(|character: char| !character.is_alphanumeric() && character != '.') == "no."
+    });
+    has_reference_word || has_no_abbreviation
 }
 
 /// Return whether nearby wording explicitly identifies a phone number.
 fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
     const PHONE_CUES: &[&str] = &[
         "phone",
         "telephone",
@@ -103,20 +103,21 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         "whatsapp",
         "fax",
     ];
-    let has_explicit_phone_word = context
-        .split(|character: char| !character.is_alphanumeric())
-        .any(|word| PHONE_CUES.contains(&word));
-    if has_explicit_phone_word {
-        return true;
-    }
-    let (context_start, _) = aligned_context_bounds(text, start, end);
-    text.get(context_start..start)
-        .and_then(|prefix| {
-            prefix
-                .split(|character: char| !character.is_alphanumeric())
-                .rfind(|word| !word.is_empty())
-        })
-        .is_some_and(|word| matches!(word.to_lowercase().as_str(), "tel" | "tél" | "cell"))
+    let is_phone_cue = |word: &str| {
+        let normalized = word.to_lowercase();
+        PHONE_CUES.contains(&normalized.as_str()) || matches!(normalized.as_str(), "tel" | "tél" | "cell")
+    };
+    let immediately_before = text.get(context_start..start).and_then(|prefix| {
+        prefix
+            .split(|character: char| !character.is_alphanumeric())
+            .rfind(|word| !word.is_empty())
+    });
+    let immediately_after = text.get(end..context_end).and_then(|suffix| {
+        suffix
+            .split(|character: char| !character.is_alphanumeric())
+            .find(|word| !word.is_empty())
+    });
+    immediately_before.is_some_and(is_phone_cue) || immediately_after.is_some_and(is_phone_cue)
 }
 
 /// Recognize compact dates and year-prefixed legal reference numbers.
@@ -226,8 +227,8 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
 #[cfg(test)]
 mod tests {
     use super::{
-        has_explicit_date_cue, has_phone_context, is_false_positive_pattern, is_legal_reference_finding,
-        rebuild_redacted_text,
+        has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
+        is_legal_reference_finding, rebuild_redacted_text,
     };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
@@ -371,6 +372,34 @@ mod tests {
             ordinary_call,
             ordinary_call_start,
             ordinary_call_start + 8
+        ));
+        let distant_phone_context = "Période 2024-2025. Contact : 06 12 34 56 78";
+        let distant_phone_start = distant_phone_context.find("2024-2025").unwrap();
+        assert!(!has_phone_context(
+            distant_phone_context,
+            distant_phone_start,
+            distant_phone_start + 9
+        ));
+        let english_no = "No objection, case 2024-1234";
+        let english_no_start = english_no.find("2024-1234").unwrap();
+        assert!(has_reference_cue(
+            english_no,
+            english_no_start,
+            english_no_start + 9
+        ));
+        let english_no_without_case = "No objection raised, 2024-1234";
+        let english_no_without_case_start = english_no_without_case.find("2024-1234").unwrap();
+        assert!(!has_reference_cue(
+            english_no_without_case,
+            english_no_without_case_start,
+            english_no_without_case_start + 9
+        ));
+        let abbreviated_no = "No. 2024-1234";
+        let abbreviated_no_start = abbreviated_no.find("2024-1234").unwrap();
+        assert!(has_reference_cue(
+            abbreviated_no,
+            abbreviated_no_start,
+            abbreviated_no_start + 9
         ));
         let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
         let unrelated_start = unrelated_short_word.find("61234567").unwrap();
