@@ -5,6 +5,7 @@ use crate::config::RedactionCustomPattern;
 /// Context radius for cue matching. Keep this bounded so a cue in a nearby
 /// sentence cannot suppress redaction of an unrelated finding.
 const CONTEXT_RADIUS_BYTES: usize = 80;
+const MAX_VALID_FR_NIR_PATTERNS: usize = 256;
 
 /// Expand a byte window to valid UTF-8 boundaries before it is sliced.
 pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -31,6 +32,8 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
     regex
         .find_iter(text)
         .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
+        // Bound regex compilation and matching work for untrusted documents.
+        .take(MAX_VALID_FR_NIR_PATTERNS)
         .map(|candidate| RedactionCustomPattern {
             label: "national_id_number".to_string(),
             pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
@@ -79,7 +82,6 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         "reference",
         "référence",
         "dossier",
-        "n°",
         "annonce",
         "bodacc",
         "facture",
@@ -94,7 +96,25 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
     let has_no_abbreviation = context
         .split_whitespace()
         .any(|word| word.trim_matches(|character: char| !character.is_alphanumeric() && character != '.') == "no.");
-    has_reference_word || has_no_abbreviation
+    has_reference_word || has_no_abbreviation || has_adjacent_number_cue(text, start, end)
+}
+
+/// Treat `n°` as a reference cue only when it labels the finding itself. It is
+/// too common in legal prose to use an unrelated occurrence in the wider window.
+fn has_adjacent_number_cue(text: &str, start: usize, end: usize) -> bool {
+    let before = text
+        .get(..start)
+        .map(|prefix| {
+            prefix.trim_end_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
+        })
+        .is_some_and(|prefix| prefix.to_lowercase().ends_with("n°"));
+    let after = text
+        .get(end..)
+        .map(|suffix| {
+            suffix.trim_start_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
+        })
+        .is_some_and(|suffix| suffix.to_lowercase().starts_with("n°"));
+    before || after
 }
 
 /// Return whether nearby wording explicitly identifies a phone number.
@@ -115,26 +135,68 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
             || matches!(normalized.as_str(), "tel" | "tél" | "cell")
             // A detector can start the phone span inside a cue word (for example,
             // `tele61234567`), leaving only the cue's prefix in the context window.
-            || normalized.starts_with("tel")
-            || normalized.starts_with("tél")
+            || (normalized.chars().count() <= 5
+                && (normalized.starts_with("tel") || normalized.starts_with("tél")))
     };
-    let immediately_before = text.get(context_start..start).and_then(|prefix| {
-        let word = prefix
-            .split(|character: char| !character.is_alphanumeric())
-            .rfind(|word| !word.is_empty())?;
-        let word_end = prefix.rfind(word)? + word.len();
-        let gap = &prefix[word_end..];
-        (!gap.chars().any(is_sentence_boundary)).then_some(word)
-    });
-    let immediately_after = text.get(end..context_end).and_then(|suffix| {
-        let word = suffix
-            .split(|character: char| !character.is_alphanumeric())
-            .find(|word| !word.is_empty())?;
-        let word_start = suffix.find(word)?;
-        let gap = &suffix[..word_start];
-        (!gap.chars().any(is_sentence_boundary)).then_some(word)
-    });
+    let immediately_before = text
+        .get(context_start..start)
+        .and_then(nearest_word_before)
+        .and_then(|(word, gap)| (!gap.chars().any(is_sentence_boundary)).then_some(word));
+    let immediately_after = text
+        .get(end..context_end)
+        .and_then(nearest_word_after)
+        .and_then(|(word, gap)| (!gap.chars().any(is_sentence_boundary)).then_some(word));
     immediately_before.is_some_and(is_phone_cue) || immediately_after.is_some_and(is_phone_cue)
+}
+
+/// Return the last alphanumeric word and its trailing separator without rescanning
+/// the prefix for a possibly repeated word.
+fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
+    let mut word_end = text.len();
+    while word_end > 0 {
+        let character = text[..word_end].chars().next_back()?;
+        if character.is_alphanumeric() {
+            break;
+        }
+        word_end -= character.len_utf8();
+    }
+    if word_end == 0 {
+        return None;
+    }
+    let mut word_start = word_end;
+    while word_start > 0 {
+        let character = text[..word_start].chars().next_back()?;
+        if !character.is_alphanumeric() {
+            break;
+        }
+        word_start -= character.len_utf8();
+    }
+    Some((&text[word_start..word_end], &text[word_end..]))
+}
+
+/// Return the first alphanumeric word and its leading separator without rescanning
+/// the suffix for a possibly repeated word.
+fn nearest_word_after(text: &str) -> Option<(&str, &str)> {
+    let mut word_start = 0;
+    while word_start < text.len() {
+        let character = text[word_start..].chars().next()?;
+        if character.is_alphanumeric() {
+            break;
+        }
+        word_start += character.len_utf8();
+    }
+    if word_start == text.len() {
+        return None;
+    }
+    let mut word_end = word_start;
+    while word_end < text.len() {
+        let character = text[word_end..].chars().next()?;
+        if !character.is_alphanumeric() {
+            break;
+        }
+        word_end += character.len_utf8();
+    }
+    Some((&text[word_start..word_end], &text[..word_start]))
 }
 
 fn is_sentence_boundary(character: char) -> bool {
@@ -176,6 +238,8 @@ fn is_valid_compact_date(value: &str) -> bool {
     let Ok(year) = value[0..4].parse::<u32>() else {
         return false;
     };
+    // The legal profile targets contemporary client files; older compact dates
+    // remain phone candidates instead of being silently treated as references.
     if !(2000..=2099).contains(&year) {
         return false;
     }
@@ -262,7 +326,7 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
 mod tests {
     use super::{
         has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
-        is_legal_reference_finding, is_valid_compact_date, rebuild_redacted_text,
+        is_legal_reference_finding, is_valid_compact_date, rebuild_redacted_text, valid_fr_nir_patterns,
     };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
@@ -292,6 +356,8 @@ mod tests {
         assert!(is_valid_compact_date("20250131"));
         assert!(!is_valid_compact_date("19991231"));
         assert!(!is_valid_compact_date("21000101"));
+        let many_nirs = "185071510000058 ".repeat(300);
+        assert_eq!(valid_fr_nir_patterns(&many_nirs).len(), 256);
         let year_reference = "Référence 2024-2025";
         let year_reference_start = year_reference.find("2024-2025").unwrap();
         let year_finding = RedactionFinding {
@@ -427,6 +493,13 @@ mod tests {
             embedded_start,
             embedded_start + 8
         ));
+        let unrelated_telephone_word = "Date 20260219, television 61234567";
+        let unrelated_telephone_start = unrelated_telephone_word.find("61234567").unwrap();
+        assert!(!has_phone_context(
+            unrelated_telephone_word,
+            unrelated_telephone_start,
+            unrelated_telephone_start + 8
+        ));
         let trailing_phone_context = "Date 20260219, 61234567 mobile";
         let trailing_start = trailing_phone_context.find("61234567").unwrap();
         assert!(has_phone_context(
@@ -496,6 +569,20 @@ mod tests {
             abbreviated_no,
             abbreviated_no_start,
             abbreviated_no_start + 9
+        ));
+        let adjacent_number_cue = "n° 61234567";
+        let adjacent_number_start = adjacent_number_cue.find("61234567").unwrap();
+        assert!(has_reference_cue(
+            adjacent_number_cue,
+            adjacent_number_start,
+            adjacent_number_start + 8
+        ));
+        let unrelated_number_cue = "Pièce n° 3, 61234567";
+        let unrelated_number_start = unrelated_number_cue.find("61234567").unwrap();
+        assert!(!has_reference_cue(
+            unrelated_number_cue,
+            unrelated_number_start,
+            unrelated_number_start + 8
         ));
         let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
         let unrelated_start = unrelated_short_word.find("61234567").unwrap();
