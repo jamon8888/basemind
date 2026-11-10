@@ -134,6 +134,8 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
         "named_place"
     ));
     assert!(super::should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
     assert!(super::should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
     assert!(super::should_skip_legal_fr_v2_ner_value(
         "France métropolitaine",

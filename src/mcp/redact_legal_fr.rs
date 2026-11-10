@@ -36,7 +36,7 @@ pub(super) fn is_false_positive_pattern(
         xberg::types::redaction::PiiCategory::SwiftBic => {
             // All-letter BIC-shaped words need a nearby banking cue. This
             // avoids masking ordinary uppercase prose such as ATTESTATION.
-            legal_fr_filters && value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
+            value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
         }
         _ => false,
     }
@@ -139,8 +139,11 @@ fn is_broad_geography(value: &str) -> bool {
     ];
     // Keep this an exact allowlist: broad scope terms are readable, while a
     // private place that merely contains one of those words remains redacted.
-    let normalized = normalize_geography_value(value);
-    BROAD_GEOGRAPHY.contains(&normalized.as_str())
+    let normalized = normalize_geography_value(value).replace('-', " ");
+    BROAD_GEOGRAPHY
+        .iter()
+        .map(|entry| normalize_geography_value(entry).replace('-', " "))
+        .any(|entry| entry == normalized)
         || (normalized.starts_with("grand ") && normalized.contains("région"))
 }
 
@@ -341,8 +344,11 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
 /// Match a cue as a word instead of matching it inside another word.
 fn contains_word_cue(text: &str, cue: &str) -> bool {
     text.match_indices(cue).any(|(start, _)| {
-        let before = text[..start].chars().next_back();
-        let after = text[start + cue.len()..].chars().next();
+        let Some(end) = start.checked_add(cue.len()) else {
+            return false;
+        };
+        let before = text.get(..start).and_then(|prefix| prefix.chars().next_back());
+        let after = text.get(end..).and_then(|suffix| suffix.chars().next());
         !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
     })
 }
@@ -358,4 +364,15 @@ fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
     ["bic", "bic8", "bic11", "swift", "iban"]
         .iter()
         .any(|cue| contains_word_cue(&context, cue))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_word_cue;
+
+    #[test]
+    fn cue_matching_stays_safe_at_utf8_boundaries() {
+        assert!(contains_word_cue("référence", "référence"));
+        assert!(!contains_word_cue("éférence", "référence"));
+    }
 }
