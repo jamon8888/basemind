@@ -649,7 +649,7 @@ impl BasemindServer {
             &options,
             Some(git_history_host),
         );
-        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options);
+        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options, config.documents.enabled);
         let shared = Arc::new(SharedReadStack::new(
             store,
             root.to_path_buf(),
