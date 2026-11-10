@@ -187,9 +187,10 @@ pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enable
     // A documents-only scan deliberately leaves the code map empty. Treating that as an empty
     // workspace starts a second background scan as soon as the MCP server opens, racing the first
     // document search against the replacement of its Lance rows. The persisted document entries
-    // are the durable scan marker for this feature set; only fall back to the code-map/Fjall test
-    // when documents are disabled (or no document entries were persisted).
-    let documents_index_empty = !documents_enabled || store.index.doc_files.is_empty();
+    // plus the completed-scan marker are the durable scan state for this feature set; only fall
+    // back to the code-map/Fjall test when documents are disabled or no document scan completed.
+    let documents_index_empty =
+        !documents_enabled || (store.index.doc_files.is_empty() && !store.index.documents_scan_completed);
     let needs_initial_scan = (options.daemon_writer || !options.read_only)
         && view_is_working
         && documents_index_empty

@@ -493,7 +493,7 @@ pub fn scan_with_observer(
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         flush_code_map(store)?;
-        flush_doc_batches_and_index(store, config, driven.doc_batches, &stage_metrics, observer)?;
+        flush_doc_batches_and_index(store, config, driven.doc_batches, &stage_metrics, observer, false)?;
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, driven.code_batches);
         });
@@ -584,7 +584,7 @@ pub fn scan_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
-        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer)?;
+        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false)?;
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
         });
@@ -605,7 +605,7 @@ pub fn scan_with_observer(
     report.timings.resolve_ms = crate::scan_metrics::elapsed_ms(resolve_started);
     advance(&mut breadcrumb, PHASE_LANES, None);
     let lanes_started = Instant::now();
-    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer)?;
+    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, true)?;
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
     });
@@ -670,12 +670,16 @@ fn flush_doc_batches_and_index(
     batches: Vec<PendingDocBatchOpt>,
     metrics: &ScanStageMetrics,
     observer: &mut dyn ScanObserver,
+    mark_documents_scan_complete: bool,
 ) -> Result<(), ScanError> {
     let has_batches = !batches.is_empty();
     let lane_completed = run_optional_lane(LANE_DOC_BATCHES, || {
         flush_doc_batches_if_any(store, config, batches, metrics, observer);
     });
-    if has_batches && lane_completed {
+    if mark_documents_scan_complete && lane_completed {
+        store.index.documents_scan_completed = true;
+    }
+    if lane_completed && (has_batches || mark_documents_scan_complete) {
         store.flush()?;
     }
     Ok(())
@@ -871,7 +875,7 @@ pub fn scan_paths_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
-        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer)?;
+        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false)?;
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
         });
@@ -892,7 +896,7 @@ pub fn scan_paths_with_observer(
         });
     });
 
-    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer)?;
+    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false)?;
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
     });

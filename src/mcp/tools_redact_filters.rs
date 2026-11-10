@@ -29,17 +29,26 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
         )
         .expect("the static French NIR regex must compile")
     });
-    regex
+    let mut patterns: Vec<_> = regex
         .find_iter(text)
         .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
-        // Bound regex compilation and matching work for untrusted documents.
-        .take(MAX_VALID_FR_NIR_PATTERNS)
+        // Bound regex compilation and matching work for untrusted documents. Take one extra
+        // candidate so truncation is observable instead of silently dropping PII.
+        .take(MAX_VALID_FR_NIR_PATTERNS + 1)
         .map(|candidate| RedactionCustomPattern {
             label: "national_id_number".to_string(),
             pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
             case_sensitive: true,
         })
-        .collect()
+        .collect();
+    if patterns.len() > MAX_VALID_FR_NIR_PATTERNS {
+        tracing::warn!(
+            max_patterns = MAX_VALID_FR_NIR_PATTERNS,
+            "French NIR redaction pattern cap reached; additional identifiers may require a follow-up pass"
+        );
+        patterns.truncate(MAX_VALID_FR_NIR_PATTERNS);
+    }
+    patterns
 }
 
 /// Decide whether a high-recall engine finding is safe to discard in this legal context.
@@ -131,12 +140,7 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     ];
     let is_phone_cue = |word: &str| {
         let normalized = word.to_lowercase();
-        PHONE_CUES.contains(&normalized.as_str())
-            || matches!(normalized.as_str(), "tel" | "tél" | "cell")
-            // A detector can start the phone span inside a cue word (for example,
-            // `tele61234567`), leaving only the cue's prefix in the context window.
-            || (normalized.chars().count() <= 5
-                && (normalized.starts_with("tel") || normalized.starts_with("tél")))
+        PHONE_CUES.contains(&normalized.as_str()) || matches!(normalized.as_str(), "tel" | "tél" | "cell")
     };
     let immediately_before = text
         .get(context_start..start)
@@ -154,7 +158,7 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
 fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
     let mut word_end = text.len();
     while word_end > 0 {
-        let character = text[..word_end].chars().next_back()?;
+        let (_, character) = text[..word_end].char_indices().next_back()?;
         if character.is_alphanumeric() {
             break;
         }
@@ -165,7 +169,7 @@ fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
     }
     let mut word_start = word_end;
     while word_start > 0 {
-        let character = text[..word_start].chars().next_back()?;
+        let (_, character) = text[..word_start].char_indices().next_back()?;
         if !character.is_alphanumeric() {
             break;
         }
@@ -179,7 +183,7 @@ fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
 fn nearest_word_after(text: &str) -> Option<(&str, &str)> {
     let mut word_start = 0;
     while word_start < text.len() {
-        let character = text[word_start..].chars().next()?;
+        let (_, character) = text[word_start..].char_indices().next()?;
         if character.is_alphanumeric() {
             break;
         }
@@ -190,7 +194,7 @@ fn nearest_word_after(text: &str) -> Option<(&str, &str)> {
     }
     let mut word_end = word_start;
     while word_end < text.len() {
-        let character = text[word_end..].chars().next()?;
+        let (_, character) = text[word_end..].char_indices().next()?;
         if !character.is_alphanumeric() {
             break;
         }
@@ -488,7 +492,7 @@ mod tests {
         ));
         let embedded_abbreviation = "Date 20260219, tele61234567";
         let embedded_start = embedded_abbreviation.find("61234567").unwrap();
-        assert!(has_phone_context(
+        assert!(!has_phone_context(
             embedded_abbreviation,
             embedded_start,
             embedded_start + 8
