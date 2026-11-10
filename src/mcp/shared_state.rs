@@ -187,10 +187,10 @@ pub(crate) fn boot_plan(store: &Store, options: &ServerOptions) -> (bool, bool) 
     let workspace_index_empty = store.index.files.is_empty() && store.index.doc_files.is_empty();
     let fjall_index_empty = !store.index.files.is_empty()
         && store
-        .index_db
-        .as_ref()
-        .map(|db| db.symbols_index_is_empty())
-        .unwrap_or(false);
+            .index_db
+            .as_ref()
+            .map(|db| db.symbols_index_is_empty())
+            .unwrap_or(false);
     let needs_initial_scan = (options.daemon_writer || !options.read_only)
         && view_is_working
         && (workspace_index_empty || fjall_index_empty);
