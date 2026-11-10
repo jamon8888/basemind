@@ -167,7 +167,9 @@ jobs:
       # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
       # ~keep that the step is present.
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Cache Rust and ORT (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           # ~keep v3 invalidates the pre-existing target cache, whose ort-sys build-script output
           # points at a runtime archive that was never cached by the old, incorrect path below.
@@ -178,11 +180,18 @@ jobs:
           # ~keep Caching target/ without this directory lets clippy pass (it does not link a final
           # ~keep binary) and then makes cargo test fail when the cached build script points at the
           # ~keep missing libonnxruntime.a.
-          cache-directories: ${{ runner.os == 'Linux' && '~/.cache/ort.pyke.io' || runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io' || '' }}
+          cache-directories: ${{ runner.os == 'Linux' && '~/.cache/ort.pyke.io' || '~/Library/Caches/ort.pyke.io' }}
           # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
           # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
           # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
           # ~keep 2026-10-09: `ubuntu-latest / full` cancelled at exactly 240m, then re-ran cold.
+          cache-on-failure: true
+
+      - name: Cache Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
           cache-on-failure: true
 
       - name: cargo fmt
