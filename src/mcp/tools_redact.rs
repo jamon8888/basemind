@@ -27,6 +27,7 @@ use crate::extract::doc::ocr_fallback::{
 use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument};
 
+#[path = "tools_redact_filters.rs"]
 mod tools_redact_filters;
 use self::tools_redact_filters::{
     aligned_context_bounds, is_false_positive_pattern, rebuild_redacted_text, valid_fr_nir_patterns,
