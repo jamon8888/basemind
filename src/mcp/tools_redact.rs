@@ -28,7 +28,9 @@ use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument};
 
 mod tools_redact_filters;
-use self::tools_redact_filters::{is_false_positive_pattern, rebuild_redacted_text};
+use self::tools_redact_filters::{
+    aligned_context_bounds, is_false_positive_pattern, rebuild_redacted_text, valid_fr_nir_patterns,
+};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -629,35 +631,6 @@ fn trim_pdf_line_padding_with_map(text: &str) -> TrimmedPdfText {
         text: normalized,
         offsets,
     }
-}
-
-fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
-    let regex = regex::Regex::new(
-        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
-    )
-    .expect("the static French NIR regex must compile");
-    regex
-        .find_iter(text)
-        .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
-        .map(|candidate| RedactionCustomPattern {
-            label: "national_id_number".to_string(),
-            pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
-            case_sensitive: true,
-        })
-        .collect()
-}
-
-/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
-pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut context_start = start.saturating_sub(80).min(text.len());
-    while context_start > 0 && !text.is_char_boundary(context_start) {
-        context_start -= 1;
-    }
-    let mut context_end = end.saturating_add(80).min(text.len());
-    while context_end < text.len() && !text.is_char_boundary(context_end) {
-        context_end += 1;
-    }
-    (context_start, context_end)
 }
 
 /// Entity category → the redaction label safe/ redaction claims.

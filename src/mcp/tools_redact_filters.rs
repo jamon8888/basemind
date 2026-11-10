@@ -1,6 +1,36 @@
 use std::sync::OnceLock;
 
-use super::aligned_context_bounds;
+use crate::config::RedactionCustomPattern;
+
+/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
+pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut context_start = start.saturating_sub(80).min(text.len());
+    while context_start > 0 && !text.is_char_boundary(context_start) {
+        context_start -= 1;
+    }
+    let mut context_end = end.saturating_add(80).min(text.len());
+    while context_end < text.len() && !text.is_char_boundary(context_end) {
+        context_end += 1;
+    }
+    (context_start, context_end)
+}
+
+/// Build exact custom patterns for valid French NIR candidates.
+pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
+    let regex = regex::Regex::new(
+        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
+    )
+    .expect("the static French NIR regex must compile");
+    regex
+        .find_iter(text)
+        .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
+        .map(|candidate| RedactionCustomPattern {
+            label: "national_id_number".to_string(),
+            pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
+            case_sensitive: true,
+        })
+        .collect()
+}
 
 /// Decide whether a high-recall engine finding is safe to discard in this legal context.
 pub(super) fn is_false_positive_pattern(
@@ -30,8 +60,8 @@ pub(super) fn is_false_positive_pattern(
     }
 }
 
-/// Detect the nearby reference/date cues that distinguish eight-digit references from phones.
-fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
+/// Return whether the local text names the finding as a legal reference.
+fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
         return false;
@@ -44,7 +74,7 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
         "case",
         "matter",
         "n°",
-        "no.",
+        "no",
         "annonce",
         "bodacc",
         "facture",
@@ -52,15 +82,13 @@ fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
         "publié",
         "période",
     ];
-    if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
-        return true;
-    }
-    static DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
-    DATE_CUE
-        .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
-        .is_match(&context)
+    context
+        .split(|character: char| !character.is_alphanumeric() && character != '°')
+        .filter(|word| !word.is_empty())
+        .any(|word| REFERENCE_CUES.contains(&word))
 }
 
+/// Return whether nearby wording explicitly identifies a phone number.
 fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
@@ -91,6 +119,7 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         .is_some_and(|word| matches!(word.to_lowercase().as_str(), "tel" | "tél" | "cell"))
 }
 
+/// Recognize compact dates and year-prefixed legal reference numbers.
 fn is_legal_reference_shape(value: &str) -> bool {
     let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
     let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
@@ -103,6 +132,7 @@ fn is_legal_reference_shape(value: &str) -> bool {
     compact_date || year_reference
 }
 
+/// Decide whether a phone-shaped finding is a legal reference in context.
 fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str) -> bool {
     if !is_legal_reference_shape(value) {
         return false;
@@ -110,9 +140,10 @@ fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str)
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
         return is_valid_compact_date(value) && has_explicit_date_cue(text, start, end);
     }
-    has_reference_or_date_cue(text, start, end)
+    has_reference_cue(text, start, end)
 }
 
+/// Validate a compact `YYYYMMDD` value using the Gregorian month lengths.
 fn is_valid_compact_date(value: &str) -> bool {
     if value.len() != 8 || !value.chars().all(|character| character.is_ascii_digit()) {
         return false;
@@ -136,6 +167,7 @@ fn is_valid_compact_date(value: &str) -> bool {
     (1..=days_in_month).contains(&day)
 }
 
+/// Return whether a compact date has an explicit nearby date cue.
 fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
@@ -160,6 +192,7 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
         .is_match(&context)
 }
 
+/// Return whether an all-letter finding has nearby banking terminology.
 fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     text.get(context_start..context_end)
@@ -220,6 +253,38 @@ mod tests {
             dated_start,
             dated_start + 8,
             "20260219"
+        ));
+        let year_reference = "Référence 2024-2025";
+        let year_reference_start = year_reference.find("2024-2025").unwrap();
+        let year_finding = RedactionFinding {
+            start: year_reference_start as u32,
+            end: (year_reference_start + 9) as u32,
+            category: PiiCategory::Phone,
+            strategy: RedactionStrategy::Mask,
+            replacement_token: "[PHONE_1]".to_string(),
+        };
+        assert!(is_legal_reference_finding(
+            year_reference,
+            year_reference_start,
+            year_reference_start + 9,
+            "2024-2025"
+        ));
+        assert!(is_false_positive_pattern(year_reference, &year_finding, true));
+        let substring_cue = "prefix 2024-2025";
+        let substring_start = substring_cue.find("2024-2025").unwrap();
+        assert!(!is_legal_reference_finding(
+            substring_cue,
+            substring_start,
+            substring_start + 9,
+            "2024-2025"
+        ));
+        let unrelated_numeric_date = "12/03/2026, 2024-2025";
+        let unrelated_start = unrelated_numeric_date.find("2024-2025").unwrap();
+        assert!(!is_legal_reference_finding(
+            unrelated_numeric_date,
+            unrelated_start,
+            unrelated_start + 9,
+            "2024-2025"
         ));
         let unrelated_date = "Jugement du 12 février 2026, dossier 61234567";
         let unrelated_date_start = unrelated_date.find("61234567").unwrap();
