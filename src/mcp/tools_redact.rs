@@ -444,7 +444,9 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         redacted_text = rebuild_redacted_text(&original, &findings);
     }
     // Overlapping findings can be skipped while rebuilding the text. Do not return map entries
-    // for tokens that are absent from the actual redacted payload.
+    // for tokens that are absent from the actual redacted payload. An authored token literal in
+    // the source is intentionally preserved by this check and remains rehydratable, matching the
+    // engine's existing token behavior.
     rehydration_map.retain(|token, _| redacted_text.contains(token));
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
