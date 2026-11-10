@@ -177,15 +177,22 @@ fn graph_memo_budget_bytes(resources: &crate::config::ResourcesConfig) -> u64 {
 /// Factored out so [`SharedReadStack::new`] (which sets the `cache_warming` atomic + eager/deferred
 /// cache) and `BasemindServer::new_with_options` (which spawns the matching background tasks) agree
 /// by construction rather than by duplicated expressions.
-pub(crate) fn boot_plan(store: &Store, options: &ServerOptions) -> (bool, bool) {
+pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enabled: bool) -> (bool, bool) {
     let view_is_working = store.view == crate::store::VIEW_WORKING;
     let fjall_index_empty = store
         .index_db
         .as_ref()
         .map(|db| db.symbols_index_is_empty())
         .unwrap_or(false);
+    // A documents-only scan deliberately leaves the code map empty. Treating that as an empty
+    // workspace starts a second background scan as soon as the MCP server opens, racing the first
+    // document search against the replacement of its Lance rows. The persisted document entries
+    // are the durable scan marker for this feature set; only fall back to the code-map/Fjall test
+    // when documents are disabled (or no document entries were persisted).
+    let documents_index_empty = !documents_enabled || store.index.doc_files.is_empty();
     let needs_initial_scan = (options.daemon_writer || !options.read_only)
         && view_is_working
+        && documents_index_empty
         && (store.index.files.is_empty() || fjall_index_empty);
     let defer_warm = options.background && !needs_initial_scan;
     (needs_initial_scan, defer_warm)
@@ -218,7 +225,7 @@ impl SharedReadStack {
             .map(|r| crate::git::scope_key(r))
             .unwrap_or_else(|| format!("path:{}", root.display()));
         let corpus_bytes: u64 = store.index.files.values().map(|e| e.size_bytes).sum();
-        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options);
+        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options, config.documents.enabled);
         let cache = if defer_warm || options.lazy_cache {
             Arc::new(MapCache::empty())
         } else {
