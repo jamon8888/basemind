@@ -57,7 +57,13 @@ const LANCE_WORKSPACE_DIR: &str = "lance";
 /// evicted either, so the workspace never returns under budget and the leak has no symptom until
 /// someone goes looking for it. `lance_evictable_tables_match_the_schema_constants` closes that gap:
 /// it fails the build if this list and the real table names diverge.
-const LANCE_EVICTABLE_TABLES: &[&str] = &["documents", "doc_links", "code_chunks"];
+const LANCE_EVICTABLE_TABLES: &[&str] = &[
+    "documents",
+    "doc_links",
+    "code_chunks",
+    "graph_entities",
+    "graph_edges",
+];
 
 /// Filename of the persisted last-GC state, in the machine-global cache root (next to `blobs/`
 /// and `workspaces/`).
@@ -549,15 +555,19 @@ mod tests {
     #[cfg(feature = "intelligence")]
     #[test]
     fn lance_evictable_tables_match_the_schema_constants() {
-        #[cfg(feature = "code-search")]
-        use crate::lance::schema::CODE_CHUNKS_TABLE;
-        use crate::lance::schema::{DOC_LINKS_TABLE, DOCUMENTS_TABLE, MEMORY_TABLE};
+        use crate::lance::schema::{
+            CODE_CHUNKS_TABLE, DOC_LINKS_TABLE, DOCUMENTS_TABLE, GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, MEMORY_TABLE,
+        };
 
-        let mut expected = vec![DOCUMENTS_TABLE];
-        #[cfg(feature = "documents")]
-        expected.push(DOC_LINKS_TABLE);
-        #[cfg(feature = "code-search")]
-        expected.push(CODE_CHUNKS_TABLE);
+        // `LANCE_EVICTABLE_TABLES` is intentionally feature-independent: a
+        // thinner binary may need to evict tables written by a richer binary.
+        let mut expected = vec![
+            DOCUMENTS_TABLE,
+            DOC_LINKS_TABLE,
+            CODE_CHUNKS_TABLE,
+            GRAPH_ENTITIES_TABLE,
+            GRAPH_EDGES_TABLE,
+        ];
 
         let mut actual: Vec<&str> = LANCE_EVICTABLE_TABLES.to_vec();
         actual.sort_unstable();

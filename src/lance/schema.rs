@@ -248,11 +248,7 @@ pub fn graph_edges_schema() -> SchemaRef {
 /// future migration code agree on what's where.
 pub const DOCUMENTS_TABLE: &str = "documents";
 pub const MEMORY_TABLE: &str = "memory";
-#[cfg(feature = "code-search")]
 pub const CODE_CHUNKS_TABLE: &str = "code_chunks";
-#[cfg(feature = "documents")]
 pub const DOC_LINKS_TABLE: &str = "doc_links";
-#[cfg(feature = "graphrag")]
 pub const GRAPH_ENTITIES_TABLE: &str = "graph_entities";
-#[cfg(feature = "graphrag")]
 pub const GRAPH_EDGES_TABLE: &str = "graph_edges";
