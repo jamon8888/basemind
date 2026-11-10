@@ -393,8 +393,7 @@ impl BasemindServer {
             None,
         );
         // ~keep Boot decisions depend on the opened store, so compute them before it moves into the stack.
-        let (needs_initial_scan, defer_warm) =
-            shared_state::boot_plan(&store, &options, config.documents.enabled);
+        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options, config.documents.enabled);
         let shared = Arc::new(SharedReadStack::new(
             store,
             root,
