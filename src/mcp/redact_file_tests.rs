@@ -5,7 +5,7 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
-use super::{RedactTextParams, run_redact};
+use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact};
 
 /// The JSON payload a tool returns (the first text content block).
 fn json_of(result: &CallToolResult) -> Value {
@@ -47,14 +47,14 @@ async fn unknown_ner_profile_is_rejected() {
 #[tokio::test]
 async fn ner_profile_metadata_reports_effective_labels_without_model() {
     let result = run_redact(RedactTextParams {
-        ner_profile: Some("legal-fr@1".to_string()),
+        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
         ner_model_dir: Some("/nonexistent/gliner2".to_string()),
         ..text_params("Alice Smith works at Acme Corp.")
     })
     .await
     .expect("profile resolution does not require a model");
     let profile = json_of(&result)["ner_profile"].clone();
-    assert_eq!(profile["name"], "legal-fr@1");
+    assert_eq!(profile["name"], LEGAL_FR_PROFILE);
     assert_eq!(
         profile["labels"],
         serde_json::json!([
@@ -408,7 +408,7 @@ async fn ner_model_dir_detects_entities_with_confidence() {
 async fn legal_profile_runs_ner_with_effective_labels() {
     let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
     let result = run_redact(RedactTextParams {
-        ner_profile: Some("legal-fr@1".to_string()),
+        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
         ner_model_dir: Some(dir),
         ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
     })
@@ -416,7 +416,7 @@ async fn legal_profile_runs_ner_with_effective_labels() {
     .expect("legal profile NER succeeds");
     let payload = json_of(&result);
     assert_eq!(payload["ner_ran"], Value::Bool(true));
-    assert_eq!(payload["ner_profile"]["name"], "legal-fr@1");
+    assert_eq!(payload["ner_profile"]["name"], LEGAL_FR_PROFILE);
     assert_eq!(payload["ner_profile"]["labels"].as_array().map(Vec::len), Some(16));
     assert_eq!(payload["ner_truncated"], Value::Bool(false));
     assert!(!payload["detections"].as_array().expect("detections").is_empty());
@@ -509,7 +509,7 @@ async fn legal_reference_numbers_are_not_redacted_as_phones() {
                 Contact : 06 12 34 56 78.";
     let payload = json_of(
         &run_redact(RedactTextParams {
-            ner_profile: Some("legal-fr@1".to_string()),
+            ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
             ..text_params(text)
         })
         .await

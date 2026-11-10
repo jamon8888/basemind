@@ -93,7 +93,7 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
 
 /// Return whether nearby wording explicitly identifies a phone number.
 fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, _) = aligned_context_bounds(text, start, end);
+    let (context_start, context_end) = aligned_context_bounds(text, start, end);
     const PHONE_CUES: &[&str] = &[
         "phone",
         "telephone",
@@ -112,11 +112,19 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
             .split(|character: char| !character.is_alphanumeric())
             .rfind(|word| !word.is_empty())
     });
-    immediately_before.is_some_and(is_phone_cue)
+    let immediately_after = text.get(end..context_end).and_then(|suffix| {
+        suffix
+            .split(|character: char| !character.is_alphanumeric())
+            .find(|word| !word.is_empty())
+    });
+    immediately_before.is_some_and(is_phone_cue) || immediately_after.is_some_and(is_phone_cue)
 }
 
 /// Recognize compact dates and year-prefixed legal reference numbers.
 fn is_legal_reference_shape(value: &str) -> bool {
+    // Compact dates are exactly YYYYMMDD. Dashed references intentionally
+    // require a four-digit year plus a three- or four-digit numeric suffix;
+    // shorter or non-numeric forms remain conservative phone candidates.
     let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
     let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
         year.len() == 4
@@ -133,7 +141,7 @@ fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str)
     if !is_legal_reference_shape(value) {
         return false;
     }
-    if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
+    if value.len() == 8 {
         return is_valid_compact_date(value) && has_explicit_date_cue(text, start, end);
     }
     has_reference_cue(text, start, end)
@@ -353,6 +361,13 @@ mod tests {
             uppercase_abbreviation,
             uppercase_start,
             uppercase_start + 8
+        ));
+        let trailing_phone_context = "Date 20260219, 61234567 mobile";
+        let trailing_start = trailing_phone_context.find("61234567").unwrap();
+        assert!(has_phone_context(
+            trailing_phone_context,
+            trailing_start,
+            trailing_start + 8
         ));
         let distant_abbreviation = format!("Date 20260219, cell{}61234567", " ".repeat(100));
         let distant_start = distant_abbreviation.find("61234567").unwrap();

@@ -756,7 +756,7 @@ struct NerProfile {
     labels: Vec<String>,
 }
 
-const LEGAL_FR_PROFILE: &str = "legal-fr@1";
+pub(super) const LEGAL_FR_PROFILE: &str = "legal-fr@1";
 
 const LEGAL_FR_LABELS: &[&str] = &[
     "full_name",
