@@ -2,13 +2,17 @@ use std::sync::OnceLock;
 
 use crate::config::RedactionCustomPattern;
 
+/// Context radius for cue matching. Keep this bounded so a cue in a nearby
+/// sentence cannot suppress redaction of an unrelated finding.
+const CONTEXT_RADIUS_BYTES: usize = 80;
+
 /// Expand a byte window to valid UTF-8 boundaries before it is sliced.
 pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut context_start = start.saturating_sub(80).min(text.len());
+    let mut context_start = start.saturating_sub(CONTEXT_RADIUS_BYTES).min(text.len());
     while context_start > 0 && !text.is_char_boundary(context_start) {
         context_start -= 1;
     }
-    let mut context_end = end.saturating_add(80).min(text.len());
+    let mut context_end = end.saturating_add(CONTEXT_RADIUS_BYTES).min(text.len());
     while context_end < text.len() && !text.is_char_boundary(context_end) {
         context_end += 1;
     }
@@ -228,6 +232,8 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
             continue;
         }
         if start < cursor {
+            // Preserve the uncovered tail of an overlapping finding. Dropping
+            // it would leave part of a PII span in the returned text.
             if end > cursor {
                 rebuilt.push_str(&finding.replacement_token);
                 cursor = end;
