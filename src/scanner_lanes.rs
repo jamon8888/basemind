@@ -71,7 +71,7 @@ fn inject_fault(_lane: &str) {}
 ///
 /// The code map is already durable on disk by the time a lane runs, so a lane that dies degrades
 /// only its own tier. The failure is logged at WARN with the lane name and the panic message.
-pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) {
+pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) -> bool {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         inject_fault(lane);
         body();
@@ -82,6 +82,9 @@ pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) {
             reason = panic_reason(payload.as_ref()),
             "optional scan lane panicked; this tier is degraded for the scan but the code map is intact"
         );
+        false
+    } else {
+        true
     }
 }
 
