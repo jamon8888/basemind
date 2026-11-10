@@ -23,7 +23,7 @@ pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (u
 }
 
 /// Build exact custom patterns for valid French NIR candidates.
-pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
+pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>, bool) {
     static NIR_REGEX: OnceLock<regex::Regex> = OnceLock::new();
     let regex = NIR_REGEX.get_or_init(|| {
         regex::Regex::new(
@@ -43,14 +43,15 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
             case_sensitive: true,
         })
         .collect();
-    if patterns.len() > MAX_VALID_FR_NIR_PATTERNS {
+    let truncated = patterns.len() > MAX_VALID_FR_NIR_PATTERNS;
+    if truncated {
         tracing::warn!(
             max_patterns = MAX_VALID_FR_NIR_PATTERNS,
             "French NIR redaction pattern cap reached; additional identifiers may require a follow-up pass"
         );
         patterns.truncate(MAX_VALID_FR_NIR_PATTERNS);
     }
-    patterns
+    (patterns, truncated)
 }
 
 /// Decide whether a high-recall engine finding is safe to discard in this legal context.
@@ -395,7 +396,9 @@ mod tests {
         assert!(!is_valid_compact_date("19991231"));
         assert!(!is_valid_compact_date("21000101"));
         let many_nirs = "185071510000058 ".repeat(300);
-        assert_eq!(valid_fr_nir_patterns(&many_nirs).len(), 256);
+        let (patterns, truncated) = valid_fr_nir_patterns(&many_nirs);
+        assert_eq!(patterns.len(), 256);
+        assert!(truncated);
         let year_reference = "Référence 2024-2025";
         let year_reference_start = year_reference.find("2024-2025").unwrap();
         let year_finding = RedactionFinding {

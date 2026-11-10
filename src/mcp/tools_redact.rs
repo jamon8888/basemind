@@ -87,7 +87,7 @@ pub struct RedactTextParams {
 impl BasemindServer {
     #[tool(
         title = "Redact text",
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), `nir_patterns_truncated` (true when the bounded French NIR pattern pass found more candidates than it could process), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -326,7 +326,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // checksum validation belongs at this boundary. Add exact patterns only
     // for valid candidates so the complete identifier wins over a shorter
     // overlapping phone match without turning every 15-digit run into a NIR.
-    custom_patterns.extend(valid_fr_nir_patterns(&original));
+    let (nir_patterns, nir_patterns_truncated) = valid_fr_nir_patterns(&original);
+    custom_patterns.extend(nir_patterns);
 
     // #37 GLiNER2: label mentions before redaction — the model's 42 PII labels
     // plus AI_ACT_NER_LABELS, with organization/location kept as extra
@@ -549,6 +550,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "redacted_text": redacted_text,
         "rehydration_map": rehydration_map,
         "detections": detections,
+        "nir_patterns_truncated": nir_patterns_truncated,
         "ner_ran": ner_run.ran,
         "ner_profile": {
             "name": ner_profile.name,

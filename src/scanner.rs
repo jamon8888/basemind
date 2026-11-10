@@ -629,7 +629,7 @@ pub fn scan_with_observer(
         run_optional_lane(LANE_DOC_REMOVALS, || {
             flush_doc_removals_if_any(store, config, &scope, &doc_stale);
         });
-        store.flush()?;
+        flush_doc_index_best_effort(store, "full scan document removals");
     }
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
@@ -699,9 +699,24 @@ fn flush_doc_batches_and_index(
         store.index.documents_scan_completed = true;
     }
     if lane_completed && flush_index_immediately && (has_batches || mark_documents_scan_complete) {
-        store.flush()?;
+        flush_doc_index_best_effort(store, "document batch metadata");
     }
     Ok(())
+}
+
+/// Persist document metadata without turning an optional document tier into a scan failure.
+///
+/// The code-map durability barrier is deliberately fallible, but document metadata is an
+/// enrichment tier. A flush error must be visible for diagnosis while allowing the bounded
+/// scan's successful code work to be committed and reported.
+fn flush_doc_index_best_effort(store: &Store, context: &'static str) {
+    if let Err(error) = store.flush() {
+        tracing::warn!(
+            ?error,
+            context,
+            "document index metadata flush failed; document tier remains best-effort"
+        );
+    }
 }
 
 /// Incremental scan: process only the given absolute paths. Used by the watcher
@@ -927,7 +942,7 @@ pub fn scan_paths_with_observer(
         run_optional_lane(LANE_DOC_REMOVALS, || {
             flush_doc_removals_if_any(store, config, &scope, &doc_removed);
         });
-        store.flush()?;
+        flush_doc_index_best_effort(store, "incremental document removals");
     }
     run_optional_lane(LANE_BM25_STATS, || finalize_bm25_stats_if_any(store, config));
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
