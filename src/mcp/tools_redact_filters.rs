@@ -109,16 +109,26 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         PHONE_CUES.contains(&normalized.as_str()) || matches!(normalized.as_str(), "tel" | "tél" | "cell")
     };
     let immediately_before = text.get(context_start..start).and_then(|prefix| {
-        prefix
+        let word = prefix
             .split(|character: char| !character.is_alphanumeric())
-            .rfind(|word| !word.is_empty())
+            .rfind(|word| !word.is_empty())?;
+        let word_end = prefix.rfind(word)? + word.len();
+        let gap = &prefix[word_end..];
+        (!gap.chars().any(is_sentence_boundary)).then_some(word)
     });
     let immediately_after = text.get(end..context_end).and_then(|suffix| {
-        suffix
+        let word = suffix
             .split(|character: char| !character.is_alphanumeric())
-            .find(|word| !word.is_empty())
+            .find(|word| !word.is_empty())?;
+        let word_start = suffix.find(word)?;
+        let gap = &suffix[..word_start];
+        (!gap.chars().any(is_sentence_boundary)).then_some(word)
     });
     immediately_before.is_some_and(is_phone_cue) || immediately_after.is_some_and(is_phone_cue)
+}
+
+fn is_sentence_boundary(character: char) -> bool {
+    matches!(character, '.' | '!' | '?' | ';' | '\n' | '\r')
 }
 
 /// Recognize compact dates and year-prefixed legal reference numbers.

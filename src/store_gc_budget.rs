@@ -549,15 +549,29 @@ mod tests {
     #[cfg(feature = "intelligence")]
     #[test]
     fn lance_evictable_tables_match_the_schema_constants() {
+        #[cfg(feature = "code-search")]
+        use crate::lance::schema::CODE_CHUNKS_TABLE;
         #[cfg(feature = "documents")]
         use crate::lance::schema::DOC_LINKS_TABLE;
         use crate::lance::schema::{DOCUMENTS_TABLE, MEMORY_TABLE};
+        #[cfg(feature = "graphrag")]
+        use crate::lance::schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE};
 
         // `LANCE_EVICTABLE_TABLES` is intentionally feature-independent: a
         // thinner binary may need to evict tables written by a richer binary.
-        let mut expected = vec![DOCUMENTS_TABLE, "code_chunks", "graph_entities", "graph_edges"];
+        let mut expected = vec![DOCUMENTS_TABLE];
+        #[cfg(feature = "code-search")]
+        expected.push(CODE_CHUNKS_TABLE);
+        #[cfg(not(feature = "code-search"))]
+        expected.push("code_chunks");
         #[cfg(feature = "documents")]
         expected.push(DOC_LINKS_TABLE);
+        #[cfg(not(feature = "documents"))]
+        expected.push("doc_links");
+        #[cfg(feature = "graphrag")]
+        expected.extend([GRAPH_ENTITIES_TABLE, GRAPH_EDGES_TABLE]);
+        #[cfg(not(feature = "graphrag"))]
+        expected.extend(["graph_entities", "graph_edges"]);
 
         let mut actual: Vec<&str> = LANCE_EVICTABLE_TABLES.to_vec();
         actual.sort_unstable();
