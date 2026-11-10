@@ -29,9 +29,7 @@ use xberg::{ExtractInput, ExtractedDocument};
 
 #[path = "tools_redact_filters.rs"]
 mod tools_redact_filters;
-use self::tools_redact_filters::{
-    is_false_positive_pattern, rebuild_redacted_text, valid_fr_nir_patterns,
-};
+use self::tools_redact_filters::{is_false_positive_pattern, rebuild_redacted_text, valid_fr_nir_patterns};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {

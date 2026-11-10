@@ -85,9 +85,9 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         .split(|character: char| !character.is_alphanumeric() && character != '°')
         .filter(|word| !word.is_empty())
         .any(|word| REFERENCE_CUES.contains(&word));
-    let has_no_abbreviation = context.split_whitespace().any(|word| {
-        word.trim_matches(|character: char| !character.is_alphanumeric() && character != '.') == "no."
-    });
+    let has_no_abbreviation = context
+        .split_whitespace()
+        .any(|word| word.trim_matches(|character: char| !character.is_alphanumeric() && character != '.') == "no.");
     has_reference_word || has_no_abbreviation
 }
 
@@ -382,11 +382,7 @@ mod tests {
         ));
         let english_no = "No objection, case 2024-1234";
         let english_no_start = english_no.find("2024-1234").unwrap();
-        assert!(has_reference_cue(
-            english_no,
-            english_no_start,
-            english_no_start + 9
-        ));
+        assert!(has_reference_cue(english_no, english_no_start, english_no_start + 9));
         let english_no_without_case = "No objection raised, 2024-1234";
         let english_no_without_case_start = english_no_without_case.find("2024-1234").unwrap();
         assert!(!has_reference_cue(
