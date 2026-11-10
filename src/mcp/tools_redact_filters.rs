@@ -68,6 +68,7 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
     };
     const REFERENCE_CUES: &[&str] = &[
         "ref",
+        "réf",
         "reference",
         "référence",
         "dossier",
@@ -141,7 +142,7 @@ fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str)
     if !is_legal_reference_shape(value) {
         return false;
     }
-    if value.len() == 8 {
+    if value.len() == 8 && value.chars().all(|character| character.is_ascii_digit()) {
         return is_valid_compact_date(value) && has_explicit_date_cue(text, start, end);
     }
     has_reference_cue(text, start, end)
@@ -362,6 +363,13 @@ mod tests {
             uppercase_start,
             uppercase_start + 8
         ));
+        let accented_abbreviation = "Date 20260219, tél: 61234567";
+        let accented_start = accented_abbreviation.find("61234567").unwrap();
+        assert!(has_phone_context(
+            accented_abbreviation,
+            accented_start,
+            accented_start + 8
+        ));
         let trailing_phone_context = "Date 20260219, 61234567 mobile";
         let trailing_start = trailing_phone_context.find("61234567").unwrap();
         assert!(has_phone_context(
@@ -399,6 +407,20 @@ mod tests {
             english_no_without_case,
             english_no_without_case_start,
             english_no_without_case_start + 9
+        ));
+        let three_digit_reference = "Réf. 2024-123";
+        let three_digit_start = three_digit_reference.find("2024-123").unwrap();
+        let three_digit_finding = RedactionFinding {
+            start: three_digit_start as u32,
+            end: (three_digit_start + 8) as u32,
+            category: PiiCategory::Phone,
+            strategy: RedactionStrategy::Mask,
+            replacement_token: "[PHONE_1]".to_string(),
+        };
+        assert!(is_false_positive_pattern(
+            three_digit_reference,
+            &three_digit_finding,
+            true
         ));
         let abbreviated_no = "No. 2024-1234";
         let abbreviated_no_start = abbreviated_no.find("2024-1234").unwrap();
