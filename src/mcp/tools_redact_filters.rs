@@ -17,10 +17,13 @@ pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (u
 
 /// Build exact custom patterns for valid French NIR candidates.
 pub(super) fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
-    let regex = regex::Regex::new(
-        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
-    )
-    .expect("the static French NIR regex must compile");
+    static NIR_REGEX: OnceLock<regex::Regex> = OnceLock::new();
+    let regex = NIR_REGEX.get_or_init(|| {
+        regex::Regex::new(
+            r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
+        )
+        .expect("the static French NIR regex must compile")
+    });
     regex
         .find_iter(text)
         .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
@@ -223,11 +226,14 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
     for finding in ordered {
         let start = finding.start as usize;
         let end = finding.end as usize;
-        if start < cursor
-            || end > original.len()
-            || !original.is_char_boundary(start)
-            || !original.is_char_boundary(end)
-        {
+        if end > original.len() || !original.is_char_boundary(start) || !original.is_char_boundary(end) {
+            continue;
+        }
+        if start < cursor {
+            if end > cursor {
+                rebuilt.push_str(&finding.replacement_token);
+                cursor = end;
+            }
             continue;
         }
         rebuilt.push_str(&original[cursor..start]);
@@ -325,6 +331,23 @@ mod tests {
             rebuild_redacted_text(unrelated_date, &[unrelated_date_finding]),
             "Jugement du 12 février 2026, dossier [PHONE_1]"
         );
+        let overlapping = [
+            RedactionFinding {
+                start: 1,
+                end: 4,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[A]".to_string(),
+            },
+            RedactionFinding {
+                start: 3,
+                end: 6,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[B]".to_string(),
+            },
+        ];
+        assert_eq!(rebuild_redacted_text("abcdef", &overlapping), "a[A][B]");
         let month_only = "En janvier, dossier 61234567";
         let month_only_start = month_only.find("61234567").unwrap();
         assert!(!has_explicit_date_cue(

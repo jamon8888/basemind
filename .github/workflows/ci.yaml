@@ -171,16 +171,14 @@ jobs:
         with:
           # ~keep v3 invalidates the pre-existing target cache, whose ort-sys build-script output
           # points at a runtime archive that was never cached by the old, incorrect path below.
-          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
           # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME at
           # ~/.cache/ort.pyke.io/dfbin/<target>/<hash> on Linux and
           # ~/Library/Caches/ort.pyke.io/dfbin/<target>/<hash> on macOS.
           # ~keep Caching target/ without this directory lets clippy pass (it does not link a final
           # ~keep binary) and then makes cargo test fail when the cached build script points at the
           # ~keep missing libonnxruntime.a.
-          cache-directories: |
-            ~/.cache/ort.pyke.io
-            ~/Library/Caches/ort.pyke.io
+          cache-directories: ${{ runner.os == 'Linux' && '~/.cache/ort.pyke.io' || runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io' || '' }}
           # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
           # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
           # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
