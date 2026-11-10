@@ -72,7 +72,6 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
         "téléphone",
         "mobile",
         "contact",
-        "call",
         "whatsapp",
         "fax",
     ];
@@ -82,13 +81,14 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     if has_explicit_phone_word {
         return true;
     }
-    text.get(..start)
+    let (context_start, _) = aligned_context_bounds(text, start, end);
+    text.get(context_start..start)
         .and_then(|prefix| {
             prefix
                 .split(|character: char| !character.is_alphanumeric())
                 .rfind(|word| !word.is_empty())
         })
-        .is_some_and(|word| matches!(word, "tel" | "tél" | "cell"))
+        .is_some_and(|word| matches!(word.to_lowercase().as_str(), "tel" | "tél" | "cell"))
 }
 
 fn is_legal_reference_shape(value: &str) -> bool {
@@ -153,7 +153,7 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
     TEXT_DATE_CUE
         .get_or_init(|| {
             regex::Regex::new(
-                r"(?i)\b\d{1,2}\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}\b",
+                r"\b\d{1,2}\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}\b",
             )
             .expect("text date cue regex")
         })
@@ -285,6 +285,27 @@ mod tests {
             adjacent_abbreviation,
             adjacent_start,
             adjacent_start + 8
+        ));
+        let uppercase_abbreviation = "Date 20260219, TEL: 61234567";
+        let uppercase_start = uppercase_abbreviation.find("61234567").unwrap();
+        assert!(has_phone_context(
+            uppercase_abbreviation,
+            uppercase_start,
+            uppercase_start + 8
+        ));
+        let distant_abbreviation = format!("Date 20260219, cell{}61234567", " ".repeat(100));
+        let distant_start = distant_abbreviation.find("61234567").unwrap();
+        assert!(!has_phone_context(
+            &distant_abbreviation,
+            distant_start,
+            distant_start + 8
+        ));
+        let ordinary_call = "The call was recorded in the minutes, 61234567";
+        let ordinary_call_start = ordinary_call.find("61234567").unwrap();
+        assert!(!has_phone_context(
+            ordinary_call,
+            ordinary_call_start,
+            ordinary_call_start + 8
         ));
         let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
         let unrelated_start = unrelated_short_word.find("61234567").unwrap();
