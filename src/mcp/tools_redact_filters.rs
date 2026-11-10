@@ -75,8 +75,6 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         "reference",
         "référence",
         "dossier",
-        "case",
-        "matter",
         "n°",
         "annonce",
         "bodacc",
@@ -431,9 +429,20 @@ mod tests {
             distant_phone_start,
             distant_phone_start + 9
         ));
-        let english_no = "No objection, case 2024-1234";
-        let english_no_start = english_no.find("2024-1234").unwrap();
-        assert!(has_reference_cue(english_no, english_no_start, english_no_start + 9));
+        let english_reference = "No objection, reference 2024-1234";
+        let english_reference_start = english_reference.find("2024-1234").unwrap();
+        assert!(has_reference_cue(
+            english_reference,
+            english_reference_start,
+            english_reference_start + 9
+        ));
+        let common_case = "No objection, in this case 2024-1234";
+        let common_case_start = common_case.find("2024-1234").unwrap();
+        assert!(!has_reference_cue(
+            common_case,
+            common_case_start,
+            common_case_start + 9
+        ));
         let english_no_without_case = "No objection raised, 2024-1234";
         let english_no_without_case_start = english_no_without_case.find("2024-1234").unwrap();
         assert!(!has_reference_cue(
