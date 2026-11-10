@@ -549,17 +549,15 @@ mod tests {
     #[cfg(feature = "intelligence")]
     #[test]
     fn lance_evictable_tables_match_the_schema_constants() {
-        use crate::lance::schema::{DOC_LINKS_TABLE, DOCUMENTS_TABLE, MEMORY_TABLE};
+        #[cfg(feature = "documents")]
+        use crate::lance::schema::DOC_LINKS_TABLE;
+        use crate::lance::schema::{DOCUMENTS_TABLE, MEMORY_TABLE};
 
         // `LANCE_EVICTABLE_TABLES` is intentionally feature-independent: a
         // thinner binary may need to evict tables written by a richer binary.
-        let mut expected = vec![
-            DOCUMENTS_TABLE,
-            DOC_LINKS_TABLE,
-            "code_chunks",
-            "graph_entities",
-            "graph_edges",
-        ];
+        let mut expected = vec![DOCUMENTS_TABLE, "code_chunks", "graph_entities", "graph_edges"];
+        #[cfg(feature = "documents")]
+        expected.push(DOC_LINKS_TABLE);
 
         let mut actual: Vec<&str> = LANCE_EVICTABLE_TABLES.to_vec();
         actual.sort_unstable();
