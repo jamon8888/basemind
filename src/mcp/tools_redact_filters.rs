@@ -111,7 +111,12 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
     ];
     let is_phone_cue = |word: &str| {
         let normalized = word.to_lowercase();
-        PHONE_CUES.contains(&normalized.as_str()) || matches!(normalized.as_str(), "tel" | "tél" | "cell")
+        PHONE_CUES.contains(&normalized.as_str())
+            || matches!(normalized.as_str(), "tel" | "tél" | "cell")
+            // A detector can start the phone span inside a cue word (for example,
+            // `tele61234567`), leaving only the cue's prefix in the context window.
+            || normalized.starts_with("tel")
+            || normalized.starts_with("tél")
     };
     let immediately_before = text.get(context_start..start).and_then(|prefix| {
         let word = prefix
@@ -171,6 +176,9 @@ fn is_valid_compact_date(value: &str) -> bool {
     let Ok(year) = value[0..4].parse::<u32>() else {
         return false;
     };
+    if !(2000..=2099).contains(&year) {
+        return false;
+    }
     let Ok(month) = value[4..6].parse::<u32>() else {
         return false;
     };
@@ -252,7 +260,7 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
 mod tests {
     use super::{
         has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
-        is_legal_reference_finding, rebuild_redacted_text,
+        is_legal_reference_finding, is_valid_compact_date, rebuild_redacted_text,
     };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
@@ -279,6 +287,9 @@ mod tests {
             dated_start + 8,
             "20260219"
         ));
+        assert!(is_valid_compact_date("20250131"));
+        assert!(!is_valid_compact_date("19991231"));
+        assert!(!is_valid_compact_date("21000101"));
         let year_reference = "Référence 2024-2025";
         let year_reference_start = year_reference.find("2024-2025").unwrap();
         let year_finding = RedactionFinding {
@@ -406,6 +417,13 @@ mod tests {
             accented_abbreviation,
             accented_start,
             accented_start + 8
+        ));
+        let embedded_abbreviation = "Date 20260219, tele61234567";
+        let embedded_start = embedded_abbreviation.find("61234567").unwrap();
+        assert!(has_phone_context(
+            embedded_abbreviation,
+            embedded_start,
+            embedded_start + 8
         ));
         let trailing_phone_context = "Date 20260219, 61234567 mobile";
         let trailing_start = trailing_phone_context.find("61234567").unwrap();
