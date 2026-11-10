@@ -6,6 +6,8 @@ use crate::config::RedactionCustomPattern;
 /// sentence cannot suppress redaction of an unrelated finding.
 const CONTEXT_RADIUS_BYTES: usize = 80;
 const MAX_VALID_FR_NIR_PATTERNS: usize = 256;
+const DATE_CUE_RADIUS_BYTES: usize = 32;
+const DATE_CUE_GAP_BYTES: usize = 16;
 
 /// Expand a byte window to valid UTF-8 boundaries before it is sliced.
 pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -157,23 +159,21 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
 /// the prefix for a possibly repeated word.
 fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
     let mut word_end = text.len();
-    while word_end > 0 {
-        let (_, character) = text[..word_end].char_indices().next_back()?;
+    for (index, character) in text.char_indices().rev() {
         if character.is_alphanumeric() {
             break;
         }
-        word_end -= character.len_utf8();
+        word_end = index;
     }
     if word_end == 0 {
         return None;
     }
     let mut word_start = word_end;
-    while word_start > 0 {
-        let (_, character) = text[..word_start].char_indices().next_back()?;
+    for (index, character) in text[..word_end].char_indices().rev() {
         if !character.is_alphanumeric() {
             break;
         }
-        word_start -= character.len_utf8();
+        word_start = index;
     }
     Some((&text[word_start..word_end], &text[word_end..]))
 }
@@ -182,23 +182,21 @@ fn nearest_word_before(text: &str) -> Option<(&str, &str)> {
 /// the suffix for a possibly repeated word.
 fn nearest_word_after(text: &str) -> Option<(&str, &str)> {
     let mut word_start = 0;
-    while word_start < text.len() {
-        let (_, character) = text[word_start..].char_indices().next()?;
+    for (index, character) in text.char_indices() {
         if character.is_alphanumeric() {
             break;
         }
-        word_start += character.len_utf8();
+        word_start = index + character.len_utf8();
     }
     if word_start == text.len() {
         return None;
     }
     let mut word_end = word_start;
-    while word_end < text.len() {
-        let (_, character) = text[word_end..].char_indices().next()?;
+    for (index, character) in text[word_start..].char_indices() {
         if !character.is_alphanumeric() {
             break;
         }
-        word_end += character.len_utf8();
+        word_end = word_start + index + character.len_utf8();
     }
     Some((&text[word_start..word_end], &text[..word_start]))
 }
@@ -220,6 +218,9 @@ fn is_legal_reference_shape(value: &str) -> bool {
             && (3..=4).contains(&suffix.len())
             && suffix.chars().all(|c| c.is_ascii_digit())
     });
+    // Dashed references keep the broader 1000..=2999 legal-document range, while compact dates
+    // are restricted to 2000..=2099 below to avoid treating arbitrary eight-digit phone-like
+    // values as dates.
     compact_date || year_reference
 }
 
@@ -265,15 +266,31 @@ fn is_valid_compact_date(value: &str) -> bool {
 
 /// Return whether a compact date has an explicit nearby date cue.
 fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let context_start = start.saturating_sub(DATE_CUE_RADIUS_BYTES);
+    let context_end = end.saturating_add(DATE_CUE_RADIUS_BYTES).min(text.len());
+    let mut context_start = context_start;
+    while context_start > 0 && !text.is_char_boundary(context_start) {
+        context_start -= 1;
+    }
+    let mut context_end = context_end;
+    while context_end < text.len() && !text.is_char_boundary(context_end) {
+        context_end += 1;
+    }
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
         return false;
     };
     const DATE_WORD_CUES: &[&str] = &["date", "dated"];
-    let explicit_word_cue = context
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c: char| !c.is_alphabetic()))
-        .any(|word| DATE_WORD_CUES.contains(&word));
+    let explicit_word_cue = [
+        text.get(context_start..start).and_then(nearest_word_before),
+        text.get(end..context_end).and_then(nearest_word_after),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|(word, gap)| {
+        gap.len() <= DATE_CUE_GAP_BYTES
+            && !gap.chars().any(is_sentence_boundary)
+            && DATE_WORD_CUES.contains(&word.to_ascii_lowercase().as_str())
+    });
     if explicit_word_cue {
         return true;
     }
@@ -285,7 +302,13 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
             )
             .expect("text date cue regex")
         })
-        .is_match(&context)
+        .find_iter(&context)
+        .any(|date| {
+            let relative_start = start - context_start;
+            let relative_end = end - context_start;
+            (date.end() <= relative_start && relative_start - date.end() <= DATE_CUE_GAP_BYTES)
+                || (date.start() >= relative_end && date.start() - relative_end <= DATE_CUE_GAP_BYTES)
+        })
 }
 
 /// Return whether an all-letter finding has nearby banking terminology.
@@ -293,7 +316,11 @@ fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
     let (context_start, context_end) = aligned_context_bounds(text, start, end);
     text.get(context_start..context_end)
         .map(str::to_ascii_lowercase)
-        .is_some_and(|context| ["bic", "swift", "iban"].iter().any(|cue| context.contains(cue)))
+        .is_some_and(|context| {
+            context
+                .split(|character: char| !character.is_alphanumeric())
+                .any(|word| matches!(word, "bic" | "swift" | "iban"))
+        })
 }
 
 pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::redaction::RedactionFinding]) -> String {
@@ -329,7 +356,7 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
 #[cfg(test)]
 mod tests {
     use super::{
-        has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
+        has_bic_context, has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
         is_legal_reference_finding, is_valid_compact_date, rebuild_redacted_text, valid_fr_nir_patterns,
     };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
@@ -351,6 +378,13 @@ mod tests {
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
         assert!(has_explicit_date_cue(dated, dated_start, dated_start + 8));
+        let unrelated_date_word = "Date de naissance, 20260219";
+        let unrelated_date_word_start = unrelated_date_word.find("20260219").unwrap();
+        assert!(!has_explicit_date_cue(
+            unrelated_date_word,
+            unrelated_date_word_start,
+            unrelated_date_word_start + 8
+        ));
         assert!(is_legal_reference_finding(
             dated,
             dated_start,
@@ -594,6 +628,17 @@ mod tests {
             unrelated_short_word,
             unrelated_start,
             unrelated_start + 8
+        ));
+
+        let bic_context = "BIC ABCDEFGH";
+        let bic_start = bic_context.find("ABCDEFGH").unwrap();
+        assert!(has_bic_context(bic_context, bic_start, bic_start + 8));
+        let unrelated_bic_context = "A bicycle ABCDEFGH";
+        let unrelated_bic_start = unrelated_bic_context.find("ABCDEFGH").unwrap();
+        assert!(!has_bic_context(
+            unrelated_bic_context,
+            unrelated_bic_start,
+            unrelated_bic_start + 8
         ));
     }
 }
