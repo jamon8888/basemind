@@ -240,8 +240,10 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
             continue;
         }
         if start < cursor {
-            // Preserve the uncovered tail of an overlapping finding. Dropping
-            // it would leave part of a PII span in the returned text.
+            // Do not emit `original[cursor..start]`: it overlaps the already
+            // redacted span and could reintroduce PII. A second token is safer
+            // than preserving source text, even when the overlap changes the
+            // output length; the behavior is covered by the overlap test below.
             if end > cursor {
                 rebuilt.push_str(&finding.replacement_token);
                 cursor = end;
