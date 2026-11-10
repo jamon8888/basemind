@@ -507,7 +507,14 @@ async fn legal_reference_numbers_are_not_redacted_as_phones() {
     let text = "Jugement du 12 février 2026, annonce 20260219-AAA-0042. \
                 Facture F-2026-0012 du 9 janvier 2026. Période 2024-2025. \
                 Contact : 06 12 34 56 78.";
-    let payload = json_of(&run_redact(text_params(text)).await.expect("redact_text succeeds"));
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@1".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     for kept in ["20260219-AAA-0042", "F-2026-0012", "2024-2025"] {
         assert!(redacted.contains(kept), "{kept} must stay: {redacted}");

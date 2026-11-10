@@ -8,7 +8,6 @@
 //! caller can store the map and send redacted text onward.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
@@ -27,6 +26,9 @@ use crate::extract::doc::ocr_fallback::{
 };
 use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument};
+
+mod tools_redact_filters;
+use self::tools_redact_filters::{is_false_positive_pattern, rebuild_redacted_text};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -645,36 +647,8 @@ fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
         .collect()
 }
 
-/// Decide whether a high-recall engine finding is safe to discard in this legal context.
-fn is_false_positive_pattern(
-    original: &str,
-    finding: &xberg::types::redaction::RedactionFinding,
-    legal_fr_filters: bool,
-) -> bool {
-    let start = finding.start as usize;
-    let end = finding.end as usize;
-    let Some(value) = original.get(start..end) else {
-        return false;
-    };
-    match &finding.category {
-        xberg::types::redaction::PiiCategory::Phone => {
-            // French phones have ten national digits; an eight-digit run with
-            // a reference/date shape is not a phone unless phone context says so.
-            legal_fr_filters
-                && is_legal_reference_finding(original, start, end, value)
-                && !has_phone_context(original, start, end)
-        }
-        xberg::types::redaction::PiiCategory::SwiftBic => {
-            // All-letter BIC-shaped words need a nearby banking cue. This
-            // avoids masking ordinary uppercase prose such as ATTESTATION.
-            value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
-        }
-        _ => false,
-    }
-}
-
 /// Expand a byte window to valid UTF-8 boundaries before it is sliced.
-fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
+pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
     let mut context_start = start.saturating_sub(80).min(text.len());
     while context_start > 0 && !text.is_char_boundary(context_start) {
         context_start -= 1;
@@ -684,166 +658,6 @@ fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize
         context_end += 1;
     }
     (context_start, context_end)
-}
-
-/// Detect the nearby reference/date cues that distinguish eight-digit references from phones.
-fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    const REFERENCE_CUES: &[&str] = &[
-        "ref",
-        "reference",
-        "référence",
-        "dossier",
-        "case",
-        "matter",
-        "n°",
-        "no.",
-        "annonce",
-        "bodacc",
-        "facture",
-        "devis",
-        "publié",
-        "période",
-    ];
-    if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
-        return true;
-    }
-    static DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
-    DATE_CUE
-        .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
-        .is_match(&context)
-}
-
-fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    const PHONE_CUES: &[&str] = &[
-        "phone",
-        "telephone",
-        "téléphone",
-        "mobile",
-        "contact",
-        "call",
-        "whatsapp",
-        "fax",
-    ];
-    let has_explicit_phone_word = context
-        .split(|character: char| !character.is_alphanumeric())
-        .any(|word| PHONE_CUES.contains(&word));
-    if has_explicit_phone_word {
-        return true;
-    }
-    text.get(..start)
-        .and_then(|prefix| {
-            prefix
-                .split(|character: char| !character.is_alphanumeric())
-                .rfind(|word| !word.is_empty())
-        })
-        .is_some_and(|word| matches!(word, "tel" | "tél" | "cell"))
-}
-
-fn is_legal_reference_shape(value: &str) -> bool {
-    let compact_date = value.len() == 8 && value.chars().all(|c| c.is_ascii_digit());
-    let year_reference = value.split_once('-').is_some_and(|(year, suffix)| {
-        year.len() == 4
-            && matches!(year.as_bytes().first(), Some(b'1' | b'2'))
-            && year.chars().all(|c| c.is_ascii_digit())
-            && (3..=4).contains(&suffix.len())
-            && suffix.chars().all(|c| c.is_ascii_digit())
-    });
-    compact_date || year_reference
-}
-
-fn is_legal_reference_finding(text: &str, start: usize, end: usize, value: &str) -> bool {
-    if !is_legal_reference_shape(value) {
-        return false;
-    }
-    if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        return is_valid_compact_date(value) && has_explicit_date_cue(text, start, end);
-    }
-    has_reference_or_date_cue(text, start, end)
-}
-
-fn is_valid_compact_date(value: &str) -> bool {
-    if value.len() != 8 || !value.chars().all(|character| character.is_ascii_digit()) {
-        return false;
-    }
-    let Ok(year) = value[0..4].parse::<u32>() else {
-        return false;
-    };
-    let Ok(month) = value[4..6].parse::<u32>() else {
-        return false;
-    };
-    let Ok(day) = value[6..8].parse::<u32>() else {
-        return false;
-    };
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
-        2 => 28,
-        _ => return false,
-    };
-    (1..=days_in_month).contains(&day)
-}
-
-fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    const DATE_WORD_CUES: &[&str] = &["date", "dated"];
-    let explicit_word_cue = context
-        .split_whitespace()
-        .map(|word| word.trim_matches(|c: char| !c.is_alphabetic()))
-        .any(|word| DATE_WORD_CUES.contains(&word));
-    if explicit_word_cue {
-        return true;
-    }
-    static TEXT_DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
-    TEXT_DATE_CUE
-        .get_or_init(|| {
-            regex::Regex::new(
-                r"(?i)\b\d{1,2}\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}\b",
-            )
-            .expect("text date cue regex")
-        })
-        .is_match(&context)
-}
-
-fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    text.get(context_start..context_end)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|context| ["bic", "swift", "iban"].iter().any(|cue| context.contains(cue)))
-}
-
-fn rebuild_redacted_text(original: &str, findings: &[xberg::types::redaction::RedactionFinding]) -> String {
-    let mut ordered = findings.to_vec();
-    ordered.sort_by_key(|finding| (finding.start, finding.end));
-    let mut rebuilt = String::with_capacity(original.len());
-    let mut cursor = 0usize;
-    for finding in ordered {
-        let start = finding.start as usize;
-        let end = finding.end as usize;
-        if start < cursor
-            || end > original.len()
-            || !original.is_char_boundary(start)
-            || !original.is_char_boundary(end)
-        {
-            continue;
-        }
-        rebuilt.push_str(&original[cursor..start]);
-        rebuilt.push_str(&finding.replacement_token);
-        cursor = end;
-    }
-    rebuilt.push_str(&original[cursor..]);
-    rebuilt
 }
 
 /// Entity category → the redaction label safe/ redaction claims.
@@ -1204,112 +1018,6 @@ async fn run_ner_windowed(model_dir: Option<&str>, _text: &str, _profile: &NerPr
         tracing::warn!(dir, "built without the ner-candle feature; redacting pattern-only");
     }
     Err("built without the ner-candle feature".to_string())
-}
-
-#[cfg(test)]
-mod false_positive_filter_tests {
-    use super::{
-        has_explicit_date_cue, has_phone_context, is_false_positive_pattern, is_legal_reference_finding,
-        rebuild_redacted_text,
-    };
-    use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
-
-    #[test]
-    fn ambiguous_eight_digit_phone_is_not_treated_as_a_reference() {
-        let ambiguous = "Dossier 61234567";
-        let ambiguous_start = ambiguous.find("61234567").unwrap();
-        for legal_fr_filters in [false, true] {
-            let finding = RedactionFinding {
-                start: ambiguous_start as u32,
-                end: (ambiguous_start + 8) as u32,
-                category: PiiCategory::Phone,
-                strategy: RedactionStrategy::Mask,
-                replacement_token: "[PHONE_1]".to_string(),
-            };
-            assert!(!is_false_positive_pattern(ambiguous, &finding, legal_fr_filters));
-        }
-        let dated = "Jugement du 12 février 2026, annonce 20260219";
-        let dated_start = dated.find("20260219").unwrap();
-        assert!(has_explicit_date_cue(dated, dated_start, dated_start + 8));
-        assert!(is_legal_reference_finding(
-            dated,
-            dated_start,
-            dated_start + 8,
-            "20260219"
-        ));
-        let unrelated_date = "Jugement du 12 février 2026, dossier 61234567";
-        let unrelated_date_start = unrelated_date.find("61234567").unwrap();
-        let unrelated_date_finding = RedactionFinding {
-            start: unrelated_date_start as u32,
-            end: (unrelated_date_start + 8) as u32,
-            category: PiiCategory::Phone,
-            strategy: RedactionStrategy::Mask,
-            replacement_token: "[PHONE_1]".to_string(),
-        };
-        assert!(!is_legal_reference_finding(
-            unrelated_date,
-            unrelated_date_start,
-            unrelated_date_start + 8,
-            "61234567"
-        ));
-        assert!(!is_false_positive_pattern(
-            unrelated_date,
-            &unrelated_date_finding,
-            true
-        ));
-        assert_eq!(
-            rebuild_redacted_text(unrelated_date, &[unrelated_date_finding]),
-            "Jugement du 12 février 2026, dossier [PHONE_1]"
-        );
-        let month_only = "En janvier, dossier 61234567";
-        let month_only_start = month_only.find("61234567").unwrap();
-        assert!(!has_explicit_date_cue(
-            month_only,
-            month_only_start,
-            month_only_start + 8
-        ));
-        assert!(!is_legal_reference_finding(
-            month_only,
-            month_only_start,
-            month_only_start + 8,
-            "61234567"
-        ));
-
-        let phone_context = "Date 20260219, téléphone 61234567";
-        let phone_start = phone_context.find("61234567").unwrap();
-        let phone_finding = RedactionFinding {
-            start: phone_start as u32,
-            end: (phone_start + 8) as u32,
-            category: PiiCategory::Phone,
-            strategy: RedactionStrategy::Mask,
-            replacement_token: "[PHONE_1]".to_string(),
-        };
-        assert!(has_phone_context(phone_context, phone_start, phone_start + 8));
-        assert!(!is_false_positive_pattern(phone_context, &phone_finding, true));
-
-        let substring_context = "Date 20260219, cellule 61234567";
-        let substring_start = substring_context.find("61234567").unwrap();
-        assert!(!has_phone_context(
-            substring_context,
-            substring_start,
-            substring_start + 8
-        ));
-
-        let adjacent_abbreviation = "Date 20260219, tel: 61234567";
-        let adjacent_start = adjacent_abbreviation.find("61234567").unwrap();
-        assert!(has_phone_context(
-            adjacent_abbreviation,
-            adjacent_start,
-            adjacent_start + 8
-        ));
-        let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
-        let unrelated_start = unrelated_short_word.find("61234567").unwrap();
-        assert!(!has_phone_context(
-            unrelated_short_word,
-            unrelated_start,
-            unrelated_start + 8
-        ));
-    }
 }
 
 #[cfg(test)]
