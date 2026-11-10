@@ -93,7 +93,7 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
 
 /// Return whether nearby wording explicitly identifies a phone number.
 fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let (context_start, _) = aligned_context_bounds(text, start, end);
     const PHONE_CUES: &[&str] = &[
         "phone",
         "telephone",
@@ -112,12 +112,7 @@ fn has_phone_context(text: &str, start: usize, end: usize) -> bool {
             .split(|character: char| !character.is_alphanumeric())
             .rfind(|word| !word.is_empty())
     });
-    let immediately_after = text.get(end..context_end).and_then(|suffix| {
-        suffix
-            .split(|character: char| !character.is_alphanumeric())
-            .find(|word| !word.is_empty())
-    });
-    immediately_before.is_some_and(is_phone_cue) || immediately_after.is_some_and(is_phone_cue)
+    immediately_before.is_some_and(is_phone_cue)
 }
 
 /// Recognize compact dates and year-prefixed legal reference numbers.
