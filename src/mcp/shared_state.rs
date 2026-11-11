@@ -185,7 +185,12 @@ pub(crate) fn boot_plan(store: &Store, options: &ServerOptions) -> (bool, bool) 
     // while Lance rebuilds its FTS indexes (the hacienda-legal macOS failure). The msgpack doc tier
     // is the durable readiness signal for a workspace with no code files.
     let workspace_index_empty = store.index.files.is_empty() && store.index.doc_files.is_empty();
-    let fjall_index_empty = !store.index.files.is_empty()
+    let fjall_index_empty = store.index.files.iter().next().is_some()
+        && cfg!(any(
+            feature = "code-intel-js",
+            feature = "code-intel-stack",
+            feature = "code-search"
+        ))
         && store
             .index_db
             .as_ref()
