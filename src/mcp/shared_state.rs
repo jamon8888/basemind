@@ -188,13 +188,13 @@ pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enable
     // workspace starts a second background scan as soon as the MCP server opens, racing the first
     // document search against the replacement of its Lance rows. The persisted document entries
     // plus the completed-scan marker are the durable scan state for this feature set; cross-check
-    // both because a purge can remove entries without clearing the marker.
+    // both because a purge can remove entries without clearing the marker. The code-index gate is
+    // independent so a documents-only scan cannot suppress a missing symbol-index build.
     let documents_index_empty =
         !documents_enabled || !store.index.documents_scan_completed || store.index.doc_files.is_empty();
-    let needs_initial_scan = (options.daemon_writer || !options.read_only)
-        && view_is_working
-        && documents_index_empty
-        && (store.index.files.is_empty() || fjall_index_empty);
+    let code_index_empty = store.index.files.is_empty() || fjall_index_empty;
+    let needs_initial_scan =
+        (options.daemon_writer || !options.read_only) && view_is_working && (documents_index_empty || code_index_empty);
     let defer_warm = options.background && !needs_initial_scan;
     (needs_initial_scan, defer_warm)
 }
