@@ -75,6 +75,30 @@ fn dictionary_filter_retry_requires_a_page_with_no_valid_dictionary_words() {
 }
 
 #[test]
+fn dictionary_filter_retry_covers_scanned_pdfs_without_the_ratio_key() {
+    // xberg's PDF OCR route keeps the filter warning but drops the per-page ratio (basemind#115).
+    let warning = xberg::types::ProcessingWarning {
+        source: "tesseract".into(),
+        message: "Tesseract removed 32 OCR line(s) because their dictionary-checkable words were mostly not real words"
+            .into(),
+    };
+    let mut document = xberg::types::ExtractedDocument::default();
+    document.processing_warnings.push(warning);
+    let outcome = Ok(xberg::ExtractionResult::single(document.clone()));
+    assert!(
+        super::dictionary_filter_warnings(&outcome).is_none(),
+        "without the ratio, only a whole-document OCR result may retry"
+    );
+
+    document
+        .metadata
+        .additional
+        .insert("extraction_method".into(), serde_json::json!("ocr"));
+    let outcome = Ok(xberg::ExtractionResult::single(document));
+    assert!(super::dictionary_filter_warnings(&outcome).is_some());
+}
+
+#[test]
 fn plain_text_retry_preserves_lines_recovered_by_structured_ocr() {
     let mut original = xberg::types::ExtractedDocument::default();
     original.content = "Name\nInvoice total: 42".into();

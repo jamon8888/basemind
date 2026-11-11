@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The OCR retry after dictionary filtering now also runs on scanned PDFs: xberg keeps the
+  "Tesseract removed N OCR line(s)" warning but not the dictionary ratio on a PDF, so a
+  whole-document OCR result without the ratio retries on the warning alone (#115).
 - OCR no longer loses real text when Tesseract's dictionary signal is unavailable: document OCR
   retries with xberg's plain-text path only when the normal hOCR pass reports dictionary-filtered
   lines, preserving structured table OCR for healthy documents.
