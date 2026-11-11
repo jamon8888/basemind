@@ -74,6 +74,18 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>,
         );
         patterns.truncate(MAX_VALID_FR_NIR_PATTERNS);
     }
+    if patterns.len() > 1 {
+        let alternatives = patterns
+            .into_iter()
+            .map(|pattern| pattern.pattern)
+            .collect::<Vec<_>>()
+            .join("|");
+        patterns = vec![RedactionCustomPattern {
+            label: "national_id_number".to_string(),
+            pattern: format!("(?:{alternatives})"),
+            case_sensitive: true,
+        }];
+    }
     (patterns, truncated)
 }
 
@@ -360,7 +372,12 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
     for finding in ordered {
         let start = finding.start as usize;
         let end = finding.end as usize;
-        if end > original.len() || !original.is_char_boundary(start) || !original.is_char_boundary(end) {
+        if start > end
+            || start > original.len()
+            || end > original.len()
+            || !original.is_char_boundary(start)
+            || !original.is_char_boundary(end)
+        {
             continue;
         }
         if start < cursor {
@@ -394,7 +411,12 @@ pub(super) fn overlapping_replacement_tokens(
     for finding in ordered {
         let start = finding.start as usize;
         let end = finding.end as usize;
-        if end > original.len() || !original.is_char_boundary(start) || !original.is_char_boundary(end) {
+        if start > end
+            || start > original.len()
+            || end > original.len()
+            || !original.is_char_boundary(start)
+            || !original.is_char_boundary(end)
+        {
             continue;
         }
         if start < cursor {
@@ -454,7 +476,7 @@ mod tests {
         assert!(!is_valid_compact_date("21000101"));
         let many_nirs = "185071510000058 ".repeat(300);
         let (patterns, truncated) = valid_fr_nir_patterns(&many_nirs);
-        assert_eq!(patterns.len(), 256);
+        assert_eq!(patterns.len(), 1);
         assert!(truncated);
         let year_reference = "Référence 2024-2025";
         let year_reference_start = year_reference.find("2024-2025").unwrap();
