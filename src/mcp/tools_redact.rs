@@ -8,7 +8,6 @@
 //! caller can store the map and send redacted text onward.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
@@ -27,6 +26,12 @@ use crate::extract::doc::ocr_fallback::{
 };
 use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument};
+
+#[path = "tools_redact_filters.rs"]
+mod tools_redact_filters;
+use self::tools_redact_filters::{
+    is_false_positive_pattern, overlapping_replacement_tokens, rebuild_redacted_text, valid_fr_nir_patterns,
+};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -84,7 +89,7 @@ pub struct RedactTextParams {
 impl BasemindServer {
     #[tool(
         title = "Redact text",
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), `nir_patterns_truncated` (true when the bounded French NIR pass hit its candidate or pattern caps before the text was fully scanned, so additional identifiers may be missing; callers must inspect it before trusting the output as complete), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -245,15 +250,16 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
-            let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
-            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, deadline)
+            let budget_start = Instant::now();
+            let deadline = budget_start + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
                 .await
                 .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
                 let original = std::mem::take(&mut extraction);
-                extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
+                extraction = match extract_file_with_deadline(input, &fallback_config, budget_start, deadline).await {
                     Ok(fallback)
                         if fallback.results.is_empty()
                             || fallback
@@ -270,6 +276,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                         ));
                     }
                     Ok(mut fallback) => {
+                        // `budget_start` measures the shared retry budget; the helper captures
+                        // a fresh attempt start for the per-attempt timeout diagnostic.
                         preserve_original_ocr_text(&original, &mut fallback);
                         preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                         fallback
@@ -322,7 +330,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // checksum validation belongs at this boundary. Add exact patterns only
     // for valid candidates so the complete identifier wins over a shorter
     // overlapping phone match without turning every 15-digit run into a NIR.
-    custom_patterns.extend(valid_fr_nir_patterns(&original));
+    let (nir_patterns, nir_patterns_truncated) = valid_fr_nir_patterns(&original);
+    custom_patterns.extend(nir_patterns);
 
     // #37 GLiNER2: label mentions before redaction — the model's 42 PII labels
     // plus AI_ACT_NER_LABELS, with organization/location kept as extra
@@ -428,16 +437,19 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut redacted_text = content_doc.content;
 
     // xberg's built-in phone/BIC regexes intentionally favour recall. The
-    // legal gateway needs the same conservative boundary for obvious date and
+    // legal profile uses a conservative boundary for obvious date and
     // prose-shaped matches; rebuild the content from the original after
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = ner_profile.name == "legal-fr@1";
+    let legal_fr_filters = ner_profile.name == LEGAL_FR_PROFILE;
     findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
-        rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
+        // Overlapping findings can be skipped while rebuilding the text. Drop only those findings'
+        // map entries; authored token literals in the source remain rehydratable.
+        let overlapping_tokens = overlapping_replacement_tokens(&original, &findings);
+        rehydration_map.retain(|token, _| !overlapping_tokens.contains(token));
     }
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
@@ -545,6 +557,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "redacted_text": redacted_text,
         "rehydration_map": rehydration_map,
         "detections": detections,
+        "nir_patterns_truncated": nir_patterns_truncated,
         "ner_ran": ner_run.ran,
         "ner_profile": {
             "name": ner_profile.name,
@@ -626,125 +639,6 @@ fn trim_pdf_line_padding_with_map(text: &str) -> TrimmedPdfText {
         text: normalized,
         offsets,
     }
-}
-
-fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
-    let regex = regex::Regex::new(
-        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
-    )
-    .expect("the static French NIR regex must compile");
-    regex
-        .find_iter(text)
-        .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
-        .map(|candidate| RedactionCustomPattern {
-            label: "national_id_number".to_string(),
-            pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
-            case_sensitive: true,
-        })
-        .collect()
-}
-
-/// Decide whether a high-recall engine finding is safe to discard in this legal context.
-fn is_false_positive_pattern(
-    original: &str,
-    finding: &xberg::types::redaction::RedactionFinding,
-    legal_fr_filters: bool,
-) -> bool {
-    let start = finding.start as usize;
-    let end = finding.end as usize;
-    let Some(value) = original.get(start..end) else {
-        return false;
-    };
-    match &finding.category {
-        xberg::types::redaction::PiiCategory::Phone => {
-            // French phones have ten national digits; an eight-digit run is a
-            // reference/year pair in this gateway's legal corpus, not a phone.
-            legal_fr_filters
-                && value.chars().filter(|c| c.is_ascii_digit()).count() == 8
-                && value.chars().all(|c| c.is_ascii_digit() || c == '-')
-                && has_reference_or_date_cue(original, start, end)
-        }
-        xberg::types::redaction::PiiCategory::SwiftBic => {
-            // All-letter BIC-shaped words need a nearby banking cue. This
-            // avoids masking ordinary uppercase prose such as ATTESTATION.
-            value.chars().all(|c| c.is_ascii_alphabetic()) && !has_bic_context(original, start, end)
-        }
-        _ => false,
-    }
-}
-
-/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
-fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut context_start = start.saturating_sub(80).min(text.len());
-    while context_start > 0 && !text.is_char_boundary(context_start) {
-        context_start -= 1;
-    }
-    let mut context_end = end.saturating_add(80).min(text.len());
-    while context_end < text.len() && !text.is_char_boundary(context_end) {
-        context_end += 1;
-    }
-    (context_start, context_end)
-}
-
-/// Detect the nearby reference/date cues that distinguish eight-digit references from phones.
-fn has_reference_or_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
-        return false;
-    };
-    const REFERENCE_CUES: &[&str] = &[
-        "ref",
-        "reference",
-        "référence",
-        "dossier",
-        "case",
-        "matter",
-        "n°",
-        "no.",
-        "annonce",
-        "bodacc",
-        "facture",
-        "devis",
-        "publié",
-        "période",
-    ];
-    if REFERENCE_CUES.iter().any(|cue| context.contains(cue)) {
-        return true;
-    }
-    static DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
-    DATE_CUE
-        .get_or_init(|| regex::Regex::new(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b").expect("date cue regex"))
-        .is_match(&context)
-}
-
-fn has_bic_context(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
-    text.get(context_start..context_end)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|context| ["bic", "swift", "iban"].iter().any(|cue| context.contains(cue)))
-}
-
-fn rebuild_redacted_text(original: &str, findings: &[xberg::types::redaction::RedactionFinding]) -> String {
-    let mut ordered = findings.to_vec();
-    ordered.sort_by_key(|finding| (finding.start, finding.end));
-    let mut rebuilt = String::with_capacity(original.len());
-    let mut cursor = 0usize;
-    for finding in ordered {
-        let start = finding.start as usize;
-        let end = finding.end as usize;
-        if start < cursor
-            || end > original.len()
-            || !original.is_char_boundary(start)
-            || !original.is_char_boundary(end)
-        {
-            continue;
-        }
-        rebuilt.push_str(&original[cursor..start]);
-        rebuilt.push_str(&finding.replacement_token);
-        cursor = end;
-    }
-    rebuilt.push_str(&original[cursor..]);
-    rebuilt
 }
 
 /// Entity category → the redaction label safe/ redaction claims.
@@ -870,6 +764,8 @@ struct NerProfile {
     name: String,
     labels: Vec<String>,
 }
+
+pub(super) const LEGAL_FR_PROFILE: &str = "legal-fr@1";
 
 const LEGAL_FR_LABELS: &[&str] = &[
     "full_name",

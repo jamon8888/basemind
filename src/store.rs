@@ -178,6 +178,11 @@ pub struct Index {
     /// `.doc.msgpack` blobs as GC-referenced so the blob GC stops reaping the doc cache.
     #[serde(default)]
     pub doc_files: AHashMap<RelPath, DocEntry>,
+    /// Whether a complete documents scan has finished successfully for this view. This remains
+    /// true when the last document is later removed, so an empty document tier does not look like
+    /// a never-scanned workspace on the next MCP server start.
+    #[serde(default)]
+    pub documents_scan_completed: bool,
     /// [`crate::config::rules::embed_policy_digest`] of the config the last complete full scan ran
     /// under. A different value means the embed on/off switches or embed globs changed, so the next
     /// full scan re-flushes eligible files and purges vector / keyword rows of ineligible ones.
@@ -198,6 +203,7 @@ impl Index {
             schema_ver: SCHEMA_VER,
             files: AHashMap::new(),
             doc_files: AHashMap::new(),
+            documents_scan_completed: false,
             embed_policy: String::new(),
             doc_tombstones: AHashMap::new(),
         }

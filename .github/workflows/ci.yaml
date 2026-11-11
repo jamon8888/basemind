@@ -167,18 +167,31 @@ jobs:
       # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
       # ~keep that the step is present.
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust and ORT (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.os }}-${{ matrix.features }}
-          # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME.
+          # ~keep v3 invalidates the pre-existing target cache, whose ort-sys build-script output
+          # points at a runtime archive that was never cached by the old, incorrect path below.
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
+          # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME at
+          # ~/.cache/ort.pyke.io/dfbin/<target>/<hash> on Linux and
+          # ~/Library/Caches/ort.pyke.io/dfbin/<target>/<hash> on macOS.
           # ~keep Caching target/ without this directory lets clippy pass (it does not link a final
           # ~keep binary) and then makes cargo test fail when the cached build script points at the
           # ~keep missing libonnxruntime.a.
-          cache-directories: ~/.cache/pyke-ort
+          cache-directories: ${{ runner.os == 'Linux' && '~/.cache/ort.pyke.io' || '~/Library/Caches/ort.pyke.io' }}
           # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
           # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
           # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
           # ~keep 2026-10-09: `ubuntu-latest / full` cancelled at exactly 240m, then re-ran cold.
+          cache-on-failure: true
+
+      - name: Cache Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
           cache-on-failure: true
 
       - name: cargo fmt
@@ -222,7 +235,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
@@ -248,7 +261,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Issue #62 was reported from a daemon under a systemd `MemoryMax`, and the whole class was
       # invisible to the matrix above because no leg there ever runs under a memory cgroup. A scope
@@ -311,7 +324,7 @@ jobs:
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: run harden.sh
         run: ./scripts/harden.sh

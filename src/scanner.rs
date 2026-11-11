@@ -20,7 +20,7 @@ use crate::scanner_code::PendingCodeBatch;
 use crate::scanner_doc_lane::flush_doc_batches_if_any;
 #[cfg(feature = "documents")]
 use crate::scanner_docs::PendingDocBatch;
-use crate::scanner_drive::{DriveOutcome, PendingCodeBatchOpt, ScanDrive, drive_scan};
+use crate::scanner_drive::{DriveOutcome, PendingCodeBatchOpt, PendingDocBatchOpt, ScanDrive, drive_scan};
 use crate::scanner_file::scanner_pool;
 use crate::scanner_filter::{Filters, IndexFilter};
 #[cfg(feature = "documents")]
@@ -493,9 +493,7 @@ pub fn scan_with_observer(
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
         flush_code_map(store)?;
-        run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, driven.doc_batches, &stage_metrics, observer);
-        });
+        flush_doc_batches_and_index(store, config, driven.doc_batches, &stage_metrics, observer, false);
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, driven.code_batches);
         });
@@ -586,9 +584,7 @@ pub fn scan_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
-        run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, doc_batches, &stage_metrics, observer);
-        });
+        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false);
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
         });
@@ -609,22 +605,20 @@ pub fn scan_with_observer(
     report.timings.resolve_ms = crate::scan_metrics::elapsed_ms(resolve_started);
     advance(&mut breadcrumb, PHASE_LANES, None);
     let lanes_started = Instant::now();
-    run_optional_lane(LANE_DOC_BATCHES, || {
-        flush_doc_batches_if_any(store, config, doc_batches, &stage_metrics, observer);
-    });
+    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, true);
+    #[cfg(feature = "documents")]
+    if !doc_stale.is_empty() {
+        run_optional_lane(LANE_DOC_REMOVALS, || {
+            flush_doc_removals_if_any(store, config, &scope, &doc_stale);
+        });
+        flush_doc_index_best_effort(store, "full scan document removals");
+    }
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
     });
     run_optional_lane(LANE_CODE_REMOVALS, || {
         flush_code_removals_if_any(store, config, &scope, &stale);
     });
-    #[cfg(feature = "documents")]
-    if !doc_stale.is_empty() {
-        run_optional_lane(LANE_DOC_REMOVALS, || {
-            flush_doc_removals_if_any(store, config, &scope, &doc_stale);
-        });
-        store.flush()?;
-    }
     run_optional_lane(LANE_BM25_STATS, || finalize_bm25_stats_if_any(store, config));
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
         maintain_lance_if_open(store)
@@ -661,6 +655,48 @@ fn flush_code_map(store: &Store) -> Result<(), ScanError> {
     // statusline sees fresh counts without ever opening the Fjall index. Best-effort by design.
     store.write_status_sidecar();
     Ok(())
+}
+
+/// Persist document metadata after the document lane succeeds.
+///
+/// `flush_code_map` intentionally runs before optional lanes so the code map survives a lane
+/// failure. Document extraction updates `store.index.doc_files` during the drive, though, and the
+/// document lane is the first point at which those entries are known to be queryable. Persisting
+/// the metadata here keeps a restarted server from mistaking a populated lexical Lance store for
+/// an empty document index and launching a competing rescan.
+fn flush_doc_batches_and_index(
+    store: &mut Store,
+    config: &Config,
+    batches: Vec<PendingDocBatchOpt>,
+    metrics: &ScanStageMetrics,
+    observer: &mut dyn ScanObserver,
+    mark_documents_scan_complete: bool,
+) {
+    let has_batches = !batches.is_empty();
+    let lane_completed = run_optional_lane(LANE_DOC_BATCHES, || {
+        flush_doc_batches_if_any(&mut *store, config, batches, metrics, observer);
+    });
+    if mark_documents_scan_complete && lane_completed {
+        store.index.documents_scan_completed = true;
+    }
+    if lane_completed && (has_batches || mark_documents_scan_complete) {
+        flush_doc_index_best_effort(store, "document batch metadata");
+    }
+}
+
+/// Persist document metadata without turning an optional document tier into a scan failure.
+///
+/// The code-map durability barrier is deliberately fallible, but document metadata is an
+/// enrichment tier. A flush error must be visible for diagnosis while allowing the bounded
+/// scan's successful code work to be committed and reported.
+fn flush_doc_index_best_effort(store: &Store, context: &'static str) {
+    if let Err(error) = store.flush() {
+        tracing::warn!(
+            ?error,
+            context,
+            "document index metadata flush failed; document tier remains best-effort"
+        );
+    }
 }
 
 /// Incremental scan: process only the given absolute paths. Used by the watcher
@@ -853,9 +889,7 @@ pub fn scan_paths_with_observer(
     if cancel.is_cancelled() {
         report.cancelled = true;
         report.timings.total_ms = crate::scan_metrics::elapsed_ms(scan_started);
-        run_optional_lane(LANE_DOC_BATCHES, || {
-            flush_doc_batches_if_any(store, config, doc_batches, &stage_metrics, observer);
-        });
+        flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false);
         run_optional_lane(LANE_CODE_BATCHES, || {
             flush_code_batches_if_any(store, config, &scope, code_batches);
         });
@@ -876,9 +910,7 @@ pub fn scan_paths_with_observer(
         });
     });
 
-    run_optional_lane(LANE_DOC_BATCHES, || {
-        flush_doc_batches_if_any(store, config, doc_batches, &stage_metrics, observer);
-    });
+    flush_doc_batches_and_index(store, config, doc_batches, &stage_metrics, observer, false);
     run_optional_lane(LANE_CODE_BATCHES, || {
         flush_code_batches_if_any(store, config, &scope, code_batches);
     });
@@ -890,7 +922,7 @@ pub fn scan_paths_with_observer(
         run_optional_lane(LANE_DOC_REMOVALS, || {
             flush_doc_removals_if_any(store, config, &scope, &doc_removed);
         });
-        store.flush()?;
+        flush_doc_index_best_effort(store, "incremental document removals");
     }
     run_optional_lane(LANE_BM25_STATS, || finalize_bm25_stats_if_any(store, config));
     run_optional_lane(crate::scanner_lanes::LANE_LANCE_MAINTENANCE, || {
