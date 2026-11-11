@@ -68,6 +68,9 @@ ignore = [
   # rusqlite 0.41 and therefore an xberg release that widens this dependency. Revisit before
   # 2027-01-01, or sooner when xberg widens rusqlite.
   "RUSTSEC-2026-0459",
+  # rustix 1.1.4 is transitive through the repository's gix/rmux dependency graph. The current
+  # graph has no compatible patched release; revisit when the upstream consumers update rustix.
+  "RUSTSEC-2026-0486",
 ]
 [licenses]
 allow = [
