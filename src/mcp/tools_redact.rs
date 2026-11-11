@@ -7,7 +7,7 @@
 //! token map) → return `{redacted_text, rehydration_map, detections}` so the
 //! caller can store the map and send redacted text onward.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
@@ -447,7 +447,14 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // for tokens that are absent from the actual redacted payload. An authored token literal in
     // the source is intentionally preserved by this check and remains rehydratable, matching the
     // engine's existing token behavior.
-    rehydration_map.retain(|token, _| redacted_text.contains(token));
+    let present_tokens: HashSet<&str> = redacted_text
+        .match_indices('[')
+        .filter_map(|(start, _)| {
+            let end = redacted_text.get(start..)?.find(']')? + start + 1;
+            redacted_text.get(start..end)
+        })
+        .collect();
+    rehydration_map.retain(|token, _| present_tokens.contains(token.as_str()));
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
     // phone number. The legal caller acts on the label, so it has to be `tax_id`.

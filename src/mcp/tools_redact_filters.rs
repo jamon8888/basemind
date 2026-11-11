@@ -4,21 +4,39 @@ use crate::config::RedactionCustomPattern;
 
 /// Context radius for cue matching. Keep this bounded so a cue in a nearby
 /// sentence cannot suppress redaction of an unrelated finding.
-const CONTEXT_RADIUS_BYTES: usize = 80;
+const CONTEXT_RADIUS_CHARS: usize = 80;
 const MAX_VALID_FR_NIR_PATTERNS: usize = 256;
-const DATE_CUE_RADIUS_BYTES: usize = 32;
+const DATE_CUE_RADIUS_CHARS: usize = 32;
 const DATE_CUE_GAP_BYTES: usize = 16;
 
-/// Expand a byte window to valid UTF-8 boundaries before it is sliced.
+/// Return a bounded character window around byte offsets, aligned to UTF-8 boundaries.
 pub(super) fn aligned_context_bounds(text: &str, start: usize, end: usize) -> (usize, usize) {
-    let mut context_start = start.saturating_sub(CONTEXT_RADIUS_BYTES).min(text.len());
+    context_bounds_with_radius(text, start, end, CONTEXT_RADIUS_CHARS)
+}
+
+fn context_bounds_with_radius(text: &str, start: usize, end: usize, radius_chars: usize) -> (usize, usize) {
+    let mut context_start = start.min(text.len());
     while context_start > 0 && !text.is_char_boundary(context_start) {
         context_start -= 1;
     }
-    let mut context_end = end.saturating_add(CONTEXT_RADIUS_BYTES).min(text.len());
+    let mut context_end = end.min(text.len());
     while context_end < text.len() && !text.is_char_boundary(context_end) {
         context_end += 1;
     }
+    if radius_chars == 0 {
+        return (context_start, context_end);
+    }
+    let context_start = text[..context_start]
+        .char_indices()
+        .rev()
+        .nth(radius_chars - 1)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let context_end = text[context_end..]
+        .char_indices()
+        .nth(radius_chars - 1)
+        .map(|(index, character)| context_end + index + character.len_utf8())
+        .unwrap_or(text.len());
     (context_start, context_end)
 }
 
@@ -108,10 +126,24 @@ fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
         .split(|character: char| !character.is_alphanumeric() && character != '°')
         .filter(|word| !word.is_empty())
         .any(|word| REFERENCE_CUES.contains(&word));
-    let has_no_abbreviation = context
-        .split_whitespace()
-        .any(|word| word.trim_matches(|character: char| !character.is_alphanumeric() && character != '.') == "no.");
-    has_reference_word || has_no_abbreviation || has_adjacent_number_cue(text, start, end)
+    has_reference_word || has_adjacent_no_cue(text, start, end) || has_adjacent_number_cue(text, start, end)
+}
+
+/// Treat `No.` as a reference cue only when it labels the finding itself.
+fn has_adjacent_no_cue(text: &str, start: usize, end: usize) -> bool {
+    let before = text
+        .get(..start)
+        .map(|prefix| {
+            prefix.trim_end_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
+        })
+        .is_some_and(|prefix| prefix.to_lowercase().ends_with("no."));
+    let after = text
+        .get(end..)
+        .map(|suffix| {
+            suffix.trim_start_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
+        })
+        .is_some_and(|suffix| suffix.to_lowercase().starts_with("no."));
+    before || after
 }
 
 /// Treat `n°` as a reference cue only when it labels the finding itself. It is
@@ -270,16 +302,7 @@ fn is_valid_compact_date(value: &str) -> bool {
 
 /// Return whether a compact date has an explicit nearby date cue.
 fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
-    let context_start = start.saturating_sub(DATE_CUE_RADIUS_BYTES);
-    let context_end = end.saturating_add(DATE_CUE_RADIUS_BYTES).min(text.len());
-    let mut context_start = context_start;
-    while context_start > 0 && !text.is_char_boundary(context_start) {
-        context_start -= 1;
-    }
-    let mut context_end = context_end;
-    while context_end < text.len() && !text.is_char_boundary(context_end) {
-        context_end += 1;
-    }
+    let (context_start, context_end) = context_bounds_with_radius(text, start, end, DATE_CUE_RADIUS_CHARS);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
         return false;
     };
@@ -433,6 +456,20 @@ mod tests {
             unrelated_start,
             unrelated_start + 9,
             "2024-2025"
+        ));
+        let page_number = "Page No. 5, 2024-1234";
+        let page_reference_start = page_number.find("2024-1234").unwrap();
+        assert!(!has_reference_cue(
+            page_number,
+            page_reference_start,
+            page_reference_start + 9
+        ));
+        let labeled_reference = "Page No. 2024-1234";
+        let labeled_reference_start = labeled_reference.find("2024-1234").unwrap();
+        assert!(has_reference_cue(
+            labeled_reference,
+            labeled_reference_start,
+            labeled_reference_start + 9
         ));
         let unrelated_date = "Jugement du 12 février 2026, dossier 61234567";
         let unrelated_date_start = unrelated_date.find("61234567").unwrap();
