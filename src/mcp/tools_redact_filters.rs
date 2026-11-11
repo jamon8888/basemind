@@ -363,6 +363,7 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
         return true;
     }
     static TEXT_DATE_CUE: OnceLock<regex::Regex> = OnceLock::new();
+    const MAX_DATE_CUE_MATCHES: usize = 8;
     TEXT_DATE_CUE
         .get_or_init(|| {
             regex::Regex::new(
@@ -371,9 +372,16 @@ fn has_explicit_date_cue(text: &str, start: usize, end: usize) -> bool {
             .expect("text date cue regex")
         })
         .find_iter(&context)
+        .take(MAX_DATE_CUE_MATCHES)
         .any(|date| {
-            let relative_start = start - context_start;
-            let relative_end = end - context_start;
+            let (Some(relative_start), Some(relative_end)) =
+                (start.checked_sub(context_start), end.checked_sub(context_start))
+            else {
+                return false;
+            };
+            if relative_start > context.len() || relative_end > context.len() {
+                return false;
+            }
             (date.end() <= relative_start && relative_start - date.end() <= DATE_CUE_GAP_BYTES)
                 || (date.start() >= relative_end && date.start() - relative_end <= DATE_CUE_GAP_BYTES)
         })
@@ -434,6 +442,7 @@ pub(super) fn overlapping_replacement_tokens(
     let mut ordered = findings.to_vec();
     ordered.sort_by_key(|finding| (finding.start, finding.end));
     let mut skipped = HashSet::new();
+    let mut represented = HashSet::new();
     let mut cursor = 0usize;
     for finding in ordered {
         let start = finding.start as usize;
@@ -444,18 +453,22 @@ pub(super) fn overlapping_replacement_tokens(
             || !original.is_char_boundary(start)
             || !original.is_char_boundary(end)
         {
+            skipped.insert(finding.replacement_token);
             continue;
         }
         if start < cursor {
             if end > cursor {
+                represented.insert(finding.replacement_token);
                 cursor = end;
             } else {
                 skipped.insert(finding.replacement_token);
             }
             continue;
         }
+        represented.insert(finding.replacement_token);
         cursor = end;
     }
+    skipped.retain(|token| !represented.contains(token));
     skipped
 }
 
@@ -594,6 +607,33 @@ mod tests {
         assert_eq!(rebuild_redacted_text("abcdef", &overlapping), "a[A][B]");
         assert_eq!(
             overlapping_replacement_tokens("abcdef", &overlapping),
+            std::collections::HashSet::new()
+        );
+        let shared_token = [
+            RedactionFinding {
+                start: 1,
+                end: 4,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[PHONE_1]".to_string(),
+            },
+            RedactionFinding {
+                start: 3,
+                end: 4,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[PHONE_1]".to_string(),
+            },
+            RedactionFinding {
+                start: 7,
+                end: 9,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[PHONE_1]".to_string(),
+            },
+        ];
+        assert_eq!(
+            overlapping_replacement_tokens("abcdefghi", &shared_token),
             std::collections::HashSet::new()
         );
         let month_only = "En janvier, dossier 61234567";
