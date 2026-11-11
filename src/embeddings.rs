@@ -350,6 +350,7 @@ mod tests {
     use super::*;
 
     static EMBED_PASS_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static EMBED_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn embed_pass_guards_nest_and_count_down() {
@@ -417,6 +418,7 @@ mod tests {
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::Duration;
 
+        let _serial = EMBED_POOL_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let embedder = SharedEmbedder::load("fast", 2, 8).expect("fast preset");
         let scan_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -457,6 +459,7 @@ mod tests {
 
     #[test]
     fn a_panicking_embed_job_is_an_error_not_a_hang() {
+        let _serial = EMBED_POOL_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let embedder = SharedEmbedder::load("fast", 2, 8).expect("fast preset");
         let result = embedder.run_on_embed_pool(|| -> u8 { panic!("boom") });
         assert!(result.is_err());

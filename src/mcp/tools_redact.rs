@@ -29,11 +29,16 @@ use xberg::{ExtractInput, ExtractedDocument};
 
 #[path = "redact_legal_fr.rs"]
 mod redact_legal_fr;
+#[path = "tools_redact_filters.rs"]
+mod tools_redact_filters;
+use self::redact_legal_fr::{
+    is_false_positive_pattern as is_legal_fr_false_positive_pattern, should_skip_legal_fr_v2_ner_span_with_categories,
+};
+use self::tools_redact_filters::{overlapping_replacement_tokens, rebuild_redacted_text, valid_fr_nir_patterns};
 #[cfg(test)]
 use redact_legal_fr::should_skip_legal_fr_v2_ner_span;
 #[cfg(test)]
 use redact_legal_fr::should_skip_legal_fr_v2_ner_value;
-use redact_legal_fr::{is_false_positive_pattern, should_skip_legal_fr_v2_ner_span_with_categories};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -69,15 +74,16 @@ pub struct RedactTextParams {
     pub pseudonyms: Vec<Vec<String>>,
     /// Local directory holding GLiNER2 artifacts (`model.safetensors`,
     /// `tokenizer.json`, `encoder_config/config.json`). When set, NER labels
-    /// every entry in the resolved profile for redaction; a missing or
-    /// unloadable model degrades to pattern-only redaction instead of failing.
+    /// every entry in `GLI_NER2_PII_LABELS` plus `AI_ACT_NER_LABELS` for
+    /// redaction; a missing or unloadable model degrades to pattern-only
+    /// redaction instead of failing.
     #[serde(default)]
     pub ner_model_dir: Option<String>,
     /// Named, versioned NER label profile. `full@1` preserves the historical
     /// label set; `legal-fr@1` is the original French legal profile and
     /// `legal-fr@2` adds named private places plus document dates. The resolved
-    /// profile and ordered labels are returned so callers can reproduce
-    /// coverage and latency measurements.
+    /// profile and ordered labels are returned in the response so callers can
+    /// reproduce coverage and latency measurements.
     #[serde(default)]
     pub ner_profile: Option<String>,
     /// Fail with an error when NER did not run (no `ner_model_dir`, model
@@ -91,7 +97,7 @@ pub struct RedactTextParams {
 impl BasemindServer {
     #[tool(
         title = "Redact text",
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), `nir_patterns_truncated` (true when the bounded French NIR pass hit its candidate or pattern caps before the text was fully scanned, so additional identifiers may be missing; callers must inspect it before trusting the output as complete), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -252,15 +258,16 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
-            let deadline = Instant::now() + FILE_EXTRACTION_TIMEOUT;
-            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, deadline)
+            let budget_start = Instant::now();
+            let deadline = budget_start + FILE_EXTRACTION_TIMEOUT;
+            let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
                 .await
                 .map_err(|error| McpError::internal_error(error, None))?;
             if let Some(dictionary_warnings) = dictionary_filter_warnings_from_extraction(&extraction)
                 && let Some(fallback_config) = plain_text_ocr_fallback_config(&extraction_config)
             {
                 let original = std::mem::take(&mut extraction);
-                extraction = match extract_file_with_deadline(input, &fallback_config, deadline).await {
+                extraction = match extract_file_with_deadline(input, &fallback_config, budget_start, deadline).await {
                     Ok(fallback)
                         if fallback.results.is_empty()
                             || fallback
@@ -277,6 +284,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                         ));
                     }
                     Ok(mut fallback) => {
+                        // `budget_start` measures the shared retry budget; the helper captures
+                        // a fresh attempt start for the per-attempt timeout diagnostic.
                         preserve_original_ocr_text(&original, &mut fallback);
                         preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                         fallback
@@ -329,7 +338,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // checksum validation belongs at this boundary. Add exact patterns only
     // for valid candidates so the complete identifier wins over a shorter
     // overlapping phone match without turning every 15-digit run into a NIR.
-    custom_patterns.extend(valid_fr_nir_patterns(&original));
+    let (nir_patterns, nir_patterns_truncated) = valid_fr_nir_patterns(&original);
+    custom_patterns.extend(nir_patterns);
 
     // #37 GLiNER2: label mentions before redaction — the model's 42 PII labels
     // plus AI_ACT_NER_LABELS, with organization/location kept as extra
@@ -393,7 +403,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
             continue;
         }
         if label == "tax_id" && !crate::pii::is_fr_tax_id(&entity.text) {
-            // `legal-fr@1` asks the model for tax IDs, but a low-confidence
+            // French legal profiles ask the model for tax IDs, but a low-confidence
             // model span is not a tax identifier by itself. Keep the format
             // gate here so invoice references do not become tax-id tokens.
             continue;
@@ -448,13 +458,13 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     let mut redacted_text = content_doc.content;
 
     // xberg's built-in phone/BIC regexes intentionally favour recall. The
-    // legal gateway needs the same conservative boundary for obvious date and
+    // legal profile uses a conservative boundary for obvious date and
     // prose-shaped matches; rebuild the content from the original after
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
     findings.retain(|finding| {
-        !is_false_positive_pattern(
+        !is_legal_fr_false_positive_pattern(
             &original,
             finding,
             legal_fr_policy.filters,
@@ -464,7 +474,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     });
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
-        rehydration_map.retain(|token, _| findings.iter().any(|finding| finding.replacement_token == *token));
+        // Overlapping findings can be skipped while rebuilding the text. Drop only those findings'
+        // map entries; authored token literals in the source remain rehydratable.
+        let overlapping_tokens = overlapping_replacement_tokens(&original, &findings);
+        rehydration_map.retain(|token, _| !overlapping_tokens.contains(token));
     }
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
@@ -572,6 +585,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         "redacted_text": redacted_text,
         "rehydration_map": rehydration_map,
         "detections": detections,
+        "nir_patterns_truncated": nir_patterns_truncated,
         "ner_ran": ner_run.ran,
         "ner_profile": {
             "name": ner_profile.name,
@@ -653,45 +667,6 @@ fn trim_pdf_line_padding_with_map(text: &str) -> TrimmedPdfText {
         text: normalized,
         offsets,
     }
-}
-
-fn valid_fr_nir_patterns(text: &str) -> Vec<RedactionCustomPattern> {
-    let regex = regex::Regex::new(
-        r"\b[12]\p{White_Space}?\d{2}\p{White_Space}?(?:0[1-9]|1[0-2])\p{White_Space}?(?:\d{2}|2[AB])\p{White_Space}?\d{3}\p{White_Space}?\d{3}\p{White_Space}?\d{2}\b",
-    )
-    .expect("the static French NIR regex must compile");
-    regex
-        .find_iter(text)
-        .filter(|candidate| crate::pii::validate_fr_nir(candidate.as_str()))
-        .map(|candidate| RedactionCustomPattern {
-            label: "national_id_number".to_string(),
-            pattern: format!(r"\b{}\b", regex::escape(candidate.as_str())),
-            case_sensitive: true,
-        })
-        .collect()
-}
-
-fn rebuild_redacted_text(original: &str, findings: &[xberg::types::redaction::RedactionFinding]) -> String {
-    let mut ordered = findings.to_vec();
-    ordered.sort_by_key(|finding| (finding.start, finding.end));
-    let mut rebuilt = String::with_capacity(original.len());
-    let mut cursor = 0usize;
-    for finding in ordered {
-        let start = finding.start as usize;
-        let end = finding.end as usize;
-        if start < cursor
-            || end > original.len()
-            || !original.is_char_boundary(start)
-            || !original.is_char_boundary(end)
-        {
-            continue;
-        }
-        rebuilt.push_str(&original[cursor..start]);
-        rebuilt.push_str(&finding.replacement_token);
-        cursor = end;
-    }
-    rebuilt.push_str(&original[cursor..]);
-    rebuilt
 }
 
 /// Entity category → the redaction label safe/ redaction claims.
@@ -834,6 +809,8 @@ impl LegalFrPolicy {
         }
     }
 }
+
+pub(super) const LEGAL_FR_PROFILE: &str = "legal-fr@1";
 
 const LEGAL_FR_LABELS: &[&str] = &[
     "full_name",

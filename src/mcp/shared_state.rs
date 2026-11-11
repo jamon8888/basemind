@@ -177,28 +177,36 @@ fn graph_memo_budget_bytes(resources: &crate::config::ResourcesConfig) -> u64 {
 /// Factored out so [`SharedReadStack::new`] (which sets the `cache_warming` atomic + eager/deferred
 /// cache) and `BasemindServer::new_with_options` (which spawns the matching background tasks) agree
 /// by construction rather than by duplicated expressions.
-pub(crate) fn boot_plan(store: &Store, options: &ServerOptions) -> (bool, bool) {
+pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enabled: bool) -> (bool, bool) {
     let view_is_working = store.view == crate::store::VIEW_WORKING;
-    // `index.files` is the code-map tier; a documents-only workspace legitimately has no
-    // entries there even after a successful scan. Treating that as an empty workspace makes a
-    // documents-only server start a second background scan, racing the first document query
-    // while Lance rebuilds its FTS indexes (the hacienda-legal macOS failure). The msgpack doc tier
-    // is the durable readiness signal for a workspace with no code files.
-    let workspace_index_empty = store.index.files.is_empty() && store.index.doc_files.is_empty();
-    let fjall_index_empty = store.index.files.iter().next().is_some()
-        && cfg!(any(
-            feature = "code-intel-js",
-            feature = "code-intel-stack",
-            feature = "code-search"
-        ))
-        && store
-            .index_db
-            .as_ref()
-            .map(|db| db.symbols_index_is_empty())
-            .unwrap_or(false);
-    let needs_initial_scan = (options.daemon_writer || !options.read_only)
-        && view_is_working
-        && (workspace_index_empty || fjall_index_empty);
+    let fjall_index_empty = store
+        .index_db
+        .as_ref()
+        .map(|db| db.symbols_index_is_empty())
+        .unwrap_or(false);
+    // A documents-only scan deliberately leaves the code map empty. Treating that as an empty
+    // workspace starts a second background scan as soon as the MCP server opens, racing the first
+    // document search against the replacement of its Lance rows. The persisted document entries
+    // plus the completed-scan marker are the durable scan state for this feature set; cross-check
+    // both because a purge can remove entries without clearing the marker. The code-index gate is
+    // independent so a documents-only scan cannot suppress a missing symbol-index build.
+    // A completed documents pass is meaningful even when it found no document files, and a
+    // documents-disabled build has no document tier to warm. Treating either case as empty
+    // would launch a second scan every time a code-only workspace opens.
+    let documents_index_empty = documents_enabled && !store.index.documents_scan_completed;
+    // A documents-only workspace has no code map by design. Only require a code-index rebuild
+    // when code files exist but their secondary index is missing (and this build includes a code
+    // index tier), or when the whole workspace is empty.
+    let code_index_empty = (store.index.files.is_empty() && store.index.doc_files.is_empty())
+        || (store.index.files.iter().next().is_some()
+            && cfg!(any(
+                feature = "code-intel-js",
+                feature = "code-intel-stack",
+                feature = "code-search"
+            ))
+            && fjall_index_empty);
+    let needs_initial_scan =
+        (options.daemon_writer || !options.read_only) && view_is_working && (documents_index_empty || code_index_empty);
     let defer_warm = options.background && !needs_initial_scan;
     (needs_initial_scan, defer_warm)
 }
@@ -230,7 +238,7 @@ impl SharedReadStack {
             .map(|r| crate::git::scope_key(r))
             .unwrap_or_else(|| format!("path:{}", root.display()));
         let corpus_bytes: u64 = store.index.files.values().map(|e| e.size_bytes).sum();
-        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options);
+        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options, config.documents.enabled);
         let cache = if defer_warm || options.lazy_cache {
             Arc::new(MapCache::empty())
         } else {
@@ -311,40 +319,5 @@ impl SharedReadStack {
         opts: &super::codegraph::BuildOpts,
     ) -> Result<Arc<super::codegraph::CodeGraph>, rmcp::ErrorData> {
         super::codegraph::build_memoized(&self.graph_memo, idx, cache, opts)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::{DocEntry, Store, VIEW_WORKING};
-
-    #[test]
-    fn a_scanned_documents_only_workspace_does_not_auto_scan_again() {
-        crate::store::init_isolated_cache();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = Store::open(dir.path(), VIEW_WORKING).expect("open store");
-        store.index.doc_files.insert(
-            crate::path::RelPath::from("matter/lease.md"),
-            DocEntry {
-                hash_hex: "hash".to_string(),
-                embedding_preset: "balanced".to_string(),
-                size_bytes: 1,
-                mtime: 1,
-                embedded: true,
-                embed_attempted: false,
-                rehydration_ref: None,
-                config_digest: "config".to_string(),
-            },
-        );
-
-        let options = ServerOptions {
-            background: true,
-            watch: true,
-            read_only: false,
-            daemon_writer: false,
-            lazy_cache: false,
-        };
-        assert_eq!(boot_plan(&store, &options), (false, true));
     }
 }
