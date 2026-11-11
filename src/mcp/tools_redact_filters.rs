@@ -150,13 +150,13 @@ fn has_adjacent_no_cue(text: &str, start: usize, end: usize) -> bool {
         .map(|prefix| {
             prefix.trim_end_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
         })
-        .is_some_and(|prefix| prefix.to_lowercase().ends_with("no."));
+        .is_some_and(|prefix| has_standalone_suffix(prefix, "no."));
     let after = text
         .get(end..)
         .map(|suffix| {
             suffix.trim_start_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
         })
-        .is_some_and(|suffix| suffix.to_lowercase().starts_with("no."));
+        .is_some_and(|suffix| has_standalone_prefix(suffix, "no."));
     before || after
 }
 
@@ -168,14 +168,34 @@ fn has_adjacent_number_cue(text: &str, start: usize, end: usize) -> bool {
         .map(|prefix| {
             prefix.trim_end_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
         })
-        .is_some_and(|prefix| prefix.to_lowercase().ends_with("n°"));
+        .is_some_and(|prefix| has_standalone_suffix(prefix, "n°"));
     let after = text
         .get(end..)
         .map(|suffix| {
             suffix.trim_start_matches(|character: char| character.is_whitespace() || ":-–—".contains(character))
         })
-        .is_some_and(|suffix| suffix.to_lowercase().starts_with("n°"));
+        .is_some_and(|suffix| has_standalone_prefix(suffix, "n°"));
     before || after
+}
+
+fn has_standalone_suffix(value: &str, suffix: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.strip_suffix(suffix).is_some_and(|prefix| {
+        prefix
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric())
+    })
+}
+
+fn has_standalone_prefix(value: &str, prefix: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_alphanumeric())
+    })
 }
 
 /// Return whether nearby wording explicitly identifies a phone number.
@@ -708,12 +728,26 @@ mod tests {
             abbreviated_no_start,
             abbreviated_no_start + 9
         ));
+        let embedded_no = "Anno. 2024-1234";
+        let embedded_no_start = embedded_no.find("2024-1234").unwrap();
+        assert!(!has_reference_cue(
+            embedded_no,
+            embedded_no_start,
+            embedded_no_start + 9
+        ));
         let adjacent_number_cue = "n° 61234567";
         let adjacent_number_start = adjacent_number_cue.find("61234567").unwrap();
         assert!(has_reference_cue(
             adjacent_number_cue,
             adjacent_number_start,
             adjacent_number_start + 8
+        ));
+        let embedded_number_cue = "conn° 61234567";
+        let embedded_number_start = embedded_number_cue.find("61234567").unwrap();
+        assert!(!has_reference_cue(
+            embedded_number_cue,
+            embedded_number_start,
+            embedded_number_start + 8
         ));
         let unrelated_number_cue = "Pièce n° 3, 61234567";
         let unrelated_number_start = unrelated_number_cue.find("61234567").unwrap();
