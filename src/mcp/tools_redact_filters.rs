@@ -77,12 +77,19 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>,
     if patterns.len() > 1 {
         let alternatives = patterns
             .into_iter()
-            .map(|pattern| pattern.pattern)
+            .map(|pattern| {
+                pattern
+                    .pattern
+                    .strip_prefix(r"\b")
+                    .and_then(|pattern| pattern.strip_suffix(r"\b"))
+                    .unwrap_or(&pattern.pattern)
+                    .to_string()
+            })
             .collect::<Vec<_>>()
             .join("|");
         patterns = vec![RedactionCustomPattern {
             label: "national_id_number".to_string(),
-            pattern: format!("(?:{alternatives})"),
+            pattern: format!(r"\b(?:{alternatives})\b"),
             case_sensitive: true,
         }];
     }

@@ -276,6 +276,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
                         ));
                     }
                     Ok(mut fallback) => {
+                        // `budget_start` measures the shared retry budget; the helper captures
+                        // a fresh attempt start for the per-attempt timeout diagnostic.
                         preserve_original_ocr_text(&original, &mut fallback);
                         preserve_dictionary_filter_warnings(&mut fallback, dictionary_warnings);
                         fallback
