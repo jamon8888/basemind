@@ -674,7 +674,7 @@ fn flush_doc_batches_and_index(
 ) {
     let has_batches = !batches.is_empty();
     let lane_completed = run_optional_lane(LANE_DOC_BATCHES, || {
-        flush_doc_batches_if_any(store, config, batches, metrics, observer);
+        flush_doc_batches_if_any(&mut *store, config, batches, metrics, observer);
     });
     if mark_documents_scan_complete && lane_completed {
         store.index.documents_scan_completed = true;
