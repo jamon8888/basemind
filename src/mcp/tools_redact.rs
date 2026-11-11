@@ -7,7 +7,7 @@
 //! token map) → return `{redacted_text, rehydration_map, detections}` so the
 //! caller can store the map and send redacted text onward.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
@@ -29,7 +29,9 @@ use xberg::{ExtractInput, ExtractedDocument};
 
 #[path = "tools_redact_filters.rs"]
 mod tools_redact_filters;
-use self::tools_redact_filters::{is_false_positive_pattern, rebuild_redacted_text, valid_fr_nir_patterns};
+use self::tools_redact_filters::{
+    is_false_positive_pattern, overlapping_replacement_tokens, rebuild_redacted_text, valid_fr_nir_patterns,
+};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -87,7 +89,7 @@ pub struct RedactTextParams {
 impl BasemindServer {
     #[tool(
         title = "Redact text",
-        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), `nir_patterns_truncated` (true when the bounded French NIR pattern pass found more candidates than it could process), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
+        description = "Redact arbitrary text (inline `text`, or a document `file_path` extracted by xberg — PDF/Office/HTML/images via OCR). Returns redacted_text, rehydration_map (token to original), detections (category, start, end, text; start/end are UTF-8 byte offsets into the text as sent for inline text, or into the extracted text for a file_path), `nir_patterns_truncated` (true when the bounded French NIR pass stopped before all shape matches could be validated or redacted; this is a conservative signal when excess candidates fail checksum validation), the resolved named/versioned `ner_profile` and `ner_ran` (false when NER did not run and only pattern redaction applied; set require_ner to fail instead). When NER ran it windows internally (#71) and reports ner_windows (windows read), ner_window_chars (largest window, in characters) and ner_truncated (true when the text could not be fully read — require_ner fails then too; with ner_truncated false those three fields vouch that every character was read by NER).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -443,18 +445,10 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
     }
-    // Overlapping findings can be skipped while rebuilding the text. Do not return map entries
-    // for tokens that are absent from the actual redacted payload. An authored token literal in
-    // the source is intentionally preserved by this check and remains rehydratable, matching the
-    // engine's existing token behavior.
-    let present_tokens: HashSet<&str> = redacted_text
-        .match_indices('[')
-        .filter_map(|(start, _)| {
-            let end = redacted_text.get(start..)?.find(']')? + start + 1;
-            redacted_text.get(start..end)
-        })
-        .collect();
-    rehydration_map.retain(|token, _| present_tokens.contains(token.as_str()));
+    // Overlapping findings can be skipped while rebuilding the text. Drop only those findings'
+    // map entries; authored token literals in the source remain rehydratable.
+    let overlapping_tokens = overlapping_replacement_tokens(&original, &findings);
+    rehydration_map.retain(|token, _| !overlapping_tokens.contains(token));
 
     // A French company identifier (SIREN, SIRET) is a run of digits the engine files as a
     // phone number. The legal caller acts on the label, so it has to be `tax_id`.

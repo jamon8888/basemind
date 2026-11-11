@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use crate::config::RedactionCustomPattern;
@@ -68,7 +69,8 @@ pub(super) fn valid_fr_nir_patterns(text: &str) -> (Vec<RedactionCustomPattern>,
     if truncated {
         tracing::warn!(
             max_patterns = MAX_VALID_FR_NIR_PATTERNS,
-            "French NIR redaction pattern cap reached; additional identifiers may require a follow-up pass"
+            max_candidates = max_candidates_to_scan,
+            "French NIR redaction pass cap reached; additional identifiers may require a follow-up pass"
         );
         patterns.truncate(MAX_VALID_FR_NIR_PATTERNS);
     }
@@ -380,11 +382,40 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
     rebuilt
 }
 
+/// Return replacement tokens for findings that the overlap policy skips.
+pub(super) fn overlapping_replacement_tokens(
+    original: &str,
+    findings: &[xberg::types::redaction::RedactionFinding],
+) -> HashSet<String> {
+    let mut ordered = findings.to_vec();
+    ordered.sort_by_key(|finding| (finding.start, finding.end));
+    let mut skipped = HashSet::new();
+    let mut cursor = 0usize;
+    for finding in ordered {
+        let start = finding.start as usize;
+        let end = finding.end as usize;
+        if end > original.len() || !original.is_char_boundary(start) || !original.is_char_boundary(end) {
+            continue;
+        }
+        if start < cursor {
+            if end > cursor {
+                cursor = end;
+            } else {
+                skipped.insert(finding.replacement_token);
+            }
+            continue;
+        }
+        cursor = end;
+    }
+    skipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         has_bic_context, has_explicit_date_cue, has_phone_context, has_reference_cue, is_false_positive_pattern,
-        is_legal_reference_finding, is_valid_compact_date, rebuild_redacted_text, valid_fr_nir_patterns,
+        is_legal_reference_finding, is_valid_compact_date, overlapping_replacement_tokens, rebuild_redacted_text,
+        valid_fr_nir_patterns,
     };
     use xberg::types::redaction::{PiiCategory, RedactionFinding, RedactionStrategy};
 
@@ -512,6 +543,10 @@ mod tests {
             },
         ];
         assert_eq!(rebuild_redacted_text("abcdef", &overlapping), "a[A][B]");
+        assert_eq!(
+            overlapping_replacement_tokens("abcdef", &overlapping),
+            std::collections::HashSet::new()
+        );
         let month_only = "En janvier, dossier 61234567";
         let month_only_start = month_only.find("61234567").unwrap();
         assert!(!has_explicit_date_cue(
