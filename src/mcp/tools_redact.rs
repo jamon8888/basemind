@@ -31,10 +31,11 @@ use xberg::{ExtractInput, ExtractedDocument};
 mod redact_legal_fr;
 #[path = "tools_redact_filters.rs"]
 mod tools_redact_filters;
-use self::redact_legal_fr::{
-    is_false_positive_pattern as is_legal_fr_false_positive_pattern, should_skip_legal_fr_v2_ner_span_with_categories,
+use self::redact_legal_fr::should_skip_legal_fr_v2_ner_span_with_categories;
+use self::tools_redact_filters::{
+    is_false_positive_pattern as is_legal_fr_false_positive_pattern, overlapping_replacement_tokens,
+    rebuild_redacted_text, valid_fr_nir_patterns,
 };
-use self::tools_redact_filters::{overlapping_replacement_tokens, rebuild_redacted_text, valid_fr_nir_patterns};
 #[cfg(test)]
 use redact_legal_fr::should_skip_legal_fr_v2_ner_span;
 #[cfg(test)]
