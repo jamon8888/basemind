@@ -420,7 +420,8 @@ pub(super) fn rebuild_redacted_text(original: &str, findings: &[xberg::types::re
             // Do not emit `original[cursor..start]`: it overlaps the already
             // redacted span and could reintroduce PII. A second token is safer
             // than preserving source text, even when the overlap changes the
-            // output length; the behavior is covered by the overlap test below.
+            // output length. The second token covers its full finding, including
+            // the part after `cursor`, so moving the cursor to `end` is intentional.
             if end > cursor {
                 rebuilt.push_str(&finding.replacement_token);
                 cursor = end;
@@ -605,6 +606,26 @@ mod tests {
             },
         ];
         assert_eq!(rebuild_redacted_text("abcdef", &overlapping), "a[A][B]");
+        let partially_overlapping = [
+            RedactionFinding {
+                start: 2,
+                end: 8,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[A]".to_string(),
+            },
+            RedactionFinding {
+                start: 6,
+                end: 10,
+                category: PiiCategory::Phone,
+                strategy: RedactionStrategy::Mask,
+                replacement_token: "[B]".to_string(),
+            },
+        ];
+        assert_eq!(
+            rebuild_redacted_text("abcdefghijkl", &partially_overlapping),
+            "ab[A][B]kl"
+        );
         assert_eq!(
             overlapping_replacement_tokens("abcdef", &overlapping),
             std::collections::HashSet::new()
