@@ -190,9 +190,21 @@ pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enable
     // plus the completed-scan marker are the durable scan state for this feature set; cross-check
     // both because a purge can remove entries without clearing the marker. The code-index gate is
     // independent so a documents-only scan cannot suppress a missing symbol-index build.
-    let documents_index_empty =
-        !documents_enabled || !store.index.documents_scan_completed || store.index.doc_files.is_empty();
-    let code_index_empty = store.index.files.is_empty() || fjall_index_empty;
+    // A completed documents pass is meaningful even when it found no document files, and a
+    // documents-disabled build has no document tier to warm. Treating either case as empty
+    // would launch a second scan every time a code-only workspace opens.
+    let documents_index_empty = documents_enabled && !store.index.documents_scan_completed;
+    // A documents-only workspace has no code map by design. Only require a code-index rebuild
+    // when code files exist but their secondary index is missing (and this build includes a code
+    // index tier), or when the whole workspace is empty.
+    let code_index_empty = (store.index.files.is_empty() && store.index.doc_files.is_empty())
+        || (store.index.files.iter().next().is_some()
+            && cfg!(any(
+                feature = "code-intel-js",
+                feature = "code-intel-stack",
+                feature = "code-search"
+            ))
+            && fjall_index_empty);
     let needs_initial_scan =
         (options.daemon_writer || !options.read_only) && view_is_working && (documents_index_empty || code_index_empty);
     let defer_warm = options.background && !needs_initial_scan;
