@@ -8,6 +8,7 @@ use crate::config::RedactionCustomPattern;
 const CONTEXT_RADIUS_CHARS: usize = 80;
 const MAX_VALID_FR_NIR_PATTERNS: usize = 256;
 const DATE_CUE_RADIUS_CHARS: usize = 32;
+const REFERENCE_CUE_RADIUS_CHARS: usize = 32;
 const DATE_CUE_GAP_BYTES: usize = 16;
 
 /// Return a bounded character window around byte offsets, aligned to UTF-8 boundaries.
@@ -126,7 +127,7 @@ pub(super) fn is_false_positive_pattern(
 
 /// Return whether the local text names the finding as a legal reference.
 fn has_reference_cue(text: &str, start: usize, end: usize) -> bool {
-    let (context_start, context_end) = aligned_context_bounds(text, start, end);
+    let (context_start, context_end) = context_bounds_with_radius(text, start, end, REFERENCE_CUE_RADIUS_CHARS);
     let Some(context) = text.get(context_start..context_end).map(str::to_lowercase) else {
         return false;
     };
@@ -453,7 +454,6 @@ pub(super) fn overlapping_replacement_tokens(
             || !original.is_char_boundary(start)
             || !original.is_char_boundary(end)
         {
-            skipped.insert(finding.replacement_token);
             continue;
         }
         if start < cursor {
@@ -802,6 +802,13 @@ mod tests {
             unrelated_number_cue,
             unrelated_number_start,
             unrelated_number_start + 8
+        ));
+        let distant_reference = format!("Réf. {}2024-1234", "texte ".repeat(8));
+        let distant_reference_start = distant_reference.find("2024-1234").unwrap();
+        assert!(!has_reference_cue(
+            &distant_reference,
+            distant_reference_start,
+            distant_reference_start + 9
         ));
         let unrelated_short_word = "Date 20260219, the cell in the table, 61234567";
         let unrelated_start = unrelated_short_word.find("61234567").unwrap();
