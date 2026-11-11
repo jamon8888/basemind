@@ -77,7 +77,11 @@ fn run_scan(root: &Path) {
 }
 
 async fn client(root: &Path) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let transport = basemind::mcp::serve_in_memory_lean(root, "working", false)
+    // `run_scan` goes through the CLI, which canonicalizes `--root`; serve the same canonical path.
+    // On macOS the tempdir sits under `/var`, a symlink to `/private/var`, and a server rooted at
+    // the raw path found no document hits for the CLI-scanned workspace.
+    let root = root.canonicalize().expect("canonical workspace root");
+    let transport = basemind::mcp::serve_in_memory_lean(&root, "working", false)
         .await
         .expect("in-memory serve");
     ().serve(transport).await.expect("rmcp handshake")
