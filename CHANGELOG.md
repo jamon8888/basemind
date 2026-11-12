@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `redact_text` now offers the versioned `legal-fr@2` NER profile: named private
   places and document dates are covered, broad legal geography remains readable,
   and common French legal references are not mistaken for phone numbers (#97).
+- `BASEMIND_FILE_EXTRACTION_TIMEOUT_SECS` (default 120, at most 3600) sets the shared
+  budget for extracting one file in `redact_text`/`redact --file`, OCR retry included, so a
+  caller with a longer deadline of its own is not cut off first.
 - New `hacienda-legal` focus release for legal client folders: a `--features hacienda-legal` build (documents + memory + `ner-candle` + `graphrag`, no comms/shells/crawl/code-intel) shipped as `basemind-hacienda-legal-<triple>` release assets, with a drop-in client-folder preset at `examples/basemind-hacienda-legal.toml` (ingestion-time `token-replace` redaction, legal NER labels, multilingual retrieval lanes, GraphRAG) and a new "Legal workspaces" docs page covering the redact → `vault encrypt` → caller-persisted blob → `vault decrypt`/`find` rehydration flow.
 - The PDF/Office benchmark accepts runtime concurrency and ONNX-provider overrides for measured tuning sweeps.
 - Document search supports opaque continuation cursors, with durable generation invalidation when the Lance index is rebuilt.
@@ -30,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Under the `legal-fr` profile, a span of years such as `2024-2025` (1900-2099, second year one
+  to ten years after the first) is no longer redacted as a phone number, even without a
+  reference cue nearby; a phone cue next to it still wins, and so does a dialing prefix or a
+  trailing digit group (`(21) 2012-2019`, `+55 21 2012-2019`), since some countries write
+  eight-digit numbers as two groups of four.
+- The OCR retry after dictionary filtering now also runs on scanned PDFs: xberg keeps the
+  "Tesseract removed N OCR line(s)" warning but not the dictionary ratio on a PDF, so a
+  whole-document OCR result without the ratio retries on the warning alone (#115).
+- `tests/hacienda_legal_smoke.rs` serves the canonical workspace path, as the CLI scan does;
+  on macOS the raw tempdir path (a `/var` symlink) found no document hits.
 - OCR no longer loses real text when Tesseract's dictionary signal is unavailable: document OCR
   retries with xberg's plain-text path only when the normal hOCR pass reports dictionary-filtered
   lines, preserving structured table OCR for healthy documents.

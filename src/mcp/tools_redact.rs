@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::BasemindServer;
 use super::helpers::record_call;
-use super::tools_redact_timeout::{FILE_EXTRACTION_TIMEOUT, extract_file_with_deadline};
+use super::tools_redact_timeout::{extract_file_with_deadline, file_extraction_timeout};
 use crate::config::{RedactionConfig, RedactionCustomPattern, RedactionCustomTerm, RedactionStrategy};
 use crate::extract::doc::ocr_fallback::{
     dictionary_filter_warnings_from_extraction, plain_text_ocr_fallback_config, preserve_dictionary_filter_warnings,
@@ -260,7 +260,7 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         Source::File(input) => {
             let input = *input;
             let budget_start = Instant::now();
-            let deadline = budget_start + FILE_EXTRACTION_TIMEOUT;
+            let deadline = budget_start + file_extraction_timeout();
             let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
                 .await
                 .map_err(|error| McpError::internal_error(error, None))?;
