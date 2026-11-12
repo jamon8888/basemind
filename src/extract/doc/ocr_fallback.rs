@@ -19,13 +19,21 @@ pub(crate) fn plain_text_ocr_fallback_config(config: &ExtractionConfig) -> Optio
 
 const TESSERACT_DICT_INVALID_WORD_RATIO_KEY: &str = "tesseract_dict_invalid_word_ratio";
 
+const EXTRACTION_METHOD_KEY: &str = "extraction_method";
+
+/// True when the dictionary filter left no valid dictionary word. Image OCR reports the ratio on
+/// the document; xberg 1.3.9's PDF OCR route does not carry it to the returned document (only the
+/// "Tesseract removed N OCR line(s)" warning survives). A whole-document OCR result without the
+/// ratio therefore relies on that warning alone, so scanned PDFs get the same retry as images.
 fn has_no_dictionary_signal(result: &xberg::types::ExtractedDocument) -> bool {
-    result
-        .metadata
-        .additional
-        .get(TESSERACT_DICT_INVALID_WORD_RATIO_KEY)
-        .and_then(serde_json::Value::as_f64)
-        .is_some_and(|ratio| ratio >= 1.0)
+    let additional = &result.metadata.additional;
+    match additional.get(TESSERACT_DICT_INVALID_WORD_RATIO_KEY) {
+        Some(ratio) => ratio.as_f64().is_some_and(|ratio| ratio >= 1.0),
+        None => additional
+            .get(EXTRACTION_METHOD_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|method| method == "ocr"),
+    }
 }
 
 /// Return warnings proving xberg's lossy dictionary filter ran. They are copied onto a
