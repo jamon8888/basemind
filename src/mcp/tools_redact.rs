@@ -804,7 +804,7 @@ struct LegalFrPolicy {
 impl LegalFrPolicy {
     fn for_profile(profile: &NerProfile, preserve_document_dates: bool) -> Self {
         Self {
-            filters: matches!(profile.name.as_str(), "legal-fr@1" | "legal-fr@2"),
+            filters: matches!(profile.name.as_str(), LEGAL_FR_PROFILE | "legal-fr@2"),
             v2: profile.name == "legal-fr@2",
             preserve_document_dates,
         }
