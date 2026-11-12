@@ -32,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Under the `legal-fr` profile, a span of years such as `2024-2025` (1900-2099, second year one
   to ten years after the first) is no longer redacted as a phone number, even without a
-  reference cue nearby; a phone cue next to it still wins.
+  reference cue nearby; a phone cue next to it still wins, and so does a dialing prefix or a
+  trailing digit group (`(21) 2012-2019`, `+55 21 2012-2019`), since some countries write
+  eight-digit numbers as two groups of four.
 - The OCR retry after dictionary filtering now also runs on scanned PDFs: xberg keeps the
   "Tesseract removed N OCR line(s)" warning but not the dictionary ratio on a PDF, so a
   whole-document OCR result without the ratio retries on the warning alone (#115).

@@ -113,9 +113,11 @@ pub(super) fn is_false_positive_pattern(
             // French phones have ten national digits; an eight-digit run with
             // a reference/date shape is not a phone unless phone context says so.
             // A span of years ("exercice 2024-2025") needs no cue: it carries the
-            // period a legal reasoning depends on, and no phone has that shape.
+            // period a legal reasoning depends on. Eight-digit numbers written 4-4
+            // exist abroad, so a dialing prefix or a trailing digit group keeps it masked.
             legal_fr_filters
-                && (is_year_range(value) || is_legal_reference_finding(original, start, end, value))
+                && (is_year_span_finding(original, start, end, value)
+                    || is_legal_reference_finding(original, start, end, value))
                 && !has_phone_context(original, start, end)
         }
         xberg::types::redaction::PiiCategory::SwiftBic => {
@@ -302,6 +304,21 @@ fn is_legal_reference_shape(value: &str) -> bool {
     // are restricted to 2000..=2099 below to avoid treating arbitrary eight-digit phone-like
     // values as dates.
     compact_date || year_reference
+}
+
+/// A year-shaped value that is not glued to other digits of a longer number.
+fn is_year_span_finding(text: &str, start: usize, end: usize, value: &str) -> bool {
+    is_year_range(value) && !touches_dialing_digits(text, start, end)
+}
+
+/// Whether a dialing prefix (`+55 21`, `(21)`) precedes the value or a digit group follows it,
+/// across blanks and dashes.
+fn touches_dialing_digits(text: &str, start: usize, end: usize) -> bool {
+    let gap = |c: char| c.is_whitespace() || c == '-';
+    let before = text[..start].trim_end_matches(gap).chars().next_back();
+    let after = text[end..].trim_start_matches(gap).chars().next();
+    matches!(before, Some(c) if c.is_ascii_digit() || c == '+' || c == ')')
+        || matches!(after, Some(c) if c.is_ascii_digit())
 }
 
 /// Recognize a span of years such as `2024-2025` or `2019-2024`: two years between
@@ -532,6 +549,29 @@ mod tests {
         // A phone cue glued to the value still wins.
         let phone = "Tél : 2024-2025, du lundi au vendredi";
         assert!(!is_false_positive_pattern(phone, &phone_at(phone, "2024-2025"), true));
+        // Some countries write eight-digit numbers as two groups of four: a dialing prefix or a
+        // trailing digit group makes the span part of a longer number, which stays redacted.
+        for text in [
+            "Joignable au (21) 2012-2019 en semaine.",
+            "Joignable au +55 21 2012-2019 en semaine.",
+            "Joignable au +2012-2019 en semaine.",
+            "Joignable au 2012-2019 44 en semaine.",
+        ] {
+            assert!(
+                !is_false_positive_pattern(text, &phone_at(text, "2012-2019"), true),
+                "{text}"
+            );
+        }
+        // Brackets and punctuation around a real span keep it readable.
+        for text in [
+            "Les exercices (2019-2021) sont clos.",
+            "Exercices 2019-2021 : 3 M€ de pertes.",
+        ] {
+            assert!(
+                is_false_positive_pattern(text, &phone_at(text, "2019-2021"), true),
+                "{text}"
+            );
+        }
         for value in [
             "2025-2024",
             "2024-2024",
