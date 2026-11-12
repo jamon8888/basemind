@@ -78,6 +78,169 @@ async fn ner_profile_metadata_reports_effective_labels_without_model() {
     );
 }
 
+#[tokio::test]
+async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@2".to_string()),
+        ..text_params("Résidence Les Hortensias, le 3 septembre 2026")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], "legal-fr@2");
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth",
+            "named_place",
+            "document_date"
+        ])
+    );
+}
+
+#[test]
+fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "sécurité sociale",
+        "organization"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "depuis le 1er janvier deux mil vingt-quatre",
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "Union européenne",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "grand Sud-Ouest",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "France métropolitaine",
+        "named_place"
+    ));
+
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "DISTRIBUTION LORMARIN SAS",
+        "organization"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1420041010050500013M02606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1X 2004 1010 0505 0001 3M02 606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "date de naissance : 3 septembre 1980",
+        "date_of_birth"
+    ));
+    let date = "3 septembre 1980";
+    let text = format!("depuis le {date}");
+    let start = text.find(date).expect("date is present");
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
+        "date_of_birth"
+    ));
+    let text = format!("{date} sans contexte de naissance");
+    let start = text.find(date).expect("date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
+        "date_of_birth"
+    ));
+    let mixed_dates = "Jean Dupont (3 septembre 1980). Contrat signé le 1 janvier 2026.";
+    let birth_start = mixed_dates.find("3 septembre 1980").expect("birth date is present");
+    let act_start = mixed_dates.find("1 janvier 2026").expect("act date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        birth_start,
+        birth_start + "3 septembre 1980".len(),
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "date_of_birth"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_span_with_categories(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "document_date",
+        true
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "Résidence Les Hortensias",
+        "named_place"
+    ));
+}
+
+#[tokio::test]
+async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
+    // Compact dates need an explicit date nearby (shared filter policy from #179): an
+    // eight-digit run without one stays a phone candidate and is redacted.
+    let text =
+        "Publié le 19 février 2026, annonce 20260219-AAA-0042. Référence devis : 2026-221. Contact : 06 12 34 56 78.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        redacted.contains("20260219-AAA-0042"),
+        "reference must stay: {redacted}"
+    );
+    assert!(redacted.contains("2026-221"), "reference must stay: {redacted}");
+    assert!(!redacted.contains("06 12 34 56 78"), "phone must redact: {redacted}");
+}
+
+#[tokio::test]
+async fn legal_fr_v2_phone_context_overrides_invoice_reference_cue() {
+    let text = "Facture 42. Téléphone Danemark : 32345678.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains("32345678"), "phone must redact: {redacted}");
+}
+
 /// A `ner_model_dir` pointing at nothing must never fail the call:
 /// NER degrades to pattern-only redaction and the response stays intact.
 #[tokio::test]
@@ -528,7 +691,14 @@ async fn legal_reference_numbers_are_not_redacted_as_phones() {
 #[tokio::test]
 async fn uppercase_prose_is_not_redacted_as_a_swift_code_without_context() {
     let text = "ATTESTATION D'EMPLOYEUR\n\nLa présente attestation est établie à la demande.";
-    let payload = json_of(&run_redact(text_params(text)).await.expect("redact_text succeeds"));
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(redacted.contains("ATTESTATION"), "ordinary prose must stay: {redacted}");
     assert!(

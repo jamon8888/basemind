@@ -27,11 +27,19 @@ use crate::extract::doc::ocr_fallback::{
 use xberg::text::redaction;
 use xberg::{ExtractInput, ExtractedDocument};
 
+#[path = "redact_legal_fr.rs"]
+mod redact_legal_fr;
 #[path = "tools_redact_filters.rs"]
 mod tools_redact_filters;
+use self::redact_legal_fr::should_skip_legal_fr_v2_ner_span_with_categories;
 use self::tools_redact_filters::{
-    is_false_positive_pattern, overlapping_replacement_tokens, rebuild_redacted_text, valid_fr_nir_patterns,
+    is_false_positive_pattern as is_legal_fr_false_positive_pattern, overlapping_replacement_tokens,
+    rebuild_redacted_text, valid_fr_nir_patterns,
 };
+#[cfg(test)]
+use redact_legal_fr::should_skip_legal_fr_v2_ner_span;
+#[cfg(test)]
+use redact_legal_fr::should_skip_legal_fr_v2_ner_value;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -73,9 +81,10 @@ pub struct RedactTextParams {
     #[serde(default)]
     pub ner_model_dir: Option<String>,
     /// Named, versioned NER label profile. `full@1` preserves the historical
-    /// label set; `legal-fr@1` sends only the labels needed by the French legal
-    /// gateway. The resolved profile and ordered labels are returned in the
-    /// response so callers can reproduce coverage and latency measurements.
+    /// label set; `legal-fr@1` is the original French legal profile and
+    /// `legal-fr@2` adds named private places plus document dates. The resolved
+    /// profile and ordered labels are returned in the response so callers can
+    /// reproduce coverage and latency measurements.
     #[serde(default)]
     pub ner_profile: Option<String>,
     /// Fail with an error when NER did not run (no `ner_model_dir`, model
@@ -370,6 +379,8 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         .iter()
         .filter_map(|entity| Some(((entity.start, entity.end), entity.confidence?)))
         .collect();
+    let preserve_document_dates = args.categories.iter().any(|category| category == "document_date");
+    let legal_fr_policy = LegalFrPolicy::for_profile(&ner_profile, preserve_document_dates);
     let mut seen_terms: std::collections::HashSet<(String, String)> = custom_terms
         .iter()
         .map(|term| (term.label.clone(), term.value.clone()))
@@ -381,8 +392,19 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
         if entity.text.chars().count() < MIN_NER_SPAN_CHARS {
             continue;
         }
+        if legal_fr_policy.v2
+            && should_skip_legal_fr_v2_ner_span_with_categories(
+                &original,
+                entity.start as usize,
+                entity.end as usize,
+                &label,
+                legal_fr_policy.preserve_document_dates,
+            )
+        {
+            continue;
+        }
         if label == "tax_id" && !crate::pii::is_fr_tax_id(&entity.text) {
-            // `legal-fr@1` asks the model for tax IDs, but a low-confidence
+            // French legal profiles ask the model for tax IDs, but a low-confidence
             // model span is not a tax identifier by itself. Keep the format
             // gate here so invoice references do not become tax-id tokens.
             continue;
@@ -442,8 +464,15 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // dropping only those findings, preserving every accepted replacement and
     // its caller-owned token map.
     let before_filter = findings.len();
-    let legal_fr_filters = ner_profile.name == LEGAL_FR_PROFILE;
-    findings.retain(|finding| !is_false_positive_pattern(&original, finding, legal_fr_filters));
+    findings.retain(|finding| {
+        !is_legal_fr_false_positive_pattern(
+            &original,
+            finding,
+            legal_fr_policy.filters,
+            legal_fr_policy.v2,
+            legal_fr_policy.preserve_document_dates,
+        )
+    });
     if findings.len() != before_filter {
         redacted_text = rebuild_redacted_text(&original, &findings);
         // Overlapping findings can be skipped while rebuilding the text. Drop only those findings'
@@ -765,6 +794,23 @@ struct NerProfile {
     labels: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LegalFrPolicy {
+    filters: bool,
+    v2: bool,
+    preserve_document_dates: bool,
+}
+
+impl LegalFrPolicy {
+    fn for_profile(profile: &NerProfile, preserve_document_dates: bool) -> Self {
+        Self {
+            filters: matches!(profile.name.as_str(), LEGAL_FR_PROFILE | "legal-fr@2"),
+            v2: profile.name == "legal-fr@2",
+            preserve_document_dates,
+        }
+    }
+}
+
 pub(super) const LEGAL_FR_PROFILE: &str = "legal-fr@1";
 
 const LEGAL_FR_LABELS: &[&str] = &[
@@ -796,8 +842,19 @@ fn resolve_ner_profile(requested: Option<&str>) -> Result<NerProfile, String> {
             labels
         }
         "legal-fr@1" => LEGAL_FR_LABELS.iter().map(|label| (*label).to_string()).collect(),
+        "legal-fr@2" => {
+            let mut labels: Vec<String> = LEGAL_FR_LABELS.iter().map(|label| (*label).to_string()).collect();
+            labels.extend(
+                ["named_place", "document_date"]
+                    .iter()
+                    .map(|label| (*label).to_string()),
+            );
+            labels
+        }
         other => {
-            return Err(format!("unknown NER profile {other}; expected full@1 or legal-fr@1"));
+            return Err(format!(
+                "unknown NER profile {other}; expected full@1, legal-fr@1 or legal-fr@2"
+            ));
         }
     };
     Ok(NerProfile {

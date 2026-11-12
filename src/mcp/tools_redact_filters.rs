@@ -102,6 +102,8 @@ pub(super) fn is_false_positive_pattern(
     original: &str,
     finding: &xberg::types::redaction::RedactionFinding,
     legal_fr_filters: bool,
+    legal_fr_v2: bool,
+    preserve_document_dates: bool,
 ) -> bool {
     let start = finding.start as usize;
     let end = finding.end as usize;
@@ -109,6 +111,15 @@ pub(super) fn is_false_positive_pattern(
         return false;
     };
     match &finding.category {
+        xberg::types::redaction::PiiCategory::Custom(label)
+            if legal_fr_v2
+                && !preserve_document_dates
+                && matches!(label.as_str(), "date_of_birth" | "document_date") =>
+        {
+            // NER custom patterns are global, so remove only the occurrence
+            // that is clearly an act date after xberg has matched it.
+            super::redact_legal_fr::is_act_date_context(original, start, end)
+        }
         xberg::types::redaction::PiiCategory::Phone => {
             // French phones have ten national digits; an eight-digit run with
             // a reference/date shape is not a phone unless phone context says so.
@@ -540,15 +551,28 @@ mod tests {
             ("Chiffre d'affaires 2019-2024 en baisse.", "2019-2024"),
         ] {
             assert!(is_year_range(value), "{value}");
-            assert!(is_false_positive_pattern(text, &phone_at(text, value), true), "{text}");
+            for legal_fr_v2 in [false, true] {
+                assert!(
+                    is_false_positive_pattern(text, &phone_at(text, value), true, legal_fr_v2, false),
+                    "{text}"
+                );
+            }
             assert!(
-                !is_false_positive_pattern(text, &phone_at(text, value), false),
+                !is_false_positive_pattern(text, &phone_at(text, value), false, false, false),
                 "{text}"
             );
         }
         // A phone cue glued to the value still wins.
         let phone = "Tél : 2024-2025, du lundi au vendredi";
-        assert!(!is_false_positive_pattern(phone, &phone_at(phone, "2024-2025"), true));
+        for legal_fr_v2 in [false, true] {
+            assert!(!is_false_positive_pattern(
+                phone,
+                &phone_at(phone, "2024-2025"),
+                true,
+                legal_fr_v2,
+                false
+            ));
+        }
         // Some countries write eight-digit numbers as two groups of four: a dialing prefix or a
         // trailing digit group makes the span part of a longer number, which stays redacted.
         for text in [
@@ -557,20 +581,24 @@ mod tests {
             "Joignable au +2012-2019 en semaine.",
             "Joignable au 2012-2019 44 en semaine.",
         ] {
-            assert!(
-                !is_false_positive_pattern(text, &phone_at(text, "2012-2019"), true),
-                "{text}"
-            );
+            for legal_fr_v2 in [false, true] {
+                assert!(
+                    !is_false_positive_pattern(text, &phone_at(text, "2012-2019"), true, legal_fr_v2, false),
+                    "{text}"
+                );
+            }
         }
         // Brackets and punctuation around a real span keep it readable.
         for text in [
             "Les exercices (2019-2021) sont clos.",
             "Exercices 2019-2021 : 3 M€ de pertes.",
         ] {
-            assert!(
-                is_false_positive_pattern(text, &phone_at(text, "2019-2021"), true),
-                "{text}"
-            );
+            for legal_fr_v2 in [false, true] {
+                assert!(
+                    is_false_positive_pattern(text, &phone_at(text, "2019-2021"), true, legal_fr_v2, false),
+                    "{text}"
+                );
+            }
         }
         for value in [
             "2025-2024",
@@ -597,7 +625,13 @@ mod tests {
                 strategy: RedactionStrategy::Mask,
                 replacement_token: "[PHONE_1]".to_string(),
             };
-            assert!(!is_false_positive_pattern(ambiguous, &finding, legal_fr_filters));
+            assert!(!is_false_positive_pattern(
+                ambiguous,
+                &finding,
+                legal_fr_filters,
+                false,
+                false
+            ));
         }
         let dated = "Jugement du 12 février 2026, annonce 20260219";
         let dated_start = dated.find("20260219").unwrap();
@@ -637,7 +671,13 @@ mod tests {
             year_reference_start + 9,
             "2024-2025"
         ));
-        assert!(is_false_positive_pattern(year_reference, &year_finding, true));
+        assert!(is_false_positive_pattern(
+            year_reference,
+            &year_finding,
+            true,
+            false,
+            false
+        ));
         let substring_cue = "prefix 2024-2025";
         let substring_start = substring_cue.find("2024-2025").unwrap();
         assert!(!is_legal_reference_finding(
@@ -686,7 +726,9 @@ mod tests {
         assert!(!is_false_positive_pattern(
             unrelated_date,
             &unrelated_date_finding,
-            true
+            true,
+            false,
+            false
         ));
         assert_eq!(
             rebuild_redacted_text(unrelated_date, &[unrelated_date_finding]),
@@ -784,7 +826,13 @@ mod tests {
             replacement_token: "[PHONE_1]".to_string(),
         };
         assert!(has_phone_context(phone_context, phone_start, phone_start + 8));
-        assert!(!is_false_positive_pattern(phone_context, &phone_finding, true));
+        assert!(!is_false_positive_pattern(
+            phone_context,
+            &phone_finding,
+            true,
+            false,
+            false
+        ));
 
         let substring_context = "Date 20260219, cellule 61234567";
         let substring_start = substring_context.find("61234567").unwrap();
@@ -890,7 +938,9 @@ mod tests {
         assert!(is_false_positive_pattern(
             three_digit_reference,
             &three_digit_finding,
-            true
+            true,
+            false,
+            false
         ));
         let abbreviated_no = "No. 2024-1234";
         let abbreviated_no_start = abbreviated_no.find("2024-1234").unwrap();

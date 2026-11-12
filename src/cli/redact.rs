@@ -48,7 +48,7 @@ pub struct RedactArgs {
     #[arg(long, value_name = "DIR")]
     pub ner_model_dir: Option<String>,
 
-    /// Named, versioned NER label profile (full@1 or legal-fr@1).
+    /// Named, versioned NER label profile (full@1, legal-fr@1 or legal-fr@2).
     #[arg(long, value_name = "PROFILE")]
     pub ner_profile: Option<String>,
 

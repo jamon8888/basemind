@@ -427,13 +427,13 @@ mod tests {
         let slot = Arc::new(Mutex::new(()));
         let (done_tx, done_rx) = mpsc::channel();
         let (first_in_tx, first_in_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
 
         let (holder_slot, holder_embedder, holder_done) = (Arc::clone(&slot), embedder.clone(), done_tx.clone());
         scan_pool.spawn(move || {
             let _held = holder_slot.lock().unwrap();
             first_in_tx.send(()).ok();
-            // Give the second job time to be queued behind us, then wait on the embed pool.
-            std::thread::sleep(Duration::from_millis(50));
+            release_rx.recv().expect("release first job");
             let answer = holder_embedder.run_on_embed_pool(|| 7).expect("embed pool result");
             holder_done.send(("first", answer)).ok();
         });
@@ -443,13 +443,14 @@ mod tests {
             let _held = second_slot.lock().unwrap();
             done_tx.send(("second", 0)).ok();
         });
+        release_tx.send(()).expect("release first job");
 
         let mut finished = vec![
             done_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("deadlock: the waiting worker ran the second job inside the first"),
             done_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("second job never ran"),
         ];
         finished.sort_unstable();

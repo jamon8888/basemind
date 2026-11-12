@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `redact_text` now offers the versioned `legal-fr@2` NER profile: named private
+  places and document dates are covered, broad legal geography remains readable,
+  and common French legal references are not mistaken for phone numbers (#97).
 - `BASEMIND_FILE_EXTRACTION_TIMEOUT_SECS` (default 120, at most 3600) sets the shared
   budget for extracting one file in `redact_text`/`redact --file`, OCR retry included, so a
   caller with a longer deadline of its own is not cut off first.

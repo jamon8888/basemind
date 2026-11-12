@@ -292,6 +292,7 @@ tree-sitter-graph = { package = "basemind-tree-sitter-graph", version = "0.12.1"
 tree-sitter-language-pack = "1.22.1"
 tree-sitter-stack-graphs = { package = "basemind-tree-sitter-stack-graphs", version = "0.10.1", path = "crates/tree-sitter-stack-graphs", optional = true }
 url = { version = "2", features = ["serde"], optional = true }
+# Keep this repository's lockfile on 1.3.9: newer xberg releases fail the bundled ORT link step in CI.
 xberg = { version = "1.3.9", default-features = false, features = ["tokio-runtime", "simd-utf8"], optional = true }
 image = { version = "0.25.10", default-features = false, features = [
   "png",
