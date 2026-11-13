@@ -126,15 +126,19 @@ pub(crate) fn run_candidates(
 /// `hash_hex`: the combined-filemap blob always, plus the code-chunk sidecar when code-search
 /// chunking is enabled (so toggling the feature on re-chunks rather than being skipped as unchanged).
 fn extraction_sidecars_present(store: &Store, config: &Config, hash_hex: &str) -> bool {
-    #[cfg(not(feature = "code-search"))]
-    let _ = config;
-    if !store.blob_path_fm_hex(hash_hex).exists() {
-        return false;
-    }
-    #[cfg(feature = "code-search")]
-    if crate::scanner_code::should_chunk(config) && !store.blob_path_chunk_hex(hash_hex).exists() {
-        return false;
-    }
+    store.blob_path_fm_hex(hash_hex).exists() && chunk_sidecar_present(store, config, hash_hex)
+}
+
+/// The code-chunk sidecar half of [`extraction_sidecars_present`]: required only when code-search
+/// chunking is enabled.
+#[cfg(feature = "code-search")]
+fn chunk_sidecar_present(store: &Store, config: &Config, hash_hex: &str) -> bool {
+    !crate::scanner_code::should_chunk(config) || store.blob_path_chunk_hex(hash_hex).exists()
+}
+
+/// Without `code-search` there is no chunk sidecar to require.
+#[cfg(not(feature = "code-search"))]
+fn chunk_sidecar_present(_store: &Store, _config: &Config, _hash_hex: &str) -> bool {
     true
 }
 
