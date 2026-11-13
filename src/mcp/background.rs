@@ -129,10 +129,12 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
 /// `Inline` pass to embed what changed — skipped when nothing did, so an unchanged workspace never
 /// loads the embedding engine at boot. The blob GC runs after it settles.
 pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
+    use std::sync::atomic::Ordering;
+    // Raised before the task is even scheduled, so no caller can observe a settled lifecycle while
+    // the catch-up is still pending.
+    state.shared.catch_up_active.store(true, Ordering::Relaxed);
     tokio::spawn(async move {
-        use std::sync::atomic::Ordering;
         await_cache_warm(&state).await;
-        state.shared.rescan_active.store(true, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let first = catch_up_pass(&state, false).await;
         match &first {
@@ -156,8 +158,8 @@ pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
                 Err(error) => tracing::warn!(%error, "startup catch-up embedding pass failed"),
             }
         }
-        // Lowered only once both passes are done, like the watcher keeps it across its inline embed.
-        state.shared.rescan_active.store(false, Ordering::Relaxed);
+        // Lowered only once both passes are done, like the watcher keeps its flag across its inline embed.
+        state.shared.catch_up_active.store(false, Ordering::Relaxed);
         run_background_gc(state).await;
     });
 }
