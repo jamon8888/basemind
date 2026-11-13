@@ -402,6 +402,11 @@ fn serve_answers_initialize_over_stdio_without_a_daemon() {
     drop(stdin);
     let _ = child.kill();
     let output = child.wait_with_output().expect("wait for serve");
+    assert!(
+        !line.trim().is_empty(),
+        "serve did not answer initialize within 60 s; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let response: Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
         panic!(
             "serve must answer initialize over stdio ({e}); stderr: {}",
