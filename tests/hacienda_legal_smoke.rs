@@ -1,6 +1,6 @@
 //! The `hacienda-legal` focus release: a documents-only build with rehydration.
 //!
-//! Four properties, all but the fourth asserted against the real MCP surface (in-memory serve + rmcp
+//! Five properties, all but the fourth asserted against the real MCP surface (in-memory serve + rmcp
 //! client, same harness as `mcp_protected_surface.rs`):
 //!
 //! 1. **Surface gating.** The build advertises `vault`, `redact_text` and the `memory`
@@ -14,6 +14,8 @@
 //!    valid `basemind.toml` — it is the file operators drop into a client folder.
 //! 4. **`serve` answers over stdio.** Without `comms`, the shipped binary's `serve` runs the
 //!    server in process; spawned for real, it must answer `initialize`.
+//! 5. **`serve` catches up at startup.** A memo filed while no serve held the index becomes
+//!    searchable, and is recorded in the index, once serve starts on that populated index.
 
 #![cfg(feature = "hacienda-legal")]
 
@@ -267,6 +269,62 @@ async fn ingest_search_redact_and_rehydrate_end_to_end() {
         found["matches"].as_array().is_some_and(|m| !m.is_empty()),
         "vault find must locate the subject by its original value: {found}"
     );
+}
+
+/// A memo filed while no `serve` was running must become searchable once `serve` starts on the
+/// already-populated index. The live watcher only sees changes made after it is armed, and the
+/// boot-time scan used to run for an empty index only, so such a memo stayed invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_catches_up_on_documents_filed_while_it_was_down() {
+    let dir = workspace();
+    run_scan(dir.path());
+    std::fs::write(
+        dir.path().join("matter-24-0187/notice.md"),
+        "# Notice — Matter 24-0187\n\nThe tenant disputes the arrears schedule and requests mediation.\n",
+    )
+    .unwrap();
+    let service = client(dir.path()).await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut hits_text = String::new();
+    while std::time::Instant::now() < deadline {
+        let result = call(
+            &service,
+            "memory",
+            json!({ "mode": "documents", "query": "arrears schedule mediation", "limit": 5 }),
+        )
+        .await
+        .expect("memory documents call");
+        hits_text = serde_json::to_string(&payload(&result)).expect("serialize hits");
+        if hits_text.contains("matter-24-0187/notice.md") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        hits_text.contains("matter-24-0187/notice.md"),
+        "a memo filed while serve was down must be indexed after serve starts: {hits_text}"
+    );
+
+    // Searchable is not enough: the keyword-only first pass leaves a document untracked, and only the
+    // follow-up pass records it. Left untracked, it would never get vectors under the default config
+    // and would be re-extracted at every boot, so the catch-up must end with the memo in the index.
+    let root = dir.path().canonicalize().expect("canonical workspace root");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let store = basemind::store::Store::open_read_only(&root, basemind::store::VIEW_WORKING)
+            .expect("open the index read-only");
+        if store.lookup_doc("matter-24-0187/notice.md").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the startup catch-up must leave the new memo tracked in the index"
+        );
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    drop(service);
 }
 
 /// The shipped legal preset must parse as a valid `basemind.toml` and carry the

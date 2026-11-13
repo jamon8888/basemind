@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `basemind serve` on builds without `comms` (including `hacienda-legal`) no longer panics at
   startup with "there is no reactor running": the Tokio runtime is now entered before the server
   and its background watchers are built.
+- `basemind serve` on builds without `comms` (including `hacienda-legal`) now catches up at startup
+  on an already-populated index: files and documents added, edited or removed while no serve held
+  the index are rescanned incrementally, keyword lane first, then an embedding pass only when
+  something changed, so an up-to-date workspace does not load the embedding model at boot.
+  Previously the boot scan ran for an empty index only and the live watcher only sees later
+  changes, so such files stayed unsearchable. The daemon-hosted server of `comms` builds does not
+  run this catch-up yet.
 - Under the `legal-fr` profile, a span of years such as `2024-2025` (1900-2099, second year one
   to ten years after the first) is no longer redacted as a phone number, even without a
   reference cue nearby; a phone cue next to it still wins, and so does a dialing prefix or a

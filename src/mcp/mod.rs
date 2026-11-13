@@ -280,9 +280,10 @@ pub struct BasemindServer {
 /// additive and defaulted so callers that only care about `background` stay terse.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
-    /// When true, spawn the empty-index auto-scan, the view watcher thread, and
-    /// the background blob GC. When false, the server is a pure one-shot query
-    /// handle: it preloads the in-RAM map cache and nothing else.
+    /// When true, spawn the empty-index auto-scan (or, on a populated index served with the live
+    /// watcher, the startup catch-up scan), the view watcher thread, and the background blob GC.
+    /// When false, the server is a pure one-shot query handle: it preloads the in-RAM map cache and
+    /// nothing else.
     pub background: bool,
     /// When true (and `background` is on, and the served view is the working
     /// view), spawn a live filesystem watcher that funnels changed paths into
@@ -438,7 +439,8 @@ impl BasemindServer {
                     Err(_) => false,
                 }
             };
-            let watcher_guard = if options.watch && (options.daemon_writer || !options.read_only) && view_is_working {
+            let live_watch = options.watch && (options.daemon_writer || !options.read_only) && view_is_working;
+            let watcher_guard = if live_watch {
                 background::spawn_serve_watcher(Arc::clone(&state))
             } else {
                 background::spawn_view_watcher(Arc::clone(&state))
@@ -451,10 +453,16 @@ impl BasemindServer {
                 if defer_warm {
                     background::spawn_cache_warm(Arc::clone(&state));
                 }
-                let gc_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    background::run_background_gc(gc_state).await;
-                });
+                if live_watch {
+                    // The live watcher only sees changes made after it is armed: catch up on whatever
+                    // changed while no serve held this index (the catch-up runs the blob GC after it).
+                    background::spawn_catch_up_scan(Arc::clone(&state));
+                } else {
+                    let gc_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        background::run_background_gc(gc_state).await;
+                    });
+                }
             }
         }
         Self {
