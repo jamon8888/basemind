@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `basemind serve` on builds without `comms` (including `hacienda-legal`) no longer panics at
+  startup with "there is no reactor running": the Tokio runtime is now entered before the server
+  and its background watchers are built.
 - Under the `legal-fr` profile, a span of years such as `2024-2025` (1900-2099, second year one
   to ten years after the first) is no longer redacted as a phone number, even without a
   reference cue nearby; a phone cue next to it still wins, and so does a dialing prefix or a

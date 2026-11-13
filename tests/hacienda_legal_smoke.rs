@@ -1,6 +1,6 @@
 //! The `hacienda-legal` focus release: a documents-only build with rehydration.
 //!
-//! Three properties, all asserted against the real MCP surface (in-memory serve + rmcp
+//! Four properties, all but the fourth asserted against the real MCP surface (in-memory serve + rmcp
 //! client, same harness as `mcp_protected_surface.rs`):
 //!
 //! 1. **Surface gating.** The build advertises `vault`, `redact_text` and the `memory`
@@ -12,6 +12,8 @@
 //!    map, and `vault` encrypt → decrypt → find round-trips it.
 //! 3. **The shipped preset parses.** `examples/basemind-hacienda-legal.toml` must stay a
 //!    valid `basemind.toml` — it is the file operators drop into a client folder.
+//! 4. **`serve` answers over stdio.** Without `comms`, the shipped binary's `serve` runs the
+//!    server in process; spawned for real, it must answer `initialize`.
 
 #![cfg(feature = "hacienda-legal")]
 
@@ -292,5 +294,65 @@ fn the_shipped_legal_preset_parses_and_enables_the_legal_stack() {
     assert!(
         cfg.documents.citations.extract,
         "the exact lane covers statute/docket cites"
+    );
+}
+
+/// 4. **`serve` answers over stdio.** Without `comms` there is no daemon to relay to: `basemind serve`
+///    runs the server in process. The in-memory harness above never goes through that path, so this
+///    spawns the shipped binary, sends `initialize` and expects a result instead of a startup panic.
+#[cfg(not(feature = "comms"))]
+#[test]
+fn serve_answers_initialize_over_stdio_without_a_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical workspace root");
+    // A bare tempdir is neither a git repository nor holds `basemind.toml`, so `serve` would refuse it.
+    std::fs::write(root.join("basemind.toml"), "\"$schema\" = \"v1\"\n").expect("write project marker");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_basemind"))
+        .args(["serve", "--root", root.to_str().expect("workspace path")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn basemind serve");
+    let mut stdin = child.stdin.take().expect("serve stdin");
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "hacienda-legal-smoke", "version": "0"}
+        }
+    });
+    writeln!(stdin, "{initialize}").expect("write initialize");
+    stdin.flush().expect("flush initialize");
+
+    let stdout = child.stdout.take().expect("serve stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_default();
+    drop(stdin);
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("wait for serve");
+    let response: Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+        panic!(
+            "serve must answer initialize over stdio ({e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(response["id"], json!(1), "{response}");
+    assert!(
+        response["result"]["serverInfo"].is_object(),
+        "initialize must return serverInfo: {response}"
     );
 }
