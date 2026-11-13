@@ -135,7 +135,6 @@ pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
         state.shared.rescan_active.store(true, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let first = catch_up_pass(&state, false).await;
-        state.shared.rescan_active.store(false, Ordering::Relaxed);
         match &first {
             Ok((scanned, changed)) => tracing::info!(
                 scanned,
@@ -157,6 +156,8 @@ pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
                 Err(error) => tracing::warn!(%error, "startup catch-up embedding pass failed"),
             }
         }
+        // Lowered only once both passes are done, like the watcher keeps it across its inline embed.
+        state.shared.rescan_active.store(false, Ordering::Relaxed);
         run_background_gc(state).await;
     });
 }
@@ -194,7 +195,7 @@ async fn catch_up_pass(state: &Arc<ServerState>, embed: bool) -> Result<(usize, 
     } else {
         crate::scanner::EmbedMode::Deferred
     };
-    let report = helpers::scan_and_refresh(Arc::clone(state), None, mode)
+    let report = helpers::scan_and_refresh_with(Arc::clone(state), None, mode, true)
         .await
         .map_err(|error| error.to_string())?;
     let stats = &report.stats;

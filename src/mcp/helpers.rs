@@ -546,6 +546,20 @@ pub(super) async fn scan_and_refresh(
     scoped_paths: Option<Vec<std::path::PathBuf>>,
     embed: crate::scanner::EmbedMode,
 ) -> Result<crate::scanner::ScanReport, McpError> {
+    scan_and_refresh_with(state, scoped_paths, embed, false).await
+}
+
+/// [`scan_and_refresh`] that, with `keep_map_if_unchanged`, leaves the published map and its
+/// generation alone when a whole-tree pass changed nothing. A full pass otherwise always rebuilds and
+/// republishes the map, which invalidates every paging cursor handed out against the previous
+/// generation: right for an explicit rescan, wrong for the startup catch-up, which runs on every boot
+/// and usually finds nothing to do.
+pub(super) async fn scan_and_refresh_with(
+    state: Arc<ServerState>,
+    scoped_paths: Option<Vec<std::path::PathBuf>>,
+    embed: crate::scanner::EmbedMode,
+    keep_map_if_unchanged: bool,
+) -> Result<crate::scanner::ScanReport, McpError> {
     if state.shared.read_only {
         return Err(McpError::invalid_request(
             "this basemind serve is read-only: another serve process holds the write lock for \
@@ -611,6 +625,10 @@ pub(super) async fn scan_and_refresh(
     .map_err(|e| McpError::internal_error(format!("rescan: {e}"), None))?;
 
     if was_scoped && report.stats.updated == 0 && report.stats.removed == 0 {
+        return Ok(report);
+    }
+    let stats = &report.stats;
+    if keep_map_if_unchanged && stats.updated == 0 && stats.docs_indexed == 0 && stats.removed == 0 {
         return Ok(report);
     }
 
