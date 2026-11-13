@@ -131,7 +131,7 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
 pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
     tokio::spawn(async move {
         use std::sync::atomic::Ordering;
-        state.await_cache_ready().await;
+        await_cache_warm(&state).await;
         state.shared.rescan_active.store(true, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let first = catch_up_pass(&state, false).await;
@@ -159,6 +159,21 @@ pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
         }
         run_background_gc(state).await;
     });
+}
+
+/// Wait for the boot-time map preload to publish, however long it takes. Unlike
+/// [`ServerState::await_cache_ready`], there is no cap: the catch-up's whole-tree refresh publishes a
+/// newer map, and a preload that finished after it would overwrite that map with its older snapshot.
+async fn await_cache_warm(state: &ServerState) {
+    use std::sync::atomic::Ordering::Relaxed;
+    while state.shared.cache_warming.load(Relaxed) {
+        let notified = state.shared.cache_ready.notified();
+        if !state.shared.cache_warming.load(Relaxed) {
+            break;
+        }
+        // Re-check on a short tick as well, in case the notification raced the registration.
+        let _ = tokio::time::timeout(Duration::from_secs(1), notified).await;
+    }
 }
 
 /// One whole-tree catch-up pass through the writer; returns `(scanned, changed)`, where `changed`

@@ -39,7 +39,7 @@ unavailable; advertised modes alone do not prove that an operation can run.
 
 | Capability | Behavior and entry points | Implementation / constraints |
 | --- | --- | --- |
-| Full and incremental indexing | `scan`, `rescan`, `watch`; working tree, staged tree and revision views. Hash/metadata reuse, ignore rules, pruning, cancellation and filesystem refresh. | `scanner*.rs`, `watcher.rs`, `store*.rs`. Document extraction is on the working-tree path. |
+| Full and incremental indexing | `scan`, `rescan`, `watch`; working tree, staged tree and revision views. Hash/metadata reuse, ignore rules, pruning, cancellation and filesystem refresh; an in-process `serve` on a populated index also runs an incremental catch-up scan at startup. | `scanner*.rs`, `watcher.rs`, `store*.rs`. Document extraction is on the working-tree path. |
 | Language support | Grammar discovery/install/cleanup, language overrides, pooled parsers and extraction query overrides. | `lang.rs`, `lang_rules.rs`, `queries/`, `cli`/binary language commands. Grammar availability and query quality differ by language. |
 | Structural code navigation | `code` outline, symbols, grep, files, find, references, callers, implementations, dependents, expand. | `extract/`, `index/`, `mcp/helpers_code.rs`, `helpers_calls.rs`, `helpers_grep.rs`, `helpers_files.rs`, `helpers_impls.rs`. |
 | Definition resolution | `code definition`; scope and import resolution where supported. | `intel/`, `extract/locals.rs`. Name-based reference search is broader than precise resolution; preserve that distinction in result descriptions. |
