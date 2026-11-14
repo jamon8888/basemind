@@ -165,7 +165,7 @@ impl ServerState {
         Lifecycle::from_flags(
             self.shared.initial_scan_active.load(Relaxed),
             self.shared.cache_warming.load(Relaxed),
-            self.shared.rescan_active.load(Relaxed),
+            self.shared.rescan_active.load(Relaxed) || self.shared.catch_up_active.load(Relaxed),
         )
     }
 

@@ -1,6 +1,6 @@
 //! The `hacienda-legal` focus release: a documents-only build with rehydration.
 //!
-//! Three properties, all asserted against the real MCP surface (in-memory serve + rmcp
+//! Five properties, all but the fourth asserted against the real MCP surface (in-memory serve + rmcp
 //! client, same harness as `mcp_protected_surface.rs`):
 //!
 //! 1. **Surface gating.** The build advertises `vault`, `redact_text` and the `memory`
@@ -12,6 +12,10 @@
 //!    map, and `vault` encrypt → decrypt → find round-trips it.
 //! 3. **The shipped preset parses.** `examples/basemind-hacienda-legal.toml` must stay a
 //!    valid `basemind.toml` — it is the file operators drop into a client folder.
+//! 4. **`serve` answers over stdio.** Without `comms`, the shipped binary's `serve` runs the
+//!    server in process; spawned for real, it must answer `initialize`.
+//! 5. **`serve` catches up at startup.** A memo filed while no serve held the index becomes
+//!    searchable, and is recorded in the index, once serve starts on that populated index.
 
 #![cfg(feature = "hacienda-legal")]
 
@@ -267,6 +271,62 @@ async fn ingest_search_redact_and_rehydrate_end_to_end() {
     );
 }
 
+/// A memo filed while no `serve` was running must become searchable once `serve` starts on the
+/// already-populated index. The live watcher only sees changes made after it is armed, and the
+/// boot-time scan used to run for an empty index only, so such a memo stayed invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_catches_up_on_documents_filed_while_it_was_down() {
+    let dir = workspace();
+    run_scan(dir.path());
+    std::fs::write(
+        dir.path().join("matter-24-0187/notice.md"),
+        "# Notice — Matter 24-0187\n\nThe tenant disputes the arrears schedule and requests mediation.\n",
+    )
+    .unwrap();
+    let service = client(dir.path()).await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut hits_text = String::new();
+    while std::time::Instant::now() < deadline {
+        let result = call(
+            &service,
+            "memory",
+            json!({ "mode": "documents", "query": "arrears schedule mediation", "limit": 5 }),
+        )
+        .await
+        .expect("memory documents call");
+        hits_text = serde_json::to_string(&payload(&result)).expect("serialize hits");
+        if hits_text.contains("matter-24-0187/notice.md") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(
+        hits_text.contains("matter-24-0187/notice.md"),
+        "a memo filed while serve was down must be indexed after serve starts: {hits_text}"
+    );
+
+    // Searchable is not enough: the keyword-only first pass leaves a document untracked, and only the
+    // follow-up pass records it. Left untracked, it would never get vectors under the default config
+    // and would be re-extracted at every boot, so the catch-up must end with the memo in the index.
+    let root = dir.path().canonicalize().expect("canonical workspace root");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let store = basemind::store::Store::open_read_only(&root, basemind::store::VIEW_WORKING)
+            .expect("open the index read-only");
+        if store.lookup_doc("matter-24-0187/notice.md").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the startup catch-up must leave the new memo tracked in the index"
+        );
+        drop(store);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    drop(service);
+}
+
 /// The shipped legal preset must parse as a valid `basemind.toml` and carry the
 /// focus-release semantics (redaction on with the reversible strategy, NER on,
 /// graphrag on, multilingual embeddings).
@@ -292,5 +352,70 @@ fn the_shipped_legal_preset_parses_and_enables_the_legal_stack() {
     assert!(
         cfg.documents.citations.extract,
         "the exact lane covers statute/docket cites"
+    );
+}
+
+/// 4. **`serve` answers over stdio.** Without `comms` there is no daemon to relay to: `basemind serve`
+///    runs the server in process. The in-memory harness above never goes through that path, so this
+///    spawns the shipped binary, sends `initialize` and expects a result instead of a startup panic.
+#[cfg(not(feature = "comms"))]
+#[test]
+fn serve_answers_initialize_over_stdio_without_a_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical workspace root");
+    // A bare tempdir is neither a git repository nor holds `basemind.toml`, so `serve` would refuse it.
+    std::fs::write(root.join("basemind.toml"), "\"$schema\" = \"v1\"\n").expect("write project marker");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_basemind"))
+        .args(["serve", "--root", root.to_str().expect("workspace path")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn basemind serve");
+    let mut stdin = child.stdin.take().expect("serve stdin");
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "hacienda-legal-smoke", "version": "0"}
+        }
+    });
+    writeln!(stdin, "{initialize}").expect("write initialize");
+    stdin.flush().expect("flush initialize");
+
+    let stdout = child.stdout.take().expect("serve stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(Duration::from_secs(60)).unwrap_or_default();
+    drop(stdin);
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("wait for serve");
+    assert!(
+        !line.trim().is_empty(),
+        "serve did not answer initialize within 60 s; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+        panic!(
+            "serve must answer initialize over stdio ({e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(response["id"], json!(1), "{response}");
+    assert!(
+        response["result"]["serverInfo"].is_object(),
+        "initialize must return serverInfo: {response}"
     );
 }

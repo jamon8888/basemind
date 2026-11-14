@@ -876,6 +876,11 @@ fn try_serve_in_process(root: &std::path::Path, view: &str) -> Result<()> {
         basemind::git_cache::GitCache::open(&basemind::store::workspace_cache_dir(root), 1024, false)
             .context("open git cache")?,
     );
+    // The server's background facilities (serve watcher, auto-scan, blob GC) capture the current
+    // Tokio handle at construction, so the runtime must exist and be entered before the server is
+    // built; constructing it first panicked with "there is no reactor running".
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let _runtime_guard = runtime.enter();
     let server = basemind::mcp::BasemindServer::new_with_options(
         store,
         root.to_path_buf(),
@@ -887,7 +892,6 @@ fn try_serve_in_process(root: &std::path::Path, view: &str) -> Result<()> {
             ..basemind::mcp::ServerOptions::default()
         },
     );
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
         let running = server
             .serve(rmcp::transport::stdio())

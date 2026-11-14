@@ -124,6 +124,10 @@ pub(crate) struct SharedReadStack {
     /// watcher) is in flight. Surfaced as the `Rescanning` lifecycle so a client sees "results may be
     /// a moment stale" rather than treating a mid-rescan snapshot as final.
     pub(crate) rescan_active: AtomicBool,
+    /// Set from the moment the startup catch-up scan is scheduled until both of its passes are done.
+    /// Kept apart from `rescan_active`, which watcher batches raise and lower on their own; the
+    /// lifecycle reports either one as rescanning.
+    pub(crate) catch_up_active: AtomicBool,
     /// True when the in-RAM code map is built ON DEMAND — at the first
     /// [`await_cache_ready`](super::ServerState::await_cache_ready) barrier — instead of at construction.
     ///
@@ -297,6 +301,7 @@ impl SharedReadStack {
             cache_warm_ms: AtomicU64::new(0),
             cache_ready: Notify::new(),
             rescan_active: AtomicBool::new(false),
+            catch_up_active: AtomicBool::new(false),
             lazy_cache: options.lazy_cache,
             lazy_cache_built: tokio::sync::OnceCell::new(),
             read_only: options.read_only,
