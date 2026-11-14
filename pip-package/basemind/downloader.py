@@ -66,10 +66,10 @@ def _platform_triple() -> str:
         if machine in {"x86", "i386", "i686"}:
             raise RuntimeError("32-bit Windows is not supported")
     elif system == "linux":
-        if machine in {"amd64", "x86_64"}:
-            return "x86_64-unknown-linux-gnu"
-        if machine in {"aarch64", "arm64"}:
-            return "aarch64-unknown-linux-gnu"
+        # Linux release binaries are no longer built or published.
+        raise RuntimeError(
+            "basemind does not publish Linux binaries; build from source on Linux"
+        )
     elif system == "darwin":
         return "aarch64-apple-darwin" if _is_apple_silicon(machine) else "x86_64-apple-darwin"
 

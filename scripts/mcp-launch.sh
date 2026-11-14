@@ -203,10 +203,8 @@ Darwin)
   fi
   ;;
 Linux)
-  case "$arch" in
-  aarch64 | arm64) TRIPLE="aarch64-unknown-linux-gnu" ;;
-  *) TRIPLE="x86_64-unknown-linux-gnu" ;;
-  esac
+  echo "basemind does not publish Linux binaries; build from source on Linux" >&2
+  exit 1
   ;;
 MINGW* | MSYS* | CYGWIN* | Windows_NT) TRIPLE="x86_64-pc-windows-msvc" ;;
 *) die "unsupported platform: $(uname -s) $arch" ;;

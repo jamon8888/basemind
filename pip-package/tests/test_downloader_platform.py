@@ -51,9 +51,13 @@ def test_genuine_intel_mac_resolves_x86_64(monkeypatch):
     assert triple == "x86_64-apple-darwin"
 
 
-def test_linux_and_windows_unaffected(monkeypatch):
-    assert _triple(monkeypatch, system="Linux", machine="x86_64", sysctls={}) == "x86_64-unknown-linux-gnu"
-    assert _triple(monkeypatch, system="Linux", machine="aarch64", sysctls={}) == "aarch64-unknown-linux-gnu"
+def test_linux_unsupported_and_windows_unaffected(monkeypatch):
+    # Linux release binaries are no longer built or published.
+    import pytest
+    with pytest.raises(RuntimeError, match="does not publish Linux binaries"):
+        _triple(monkeypatch, system="Linux", machine="x86_64", sysctls={})
+    with pytest.raises(RuntimeError, match="does not publish Linux binaries"):
+        _triple(monkeypatch, system="Linux", machine="aarch64", sysctls={})
     assert _triple(monkeypatch, system="Windows", machine="AMD64", sysctls={}) == "x86_64-pc-windows-msvc"
 
 

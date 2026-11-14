@@ -34,9 +34,8 @@ function getPlatformTriple() {
   }
 
   if (type === "Linux") {
-    if (arch === "x64") return "x86_64-unknown-linux-gnu";
-    if (arch === "arm64") return "aarch64-unknown-linux-gnu";
-    return "x86_64-unknown-linux-gnu";
+    // Linux release binaries are no longer built or published.
+    throw new Error("basemind does not publish Linux binaries; build from source on Linux");
   }
 
   if (type === "Darwin") {

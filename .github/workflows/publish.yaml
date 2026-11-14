@@ -288,9 +288,6 @@ jobs:
           # partial draft, so a release that lost a platform binary could never complete on
           # a rerun (the v0.10.0 / release-window failure class).
           required=(
-            "basemind-x86_64-unknown-linux-gnu.tar.gz"
-            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
-            "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"
@@ -562,197 +559,37 @@ jobs:
           bash .github/scripts/release-asset.sh upload \
             "${{ needs.create_release.outputs.release_id }}" "$archive" "$content_type"
 
-  build-linux-binaries:
-    name: Build Linux binaries / ${{ matrix.triple }}
-    needs: [meta, create_release]
+  build-macos-universal:
+    name: Build macOS universal2 binary (arm64 + x86_64)
+    needs: [meta, create_release, build-binaries]
     if: needs.meta.outputs.release_assets_exist != 'true'
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.image }}
-    # Optional focus archives are allowed to fail without blocking the required release assets.
-    continue-on-error: ${{ matrix.variant != '' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - triple: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            image: quay.io/pypa/manylinux_2_28_x86_64:latest
-            protoc_arch: linux-x86_64
-            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
-          - triple: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            image: quay.io/pypa/manylinux_2_28_aarch64:latest
-            protoc_arch: linux-aarch_64
-            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
-          # Reduced focus releases are separate optional assets (not in the required set).
-          - triple: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            image: quay.io/pypa/manylinux_2_28_x86_64:latest
-            protoc_arch: linux-x86_64
-            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
-            features: hacienda
-            variant: hacienda
-          - triple: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            image: quay.io/pypa/manylinux_2_28_aarch64:latest
-            protoc_arch: linux-aarch_64
-            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
-            features: hacienda
-            variant: hacienda
-          - triple: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            image: quay.io/pypa/manylinux_2_28_x86_64:latest
-            protoc_arch: linux-x86_64
-            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
-            features: hacienda-legal
-            variant: hacienda-legal
-          - triple: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
-            image: quay.io/pypa/manylinux_2_28_aarch64:latest
-            protoc_arch: linux-aarch_64
-            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
-            features: hacienda-legal
-            variant: hacienda-legal
+    # A convenience archive merging the two already-built darwin slices with lipo (see
+    # scripts/build-macos-universal.sh) — no extra compile. It is NOT consumed by npm/PyPI/
+    # Homebrew (those install the per-arch archives), so like the focus variants it is optional:
+    # continue-on-error keeps a lipo or runner hiccup from blocking the required release train.
+    # It is still wired into `checksums` below, so when it succeeds the checksums file covers it.
+    continue-on-error: true
+    runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Install Rust (in container)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Pin CARGO_HOME/RUSTUP_HOME to absolute paths and export them to
-          # GITHUB_ENV. Container steps do not share $HOME reliably, so rustup
-          # installs its default toolchain under one HOME and a later step cannot
-          # find it ("no default is configured"). Fixed paths remove the ambiguity.
-          export CARGO_HOME=/opt/cargo
-          export RUSTUP_HOME=/opt/rustup
-          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
-          # Re-pin deliberately on toolchain upgrades (hash from a fresh
-          # HTTPS download of the official static archive).
-          # The archive is arch-specific and `matrix.triple` names it exactly:
-          # the aarch64 job runs ARM, so an x86_64 init dies with
-          # "Exec format error" before anything else runs (v0.32.x, v0.33.0).
-          rustup_ver="1.28.2"
-          rustup_sha256="${{ matrix.rustup_sha256 }}"
-          curl -fsSL -o /tmp/rustup-init \
-            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/${{ matrix.triple }}/rustup-init"
-          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
-          chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y --profile minimal --default-toolchain stable
-          rm -f /tmp/rustup-init
-          export PATH="$CARGO_HOME/bin:$PATH"
-          rustup default stable
-          rustup target add "${{ matrix.triple }}"
-          echo "CARGO_HOME=/opt/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=/opt/rustup" >> "$GITHUB_ENV"
-          echo "/opt/cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install system dependencies (AlmaLinux 8)
-        shell: bash
-        run: |
-          set -euo pipefail
-          dnf install -y epel-release
-          dnf install -y dnf-plugins-core
-          # gh CLI for the release-asset upload from inside the container.
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          # Core build + image/text libraries. Some codecs (libde265, x265, dav1d)
-          # and libmagic-devel are unavailable on AlmaLinux 8; libaom is via EPEL.
-          # tesseract-langpack-eng conflicts with tesseract, so install tesseract only.
-          dnf install -y \
-            gcc gcc-c++ make cmake pkgconfig \
-            openssl-devel \
-            tesseract \
-            libaom-devel \
-            patchelf gh \
-            git curl wget unzip
-          echo "gcc: $(gcc --version | head -1)"
-
-      - name: Install protoc from official release
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="28.2"
-          zip="protoc-${ver}-${{ matrix.protoc_arch }}.zip"
-          mkdir -p /usr/local/protoc
-          cd /tmp
-          curl -fsSL -o "$zip" \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/${zip}"
-          unzip -q "$zip" -d /usr/local/protoc
-          ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
-          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
-          protoc --version
-
-      - name: Build libheif from source (1.23.0)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="1.23.0"
-          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
-          d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
-          cd "$d"
-          curl -fsSL -o libheif.tar.gz \
-            "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
-          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
-          tar xzf libheif.tar.gz
-          cd "libheif-${ver}"
-          mkdir build && cd build
-          # Disable codecs unavailable on AlmaLinux 8 (libde265, x265, dav1d);
-          # libaom is present via EPEL.
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DCMAKE_INSTALL_LIBDIR=lib \
-            -DWITH_EXAMPLES=OFF \
-            -DWITH_GDK_PIXBUF=OFF \
-            -DBUILD_TESTING=OFF \
-            -DWITH_LIBDE265=OFF \
-            -DWITH_X265=OFF \
-            -DWITH_DAV1D=OFF \
-            -DWITH_AOM=ON
-          make -j"$(nproc)"
-          make install
-          ldconfig
-          {
-            echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-            echo "LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          } >> "$GITHUB_ENV"
-
-      - name: Build release binary (native gcc + glibc-2.28 compat shim)
-        shell: bash
+      - name: Resolve the release id
         env:
-          TRIPLE: ${{ matrix.triple }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Compile the glibc-2.28 compat shim and link it into the binary so
-          # ort's prebuilt ONNX Runtime (which references glibc 2.38 symbols)
-          # links against the 2.28 floor. Scoped to this target's RUSTFLAGS.
-          shim_obj="$PWD/glibc228_compat.o"
-          gcc -O2 -fPIC -c scripts/glibc228_compat.c -o "$shim_obj"
-          rustflags_var="CARGO_TARGET_$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
-          export "${rustflags_var}=-C link-arg=${shim_obj}"
-          cargo build --release --features "${{ matrix.features || 'full' }}" --bin basemind --target "$TRIPLE"
+          id="$(bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}")"
+          echo "release_id=$id" >>"$GITHUB_ENV"
 
-      - name: Verify glibc floor (<= 2.28)
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.triple }}/release/basemind"
-          max="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
-          echo "highest glibc symbol required: ${max:-none}"
-          if [ -n "$max" ] && \
-             [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
-            echo "::error::basemind requires $max (> GLIBC_2.28); a dependency pulled a newer glibc symbol"
-            exit 1
-          fi
-          echo "✓ glibc floor verified: ${max:-none} <= GLIBC_2.28"
-
-      - name: Package release
-        shell: bash
-        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
+      - name: Merge the darwin slices into a universal2 archive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/build-macos-universal.sh from-release "$release_id"
 
       - name: Verify release state before upload
         shell: bash
@@ -771,218 +608,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          variant="${{ matrix.variant }}"
           bash .github/scripts/release-asset.sh upload \
             "${{ needs.create_release.outputs.release_id }}" \
-            "basemind-${variant:+$variant-}${{ matrix.triple }}.tar.gz" application/gzip
-
-  build-linux-noavx2:
-    name: Build Linux no-AVX2 binary (x86_64, SSE2 baseline)
-    needs: [meta, create_release]
-    if: needs.meta.outputs.release_assets_exist != 'true'
-    # The stock x86_64 release links ort's prebuilt ONNX Runtime, which is
-    # compiled with AVX2 and SIGILL-crashes on pre-Haswell CPUs (Sandy Bridge
-    # and older). This leg builds ONNX Runtime from source without AVX and
-    # basemind with `ort-dynamic` against it, so the same `full` feature set
-    # runs on any x86_64 CPU (MLAS dispatches to AVX2/AVX-512 at runtime where
-    # available). The result ships as a separate `-noavx2` archive; the stock
-    # leg is untouched.
-    runs-on: ubuntu-latest
-    container:
-      # Float on :latest like the stock build legs: a digest of a rotating
-      # tag is a time bomb — quay pruned the pinned manifest and every pull
-      # died with "manifest unknown". The glibc-floor audit below catches
-      # any drift the floating image introduces.
-      image: quay.io/pypa/manylinux_2_28_x86_64:latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
-          persist-credentials: false
-
-      - name: Install Rust (in container)
-        shell: bash
-        run: |
-          set -euo pipefail
-          export CARGO_HOME=/opt/cargo
-          export RUSTUP_HOME=/opt/rustup
-          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
-          # Re-pin deliberately on toolchain upgrades (hash from a fresh
-          # HTTPS download of the official static archive).
-          rustup_ver="1.28.2"
-          rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
-          curl -fsSL -o /tmp/rustup-init \
-            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/x86_64-unknown-linux-gnu/rustup-init"
-          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
-          chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y --profile minimal --default-toolchain stable
-          rm -f /tmp/rustup-init
-          export PATH="$CARGO_HOME/bin:$PATH"
-          rustup default stable
-          rustup target add x86_64-unknown-linux-gnu
-          echo "CARGO_HOME=/opt/cargo" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=/opt/rustup" >> "$GITHUB_ENV"
-          echo "/opt/cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install system dependencies (AlmaLinux 8)
-        shell: bash
-        run: |
-          set -euo pipefail
-          dnf install -y epel-release
-          dnf install -y dnf-plugins-core
-          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
-          dnf install -y \
-            gcc gcc-c++ make cmake pkgconfig \
-            openssl-devel \
-            tesseract \
-            libaom-devel \
-            patchelf gh git \
-            curl wget unzip python3
-          echo "gcc: $(gcc --version | head -1)"
-
-      - name: Install protoc from official release
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="28.2"
-          zip="protoc-28.2-linux-x86_64.zip"
-          sha256="2febfd42b59ce93a28eb789019a470a3dd0449619bc04f84dad1333da261dec1"
-          mkdir -p /usr/local/protoc
-          cd /tmp
-          curl -fsSL -o "$zip" \
-            "https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/${zip}"
-          echo "${sha256}  ${zip}" | sha256sum -c -
-          unzip -q "$zip" -d /usr/local/protoc
-          ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
-          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
-          protoc --version
-
-      - name: Build libheif from source (1.23.0)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ver="1.23.0"
-          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
-          d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
-          cd "$d"
-          curl -fsSL -o libheif.tar.gz \
-            "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
-          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
-          tar xzf libheif.tar.gz
-          cd "libheif-${ver}"
-          mkdir build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DCMAKE_INSTALL_LIBDIR=lib \
-            -DWITH_EXAMPLES=OFF \
-            -DWITH_GDK_PIXBUF=OFF \
-            -DBUILD_TESTING=OFF \
-            -DWITH_LIBDE265=OFF \
-            -DWITH_X265=OFF \
-            -DWITH_DAV1D=OFF \
-            -DWITH_AOM=ON
-          make -j"$(nproc)"
-          make install
-          ldconfig
-          {
-            echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-            echo "LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}"
-          } >> "$GITHUB_ENV"
-
-      - name: Build ONNX Runtime from source (no AVX)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # ORT_VERSION must match ort-sys's dist.tsv for x86_64-unknown-linux-gnu.
-          ./scripts/build-ort-noavx2.sh /tmp/ort-src /tmp/ort-build /opt/ort
-
-      - name: Build release binary (full + ort-dynamic)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # ort-dynamic loads libonnxruntime.so at runtime (no link-time ORT),
-          # so no ORT env vars are needed at build time. The .so is staged into
-          # release/deps next so package-release.sh bundles it into lib/.
-          cargo build --release --features full,ort-dynamic --bin basemind \
-            --target x86_64-unknown-linux-gnu
-          cp /opt/ort/lib/libonnxruntime.so* \
-            target/x86_64-unknown-linux-gnu/release/deps/
-          ls -la target/x86_64-unknown-linux-gnu/release/deps/ | grep onnxruntime
-
-      - name: Verify glibc floor (<= 2.28)
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin="target/x86_64-unknown-linux-gnu/release/basemind"
-          max="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
-          echo "highest glibc symbol required: ${max:-none}"
-          if [ -n "$max" ] && \
-             [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
-            echo "::error::basemind requires $max (> GLIBC_2.28); a dependency pulled a newer glibc symbol"
-            exit 1
-          fi
-          echo "✓ glibc floor verified: ${max:-none} <= GLIBC_2.28"
-
-      - name: Package release (noavx2 archive)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./scripts/package-release.sh x86_64-unknown-linux-gnu
-          mv basemind-x86_64-unknown-linux-gnu.tar.gz \
-            basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz
-          tar tzf basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz | sort
-
-      - name: Smoke-test packaged noavx2 binary (ONNX Runtime loads)
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
-          dir="$(mktemp -d)"
-          tar xzf "$archive" -C "$dir"
-          # Binary + its bundled ORT load — the exact runtime shape ort-dynamic
-          # resolves (binary RPATH $ORIGIN/lib, lib/ closure). A broken RPATH,
-          # SONAME, or missing bundled dep fails here instead of shipping.
-          "$dir/basemind" --version
-          test -f "$dir/lib/libonnxruntime.so.1"
-          # ponytail: no embedding session here on purpose — that needs a model
-          # download; linkage proof (dlopen name/RPATH/SONAME + real dlopen) is
-          # the deterministic gate that blocks a broken bundle before publish.
-          # ort-dynamic is load-dynamic: no DT_NEEDED entry exists for ORT, so
-          # ldd can never list it (the macOS twin builds the same way). Prove
-          # the other side of the chain instead — the binary carries the
-          # dlopen target name, and the RUNPATH/ctypes checks below resolve it.
-          # grep -a directly on the file: `strings | grep -q` dies under
-          # `set -o pipefail` (grep -q exits on first match, strings gets
-          # SIGPIPE, pipeline fails even when the match is there).
-          grep -aq "libonnxruntime" "$dir/basemind" || {
-            echo "::error::basemind binary has no libonnxruntime runtime reference"; exit 1
-          }
-          readelf -d "$dir/basemind" | grep -q "RUNPATH.*\$ORIGIN/lib" || {
-            echo "::error::basemind RUNPATH missing \$ORIGIN/lib"; readelf -d "$dir/basemind"; exit 1
-          }
-          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./lib/libonnxruntime.so.1'); print('libonnxruntime.so.1 load OK')" )
-
-      - name: Upload to GitHub release
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="${{ needs.meta.outputs.tag }}"
-          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
-          if [ ! -f "$archive" ]; then
-            echo "::error::Archive not found: $archive"
-            exit 1
-          fi
-          git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
-          gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
+            basemind-universal2-apple-darwin.tar.gz application/gzip
 
   checksums:
     name: Generate and upload checksums
-    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2]
+    needs: [meta, create_release, build-binaries, build-macos-universal]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -999,7 +631,7 @@ jobs:
             "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}")"
           echo "release_id=$id" >>"$GITHUB_ENV"
 
-      - name: Verify all 5 platform archives are present
+      - name: Verify all 3 platform archives are present
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -1010,8 +642,6 @@ jobs:
             -q '.[].name' >/tmp/release_assets.txt
           missing=0
           for asset in \
-            basemind-x86_64-unknown-linux-gnu.tar.gz \
-            basemind-aarch64-unknown-linux-gnu.tar.gz \
             basemind-aarch64-apple-darwin.tar.gz \
             basemind-x86_64-apple-darwin.tar.gz \
             basemind-x86_64-pc-windows-msvc.zip; do
@@ -1021,10 +651,10 @@ jobs:
             fi
           done
           if [ "$missing" -gt 0 ]; then
-            echo "::error::$missing of 5 platform archives missing; refusing to checksum a partial release"
+            echo "::error::$missing of 3 platform archives missing; refusing to checksum a partial release"
             exit 1
           fi
-          echo "all 5 archives present on release $release_id"
+          echo "all 3 archives present on release $release_id"
 
       - name: Download archives and generate checksums
         env:
@@ -1078,9 +708,6 @@ jobs:
           # every platform archive plus the checksums file they verify against. v0.27.0 was
           # promoted with 3 of 5 archives and no checksums file, so every downloader broke.
           required=(
-            "basemind-x86_64-unknown-linux-gnu.tar.gz"
-            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
-            "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"

@@ -19,11 +19,8 @@ sha_for() {
 
 MAC_ARM=$(sha_for aarch64-apple-darwin)
 MAC_X64=$(sha_for x86_64-apple-darwin)
-LINUX_ARM=$(sha_for aarch64-unknown-linux-gnu)
-LINUX_X64=$(sha_for x86_64-unknown-linux-gnu)
 
-for pair in "aarch64-apple-darwin:$MAC_ARM" "x86_64-apple-darwin:$MAC_X64" \
-  "aarch64-unknown-linux-gnu:$LINUX_ARM" "x86_64-unknown-linux-gnu:$LINUX_X64"; do
+for pair in "aarch64-apple-darwin:$MAC_ARM" "x86_64-apple-darwin:$MAC_X64"; do
   if [ -z "${pair#*:}" ]; then
     echo "missing checksum for ${pair%%:*} in $SUMS" >&2
     exit 1
@@ -52,16 +49,7 @@ class Basemind < Formula
     end
   end
 
-  on_linux do
-    on_arm do
-      url "${BASE}/basemind-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "${LINUX_ARM}"
-    end
-    on_intel do
-      url "${BASE}/basemind-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "${LINUX_X64}"
-    end
-  end
+  # Linux binaries are no longer built or published; the formula is macOS-only.
 
   def install
     # Archive root holds the binary + lib/ of bundled native libs (plus a co-located
