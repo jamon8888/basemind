@@ -8,7 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
-## [Unreleased]
+## [0.38.0] - 2026-11-14
+
+> **Minor release.** This release uses persisted-schema version `38`; the first
+> scan after upgrading may pay one full re-index (durable, not destructive — see
+> `src/version.rs`).
 
 ### Added
 
