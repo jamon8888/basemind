@@ -571,11 +571,12 @@ jobs:
     continue-on-error: true
     runs-on: macos-latest
     steps:
+      # Default checkout (the ref this workflow runs on), NOT the release tag: this job
+      # never touches tag source — it downloads the already-built release assets and
+      # merges them. The merge script only exists on the workflow's own ref, so a tag
+      # created before the script was committed would fail here (v0.38.0 rerun).
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
       - name: Resolve the release id
         env:
