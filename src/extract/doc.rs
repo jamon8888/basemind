@@ -387,11 +387,7 @@ impl DocConfig {
             max_files_in_archive: self.max_archive_entries,
             ..SecurityLimits::default()
         };
-        let ocr = (!strip_enrichment).then(|| xberg::core::config::OcrConfig {
-            language: self.ocr_languages.clone(),
-            tessdata_path: tessdata_path.map(Path::to_path_buf),
-            ..Default::default()
-        });
+        let ocr = (!strip_enrichment).then(|| ocr_assets::xberg_ocr_config(&self.ocr_languages, tessdata_path));
         ExtractionConfig {
             use_cache: false,
             chunking: Some(chunking),
@@ -646,10 +642,8 @@ pub(crate) fn extract_doc_with_metrics(
         && !matches!(
             config.document_models,
             DocumentModelProfile::CodeOnly | DocumentModelProfile::None_
-        )
-        && ocr_assets::can_bundle_languages(&config.ocr_languages)
-    {
-        Some(ocr_assets::ensure_tessdata().map_err(ExtractError::Document)?)
+        ) {
+        ocr_assets::bundled_tessdata_for(&config.ocr_languages).map_err(ExtractError::Document)?
     } else {
         None
     };

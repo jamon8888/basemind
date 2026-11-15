@@ -77,3 +77,23 @@ fn ensure_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The tessdata directory document OCR reads `languages` from: the bundled one when it holds every
+/// language, `None` otherwise (xberg then resolves the language files itself).
+pub(crate) fn bundled_tessdata_for(languages: &[String]) -> Result<Option<PathBuf>, String> {
+    if can_bundle_languages(languages) {
+        ensure_tessdata().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// xberg OCR settings for `languages`, read from `tessdata_path`. Shared by document indexing and
+/// `redact_text` so a file is OCR'd the same way by both.
+pub(crate) fn xberg_ocr_config(languages: &[String], tessdata_path: Option<&Path>) -> xberg::core::config::OcrConfig {
+    xberg::core::config::OcrConfig {
+        language: languages.to_vec(),
+        tessdata_path: tessdata_path.map(Path::to_path_buf),
+        ..Default::default()
+    }
+}
