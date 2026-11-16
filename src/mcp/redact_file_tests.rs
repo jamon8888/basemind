@@ -5,7 +5,51 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
-use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact};
+use super::{LEGAL_FR_PROFILE, RedactTextParams};
+
+/// `run_redact` with the default `[documents.ocr] languages`.
+async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, rmcp::ErrorData> {
+    super::run_redact(args, &crate::config::OcrConfig::default().languages).await
+}
+
+#[test]
+fn file_extraction_config_skips_xberg_caches_and_reads_the_bundled_tessdata() {
+    crate::store::init_isolated_cache();
+    let languages = crate::config::OcrConfig::default().languages;
+    assert!(languages.iter().any(|language| language == "fra"), "{languages:?}");
+    let config = super::file_extraction_config(&languages).expect("bundled tessdata");
+    assert!(!config.use_cache, "the whole-extraction cache must be off");
+    assert!(config.redaction.is_none());
+    // The plain-text OCR retry starts from this configuration and must keep all of it.
+    let retry = crate::extract::doc::ocr_fallback::plain_text_ocr_fallback_config(&config).expect("retry");
+    assert!(!retry.use_cache);
+    for ocr in [config.ocr.expect("OCR configured"), retry.ocr.expect("OCR configured")] {
+        assert_eq!(ocr.language, languages, "same languages as document indexing");
+        let tessdata = ocr.tessdata_path.expect("bundled tessdata selected");
+        assert_eq!(tessdata, crate::extract::ocr_assets::tessdata_path());
+        for language in &languages {
+            assert!(tessdata.join(format!("{language}.traineddata")).is_file(), "{language}");
+        }
+        let options = ocr.backend_options.expect("backend options");
+        assert_eq!(
+            options["use_cache"],
+            serde_json::json!(false),
+            "Tesseract result cache off"
+        );
+    }
+}
+
+#[test]
+fn file_extraction_config_follows_indexing_for_languages_it_does_not_bundle() {
+    let config = super::file_extraction_config(&["jpn".to_string()]).expect("config");
+    assert!(!config.use_cache);
+    let ocr = config.ocr.expect("OCR configured");
+    assert_eq!(ocr.language, ["jpn"]);
+    assert!(
+        ocr.tessdata_path.is_none(),
+        "indexing leaves an unbundled language to xberg too"
+    );
+}
 
 /// The JSON payload a tool returns (the first text content block).
 fn json_of(result: &CallToolResult) -> Value {
