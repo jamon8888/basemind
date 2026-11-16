@@ -284,10 +284,13 @@ async fn ner_model_dir_missing_model_still_redacts() {
 #[tokio::test]
 async fn ner_ran_is_false_when_the_model_is_unavailable() {
     for dir in [None, Some("/nonexistent/gliner2".to_string())] {
-        let result = run_redact(RedactTextParams {
-            ner_model_dir: dir,
-            ..text_params("Reach me at alice@example.com today")
-        })
+        let result = run_redact(
+            RedactTextParams {
+                ner_model_dir: dir,
+                ..text_params("Reach me at alice@example.com today")
+            },
+            None,
+        )
         .await
         .expect("degrades to pattern-only by default");
         assert_eq!(json_of(&result)["ner_ran"], Value::Bool(false));
@@ -299,11 +302,14 @@ async fn ner_ran_is_false_when_the_model_is_unavailable() {
 #[tokio::test]
 async fn require_ner_fails_instead_of_degrading() {
     for dir in [None, Some("/nonexistent/gliner2".to_string())] {
-        let error = run_redact(RedactTextParams {
-            ner_model_dir: dir,
-            require_ner: true,
-            ..text_params("Alice Smith owes 10 000 EUR")
-        })
+        let error = run_redact(
+            RedactTextParams {
+                ner_model_dir: dir,
+                require_ner: true,
+                ..text_params("Alice Smith owes 10 000 EUR")
+            },
+            None,
+        )
         .await
         .expect_err("require_ner must not fall back to pattern-only redaction");
         assert!(
@@ -374,6 +380,7 @@ async fn file_path_redacts_extracted_text() {
             ner_model_dir: None,
             ner_profile: None,
             require_ner: false,
+            ocr_languages: None,
         },
         None,
     )
@@ -401,6 +408,7 @@ async fn file_path_missing_file_errors() {
             ner_model_dir: None,
             ner_profile: None,
             require_ner: false,
+            ocr_languages: None,
         },
         None,
     )
@@ -423,6 +431,7 @@ async fn text_and_file_path_together_rejected() {
             ner_model_dir: None,
             ner_profile: None,
             require_ner: false,
+            ocr_languages: None,
         },
         None,
     )
@@ -449,6 +458,7 @@ async fn oversized_extracted_content_errors() {
             ner_model_dir: None,
             ner_profile: None,
             require_ner: false,
+            ocr_languages: None,
         },
         None,
     )
