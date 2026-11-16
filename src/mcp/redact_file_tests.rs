@@ -30,15 +30,19 @@ fn text_params(text: &str) -> RedactTextParams {
         ner_model_dir: None,
         ner_profile: None,
         require_ner: false,
+        ocr_languages: None,
     }
 }
 
 #[tokio::test]
 async fn unknown_ner_profile_is_rejected() {
-    let error = run_redact(RedactTextParams {
-        ner_profile: Some("legal-fr@99".to_string()),
-        ..text_params("Alice Smith")
-    })
+    let error = run_redact(
+        RedactTextParams {
+            ner_profile: Some("legal-fr@99".to_string()),
+            ..text_params("Alice Smith")
+        },
+        None,
+    )
     .await
     .expect_err("unknown NER profiles must fail closed");
     assert!(error.message.contains("unknown NER profile"), "{}", error.message);
@@ -46,11 +50,14 @@ async fn unknown_ner_profile_is_rejected() {
 
 #[tokio::test]
 async fn ner_profile_metadata_reports_effective_labels_without_model() {
-    let result = run_redact(RedactTextParams {
-        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
-        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
-        ..text_params("Alice Smith works at Acme Corp.")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+            ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+            ..text_params("Alice Smith works at Acme Corp.")
+        },
+        None,
+    )
     .await
     .expect("profile resolution does not require a model");
     let profile = json_of(&result)["ner_profile"].clone();
@@ -80,10 +87,13 @@ async fn ner_profile_metadata_reports_effective_labels_without_model() {
 
 #[tokio::test]
 async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
-    let result = run_redact(RedactTextParams {
-        ner_profile: Some("legal-fr@2".to_string()),
-        ..text_params("Résidence Les Hortensias, le 3 septembre 2026")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params("Résidence Les Hortensias, le 3 septembre 2026")
+        },
+        None,
+    )
     .await
     .expect("profile resolution does not require a model");
     let profile = json_of(&result)["ner_profile"].clone();
@@ -210,10 +220,13 @@ async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
     let text =
         "Publié le 19 février 2026, annonce 20260219-AAA-0042. Référence devis : 2026-221. Contact : 06 12 34 56 78.";
     let payload = json_of(
-        &run_redact(RedactTextParams {
-            ner_profile: Some("legal-fr@2".to_string()),
-            ..text_params(text)
-        })
+        &run_redact(
+            RedactTextParams {
+                ner_profile: Some("legal-fr@2".to_string()),
+                ..text_params(text)
+            },
+            None,
+        )
         .await
         .expect("redact_text succeeds"),
     );
@@ -230,10 +243,13 @@ async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
 async fn legal_fr_v2_phone_context_overrides_invoice_reference_cue() {
     let text = "Facture 42. Téléphone Danemark : 32345678.";
     let payload = json_of(
-        &run_redact(RedactTextParams {
-            ner_profile: Some("legal-fr@2".to_string()),
-            ..text_params(text)
-        })
+        &run_redact(
+            RedactTextParams {
+                ner_profile: Some("legal-fr@2".to_string()),
+                ..text_params(text)
+            },
+            None,
+        )
         .await
         .expect("redact_text succeeds"),
     );
@@ -245,10 +261,13 @@ async fn legal_fr_v2_phone_context_overrides_invoice_reference_cue() {
 /// NER degrades to pattern-only redaction and the response stays intact.
 #[tokio::test]
 async fn ner_model_dir_missing_model_still_redacts() {
-    let result = run_redact(RedactTextParams {
-        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
-        ..text_params("Reach me at alice@example.com today")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+            ..text_params("Reach me at alice@example.com today")
+        },
+        None,
+    )
     .await
     .expect("missing NER model degrades, never errors");
     let payload = json_of(&result);
@@ -300,10 +319,13 @@ async fn require_ner_fails_instead_of_degrading() {
 /// nothing about windows it never read.
 #[tokio::test]
 async fn coverage_fields_appear_only_when_ner_ran() {
-    let result = run_redact(RedactTextParams {
-        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
-        ..text_params("Reach me at alice@example.com today")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+            ..text_params("Reach me at alice@example.com today")
+        },
+        None,
+    )
     .await
     .expect("degrades to pattern-only by default");
     let payload = json_of(&result);
@@ -318,7 +340,7 @@ async fn coverage_fields_appear_only_when_ner_ran() {
 
 #[tokio::test]
 async fn text_param_still_redacts() {
-    let result = run_redact(text_params("Reach me at alice@example.com today"))
+    let result = run_redact(text_params("Reach me at alice@example.com today"), None)
         .await
         .expect("redact_text succeeds");
     let payload = json_of(&result);
@@ -340,18 +362,21 @@ async fn file_path_redacts_extracted_text() {
     let file = dir.path().join("note.txt");
     std::fs::write(&file, "Contact bob@corp.com for details").expect("write fixture");
 
-    let result = run_redact(RedactTextParams {
-        text: String::new(),
-        file_path: Some(file.to_string_lossy().into_owned()),
-        categories: vec![],
-        strategy: None,
-        custom_terms: vec![],
-        custom_patterns: vec![],
-        pseudonyms: vec![],
-        ner_model_dir: None,
-        ner_profile: None,
-        require_ner: false,
-    })
+    let result = run_redact(
+        RedactTextParams {
+            text: String::new(),
+            file_path: Some(file.to_string_lossy().into_owned()),
+            categories: vec![],
+            strategy: None,
+            custom_terms: vec![],
+            custom_patterns: vec![],
+            pseudonyms: vec![],
+            ner_model_dir: None,
+            ner_profile: None,
+            require_ner: false,
+        },
+        None,
+    )
     .await
     .expect("redact_text succeeds");
     let payload = json_of(&result);
@@ -364,18 +389,21 @@ async fn file_path_redacts_extracted_text() {
 async fn file_path_missing_file_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let missing = dir.path().join("nope.txt");
-    let err = run_redact(RedactTextParams {
-        text: String::new(),
-        file_path: Some(missing.to_string_lossy().into_owned()),
-        categories: vec![],
-        strategy: None,
-        custom_terms: vec![],
-        custom_patterns: vec![],
-        pseudonyms: vec![],
-        ner_model_dir: None,
-        ner_profile: None,
-        require_ner: false,
-    })
+    let err = run_redact(
+        RedactTextParams {
+            text: String::new(),
+            file_path: Some(missing.to_string_lossy().into_owned()),
+            categories: vec![],
+            strategy: None,
+            custom_terms: vec![],
+            custom_patterns: vec![],
+            pseudonyms: vec![],
+            ner_model_dir: None,
+            ner_profile: None,
+            require_ner: false,
+        },
+        None,
+    )
     .await
     .expect_err("missing file must fail");
     assert!(err.message.contains("cannot read"), "unexpected error: {}", err.message);
@@ -383,18 +411,21 @@ async fn file_path_missing_file_errors() {
 
 #[tokio::test]
 async fn text_and_file_path_together_rejected() {
-    let err = run_redact(RedactTextParams {
-        text: "hello".to_string(),
-        file_path: Some("/tmp/whatever.txt".to_string()),
-        categories: vec![],
-        strategy: None,
-        custom_terms: vec![],
-        custom_patterns: vec![],
-        pseudonyms: vec![],
-        ner_model_dir: None,
-        ner_profile: None,
-        require_ner: false,
-    })
+    let err = run_redact(
+        RedactTextParams {
+            text: "hello".to_string(),
+            file_path: Some("/tmp/whatever.txt".to_string()),
+            categories: vec![],
+            strategy: None,
+            custom_terms: vec![],
+            custom_patterns: vec![],
+            pseudonyms: vec![],
+            ner_model_dir: None,
+            ner_profile: None,
+            require_ner: false,
+        },
+        None,
+    )
     .await
     .expect_err("both inputs must fail");
     assert!(err.message.contains("not both"), "unexpected error: {}", err.message);
@@ -406,18 +437,21 @@ async fn oversized_extracted_content_errors() {
     let file = dir.path().join("big.txt");
     std::fs::write(&file, "x".repeat(2 << 20)).expect("write fixture");
 
-    let err = run_redact(RedactTextParams {
-        text: String::new(),
-        file_path: Some(file.to_string_lossy().into_owned()),
-        categories: vec![],
-        strategy: None,
-        custom_terms: vec![],
-        custom_patterns: vec![],
-        pseudonyms: vec![],
-        ner_model_dir: None,
-        ner_profile: None,
-        require_ner: false,
-    })
+    let err = run_redact(
+        RedactTextParams {
+            text: String::new(),
+            file_path: Some(file.to_string_lossy().into_owned()),
+            categories: vec![],
+            strategy: None,
+            custom_terms: vec![],
+            custom_patterns: vec![],
+            pseudonyms: vec![],
+            ner_model_dir: None,
+            ner_profile: None,
+            require_ner: false,
+        },
+        None,
+    )
     .await
     .expect_err("oversized extraction must fail");
     assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
@@ -435,11 +469,14 @@ async fn raw_file_size_capped_before_extraction() {
         .set_len(super::MAX_FILE_BYTES + 1)
         .expect("extend to sparse size");
 
-    let err = run_redact(RedactTextParams {
-        text: String::new(),
-        file_path: Some(file.to_string_lossy().into_owned()),
-        ..text_params("")
-    })
+    let err = run_redact(
+        RedactTextParams {
+            text: String::new(),
+            file_path: Some(file.to_string_lossy().into_owned()),
+            ..text_params("")
+        },
+        None,
+    )
     .await
     .expect_err("oversized raw file must fail before extraction");
     assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
@@ -450,14 +487,17 @@ async fn raw_file_size_capped_before_extraction() {
 /// default renders, which the app-side parser would report as "unknown".
 #[tokio::test]
 async fn custom_term_labels_surface_in_detections() {
-    let result = run_redact(RedactTextParams {
-        text: "Alice visited Paris today".to_string(),
-        custom_terms: vec![
-            vec!["person".to_string(), "Alice".to_string()],
-            vec!["location".to_string(), "Paris".to_string()],
-        ],
-        ..text_params("Alice visited Paris today")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            text: "Alice visited Paris today".to_string(),
+            custom_terms: vec![
+                vec!["person".to_string(), "Alice".to_string()],
+                vec!["location".to_string(), "Paris".to_string()],
+            ],
+            ..text_params("Alice visited Paris today")
+        },
+        None,
+    )
     .await
     .expect("redact_text succeeds");
     let payload = json_of(&result);
@@ -515,11 +555,14 @@ fn ner_span_patterns_are_boundary_aware_and_escaped() {
 #[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
 async fn ner_model_dir_detects_entities_with_confidence() {
     let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
-    let result = run_redact(RedactTextParams {
-        text: "Alice Smith met Bob Jones in Paris near Acme Corp.".to_string(),
-        ner_model_dir: Some(dir),
-        ..text_params("Alice Smith met Bob Jones in Paris near Acme Corp.")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            text: "Alice Smith met Bob Jones in Paris near Acme Corp.".to_string(),
+            ner_model_dir: Some(dir),
+            ..text_params("Alice Smith met Bob Jones in Paris near Acme Corp.")
+        },
+        None,
+    )
     .await
     .expect("redact_text succeeds with a real model");
     let payload = json_of(&result);
@@ -570,11 +613,14 @@ async fn ner_model_dir_detects_entities_with_confidence() {
 #[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
 async fn legal_profile_runs_ner_with_effective_labels() {
     let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
-    let result = run_redact(RedactTextParams {
-        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
-        ner_model_dir: Some(dir),
-        ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
-    })
+    let result = run_redact(
+        RedactTextParams {
+            ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+            ner_model_dir: Some(dir),
+            ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
+        },
+        None,
+    )
     .await
     .expect("legal profile NER succeeds");
     let payload = json_of(&result);
@@ -605,7 +651,9 @@ async fn international_and_french_phone_formats_redact() {
         "+33 (0)1 42 68 53 00",
     ] {
         let text = format!("Appelez le {phone} demain");
-        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let result = run_redact(text_params(&text), None)
+            .await
+            .expect("redact_text succeeds");
         let payload = json_of(&result);
         let redacted = payload["redacted_text"].as_str().expect("redacted_text");
         assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
@@ -628,7 +676,9 @@ async fn french_phone_formats_beyond_digit_pairs_redact() {
         "+33 1 4268 5300",
     ] {
         let text = format!("Appelez le {phone} demain");
-        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let result = run_redact(text_params(&text), None)
+            .await
+            .expect("redact_text succeeds");
         let payload = json_of(&result);
         let redacted = payload["redacted_text"].as_str().expect("redacted_text");
         assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
@@ -640,7 +690,7 @@ async fn french_phone_formats_beyond_digit_pairs_redact() {
 #[tokio::test]
 async fn french_phone_does_not_swallow_a_following_street_number() {
     let text = "Tél. +33 6 39 98 21 47 11 rue Ferdinand Quéniart, 82000 Montauban";
-    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let result = run_redact(text_params(text), None).await.expect("redact_text succeeds");
     let payload = json_of(&result);
     let map = payload["rehydration_map"].as_object().expect("map");
     assert!(
@@ -657,7 +707,7 @@ async fn french_phone_does_not_swallow_a_following_street_number() {
 #[tokio::test]
 async fn phone_patterns_leave_dates_and_amounts_alone() {
     let text = "Réunion le 28/09/2026 à 14:30, montant 1 234,56 €, dossier 2026-09-28, page 12";
-    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let result = run_redact(text_params(text), None).await.expect("redact_text succeeds");
     let payload = json_of(&result);
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     for kept in ["28/09/2026", "14:30", "1 234,56", "2026-09-28", "page 12"] {
@@ -671,10 +721,13 @@ async fn legal_reference_numbers_are_not_redacted_as_phones() {
                 Facture F-2026-0012 du 9 janvier 2026. Période 2024-2025. \
                 Contact : 06 12 34 56 78.";
     let payload = json_of(
-        &run_redact(RedactTextParams {
-            ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
-            ..text_params(text)
-        })
+        &run_redact(
+            RedactTextParams {
+                ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+                ..text_params(text)
+            },
+            None,
+        )
         .await
         .expect("redact_text succeeds"),
     );
@@ -692,10 +745,13 @@ async fn legal_reference_numbers_are_not_redacted_as_phones() {
 async fn uppercase_prose_is_not_redacted_as_a_swift_code_without_context() {
     let text = "ATTESTATION D'EMPLOYEUR\n\nLa présente attestation est établie à la demande.";
     let payload = json_of(
-        &run_redact(RedactTextParams {
-            ner_profile: Some("legal-fr@2".to_string()),
-            ..text_params(text)
-        })
+        &run_redact(
+            RedactTextParams {
+                ner_profile: Some("legal-fr@2".to_string()),
+                ..text_params(text)
+            },
+            None,
+        )
         .await
         .expect("redact_text succeeds"),
     );
@@ -714,7 +770,11 @@ async fn uppercase_prose_is_not_redacted_as_a_swift_code_without_context() {
 async fn a_valid_spaced_french_nir_redacts_as_one_national_id() {
     let nir = "1 85 07 15 100 000 58";
     let text = format!("Numéro de sécurité sociale : **{nir}**.");
-    let payload = json_of(&run_redact(text_params(&text)).await.expect("redact_text succeeds"));
+    let payload = json_of(
+        &run_redact(text_params(&text), None)
+            .await
+            .expect("redact_text succeeds"),
+    );
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(!redacted.contains(nir), "the complete NIR must be redacted: {redacted}");
     let detections = payload["detections"].as_array().expect("detections");
@@ -750,7 +810,7 @@ fn pdf_line_padding_keeps_source_offsets_for_detections() {
 #[tokio::test]
 async fn ai_act_citation_redacts_only_the_2024_1689_number() {
     let text = "Per the AI Act, Regulation (EU) 2024/1689 applies; see also Regulation (EU) 2022/2065.";
-    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let result = run_redact(text_params(text), None).await.expect("redact_text succeeds");
     let payload = json_of(&result);
     let redacted = payload["redacted_text"].as_str().expect("redacted_text");
     assert!(
@@ -783,7 +843,7 @@ async fn ai_act_citation_redacts_only_the_2024_1689_number() {
 /// Redacts `text` with no NER and returns the detections whose text is `needle`,
 /// asserting each one indexes `text` itself (UTF-8 bytes), not an extracted copy.
 async fn assert_spans_index_the_input(text: &str, needle: &str) -> Value {
-    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let result = run_redact(text_params(text), None).await.expect("redact_text succeeds");
     let payload = json_of(&result);
     let detections = payload["detections"].as_array().expect("detections");
     let found: Vec<&Value> = detections
@@ -844,7 +904,7 @@ async fn offsets_hold_after_decomposed_accents() {
 #[tokio::test]
 async fn redacted_text_keeps_the_surrounding_text_verbatim() {
     let text = "  Intro\r\n\r\n\r\nContact: jane.roe@exemple.fr merci\n\n";
-    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let result = run_redact(text_params(text), None).await.expect("redact_text succeeds");
     let redacted = json_of(&result)["redacted_text"]
         .as_str()
         .expect("redacted_text")
@@ -886,11 +946,14 @@ async fn ner_windows_read_the_whole_text() {
         while text.chars().count() < 20_000 {
             text.push_str(filler);
         }
-        let result = run_redact(RedactTextParams {
-            text: text.clone(),
-            ner_model_dir: Some(dir.clone()),
-            ..text_params(&text)
-        })
+        let result = run_redact(
+            RedactTextParams {
+                text: text.clone(),
+                ner_model_dir: Some(dir.clone()),
+                ..text_params(&text)
+            },
+            None,
+        )
         .await
         .expect("redact_text succeeds with a real model over 20k characters");
         let payload = json_of(&result);
@@ -938,11 +1001,14 @@ async fn dense_text_reports_no_truncation() {
         "alice@exemple.fr"
     );
     let text = filler.repeat(500);
-    let result = run_redact(RedactTextParams {
-        text: text.clone(),
-        ner_model_dir: Some(dir),
-        ..text_params(&text)
-    })
+    let result = run_redact(
+        RedactTextParams {
+            text: text.clone(),
+            ner_model_dir: Some(dir),
+            ..text_params(&text)
+        },
+        None,
+    )
     .await
     .expect("dense text redacts with a real model");
     let payload = json_of(&result);
