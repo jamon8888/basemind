@@ -125,9 +125,10 @@ impl BasemindServer {
         }
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
         // Use OCR languages from params if provided, otherwise fall back to config default
-        let ocr_languages = p.ocr_languages.clone().or_else(|| {
-            Some(self.state.shared.config.documents.ocr.languages.clone())
-        });
+        let ocr_languages = p
+            .ocr_languages
+            .clone()
+            .or_else(|| Some(self.state.shared.config.documents.ocr.languages.clone()));
         let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
@@ -138,9 +139,10 @@ impl BasemindServer {
         let started = std::time::Instant::now();
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
         // Use OCR languages from params if provided, otherwise fall back to config default
-        let ocr_languages = p.ocr_languages.clone().or_else(|| {
-            Some(self.state.shared.config.documents.ocr.languages.clone())
-        });
+        let ocr_languages = p
+            .ocr_languages
+            .clone()
+            .or_else(|| Some(self.state.shared.config.documents.ocr.languages.clone()));
         let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
@@ -181,10 +183,7 @@ enum Source {
 /// xberg redact them together with its own pattern detectors in one pass.
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
-async fn run_redact(
-    args: RedactTextParams,
-    ocr_languages: Option<Vec<String>>,
-) -> Result<CallToolResult, McpError> {
+async fn run_redact(args: RedactTextParams, ocr_languages: Option<Vec<String>>) -> Result<CallToolResult, McpError> {
     let ner_profile =
         resolve_ner_profile(args.ner_profile.as_deref()).map_err(|reason| McpError::invalid_params(reason, None))?;
     let source = match args.file_path.as_deref() {
