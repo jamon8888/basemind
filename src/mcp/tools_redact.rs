@@ -93,6 +93,11 @@ pub struct RedactTextParams {
     /// not release text whose names, companies or places went undetected.
     #[serde(default)]
     pub require_ner: bool,
+    /// Tesseract language packs to use for OCR (ISO 639-3 codes like `"fra"`, `"eng"`).
+    /// Overrides the `[documents.ocr] languages` config when set. Only used when
+    /// `file_path` points to an image or scanned PDF.
+    #[serde(default)]
+    pub ocr_languages: Option<Vec<String>>,
 }
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_redact_text")]
 impl BasemindServer {
@@ -119,7 +124,11 @@ impl BasemindServer {
             return result;
         }
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
-        let result = run_redact(p).await;
+        // Use OCR languages from params if provided, otherwise fall back to config default
+        let ocr_languages = p.ocr_languages.clone().or_else(|| {
+            Some(self.state.shared.config.documents.ocr.languages.clone())
+        });
+        let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
     }
@@ -128,7 +137,11 @@ impl BasemindServer {
     pub(crate) async fn redact_text_cli(&self, p: RedactTextParams) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
-        let result = run_redact(p).await;
+        // Use OCR languages from params if provided, otherwise fall back to config default
+        let ocr_languages = p.ocr_languages.clone().or_else(|| {
+            Some(self.state.shared.config.documents.ocr.languages.clone())
+        });
+        let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
     }
@@ -168,7 +181,10 @@ enum Source {
 /// xberg redact them together with its own pattern detectors in one pass.
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
-async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> {
+async fn run_redact(
+    args: RedactTextParams,
+    ocr_languages: Option<Vec<String>>,
+) -> Result<CallToolResult, McpError> {
     let ner_profile =
         resolve_ner_profile(args.ner_profile.as_deref()).map_err(|reason| McpError::invalid_params(reason, None))?;
     let source = match args.file_path.as_deref() {
@@ -251,9 +267,19 @@ async fn run_redact(args: RedactTextParams) -> Result<CallToolResult, McpError> 
     // grouping, French pairs) — always on, like the pattern engine itself.
     custom_patterns.extend(RedactionConfig::phone_patterns());
 
-    let extraction_config = xberg::core::config::ExtractionConfig {
-        redaction: None,
-        ..Default::default()
+    // Build extraction config with OCR languages if provided (only relevant for file_path with images/scanned PDFs)
+    let extraction_config = {
+        let mut config = xberg::core::config::ExtractionConfig {
+            redaction: None,
+            ..Default::default()
+        };
+        if let Some(langs) = ocr_languages.filter(|l| !l.is_empty()) {
+            config.ocr = Some(xberg::core::config::OcrConfig {
+                language: langs,
+                ..Default::default()
+            });
+        }
+        config
     };
 
     let mut doc = match source {
