@@ -8,6 +8,10 @@ trim_trailing_whitespace = true
 
 [discovery]
 exclude = [
+  "/.mcp.json",
+  "/opencode.json",
+  "/plugin/**",
+  "/skills/**",
   "**/*.lock",
   "**/*.svg",
   "**/Cargo.lock",
@@ -36,6 +40,17 @@ exclude = [
 
 [lint.markdown.rumdl]
 disable = ["MD025", "MD013", "MD024", "MD033", "MD036", "MD041"]
+
+# The ADR log is docs/adr (the engine default). `adrlint.lock` pins the accepted records
+# (`adrlint lock docs/adr`, configured by `.adrlint.toml`). The records keep the Nygard section names
+# (`## Decision`, `## Consequences`, `## Alternatives considered`), so the three MADR rules that
+# demand `## Decision Outcome`, `## Considered Options` and a level-3 `### Consequences` are off;
+# every other document and numbering rule runs.
+# MADR31 wants `*` bullets, which `poly fmt` rewrites to `-`; poly before 0.34 has it on by default.
+[lint.markdown.adrlint]
+enabled = true
+start = 0
+ignore = ["MADR01c", "MADR01d", "MADR06", "MADR31"]
 
 # The quality tier's budgets are tuned to this repo's reality: the MCP/CLI
 # handlers are long by construction, most ships in vendored tree-sitter crates,
@@ -175,12 +190,20 @@ extend_exclude = ["tests/fixtures/**"]
 "tests/fixtures/**" = ["ANN", "C416", "RET504", "PERF203"]
 # CHANGELOG.md accumulates release notes without bound; length is intentional.
 "CHANGELOG.md" = ["file-too-long"]
+# The template shares number 0000 with the first record. adrlint reports a duplicate number on
+# every file that carries it, so exactly this pair is exempt; a third 0000 file is still reported.
+"docs/adr/0000-record-architecture-decisions.md" = ["MADR43"]
+"docs/adr/0000-template.md" = ["MADR43"]
 
 [hooks]
 stages = ["pre-commit"]
 
 [hooks.builtin]
 lint = { exclude = [
+  "/.mcp.json",
+  "/opencode.json",
+  "/plugin/**",
+  "/skills/**",
   "**/*.lock",
   "**/Cargo.lock",
   "**/go.sum",
@@ -196,6 +219,10 @@ lint = { exclude = [
   "packages/go/include/*.h",
 ] }
 fmt = { exclude = [
+  "/.mcp.json",
+  "/opencode.json",
+  "/plugin/**",
+  "/skills/**",
   "**/*.lock",
   "**/Cargo.lock",
   "**/go.sum",
@@ -213,6 +240,10 @@ fmt = { exclude = [
 ] }
 commit = { stages = ["commit-msg"] }
 file_safety = { exclude = [
+  "/.mcp.json",
+  "/opencode.json",
+  "/plugin/**",
+  "/skills/**",
   "**/*.lock",
   "**/Cargo.lock",
   "**/go.sum",
@@ -235,13 +266,25 @@ enabled = true
 [tools.shellcheck]
 enabled = true
 
+# Scoped to what the smoke test exercises: the statusline script, the plugin manifest it reads
+# the version from, and the sources of `basemind statusline` and the status.json sidecar. It may
+# build the binary, so it shares the cargo exclusion set.
 [hooks.pre-commit.scripts.statusline_smoke]
 run = "bash tests/statusline_smoke.sh"
+glob = [
+  ".claude-plugin/plugin.json",
+  ".claude-plugin/statusline.sh",
+  "src/comms_cli.rs",
+  "src/store_layout.rs",
+  "tests/statusline_smoke.sh",
+]
+serial = "cargo"
 
 [hooks.pre-commit.scripts.sync_plugin_skills]
-run = "bash scripts/sync-plugin-skills.sh"
+run = "python3 scripts/sync_legacy_plugin_exports.py --check"
+workspace = true
 [[hooks.sources]]
 id = "ai-rulez"
 git = "https://github.com/Goldziher/ai-rulez.git"
-revision = "v4.9.3"
+revision = "v5"
 hooks = ["ai-rulez-validate", "ai-rulez-plugin-verify"]

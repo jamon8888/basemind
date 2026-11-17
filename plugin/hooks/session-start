@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# basemind SessionStart hook.
+#   1. Availability probe: run `basemind status` through the launcher, which also
+#      caches a version-matched binary so the first MCP tool call isn't a cold install.
+#   2. Context-economy nudge: always inject the operating discipline so the agent
+#      defaults to basemind over grep/read and stays token-frugal.
+#   3. Status-line nudge: Claude Code plugins cannot set the main status line, so
+#      if the user hasn't wired it yet, append a hint about /bm-statusline.
+#
+# Output goes to stdout as the hook's JSON result; diagnostics would go to stderr.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+WORKSPACE="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+# 1. PROBE before advertising. A hook that tells the agent to prefer tools that are not there is
+#    worse than no hook at all: the agent burns calls hunting for them, then falls back to grep and
+#    reports basemind as broken. Ask the CLI, through the same launcher the MCP server uses, for
+#    this workspace's index status. That works on a default install (no HTTP front-end needed), and
+#    the first run also warms the version-matched binary cache. Bounded by `timeout` when available
+#    and fail-open: a failure only changes the context line, never the exit status.
+STATUS_TIMEOUT=20
+STATUS_RC=0
+STATUS_JSON=""
+if command -v timeout >/dev/null 2>&1; then
+  STATUS_JSON="$(timeout "${STATUS_TIMEOUT}" "${PLUGIN_ROOT}/scripts/mcp-launch.sh" status --root "${WORKSPACE}" --json 2>/dev/null)" || STATUS_RC=$?
+else
+  STATUS_JSON="$("${PLUGIN_ROOT}/scripts/mcp-launch.sh" status --root "${WORKSPACE}" --json 2>/dev/null)" || STATUS_RC=$?
+fi
+
+FILE_COUNT=""
+SCHEMA_VER=""
+if [ "${STATUS_RC}" -eq 0 ] && [ -n "${STATUS_JSON}" ] && command -v jq >/dev/null 2>&1; then
+  FILE_COUNT="$(printf '%s' "${STATUS_JSON}" | jq -r '.file_count | numbers' 2>/dev/null || true)"
+  SCHEMA_VER="$(printf '%s' "${STATUS_JSON}" | jq -r '.schema_version | numbers' 2>/dev/null || true)"
+fi
+
+# The MCP tools this plugin's server advertises: the verb tools, plus the coordination tool a
+# `comms` build adds. Every definition carries `_meta["anthropic/alwaysLoad"]`, so a host that defers
+# MCP tools still loads these at session start and no tool search is needed. Claude Code namespaces
+# plugin MCP tools as mcp__plugin_<plugin>_<server>__<tool>.
+TOOL_PREFIX="mcp__plugin_basemind_basemind__"
+TOOL_NAMES="code_outline code_symbols code_read code_grep code_search code_refs find_files docs_search git_log git_blame git_diff memory_save memory_search index_status index_rescan agents"
+TOOL_LIST=""
+for t in ${TOOL_NAMES}; do
+  TOOL_LIST="${TOOL_LIST:+${TOOL_LIST}, }${t}"
+done
+
+FALLBACK="Use ordinary file and git tools for now; run /bm-doctor to diagnose."
+CALL_TOOLS=" Its tools are always loaded, so call them directly with no tool search: ${TOOL_LIST}."
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${CURSOR_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  CALL_TOOLS="${CALL_TOOLS} Claude Code registers each one as ${TOOL_PREFIX}<tool>."
+fi
+
+if [ "${STATUS_RC}" -eq 124 ]; then
+  STATUS_LINE="basemind status timed out after ${STATUS_TIMEOUT}s (the first run may still be installing the binary), so basemind is unverified. ${FALLBACK}"
+elif [ "${STATUS_RC}" -ne 0 ] || [ -z "${STATUS_JSON}" ]; then
+  STATUS_LINE="basemind is unavailable: the launcher could not run \`basemind status\` (exit ${STATUS_RC}; binary missing or not installable). ${FALLBACK}"
+elif ! command -v jq >/dev/null 2>&1; then
+  STATUS_LINE="basemind runs but jq is not installed, so the index could not be read. ${FALLBACK}"
+elif [ -z "${FILE_COUNT}" ]; then
+  STATUS_LINE="basemind returned an unreadable status (no file_count). ${FALLBACK}"
+elif [ "${FILE_COUNT}" -eq 0 ]; then
+  STATUS_LINE="basemind index is empty for ${WORKSPACE}: run /bm-scan (basemind scan) before relying on its tools. Use ordinary file and git tools until then."
+else
+  STATUS_LINE="basemind verified: ${FILE_COUNT} files indexed (schema ${SCHEMA_VER:-unknown}).${CALL_TOOLS}"
+fi
+
+ROUTING="Use basemind before shell rg, grep, find and git, and before reading whole files. What a file contains: code_outline {\"path\":\"src/store.rs\"}, then code_read {\"path\":\"src/store.rs\",\"symbol\":\"open\"} for the one body you need. Where a name is defined: code_symbols {\"name\":\"open_store\"}. What calls, implements or imports it: code_refs {\"name\":\"open_store\"}. A string or comment in indexed code: code_grep {\"pattern\":\"cache_root(\"} (literal text; add \"regex\":true for a regex). Code by what it does: code_search {\"query\":\"retry a failed upload\"}. A file by name: find_files {\"query\":\"readme\"}. History: git_log {} for recent commits (add path, query, author, symbol or rev), git_blame {\"path\":\"src/store.rs\"}, git_diff {} for the working-tree status (add path, from, to). Documents, which the code tools do not cover (markdown, config, PDFs, Jupyter notebooks): docs_search {\"query\":\"how releases are versioned\"}. Notes shared across sessions: memory_save {\"key\":\"decision/x\",\"value\":\"…\"} and memory_search {\"query\":\"…\"}. Lines are 1-based, an unknown argument is rejected, and a failure is a tool result that names the fix. For exact literals or regex outside the code map, search the files directly; a semantic miss does not establish absence. Fall back to ordinary tools when basemind cannot cover the task, and run index_rescan {} after editing indexed files. Use agents for thread communication when that tool is available."
+CONTEXT="${STATUS_LINE} ${ROUTING}"
+
+# 2. Append the status-line nudge only when a basemind status line isn't wired yet.
+#    Detect robustly: prefer parsing the `statusLine.command` value with jq (catches
+#    any script name / absolute path that references basemind), and fall back to a
+#    case-insensitive grep for "basemind" near a statusLine key when jq is absent.
+#    The old literal "statusline.sh" grep missed renamed scripts and matched unrelated
+#    files.
+SETTINGS="${HOME}/.claude/settings.json"
+statusline_wired() {
+  [ -f "${SETTINGS}" ] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -e '(.statusLine.command // "") | test("basemind"; "i")' \
+      "${SETTINGS}" >/dev/null 2>&1
+    return $?
+  fi
+  # No jq: best-effort. Require both a statusLine key and a basemind reference.
+  grep -qi 'statusLine' "${SETTINGS}" 2>/dev/null &&
+    grep -qi 'basemind' "${SETTINGS}" 2>/dev/null
+}
+if ! statusline_wired; then
+  CONTEXT="${CONTEXT} The basemind status line is not enabled in the user's Claude Code settings; if the user asks about the status line or basemind activity, tell them they can enable a live status line (indexed files, scan age, tool calls, tokens saved) by running the /bm-statusline command once."
+fi
+
+# 3. Agent-comms boot: connect to the broker (starting it if needed) and surface a CONDENSED view
+#    of the agent's inbox — front-matter only, never bodies — so the agent knows the conversation
+#    state and the levers to participate. Threads are scope-discovered and explicit-join (no
+#    auto-join). Best-effort + time-boxed; comms never blocks or fails session startup. Requires jq
+#    to parse the inbox JSON.
+if command -v jq >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+  INBOX_JSON="$(timeout 8 "${PLUGIN_ROOT}/scripts/mcp-launch.sh" agents inbox --root "${WORKSPACE}" --json --limit 8 2>/dev/null || true)"
+  MSG_COUNT="$(printf '%s' "${INBOX_JSON}" | jq -er '.messages | arrays | length' 2>/dev/null || true)"
+  if [ -n "${MSG_COUNT}" ]; then
+    COMMS_TOOLS="You are connected to basemind agent-comms — a shared multi-agent chat built on THREADS scoped by at least two of subject, path_glob, and members. Threads are discovered by membership, cwd path match, or subject filter; there is no auto-join. Use agents with a required mode: thread_list to find threads, join to participate, thread_start to open one, post to send, history or inbox to scan front-matter, message with message_ref to read a body, and ack to clear read messages. Prefer posting a concise status/question over staying silent when collaborating."
+    if [ "${MSG_COUNT}" -gt 0 ]; then
+      RECENT="$(printf '%s' "${INBOX_JSON}" | jq -r '.messages[] | "  • [\(.subject)] from \(.from) (ref: \(.message_ref // .id))"' 2>/dev/null || true)"
+      CONTEXT="${CONTEXT} ${COMMS_TOOLS}"$'\n'"Recent messages (front-matter only; call agents mode message with message_ref to read a body):"$'\n'"${RECENT}"
+    else
+      CONTEXT="${CONTEXT} ${COMMS_TOOLS} No messages in your inbox yet — start or join a thread to kick things off."
+    fi
+  fi
+fi
+
+# Escape for JSON embedding (single-pass parameter substitutions).
+escape_for_json() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+CTX="$(escape_for_json "${CONTEXT}")"
+
+# Emit the field the current harness consumes. Cursor expects additional_context;
+# Claude Code expects hookSpecificOutput.additionalContext; SDK-standard hosts
+# (e.g. Copilot CLI) expect a top-level additionalContext.
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  printf '{\n  "additional_context": "%s"\n}\n' "${CTX}"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "${CTX}"
+else
+  printf '{\n  "additionalContext": "%s"\n}\n' "${CTX}"
+fi
+
+exit 0
