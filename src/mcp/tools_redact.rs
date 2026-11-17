@@ -288,11 +288,10 @@ async fn run_redact(args: RedactTextParams, ocr_languages: Option<Vec<String>>) 
     // grouping, French pairs) — always on, like the pattern engine itself.
     custom_patterns.extend(RedactionConfig::phone_patterns());
 
-    // Build extraction config with OCR languages if provided (only relevant for file_path with images/scanned PDFs)
-    let extraction_config = build_redaction_extraction_config(ocr_languages)?;
-
     let mut doc = match source {
         Source::File(input) => {
+            // Build extraction config with OCR languages if provided (only relevant for file_path with images/scanned PDFs)
+            let extraction_config = build_redaction_extraction_config(ocr_languages)?;
             let input = *input;
             let budget_start = Instant::now();
             let deadline = budget_start + file_extraction_timeout();
