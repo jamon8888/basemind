@@ -62,7 +62,7 @@ fn build_redaction_extraction_config(
             ..Default::default()
         });
     }
-    config
+    Ok(config)
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
