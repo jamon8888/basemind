@@ -44,27 +44,6 @@ fn resolve_ocr_languages(override_langs: Option<Vec<String>>, default_langs: &[S
         .or_else(|| Some(default_langs.to_vec()))
 }
 
-/// Build the xberg extraction configuration for redaction, including OCR configuration if languages are specified.
-fn build_redaction_extraction_config(
-    ocr_languages: Option<Vec<String>>,
-) -> Result<xberg::core::config::ExtractionConfig, McpError> {
-    let mut config = xberg::core::config::ExtractionConfig {
-        redaction: None,
-        ..Default::default()
-    };
-    if let Some(langs) = ocr_languages.filter(|l| !l.is_empty()) {
-        // Ensure bundled tessdata is available and set the path for xberg
-        let tessdata_path =
-            crate::extract::ocr_assets::ensure_tessdata().map_err(|e| McpError::internal_error(e, None))?;
-        config.ocr = Some(xberg::core::config::OcrConfig {
-            language: langs,
-            tessdata_path: Some(tessdata_path),
-            ..Default::default()
-        });
-    }
-    Ok(config)
-}
-
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
     /// Text to redact. Mutually exclusive with `file_path`.
@@ -152,7 +131,7 @@ impl BasemindServer {
             p.ocr_languages.clone(),
             &self.state.shared.config.documents.ocr.languages,
         );
-        let result = run_redact(p, ocr_languages).await;
+        let result = run_redact(p, &ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
     }
@@ -165,7 +144,7 @@ impl BasemindServer {
             p.ocr_languages.clone(),
             &self.state.shared.config.documents.ocr.languages,
         );
-        let result = run_redact(p, ocr_languages).await;
+        let result = run_redact(p, &ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
     }
@@ -200,12 +179,31 @@ enum Source {
     Inline(String),
 }
 
+/// Extraction settings for a `file_path`. The text is extracted before it is redacted, so none of
+/// it may reach xberg's on-disk caches: `use_cache: false` skips the whole-extraction cache, and the
+/// `use_cache` backend option skips Tesseract's OCR result cache, which xberg 1.3.9 leaves on for
+/// scanned PDFs whatever the top-level flag says. OCR reads the root's indexing languages from the
+/// bundled tessdata, exactly as document indexing does, so a scan is read offline.
+fn file_extraction_config(ocr_languages: &[String]) -> Result<xberg::core::config::ExtractionConfig, String> {
+    use crate::extract::ocr_assets;
+    let tessdata = ocr_assets::bundled_tessdata_for(ocr_languages)?;
+    let mut ocr = ocr_assets::xberg_ocr_config(ocr_languages, tessdata.as_deref());
+    ocr.backend_options = Some(serde_json::json!({ "use_cache": false }));
+    Ok(xberg::core::config::ExtractionConfig {
+        use_cache: false,
+        ocr: Some(ocr),
+        redaction: None,
+        ..Default::default()
+    })
+}
+
 /// Body of the `redact_text` tool: reads the inline text or extracts the
 /// file, turns NER mentions into boundary-aware custom patterns, then lets
 /// xberg redact them together with its own pattern detectors in one pass.
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
-async fn run_redact(args: RedactTextParams, ocr_languages: Option<Vec<String>>) -> Result<CallToolResult, McpError> {
+/// `ocr_languages` is the root's `[documents.ocr] languages`, used for a scanned `file_path`.
+async fn run_redact(args: RedactTextParams, ocr_languages: &[String]) -> Result<CallToolResult, McpError> {
     let ner_profile =
         resolve_ner_profile(args.ner_profile.as_deref()).map_err(|reason| McpError::invalid_params(reason, None))?;
     let source = match args.file_path.as_deref() {
@@ -290,11 +288,11 @@ async fn run_redact(args: RedactTextParams, ocr_languages: Option<Vec<String>>) 
 
     let mut doc = match source {
         Source::File(input) => {
-            // Build extraction config with OCR languages if provided (only relevant for file_path with images/scanned PDFs)
-            let extraction_config = build_redaction_extraction_config(ocr_languages)?;
             let input = *input;
             let budget_start = Instant::now();
             let deadline = budget_start + file_extraction_timeout();
+            let extraction_config =
+                file_extraction_config(ocr_languages).map_err(|e| McpError::internal_error(e, None))?;
             let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
                 .await
                 .map_err(|error| McpError::internal_error(error, None))?;

@@ -5,7 +5,11 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
-use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact, redact_legal_fr::should_skip_legal_fr_v2_ner_value, redact_legal_fr::should_skip_legal_fr_v2_ner_span, redact_legal_fr::should_skip_legal_fr_v2_ner_span_with_categories};
+use super::{
+    LEGAL_FR_PROFILE, RedactTextParams, redact_legal_fr::should_skip_legal_fr_v2_ner_span,
+    redact_legal_fr::should_skip_legal_fr_v2_ner_span_with_categories,
+    redact_legal_fr::should_skip_legal_fr_v2_ner_value, run_redact,
+};
 
 /// The JSON payload a tool returns (the first text content block).
 fn json_of(result: &CallToolResult) -> Value {
@@ -125,24 +129,15 @@ async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
 
 #[test]
 fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
-    assert!(should_skip_legal_fr_v2_ner_value(
-        "sécurité sociale",
-        "organization"
-    ));
+    assert!(should_skip_legal_fr_v2_ner_value("sécurité sociale", "organization"));
     assert!(should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
     assert!(should_skip_legal_fr_v2_ner_value(
         "depuis le 1er janvier deux mil vingt-quatre",
         "date_of_birth"
     ));
     assert!(should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
-    assert!(should_skip_legal_fr_v2_ner_value(
-        "Union européenne",
-        "named_place"
-    ));
-    assert!(should_skip_legal_fr_v2_ner_value(
-        "grand Sud-Ouest",
-        "named_place"
-    ));
+    assert!(should_skip_legal_fr_v2_ner_value("Union européenne", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value("grand Sud-Ouest", "named_place"));
     assert!(should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
     assert!(should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
     assert!(should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
