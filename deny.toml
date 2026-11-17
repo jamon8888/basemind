@@ -8,7 +8,6 @@ feature-depth = 1
 
 [advisories]
 ignore = [
-  "RUSTSEC-2025-0119",
   "RUSTSEC-2024-0436",
   "RUSTSEC-2025-0134",
   "RUSTSEC-2025-0057",
@@ -16,9 +15,6 @@ ignore = [
   "RUSTSEC-2025-0141",
   # unsafe-libyaml is unmaintained; pulled in only by serde_yaml_ng via lindera -> lance-tokenizer.
   "RUSTSEC-2024-0449",
-  # Fork-line advisory carried by our pinned dependency set; regenerate via `cargo deny` when the
-  # merge settles.
-  "RUSTSEC-2026-0285",
   # zip 8.6.0 is transitive only (calamine via xberg, candle-core via xberg-gliner); both require
   # zip ^8 and the fixes shipped in >=9.0.0 exclusively. basemind reads archives through those
   # crates and never calls the vulnerable ZipArchive::extract / stream-extraction APIs.
@@ -39,7 +35,6 @@ ignore = [
   "RUSTSEC-2026-0258",
   "RUSTSEC-2026-0418",
   "RUSTSEC-2026-0173",
-  "RUSTSEC-2026-0414",
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
   "RUSTSEC-2023-0071",
