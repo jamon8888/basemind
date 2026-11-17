@@ -36,10 +36,34 @@ use self::tools_redact_filters::{
     is_false_positive_pattern as is_legal_fr_false_positive_pattern, overlapping_replacement_tokens,
     rebuild_redacted_text, valid_fr_nir_patterns,
 };
-#[cfg(test)]
-use redact_legal_fr::should_skip_legal_fr_v2_ner_span;
-#[cfg(test)]
-use redact_legal_fr::should_skip_legal_fr_v2_ner_value;
+/// Resolve the OCR languages for redaction: use the per-call override if provided and non-empty,
+/// otherwise fall back to the configured default OCR languages.
+fn resolve_ocr_languages(override_langs: Option<Vec<String>>, default_langs: &[String]) -> Option<Vec<String>> {
+    override_langs
+        .and_then(|langs| if langs.is_empty() { None } else { Some(langs) })
+        .or_else(|| Some(default_langs.to_vec()))
+}
+
+/// Build the xberg extraction configuration for redaction, including OCR configuration if languages are specified.
+fn build_redaction_extraction_config(
+    ocr_languages: Option<Vec<String>>,
+) -> Result<xberg::core::config::ExtractionConfig, McpError> {
+    let mut config = xberg::core::config::ExtractionConfig {
+        redaction: None,
+        ..Default::default()
+    };
+    if let Some(langs) = ocr_languages.filter(|l| !l.is_empty()) {
+        // Ensure bundled tessdata is available and set the path for xberg
+        let tessdata_path =
+            crate::extract::ocr_assets::ensure_tessdata().map_err(|e| McpError::internal_error(e, None))?;
+        config.ocr = Some(xberg::core::config::OcrConfig {
+            language: langs,
+            tessdata_path: Some(tessdata_path),
+            ..Default::default()
+        });
+    }
+    config
+}
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RedactTextParams {
@@ -124,11 +148,10 @@ impl BasemindServer {
             return result;
         }
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
-        // Use OCR languages from params if provided, otherwise fall back to config default
-        let ocr_languages = p
-            .ocr_languages
-            .clone()
-            .or_else(|| Some(self.state.shared.config.documents.ocr.languages.clone()));
+        let ocr_languages = resolve_ocr_languages(
+            p.ocr_languages.clone(),
+            &self.state.shared.config.documents.ocr.languages,
+        );
         let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
@@ -138,11 +161,10 @@ impl BasemindServer {
     pub(crate) async fn redact_text_cli(&self, p: RedactTextParams) -> Result<CallToolResult, McpError> {
         let started = std::time::Instant::now();
         let params_json = serde_json::to_value(&p).unwrap_or(serde_json::Value::Null);
-        // Use OCR languages from params if provided, otherwise fall back to config default
-        let ocr_languages = p
-            .ocr_languages
-            .clone()
-            .or_else(|| Some(self.state.shared.config.documents.ocr.languages.clone()));
+        let ocr_languages = resolve_ocr_languages(
+            p.ocr_languages.clone(),
+            &self.state.shared.config.documents.ocr.languages,
+        );
         let result = run_redact(p, ocr_languages).await;
         record_call(&self.state, "redact_text", &params_json, started, &result);
         result
@@ -267,19 +289,7 @@ async fn run_redact(args: RedactTextParams, ocr_languages: Option<Vec<String>>) 
     custom_patterns.extend(RedactionConfig::phone_patterns());
 
     // Build extraction config with OCR languages if provided (only relevant for file_path with images/scanned PDFs)
-    let extraction_config = {
-        let mut config = xberg::core::config::ExtractionConfig {
-            redaction: None,
-            ..Default::default()
-        };
-        if let Some(langs) = ocr_languages.filter(|l| !l.is_empty()) {
-            config.ocr = Some(xberg::core::config::OcrConfig {
-                language: langs,
-                ..Default::default()
-            });
-        }
-        config
-    };
+    let extraction_config = build_redaction_extraction_config(ocr_languages)?;
 
     let mut doc = match source {
         Source::File(input) => {
