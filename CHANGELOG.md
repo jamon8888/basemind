@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `redact_text` (MCP) and `basemind redact` (CLI) accept an optional per-call `ocr_languages`
+  parameter (`--ocr-languages fra,eng` on the CLI) to override the configured
+  `[documents.ocr] languages` default when redacting images or scanned PDFs. The bundled
+  Tesseract data is automatically used when the requested languages are covered by the
+  built-in packs (eng, deu, fra, spa, ita, nld, pol) (#183).
 - `redact_text` now offers the versioned `legal-fr@2` NER profile: named private
   places and document dates are covered, broad legal geography remains readable,
   and common French legal references are not mistaken for phone numbers (#97).
