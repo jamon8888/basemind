@@ -8,11 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
-## [0.38.0] - 2026-11-14
-
-> **Minor release.** This release uses persisted-schema version `38`; the first
-> scan after upgrading may pay one full re-index (durable, not destructive — see
-> `src/version.rs`).
+## [Unreleased]
 
 ### Added
 
@@ -21,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[documents.ocr] languages` default when redacting images or scanned PDFs. The bundled
   Tesseract data is automatically used when the requested languages are covered by the
   built-in packs (eng, deu, fra, spa, ita, nld, pol) (#183).
+
+## [0.38.0] - 2026-11-14
+
+> **Minor release.** This release uses persisted-schema version `38`; the first
+> scan after upgrading may pay one full re-index (durable, not destructive — see
+> `src/version.rs`).
+
+### Added
+
 - `redact_text` now offers the versioned `legal-fr@2` NER profile: named private
   places and document dates are covered, broad legal geography remains readable,
   and common French legal references are not mistaken for phone numbers (#97).

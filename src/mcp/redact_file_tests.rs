@@ -5,7 +5,7 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 
-use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact};
+use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact, redact_legal_fr::should_skip_legal_fr_v2_ner_value, redact_legal_fr::should_skip_legal_fr_v2_ner_span, redact_legal_fr::should_skip_legal_fr_v2_ner_span_with_categories};
 
 /// The JSON payload a tool returns (the first text content block).
 fn json_of(result: &CallToolResult) -> Value {
@@ -125,53 +125,53 @@ async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
 
 #[test]
 fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
-    assert!(super::should_skip_legal_fr_v2_ner_value(
+    assert!(should_skip_legal_fr_v2_ner_value(
         "sécurité sociale",
         "organization"
     ));
-    assert!(super::should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
-    assert!(super::should_skip_legal_fr_v2_ner_value(
+    assert!(should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
+    assert!(should_skip_legal_fr_v2_ner_value(
         "depuis le 1er janvier deux mil vingt-quatre",
         "date_of_birth"
     ));
-    assert!(super::should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
-    assert!(super::should_skip_legal_fr_v2_ner_value(
+    assert!(should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value(
         "Union européenne",
         "named_place"
     ));
-    assert!(super::should_skip_legal_fr_v2_ner_value(
+    assert!(should_skip_legal_fr_v2_ner_value(
         "grand Sud-Ouest",
         "named_place"
     ));
-    assert!(super::should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
-    assert!(super::should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
-    assert!(super::should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
-    assert!(super::should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
-    assert!(super::should_skip_legal_fr_v2_ner_value(
+    assert!(should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
+    assert!(should_skip_legal_fr_v2_ner_value(
         "France métropolitaine",
         "named_place"
     ));
 
-    assert!(!super::should_skip_legal_fr_v2_ner_value(
+    assert!(!should_skip_legal_fr_v2_ner_value(
         "DISTRIBUTION LORMARIN SAS",
         "organization"
     ));
-    assert!(!super::should_skip_legal_fr_v2_ner_value(
+    assert!(!should_skip_legal_fr_v2_ner_value(
         "FR1420041010050500013M02606",
         "iban"
     ));
-    assert!(!super::should_skip_legal_fr_v2_ner_value(
+    assert!(!should_skip_legal_fr_v2_ner_value(
         "FR1X 2004 1010 0505 0001 3M02 606",
         "iban"
     ));
-    assert!(!super::should_skip_legal_fr_v2_ner_value(
+    assert!(!should_skip_legal_fr_v2_ner_value(
         "date de naissance : 3 septembre 1980",
         "date_of_birth"
     ));
     let date = "3 septembre 1980";
     let text = format!("depuis le {date}");
     let start = text.find(date).expect("date is present");
-    assert!(super::should_skip_legal_fr_v2_ner_span(
+    assert!(should_skip_legal_fr_v2_ner_span(
         &text,
         start,
         start + date.len(),
@@ -179,7 +179,7 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
     ));
     let text = format!("{date} sans contexte de naissance");
     let start = text.find(date).expect("date is present");
-    assert!(!super::should_skip_legal_fr_v2_ner_span(
+    assert!(!should_skip_legal_fr_v2_ner_span(
         &text,
         start,
         start + date.len(),
@@ -188,26 +188,26 @@ fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
     let mixed_dates = "Jean Dupont (3 septembre 1980). Contrat signé le 1 janvier 2026.";
     let birth_start = mixed_dates.find("3 septembre 1980").expect("birth date is present");
     let act_start = mixed_dates.find("1 janvier 2026").expect("act date is present");
-    assert!(!super::should_skip_legal_fr_v2_ner_span(
+    assert!(!should_skip_legal_fr_v2_ner_span(
         mixed_dates,
         birth_start,
         birth_start + "3 septembre 1980".len(),
         "date_of_birth"
     ));
-    assert!(super::should_skip_legal_fr_v2_ner_span(
+    assert!(should_skip_legal_fr_v2_ner_span(
         mixed_dates,
         act_start,
         act_start + "1 janvier 2026".len(),
         "date_of_birth"
     ));
-    assert!(!super::should_skip_legal_fr_v2_ner_span_with_categories(
+    assert!(!should_skip_legal_fr_v2_ner_span_with_categories(
         mixed_dates,
         act_start,
         act_start + "1 janvier 2026".len(),
         "document_date",
         true
     ));
-    assert!(!super::should_skip_legal_fr_v2_ner_value(
+    assert!(!should_skip_legal_fr_v2_ner_value(
         "Résidence Les Hortensias",
         "named_place"
     ));
