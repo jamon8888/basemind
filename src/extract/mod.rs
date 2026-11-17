@@ -13,7 +13,7 @@ pub mod l2;
 pub mod l3;
 pub mod locals;
 #[cfg(feature = "documents")]
-mod ocr_assets;
+pub mod ocr_assets;
 mod rationale;
 
 use serde::{Deserialize, Serialize};
