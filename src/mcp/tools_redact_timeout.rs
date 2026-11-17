@@ -21,6 +21,11 @@ fn parse_file_extraction_timeout(raw: Option<&str>) -> Duration {
         .map_or(FILE_EXTRACTION_TIMEOUT, Duration::from_secs)
 }
 
+/// Stack of the thread that drives one file extraction: the same 8 MiB document indexing gives its
+/// extraction thread (`doc_guard::run_with_deadline`). With OCR configured, xberg's pipeline overflows
+/// the 2 MiB of a Tokio worker or test thread in unoptimised builds.
+const EXTRACTION_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 pub(super) async fn extract_file_with_deadline(
     input: ExtractInput,
     config: &xberg::core::config::ExtractionConfig,
@@ -32,7 +37,25 @@ pub(super) async fn extract_file_with_deadline(
     if remaining.is_zero() {
         return Err("xberg file extraction shared deadline exhausted before extraction".to_string());
     }
-    match tokio::time::timeout(remaining, xberg::extract(input, config)).await {
+    // The future is polled on its own thread, inside the caller's runtime; the timeout drops it there.
+    // The timeout is built inside the async block: its timer needs the runtime context `block_on` enters.
+    let runtime = tokio::runtime::Handle::current();
+    let config = config.clone();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("basemind-redact-extract".to_string())
+        .stack_size(EXTRACTION_STACK_SIZE)
+        .spawn(move || {
+            let outcome = runtime
+                .block_on(async move { tokio::time::timeout(remaining, xberg::extract(input, &config)).await });
+            // The caller may be gone (its request was cancelled); the result is then dropped.
+            let _ = sender.send(outcome);
+        })
+        .map_err(|error| format!("spawn xberg file extraction thread: {error}"))?;
+    let outcome = receiver
+        .await
+        .map_err(|_| "xberg file extraction thread ended without a result".to_string())?;
+    match outcome {
         Ok(Ok(extraction)) => Ok(extraction),
         Ok(Err(_)) => Err("xberg file extraction failed".to_string()),
         Err(_) => Err(format!(
