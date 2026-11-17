@@ -40,7 +40,7 @@ use self::tools_redact_filters::{
 /// otherwise fall back to the configured default OCR languages.
 fn resolve_ocr_languages(override_langs: Option<Vec<String>>, default_langs: &[String]) -> Option<Vec<String>> {
     override_langs
-        .and_then(|langs| if langs.is_empty() { None } else { Some(langs) })
+        .filter(|langs| !langs.is_empty())
         .or_else(|| Some(default_langs.to_vec()))
 }
 
