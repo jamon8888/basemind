@@ -46,8 +46,8 @@ pub(super) async fn extract_file_with_deadline(
         .name("basemind-redact-extract".to_string())
         .stack_size(EXTRACTION_STACK_SIZE)
         .spawn(move || {
-            let outcome = runtime
-                .block_on(async move { tokio::time::timeout(remaining, xberg::extract(input, &config)).await });
+            let outcome =
+                runtime.block_on(async move { tokio::time::timeout(remaining, xberg::extract(input, &config)).await });
             // The caller may be gone (its request was cancelled); the result is then dropped.
             let _ = sender.send(outcome);
         })
