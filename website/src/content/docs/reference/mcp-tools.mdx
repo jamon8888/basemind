@@ -1,178 +1,140 @@
 ---
 title: MCP Tools Reference
-description: Complete catalog of basemind's MCP tools, one tool per job, with arguments, contract and example calls.
+description: Complete catalog of basemind's nine domain tools, one section per domain.
 ---
 
 import { Aside, Badge } from '@astrojs/starlight/components';
 
-basemind exposes **one tool per job** over stdio MCP: fifteen tools for code, documents, git history,
-memory and the index. Each has its own exact schema; none takes a `mode` argument. Builds with the
-`comms` feature add one coordination tool, `agents`, which still dispatches on a required `mode`.
+basemind exposes **nine domain tools** over stdio MCP — `code`, `graph`, `git`, `memory`, `admin`,
+`web`, `agents`, `workspace`, `shell` — each dispatching on a required `mode` rather than one tool
+per operation. The CLI mirrors the same nine groups (`basemind <domain> <mode>`); `tests/cli_parity/` fails the build
+when an MCP mode has no CLI command or the two disagree on parameters or results. All paths are byte-precise repo-relative (`RelPath`). Lists are
+capped per mode (see [Metadata & pagination](#metadata--pagination)); index scans use
+`scan_cap = limit * 8` (at least 2000) to bound work on common names. Mode descriptions state matching semantics (substring, prefix, scope-aware) and what's
+indexed (name-only vs scope-resolved) — they're the routing surface an agent searches by, so read
+them before guessing.
 
-Every tool definition carries `_meta["anthropic/alwaysLoad"]: true`, so a host that defers MCP tools
-loads the schemas at session start: the tools are always loaded and are called directly, with no
-tool-search round trip. `tools/list` for the fifteen tools is about 17 KB (about 4.2k tokens), down
-from about 25 KB (about 6.3k tokens) for the four domain tools they replace; a test holds it under
-20,000 bytes.
+## `code` — code-map lookups
 
-Every tool has a CLI command (`basemind code|git|memory ...`, `basemind status`, `basemind rescan`);
-`tests/cli_parity/` fails the build when a tool has none or the two disagree on parameters or
-results. See the [CLI reference](/reference/cli/). Moving from the `code` / `git` / `memory` / `admin`
-tools: see [Upgrading](/start/upgrading/).
+Query your project's structure across **300+ languages** via tree-sitter: symbols, references,
+calls, and definitions.
 
-## Tools
-
-In the argument column required arguments come first and `?` marks an optional one.
-
-### Code
-
-| Tool | Arguments | Use it for |
+| Mode | Purpose | Matching |
 |---|---|---|
-| `code_outline` | `path`, `limit?`, `cursor?`, `max_tokens?` | What is in a file: symbols with kind, signature and 1-based `line` / `end_line`, plus imports. Code files only. A file edited since it was indexed is outlined as it is now and flagged `stale`; more than 200 imports are cut (`truncated_reason: "imports"`). |
-| `code_symbols` | `name`, `kind?`, `fuzzy?`, `limit?`, `cursor?`, `max_tokens?` | "Where is X defined". Ranked: exact name, then prefix, then substring, then (with `fuzzy: true`) fuzzy subsequence. Case-sensitive. |
-| `code_read` | `path`, then `symbol?` (+ `kind?`) or `line?` + `end_line?` | A symbol's source body, or a 1-based inclusive line span. Exactly one of the two forms. A body over 128 KiB is cut after its last whole line that fits and flagged `truncated` (`truncated_reason: "size_cap"`, `omitted_bytes` left out): read on from `end_line + 1`. A symbol in a file edited since it was indexed is found by parsing the file as it is, and the response is flagged `stale`. A symbol read refuses a file grown past `scan.max_file_bytes`. |
-| `code_grep` | `pattern`, `regex?`, `path?`, `language?`, `context?`, `limit?`, `cursor?`, `max_tokens?` | Text search over the indexed code. `pattern` is literal unless `regex: true`; a regex anchors `^` / `$` at every line (CRLF-aware). `path` is a substring of the repo-relative path, never a glob. Each hit has the full line `text` and the enclosing `symbol` (`name`, `kind`); a hit in a file edited since it was indexed has `stale: true` and no `symbol`. `skipped_files` counts files that could not be searched (deleted, not UTF-8, grown past `scan.max_file_bytes`, or leading out of the repository). A `path` or `language` filter that no indexed code file passes is an error, which names `docs_search` when the filter matches only documents. |
-| `code_search` | `query`, `lane?` (`hybrid` / `semantic` / `keyword`), `limit?`, `cursor?`, `max_tokens?` | Search code by meaning. Returns pointers (path, `line` / `end_line`, symbol), not bodies, and reports `lanes_ran` and `lanes_unavailable` with reasons. A ranking is paged to 100 hits; `truncated` says it was cut (`truncated_reason`: `depth` or `rerank_top_k`). The ranked list of a query is kept for up to two minutes, so a later page does not rank again. Needs the `code-search` feature. |
-| `code_refs` | `name`, `relation?` (`callers` default / `implementations` / `importers` / `definition`), `path?`, `line?`, `column?`, `match?` (`exact` default / `substring`), `limit?`, `cursor?`, `max_tokens?` | Usages. `{name}`: call sites of a name, matched on the exact identifier. `{name, path}`: callers of the definition in that file. Each hit then has `resolved: true` (scope / import resolution proved it binds to that definition), `resolved: false` (checked and not proven) or no `resolved` at all (not checked: the language has no resolution, the definition has no resolution facts, or the hit's file was past the probe cap; `resolution` gives the reason when it holds for the whole definition). A pinned file edited or deleted since it was indexed is an error naming `index_rescan`, as it is for `relation: "definition"`. `relation: "implementations"`: types implementing or inheriting it. `relation: "importers"`: files importing a module. `relation: "definition"` with `path` + `line` (+ 1-based `column`): go-to-definition. |
-| `find_files` | `query?`, `path_prefix?`, `language?`, `limit?`, `cursor?`, `max_tokens?` | Fuzzy file-name search, or a listing when `query` is omitted. Covers code and documents (markdown, config, PDFs). A `path_prefix` or `language` that no indexed file has is an error. |
+| `outline` | A file's full structure: symbols, line/col, signatures, imports — read this instead of the file. | scope-aware |
+| `symbols` | Find a definition by name across every indexed file. | substring |
+| `grep` | Pattern search across the indexed code files, filtered by language or path; a per-file trigram bloom prefilter skips files that cannot match. Code only: prose, data and config files are in the document tier. | regex |
+| `files` | Enumerate indexed files, documents included, with optional `path_contains` and `language` filters. | substring |
+| `find` | Locate a file by a fuzzy fragment of its name or path, over code and document files (fzf/fd-style, nucleo-matcher ranked). | fuzzy substring |
+| `definition` | Resolve a reference position to the definition it binds to. | scope-aware |
+| `references` | Every call site of a name — no scope resolution; `Foo::bar()` and `bar()` both match `name="bar"`. | substring |
+| `callers` | Callers of one specific definition, disambiguated by path — resolves the definition first, then runs the same name-based scan as `references`. | resolves def, then name-only |
+| `implementations` | Types implementing or inheriting a trait, interface or base class. | substring |
+| `dependents` | Heuristic reverse lookup: what imports a given module. | import-based |
+| `expand` | One symbol's raw source body — the inverse of an outline entry. | — |
+| `semantic` | Search code by meaning over indexed chunks; returns pointers, fetch bodies with `chunk`. Needs `--features code-search`. | vector + BM25 + symbol |
+| `chunk` | Fetch one code chunk's source body (pairs with `semantic`). | — |
 
-See [Code Intelligence](/capabilities/code-intelligence/) and [Code Search](/capabilities/code-search/).
+See [Code Intelligence](/capabilities/code-intelligence/) and [Code Search](/capabilities/code-search/)
+for detailed examples.
 
-### Documents
+## `graph` — the unified code graph
 
-| Tool | Arguments | Use it for |
-|---|---|---|
-| `docs_search` | `query`, `mime_type?`, `keywords?`, `entity?`, `scope?`, `limit?`, `cursor?`, `max_tokens?` | Semantic search over indexed documents (markdown, PDFs, Office, HTML, config and data files). Returns the best-matching passages with their path; each hit carries its document's `keywords`, `entities` and `summary`. A ranking is paged to 100 hits, and `truncated` says it was cut: `truncated_reason` is `depth` (it goes on past them), `rerank_top_k` (the reranker kept its `top_k` best) or `filter_depth` (the ranking goes on past the 400 best-ranked chunks a `keywords` / `entity` filter saw). Needs the `documents` feature. |
+Walk the typed code graph built from resolved calls, imports, and containment. Every edge carries
+provenance and confidence; every result is deterministic and bounded.
 
-See [Document Search](/capabilities/document-search/).
-
-### Git
-
-| Tool | Arguments | Use it for |
-|---|---|---|
-| `git_log` | `path?`, `query?`, `author?`, `symbol?`, `rev?`, `limit?`, `cursor?`, `max_tokens?` | No arguments: recent commits. `path`: commits touching a file, or a directory when it ends with `/` (200 commits inspected per page). `query` / `author`: full-text search; before the git-history index is ready it covers the subjects and authors of the newest 10,000 commits and sets `truncated_reason: "live_walk"`. `path` + `symbol`: when that symbol's body changed, read one window of the commits touching the file per page. A symbol or directory window that ends before the history does returns `next_cursor` (and `truncated_reason: "window"` when the page is short or empty), so follow the cursor until it is absent. Any `git_log` cursor is refused, and the walk must restart without it, when the git-history index came up since it was issued; `unmatched` on an empty page says that nothing inspected so far defines the symbol or touches the directory, and the last page is then an error. `rev`: that one commit in full, its file list held to `max_tokens` (`budgeted` and `omitted` when cut). A `path` that no commit reachable from HEAD touches and that is not on disk is an error. |
-| `git_blame` | `path`, `line?` + `end_line?`, `symbol?`, `rev?`, `limit?`, `cursor?` | Who last changed a file, a 1-based line span, or one symbol. A symbol is located in the file as it is at `rev` (default HEAD), not in the working tree, and `line` is a line at `rev`. |
-| `git_diff` | `path?`, `from?`, `to?`, `structural?` | No arguments: working-tree status (staged, modified, untracked), each list cut at 200 paths (`truncated_reason: "path_cap"`, `omitted` counts the rest). A `path` ending in `/`: the status under that directory, every untracked file listed on its own and `is_clean` scoped to it; a directory that is not on disk and has no changed path under it is an error. `path` alone: that file's working-tree diff against HEAD (a directory without the trailing slash is an error). `path` + `from` / `to`: diff between revisions, cut at 200 hunks or 128 KiB of hunk text (`truncated_reason`: `hunk_cap` or `byte_cap`, `omitted` hunks). `structural: true`: symbols `added` and `removed` instead of text hunks, with `common` the count of the unchanged ones. |
-
-See [Git Intelligence](/capabilities/git-intelligence/).
-
-### Memory
-
-| Tool | Arguments | Use it for |
-|---|---|---|
-| `memory_save` | `key`, `value`, `tags?`, `visibility?` (`group` / `individual`) | Write a durable note for later sessions and other agents. Saving an existing `key` replaces it. Needs the `memory` feature. |
-| `memory_search` | `query?` or `key?` or `prefix?`, `tag?`, `visibility?`, `limit?`, `cursor?` | Recall notes: by meaning (`query`), one by key (`key`), or a list by key prefix (`prefix`). No selector lists everything. |
-
-See [Shared memory](/concepts/memory/).
-
-### Index
-
-| Tool | Arguments | Use it for |
-|---|---|---|
-| `index_status` | none | Index health and repo identity: file counts per language, scan and degraded state, `cache_dir` (basemind's cache directory), `branch`, `head_sha`. |
-| `index_rescan` | `paths?` | Re-index the given paths, or with no arguments the whole workspace, skipping unchanged files. Writes only basemind's cache, never the repository. |
-
-CLI only, with no MCP tool: `basemind git churn`, `basemind git by-path <regex>`, `basemind code chunk`,
-`basemind memory delete <key>`, `basemind cache stats|gc|clear` and `basemind admin telemetry`.
-
-## Contract
-
-Every tool above follows the same rules.
-
-- **Exact schema.** Required fields are required. An unknown argument is rejected with a
-  did-you-mean suggestion and the accepted list; it is never silently dropped. There are no hidden
-  aliases and no `format` argument.
-- **Paths and positions.** `path` is repo-relative with forward slashes. Every position is 1-based:
-  `line`, `end_line`, `column`.
-- **Paging and budget.** Every list takes `limit` and `cursor` and returns `next_cursor`. Lists are
-  trimmed to a `max_tokens` budget (default 6000) and set `budgeted` when trimmed. `limit: 0` is
-  refused by every tool that takes `limit`.
-- **Cuts.** A page that ends at `limit` is paging: `next_cursor` says there is more and nothing
-  else is set. A cut made by the token budget also sets `budgeted`. A cut the caller did not ask
-  for sets `truncated: true` and `truncated_reason`, and `omitted` counts the items left out where
-  the count is known: follow `next_cursor` where there is one, else narrow the call. Reasons:
-  `scan_cap` (`code_refs`, `code_symbols`, an `author`-filtered `git_log` search), `byte_budget`
-  (`code_grep`), `imports` (`code_outline`), `size_cap` (`code_read`, which counts
-  `omitted_bytes`), `depth` / `rerank_top_k` / `filter_depth` (`code_search`, `docs_search`),
-  `path_cap` / `hunk_cap` / `byte_cap` (`git_diff`), `window` / `shallow_clone` / `live_walk`
-  (`git_log`). Four fields say something else and keep their names: `skipped_files` (`code_grep`:
-  files that could not be searched), `limit_clamped` (`find_files`: an over-large `limit` was
-  lowered), `body_truncated` (one commit message in a `git_log` search hit) and `too_large`
-  (`git_diff`: a file over 4 MiB was not diffed). `memory_search` sets a bare `truncated` on a
-  listing.
-- **Lines.** A line ends at `\n`; a `\r` right before it is part of the ending and a `\r` on its
-  own is text inside its line. `code_read`, `code_grep`, the outline and `git_blame` count lines
-  this way, so a line number from one is a line number in the others.
-- **Edited and deleted files.** A file edited since it was indexed is read as it is now and the
-  response says `stale: true` (`code_outline`, `code_read`, `code_grep`); a tool that can only
-  answer from indexed positions (`code_refs` with `path`) returns an error naming `index_rescan`.
-  A file deleted since the scan gets the same error from every tool. No tool reads an indexed file
-  whole past `scan.max_file_bytes`.
-- **Filters.** A `path` / `path_prefix` / `language` filter that no indexed file passes is an error
-  saying what would match, not an empty result. While the index is still being built the page is
-  returned with its `notice` instead.
-- **Errors.** A failure the caller can fix is a tool result with `isError: true` whose text names
-  the fix. A file that is not indexed says whether it is a document (use `docs_search`) or needs
-  `index_rescan`; an empty index says to run `index_rescan` or `basemind scan`; a feature compiled
-  out names the Cargo feature.
-- **Empty index.** An empty index is never a plain empty result: the response carries a `notice`
-  with `state: "empty_index"`.
-- **Inline results.** Results are returned inline. A server-side Task is used only for a call still
-  running after 3 s (`index_rescan`, `code_search`, `docs_search`), and only when the client declared
-  the tasks extension.
-- **Annotations.** Every tool is read-only except `memory_save` and `index_rescan`; none is
-  destructive. No tool has an `output_schema`.
-- **Telemetry.** Telemetry keys are the tool names.
-
-## Example calls
-
-```text
-code_outline  {"path":"src/store.rs"}
-code_symbols  {"name":"parse_config","kind":"function"}
-code_read     {"path":"src/store.rs","symbol":"open"}
-code_read     {"path":"src/store.rs","line":120,"end_line":160}
-code_grep     {"pattern":"cache_root(","path":"src/"}
-code_grep     {"pattern":"fn \\w+_call","regex":true}
-code_search   {"query":"retry a failed upload with backoff"}
-code_refs     {"name":"open_store"}
-code_refs     {"name":"open_store","path":"src/store.rs"}
-code_refs     {"name":"Drawable","relation":"implementations"}
-code_refs     {"name":"tokio::sync","relation":"importers"}
-code_refs     {"name":"open_store","relation":"definition","path":"src/main.rs","line":42}
-find_files    {"query":"readme"}
-docs_search   {"query":"how releases are versioned"}
-git_log       {}
-git_log       {"path":"src/store.rs","limit":5}
-git_log       {"query":"fix race"}
-git_log       {"path":"src/store.rs","symbol":"open"}
-git_log       {"rev":"HEAD~1"}
-git_blame     {"path":"src/store.rs","symbol":"open"}
-git_diff      {}
-git_diff      {"path":"src/store.rs"}
-git_diff      {"path":"src/store.rs","from":"HEAD~1","to":"HEAD"}
-memory_save   {"key":"decision/auth-tokens","value":"Tokens rotate every 24h.","tags":["auth"]}
-memory_search {"query":"token rotation"}
-index_status  {}
-index_rescan  {"paths":["src/store.rs"]}
-```
-
-### Instead of the shell
-
-| Shell | basemind tool call |
+| Mode | Purpose |
 |---|---|
-| `rg foo` / `grep -r foo` | `code_grep {"pattern":"foo"}` |
-| `rg -e 'fo+'` (regex) | `code_grep {"pattern":"fo+","regex":true}` |
-| `rg foo src/` | `code_grep {"pattern":"foo","path":"src/"}` |
-| `find . -name '*store*'` / `fd store` / `ls -R` | `find_files {"query":"store"}` |
-| `cat file` / reading a whole source file | `code_outline {"path":"file"}` then `code_read {"path":"file","symbol":"name"}` |
-| `git log` | `git_log {}` |
-| `git log -- path` | `git_log {"path":"path"}` |
-| `git log --grep X` | `git_log {"query":"X"}` |
-| `git show REV` | `git_log {"rev":"REV"}` |
-| `git blame file` | `git_blame {"path":"file"}` |
-| `git status` | `git_diff {}` |
-| `git diff` / `git diff -- file` | `git_diff {"path":"file"}` |
-| `git diff A B -- file` | `git_diff {"path":"file","from":"A","to":"B"}` |
+| `calls` | Rooted call BFS: walk the call chain up (`callers`) or down (`callees`) from one definition, depth-bounded. |
+| `neighbors` | The n-hop neighborhood around a symbol (`direction` / `edges` / `depth` / `min_confidence` / `max_nodes`). |
+| `path` | The confidence-weighted shortest path between two symbols; containment excluded unless `include_contains`. |
+| `subgraph` | A symbol's neighborhood cut to its most central nodes. |
+| `communities` | Cluster the graph into its de-facto modules (`label_propagation` default, `louvain` opt-in). |
+| `map` | Whole-repo architecture: hub modules ranked by PageRank + git churn, plus dependency cycles (SCCs). |
+| `export` | Render the graph as node-link JSON, DOT, Mermaid, GraphML, Cypher, or offline interactive HTML. |
+| `display` | Open a rendered view in a human's desktop viewer. |
+| `open` | Return a live browsable URL for the interactive graph page. Both `display` and `open` accept `open: false` to return the path/URL without launching anything. |
+
+See [Code Intelligence](/capabilities/code-intelligence/) for examples.
+
+## `git` — git history
+
+Query your repository's history, blame, diffs, and churn — powered by `gix` with a built-in history
+index for microsecond latency.
+
+| Mode | Purpose | Scope |
+|---|---|---|
+| `status` | Staged and unstaged files right now. | — |
+| `recent` | Recent commits with their touched paths and summaries. | branch depth |
+| `touching` | Commits that modified a given path. | posting-list (indexed) |
+| `by_path` | Path-filtered commit log (regex over changed paths). | branch depth |
+| `churn` | Files ranked by how often they change. | branch depth |
+| `diff` | A file's textual diff between two revisions. | — |
+| `diff_outline` | Which symbols a file gained, lost, or changed between revisions. | scope-aware |
+| `blame` | Who last changed each line of a file. | per-line |
+| `blame_symbol` | Who last changed one symbol, resolved to its line span. | per-symbol |
+| `symbol_history` | When a symbol's body actually changed, by structural hash. | commit walk |
+| `search` | Full-text search over commit messages and authors, at full branch depth. Each hit's body is cut at `body_chars` (default 1000). | branch depth |
+| `show` | One commit by `sha` or revision with its full, untruncated message and changed files. | — |
+
+The commit-list modes (`recent`, `touching`, `by_path`, `search`) hold their output to `max_tokens`
+(default 20000): overflow is dropped, `budgeted: true` is set and `next_cursor` resumes at the first
+dropped commit.
+
+See [Git Intelligence](/capabilities/git-intelligence/) for examples.
+
+## `memory` — shared memory, documents, and proposals
+
+A per-repo memory agents write to and search by meaning (clones of the same repo share it, unrelated
+repos stay separate), semantic search over indexed documents, and a review queue of notes mined from
+files that change together.
+
+| Mode | Purpose | Scope |
+|---|---|---|
+| `put` | Write a durable note other sessions and agents will read. | per-repo |
+| `get` | Read one memory entry by key. | per-repo |
+| `list` | Enumerate memory entries, newest first, optional prefix/tag filter. | per-repo |
+| `search` | Semantic search across stored memory. | per-repo |
+| `delete` | Remove a memory entry by key. | per-repo |
+| `audit` | The write history behind a memory entry; also recomputes verdicts and archives stale entries. | per-repo |
+| `documents` | Semantic search over indexed PDFs, Office files, and HTML instead of opening them. Needs `--features documents` (or `full`). | per-scope |
+| `mine` | Derive co-change proposals from git history. | per-repo |
+| `proposals` | List proposals awaiting review. | per-repo |
+| `accept` | Accept a proposal into memory. | per-repo |
+| `reject` | Reject a proposal. | per-repo |
+
+See [Document Search](/capabilities/document-search/) and [Shared memory](/concepts/memory/) for
+examples.
+
+## `admin` — server and cache administration
+
+Refresh the index, inspect health and cache footprint, and shrink what an agent carries.
+
+| Mode | Purpose |
+|---|---|
+| `status` | Index health for this workspace: file counts, languages, scan age. |
+| `repo` | Repository identity: workdir, branch, HEAD sha. |
+| `rescan` | Re-index changed files, or the whole workspace when no paths are given. The result carries `docs_indexed` plus the document-guard counters `docs_degraded` (large text documents chunked by the linear fallback), `docs_text_fallback` (the subset re-read as plain text after xberg rejected a text-like file), and `doc_timeouts` (documents abandoned past `extraction_timeout_secs`). |
+| `cache_stats` | On-disk size, blob accounting (tier-aware orphan count, `last_gc`) and process RAM for the machine-global cache. |
+| `gc` | Report blobs no live view references — non-destructive, deletes nothing. To reclaim them, run `basemind cache gc`, which performs the cross-workspace reference-counted sweep. |
+| `cache_clear` | Delete one cache component (`component`). `blobs` needs `confirm`; `views` and `all` back the live index and are refused over MCP (use `basemind cache clear --yes`). |
+| `telemetry` | Aggregate recorded tool calls into a usage and token-savings summary. |
+| `compress` | Shrink an indexed file (`path`, as an outline) or prose (`text`) for re-use in a smaller context. |
+| `delta` | Compact `+N/-M` line diff from `old` to `new`. |
+| `checkpoint` | Distill session `text` into decisions, errors and changed files. |
+| `waste` | Flag redundant reads and repeated queries in a tool-call `log`. |
+
+## `web` — web crawl
+
+Fetch and index web pages; results join the document search index. Requires `--features crawl`.
+
+| Mode | Purpose |
+|---|---|
+| `scrape` | Fetch one URL, extract markdown, and index it into the documents store. |
+| `crawl` | Follow links breadth-first from a seed URL and index every page. |
+| `map` | Discover a site's URLs from its sitemap and link map, without fetching bodies. |
+
+See [Web Crawl](/capabilities/web-crawl/) for examples.
 
 ## `agents` — multi-agent coordination
 
@@ -203,34 +165,59 @@ with a recency-filtered inbox. Requires `--features comms`.
 
 See [Agent Comms](/concepts/agent-comms/) for orchestration examples.
 
+## `workspace` — machine registry
+
+Coordinate across every repo and worktree the daemon knows about on this machine. The registry is
+daemon-managed; claims are advisory (no locking) but help avoid collisions. Requires
+`--features comms`.
+
+| Mode | Purpose |
+|---|---|
+| `workspaces` | Every repository the machine daemon has indexed. |
+| `worktrees` | Git worktrees of this repository, with their branches and claims. |
+| `branches` | Branches known to this repository. |
+| `claim` | Take ownership of a worktree so another session does not edit it. |
+| `release` | Give up a worktree claim this session holds. |
+
+See CLI: `basemind workspace` (worktree/branch listing), `basemind statusline` (current status).
+
+## `shell` — agent shells
+
+Let agents spawn, type into, and read terminal sessions in the background. Requires
+`--features shells`.
+
+| Mode | Purpose |
+|---|---|
+| `spawn` | Start a background terminal session running a command (`--cwd`, `--env`, `--title`). Returns `session_id`. |
+| `send` | Type into a live session (`--no-enter` to suppress the trailing newline). |
+| `capture` | Read back what a session has printed (`--lines` to limit). |
+| `kill` | Terminate a session. |
+| `list` | Every session the shell daemon currently hosts, with liveness. |
+| `broadcast` | Type the same input into several sessions at once. |
+
+See [Agent Shells](/capabilities/agent-shells/) for examples.
+
 ## Tool titles and annotations
 
 Each tool carries a human-readable title and MCP annotation hints, so a client can show a readable
-name and decide what to auto-approve. The hints are exact per tool: a host that gates on read-only
-can allow `index_status` and `git_log` without allowing `index_rescan`.
+name and decide what to auto-approve. The hints describe the union of a tool's modes.
 
 | Tool | Title | Read-only | Destructive | Idempotent | Open-world |
 |---|---|---|---|---|---|
-| `code_outline` | Outline a file | yes | no | yes | no |
-| `code_symbols` | Find a definition | yes | no | yes | no |
-| `code_read` | Read a symbol or line span | yes | no | yes | no |
-| `code_grep` | Search code text | yes | no | yes | no |
-| `code_search` | Search code by meaning | yes | no | yes | no |
-| `code_refs` | Find usages | yes | no | yes | no |
-| `find_files` | Find files | yes | no | yes | no |
-| `docs_search` | Search documents | yes | no | yes | no |
-| `git_log` | Commit history | yes | no | yes | no |
-| `git_blame` | Blame | yes | no | yes | no |
-| `git_diff` | Diff and status | yes | no | yes | no |
-| `memory_save` | Save a note | no | no | yes | no |
-| `memory_search` | Recall notes | yes | no | yes | no |
-| `index_status` | Index status | yes | no | yes | no |
-| `index_rescan` | Re-index | no | no | yes | no |
+| `code` | Code map | yes | no | yes | no |
+| `git` | Git history | yes | — | — | no |
+| `graph` | Code graph | no | no | no | yes |
+| `memory` | Memory and documents | no | yes | no | no |
+| `admin` | Admin | no | yes | no | no |
+| `web` | Web | no | no | no | yes |
+| `agents` | Agent comms | no | no | no | no |
+| `workspace` | Workspace registry | no | no | yes | no |
+| `shell` | Shell sessions | no | yes | no | yes |
 
-`agents` (title "Agent comms") advertises the union of its
-modes. Its `mode` parameter is a flat string enum in the tool schema, so a client sees every valid
-mode and an invalid one is rejected with the accepted list. The server emits no MCP logging
-notifications; use `daemon.log` and `RUST_LOG` for diagnostics.
+A dash means the hint is left unset. `graph` is open-world and not read-only because `display` and
+`open` launch a viewer or serve a page. The server no longer emits MCP logging notifications; use
+`daemon.log` and `RUST_LOG` for diagnostics. The `mode` parameter is a flat string enum in the tool
+schema, so a client sees every valid mode and an invalid one is rejected with the accepted list.
 
 ## MCP resources
 
@@ -242,9 +229,10 @@ mode, over the daemon stdio relay and over the HTTP front-end.
 
 | URI | Backing call |
 |---|---|
-| `basemind://status` | `index_status` |
-| `basemind://outline/{path}` | `code_outline`; `{path}` is repo-relative and percent-encoded |
-| `basemind://memory/{key}` | `memory_search` with `key` (shared tier) |
+| `basemind://status` | `admin` mode `status` |
+| `basemind://repo/map` | `graph` mode `map` |
+| `basemind://outline/{path}` | `code` mode `outline`; `{path}` is repo-relative and percent-encoded |
+| `basemind://memory/{key}` | `memory` mode `get` (shared tier) |
 
 Paths are validated before they reach the index: absolute paths, `..` or `.` segments, empty
 segments, backslashes and NUL are rejected. `completion/complete` completes `{path}` from the index.
@@ -253,39 +241,53 @@ segments, backslashes and NUL are rejected. `completion/complete` completes `{pa
 ## Cancellation and tasks
 
 A client cancellation (`notifications/cancelled`) abandons these read-only calls at once and
-answers `request_cancelled` (-32800): `code_grep`, `code_search`, `docs_search`, and `agents`
-`wait`. Writing calls are never dropped mid-flight.
+answers `request_cancelled` (-32800): `code` `grep` and `semantic`, `graph` `map` and `calls`,
+`memory` `documents`, and `agents` `wait`. Writing modes are never dropped mid-flight.
 
-Results are returned inline. When the client declares the tasks extension
-(`io.modelcontextprotocol/tasks`), a call that can run for seconds (`index_rescan`, `code_search`,
-`docs_search`) gets 3 s to finish and is answered as an ordinary `tools/call` result if it does;
-only a call still running after 3 s returns a pollable task handle (`tasks/get`). Clients that did
-not declare the extension always get the synchronous result.
+When the client declares the tasks extension (`io.modelcontextprotocol/tasks`), the slow calls
+(`admin` `rescan`, `graph` `map`, `code` `semantic`, `memory` `documents`, and `web` `scrape` /
+`crawl` / `map`) return a pollable task handle (`tasks/get`) instead of blocking the connection.
+Clients that did not declare the extension get the synchronous result.
 
-## Paging
+## Metadata & pagination
 
-- **`limit`**: per-tool default. `code_symbols`, `code_grep` and `code_refs` default to 100,
-  `code_outline` to 500, `find_files` to 200, `git_log` to 20, `code_search` and `docs_search` to 10.
-- **`max_tokens`**: a token budget for the returned list, default 6000. Entries are kept in result
-  order until the budget is hit; the response then carries `budgeted: true` and a `next_cursor`.
-- **`cursor`**: opaque token; pass a response's `next_cursor` back to continue.
+All list-returning modes:
 
-For index scans (`code_refs`), basemind bounds work on common names with `scan_cap = limit * 8` (at
-least 2000).
+- **`limit`** parameter: `code` modes `symbols` / `grep` / `references` / `callers` /
+  `implementations` and most other lists default to 100 (max 1000); `files` / `find` default to 200
+  (max 5000); `semantic` defaults to 10 (max 100).
+- **`max_tokens`** (`code` modes): a token budget for the returned list. Entries are kept in result
+  order until the budget is hit; the response then carries `budgeted: true` and, where the mode pages,
+  a `next_cursor`.
+- **`format`** (`code` modes): `json` (default) or `toon`, a compact tabular encoding that costs far
+  fewer tokens than JSON for large result sets.
+- **`cursor`** for pagination: opaque token returned in response; pass back to continue.
+- **`any_truncated`** flag: set to `true` if the result hit the limit and more results exist.
+
+For index scans (`code` modes `references` / `callers` / `implementations`), basemind internally
+uses `scan_cap = limit * 8` (at least 2000) to bound work on common names. Cursors for those
+Fjall-backed modes stay valid across rescans; for the in-memory modes (`symbols`, `grep`, `files`,
+`find`) a rescan invalidates them and the response sets `cursor_invalidated`.
+
+<Aside>
+Mode descriptions are the routing surface for agents. Read them carefully — they describe matching
+semantics (substring vs. prefix), scope resolution (name-only vs. scope-aware), and what each mode
+trades off. This helps agents pick the right mode for the question.
+</Aside>
 
 ## Lifecycle notices
 
 The server warms the code map in the background after answering the MCP handshake. While
-it isn't fully ready, `index_status` and every code read tool may include a `notice` object instead
+it isn't fully ready, `admin status` and every `code` read mode may include a `notice` object instead
 of, or alongside, their normal result:
 
 | Field | Meaning |
 |---|---|
-| `state` | One of `warming_up`, `building_index`, `rescanning`, `index_rebuilding`, `empty_index`. |
+| `state` | One of `warming_up`, `building_index`, `rescanning`. |
 | `message` | Human/agent-readable explanation of what's happening. |
 | `retry` | `true` to retry shortly for complete results; `false` if the result is usable but may be stale. |
 
-`index_status` additionally reports `warming` / `warm_ms` (in-memory preload of an existing index)
+`admin status` additionally reports `warming` / `warm_ms` (in-memory preload of an existing index)
 and `indexing` / `index_build_ms` (first-time index build). Treat an empty or partial result carrying
 a `notice` as "retry shortly," not "no matches." See
 [Index lifecycle and freshness](/concepts/how-it-works/#index-lifecycle-and-freshness) for details.

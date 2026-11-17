@@ -44,7 +44,7 @@ use crate::store::Store;
 /// Alias that's `PendingDocBatch` under the `documents` feature and `()` otherwise. Lets the drive
 /// loop keep one signature while still carrying real values when the feature is on.
 #[cfg(feature = "documents")]
-pub(crate) type PendingDocBatchOpt = crate::scan_retrieval::PendingDocBatch;
+pub(crate) type PendingDocBatchOpt = crate::scanner_docs::PendingDocBatch;
 #[cfg(not(feature = "documents"))]
 pub(crate) type PendingDocBatchOpt = ();
 
@@ -67,6 +67,9 @@ pub(crate) type PendingCodeBatchOpt = ();
 pub trait ScanObserver {
     /// One file's outcome.
     fn on_file(&mut self, result: FileResult);
+
+    /// Called after the first persisted search row becomes queryable for this scan.
+    fn on_searchable(&mut self) {}
 
     /// End of one drive chunk; `live_results` is how many [`FileResult`]s that chunk held live at
     /// once. The bound this module exists to enforce is observable through exactly this hook.
@@ -238,6 +241,7 @@ pub(crate) struct ScanDrive<'a> {
     pub(crate) scope: &'a str,
     pub(crate) embed: crate::scanner::EmbedMode,
     pub(crate) cancel: &'a ScanCancel,
+    pub(crate) metrics: &'a crate::scan_metrics::ScanStageMetrics,
 }
 
 /// What the drive loop hands back: the deferred batch descriptors, plus the path sets the stale
@@ -291,12 +295,6 @@ pub(crate) fn drive_scan(
         .filters
         .doc_phase
         .begin(std::time::Duration::from_secs(drive.filters.doc_phase_budget_secs));
-    // A fatal index commit failure (disk full, poisoned handle) stops the drive like a cancel: every
-    // later commit would fail too. Held as a handle clone because `ctx` owns the `&mut Store`.
-    let index_db = store.index_db.clone();
-    // `stats` may already carry counts from earlier work; the summary reports only this drive's. ~keep
-    #[cfg(feature = "documents")]
-    let deferred_before = stats.docs_deferred;
     let mut ctx = DriveCtx {
         store,
         stats,
@@ -308,7 +306,7 @@ pub(crate) fn drive_scan(
         &mut ctx,
         candidates,
         || {
-            if drive.cancel.is_cancelled() || index_db.as_ref().is_some_and(crate::index::IndexDb::has_fatal_fault) {
+            if drive.cancel.is_cancelled() {
                 return None;
             }
             let plan = governor.admit();
@@ -343,6 +341,7 @@ pub(crate) fn drive_scan(
                 drive.embed,
                 drive.cancel,
                 max_workers,
+                drive.metrics,
             )
         },
         |ctx: &mut DriveCtx<'_>, produced| apply_outcomes(ctx, produced),
@@ -350,7 +349,7 @@ pub(crate) fn drive_scan(
 
     #[cfg(feature = "documents")]
     {
-        ctx.stats.abandoned_extractions = drive.filters.retrieval.documents.abandoned_extractions();
+        ctx.stats.abandoned_extractions = crate::extract::doc_guard::abandoned_extractions();
         if ctx.stats.abandoned_extractions > 0 {
             tracing::warn!(
                 abandoned_live = ctx.stats.abandoned_extractions,
@@ -358,24 +357,8 @@ pub(crate) fn drive_scan(
                 "timed-out document extraction threads are still running"
             );
         }
-        let deferred = ctx.stats.docs_deferred.saturating_sub(deferred_before);
-        if let Some(summary) = deferral_summary(deferred, drive.filters.doc_phase_budget_secs) {
-            tracing::warn!("{summary}");
-        }
     }
     ctx.out
-}
-
-/// The single end-of-phase line that replaces a warning per deferred document; `None` when nothing
-/// was deferred. Per-file detail stays at debug level.
-#[cfg(feature = "documents")]
-fn deferral_summary(deferred: usize, phase_budget_secs: u64) -> Option<String> {
-    (deferred > 0).then(|| {
-        format!(
-            "{deferred} documents deferred to the next scan (document-phase budget {phase_budget_secs}s \
-             or abandoned-extraction cap reached; see [documents] phase_budget_secs, max_abandoned_extractions)"
-        )
-    })
 }
 
 /// Drain one chunk's parallel-map results into the single-threaded store, the stats, and the
@@ -421,14 +404,21 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
             }
             #[cfg(feature = "documents")]
             FileStatus::DocIndexed {
+                chunk_count,
                 reused,
                 degraded,
                 text_fallback,
                 ..
             } => {
                 ctx.stats.docs_indexed += 1;
+                ctx.stats.docs_chunks += *chunk_count;
+                ctx.stats.docs_tokens += o.doc_batch.as_ref().map_or(0, |batch| batch.token_count);
+                ctx.stats.docs_bytes += o.doc_batch.as_ref().map_or(0, |batch| batch.content_bytes);
                 if *reused {
                     ctx.stats.reused_doc_extraction += 1;
+                }
+                if o.doc_batch.as_ref().is_some_and(|batch| batch.reembedded) {
+                    ctx.stats.reembedded_doc_embeddings += 1;
                 }
                 if *degraded {
                     ctx.stats.docs_degraded += 1;
@@ -451,9 +441,8 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
         if matches!(o.status, FileStatus::Updated { .. } | FileStatus::Unchanged) {
             ctx.out.seen.insert(o.path.clone());
         }
-        // A `DocIndexed` status is set by exactly the `scanner_docs_lane::process_doc` arm that ~keep
-        // attaches a doc batch, so the status is a faithful stand-in for a `doc_batch` this loop ~keep
-        // is about to take. ~keep
+        // A `DocIndexed` status is set by exactly the `process_doc` arm that attaches a doc batch, ~keep
+        // so the status is a faithful stand-in for a `doc_batch` this loop is about to take. ~keep
         #[cfg(feature = "documents")]
         // A deferred document keeps whatever entry it already has: running out of budget is not a ~keep
         // verdict on the file, so the stale purge must not drop its rows until the next scan retries. ~keep
@@ -474,24 +463,12 @@ fn apply_outcomes(ctx: &mut DriveCtx<'_>, outcomes: Vec<FileResult>) {
         if let Some(entry) = o.doc_upsert.take() {
             ctx.store.upsert_doc(&o.path, entry);
         }
-        // A batch with rows to write puts its path in the owed set; one with none takes it out, so
-        // a debt from an earlier scan does not outlive the content it was for. ~keep
         #[cfg(feature = "documents")]
         if let Some(batch) = o.doc_batch.take() {
-            if batch.emit_rows && batch.embedding_dim > 0 {
-                ctx.store.pending_vectors.owe_doc(&o.path);
-            } else {
-                ctx.store.pending_vectors.settle_docs(&[o.path.as_str()]);
-            }
             ctx.out.doc_batches.push(batch);
         }
         #[cfg(feature = "code-search")]
         if let Some(batch) = o.code_batch.take() {
-            if batch.embedding_dim > 0 {
-                ctx.store.pending_vectors.owe_code(&o.path);
-            } else {
-                ctx.store.pending_vectors.settle_code(&[o.path.as_str()]);
-            }
             ctx.out.code_batches.push(batch);
         }
         ctx.observer.on_file(FileResult::bare(o.path, o.status));
@@ -505,17 +482,6 @@ mod tests {
     use super::*;
 
     const MB: u64 = 1024 * 1024;
-
-    #[cfg(feature = "documents")]
-    #[test]
-    fn deferral_summary_reports_one_count_or_nothing() {
-        assert_eq!(deferral_summary(0, 1800), None);
-        // A drive that began with a non-zero counter reports only its own deferrals.
-        assert_eq!(deferral_summary(5usize.saturating_sub(5), 1800), None);
-        let line = deferral_summary(30_562, 1800).expect("deferrals produce a summary");
-        assert!(line.starts_with("30562 documents deferred"), "{line}");
-        assert!(line.contains("1800s"), "{line}");
-    }
 
     /// A governor whose gate is always over the ceiling, with a wait short enough to test.
     fn always_over(base_items: usize, base_workers: usize) -> DriveGovernor<fn() -> Option<u64>> {

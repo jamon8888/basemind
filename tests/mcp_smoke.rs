@@ -125,24 +125,10 @@ fn decode_text(result: &CallToolResult) -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::Null)
 }
 
-/// `forged` in place of the tool's own cursor inside `real`, a `next_cursor` the server issued. The
-/// result is still bound to the query that issued `real`, so the tool body sees `forged`.
-fn rebound(real: &str, forged: &str) -> String {
-    let (binding, _) = real
-        .split_once('.')
-        .expect("a cursor the server issued is bound to its query");
-    format!("{binding}.{forged}")
-}
-
-/// The message of a verb-tool failure. A verb tool reports every failure as an `isError` result
-/// whose first text block is the plain message, never as a JSON-RPC error.
-fn error_text(result: &CallToolResult) -> String {
+/// Return the first text content item verbatim (no JSON parse) — used to inspect the
+/// raw TOON payload a tool emits when `format="toon"`.
+fn raw_text(result: &CallToolResult) -> String {
     use rmcp::model::ContentBlock;
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected an isError tool result: {result:?}"
-    );
     result
         .content
         .iter()
@@ -191,23 +177,19 @@ async fn mcp_server_exercises_representative_tools() {
         .and_then(|info| info.instructions.clone())
         .unwrap_or_default();
     assert!(
-        instructions.contains("before shell `rg`/`grep`/`find`/`git`"),
+        instructions.contains("basemind first"),
         "server instructions should state the prefer-basemind-over-grep directive: {instructions}"
     );
     assert!(
         instructions.contains("fraction of the tokens"),
         "server instructions should state the context-economy rationale: {instructions}"
     );
-    assert!(
-        instructions.contains("code_outline") && instructions.contains("git_log"),
-        "server instructions should name the verb tools: {instructions}"
-    );
 
     let body = decode_text(
         &service
-            .call_tool(call_params("index_status", json!({})))
+            .call_tool(call_params("admin", json!({ "mode": "status"})))
             .await
-            .expect("index_status"),
+            .expect("status"),
     );
     let file_count = body.get("file_count").and_then(Value::as_u64).unwrap_or(0);
     assert!(file_count >= 2, "scan should have indexed at least 2 files");
@@ -226,36 +208,15 @@ async fn mcp_server_exercises_representative_tools() {
     );
 
     let outline_result = service
-        .call_tool(call_params("code_outline", json!({ "path": "a.rs" })))
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "outline", "path": "a.rs", "l2": false }),
+        ))
         .await
-        .expect("code_outline");
+        .expect("outline");
     assert_structured_matches_text(&outline_result);
     let body = decode_text(&outline_result);
     let symbols = body.get("symbols").and_then(Value::as_array).expect("symbols");
-    let alpha = symbols
-        .iter()
-        .find(|s| s.get("name").and_then(Value::as_str) == Some("alpha"))
-        .expect("alpha in the outline");
-    assert_eq!(
-        alpha.get("line").and_then(Value::as_u64),
-        Some(1),
-        "outline lines are 1-based: {body}"
-    );
-    assert!(
-        symbols.iter().all(|s| {
-            let line = s.get("line").and_then(Value::as_u64).unwrap_or(0);
-            line >= 1 && s.get("end_line").and_then(Value::as_u64).unwrap_or(0) >= line
-        }),
-        "every outline symbol must carry a 1-based inclusive `line`..`end_line` span: {body}"
-    );
-    assert!(
-        symbols.iter().all(|s| s.get("start_row").is_none()),
-        "the outline no longer reports 0-based rows: {body}"
-    );
-    assert!(
-        body.get("calls").is_none() && body.get("docs").is_none(),
-        "the outline carries symbols and imports only: {body}"
-    );
     let names: Vec<String> = symbols
         .iter()
         .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_string))
@@ -269,9 +230,12 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "Greet", "limit": 10 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "Greet", "limit": 10 }),
+            ))
             .await
-            .expect("code_symbols"),
+            .expect("search_symbols"),
     );
     let results = body.get("results").and_then(Value::as_array).expect("results");
     assert_eq!(results.len(), 1, "one Greet hit: {results:?}");
@@ -281,28 +245,57 @@ async fn mcp_server_exercises_representative_tools() {
         "Stage 2 arrow-fn const should be kind=function"
     );
 
-    let body = decode_text(
-        &service
-            .call_tool(call_params("code_symbols", json!({ "name": "draw", "limit": 50 })))
-            .await
-            .expect("code_symbols(draw)"),
+    let json_result = service
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "symbols", "needle": "draw", "limit": 50 }),
+        ))
+        .await
+        .expect("search_symbols json");
+    let json_body = decode_text(&json_result);
+    let json_raw = raw_text(&json_result);
+    let json_results = json_body
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("json results")
+        .clone();
+    assert!(!json_results.is_empty(), "expected draw hits: {json_body:?}");
+
+    let toon_result = service
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "symbols", "needle": "draw", "limit": 50, "format": "toon" }),
+        ))
+        .await
+        .expect("search_symbols toon");
+    let toon_raw = raw_text(&toon_result);
+    assert!(
+        toon_raw.len() < json_raw.len(),
+        "TOON payload ({} bytes) should be smaller than JSON ({} bytes)\nTOON:\n{toon_raw}",
+        toon_raw.len(),
+        json_raw.len(),
     );
     assert!(
-        body.get("results")
-            .and_then(Value::as_array)
-            .is_some_and(|results| !results.is_empty()),
-        "expected draw hits: {body:?}"
+        toon_raw.contains("results[") && toon_raw.contains("name") && toon_raw.contains("path"),
+        "TOON should carry a labeled results table with name + path columns:\n{toon_raw}"
     );
-    assert!(
-        body.get("truncated").is_none(),
-        "no sweep hit its cap, and a false flag is left out: {body}"
-    );
+    for hit in &json_results {
+        let name = hit.get("name").and_then(Value::as_str).expect("hit name");
+        let path = hit.get("path").and_then(Value::as_str).expect("hit path");
+        assert!(
+            toon_raw.contains(name) && toon_raw.contains(path),
+            "TOON body should round-trip hit ({path}, {name}):\n{toon_raw}"
+        );
+    }
 
     let body = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "limit": 5 })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "recent", "limit": 5, "include_files": true }),
+            ))
             .await
-            .expect("git_log"),
+            .expect("git recent"),
     );
     let commits = body.get("commits").and_then(Value::as_array).expect("commits");
     assert_eq!(commits.len(), 2, "two commits expected");
@@ -313,9 +306,12 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "query": "tweak", "limit": 10 })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "search", "pattern": "tweak", "field": "message", "limit": 10 }),
+            ))
             .await
-            .expect("git_log search"),
+            .expect("git search"),
     );
     let hits = body.get("commits").and_then(Value::as_array).expect("commits");
     assert_eq!(hits.len(), 1, "one commit summary contains 'tweak', got {hits:?}");
@@ -328,9 +324,12 @@ async fn mcp_server_exercises_representative_tools() {
     );
     let body = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "author": "tweak" })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "search", "pattern": "tweak", "field": "author" }),
+            ))
             .await
-            .expect("git_log search author scope"),
+            .expect("git search author scope"),
     );
     assert_eq!(
         body.get("commits").and_then(Value::as_array).map(Vec::len),
@@ -339,31 +338,26 @@ async fn mcp_server_exercises_representative_tools() {
     );
     let body = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "query": "tweak", "author": "t" })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "search", "pattern": "tweak alpha", "field": "all" }),
+            ))
             .await
-            .expect("git_log search AND same-commit"),
+            .expect("git search AND same-commit"),
     );
     assert_eq!(
         body.get("commits").and_then(Value::as_array).map(Vec::len),
         Some(1),
-        "the 'tweak alpha' commit was written by `t`"
+        "'tweak' AND 'alpha' both in the 'tweak alpha' commit"
     );
     let body = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "query": "tweak", "author": "alpha" })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "search", "pattern": "init tweak", "field": "all" }),
+            ))
             .await
-            .expect("git_log search, author term only in the message"),
-    );
-    assert_eq!(
-        body.get("commits").and_then(Value::as_array).map(Vec::len),
-        Some(0),
-        "'alpha' is in the message of that commit, not in its author"
-    );
-    let body = decode_text(
-        &service
-            .call_tool(call_params("git_log", json!({ "query": "init", "author": "tweak" })))
-            .await
-            .expect("git_log search AND cross-commit"),
+            .expect("git search AND cross-commit"),
     );
     assert_eq!(
         body.get("commits").and_then(Value::as_array).map(Vec::len),
@@ -374,11 +368,11 @@ async fn mcp_server_exercises_representative_tools() {
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "git_log",
-                json!({ "path": "a.rs", "symbol": "alpha", "limit": 10 }),
+                "git",
+                json!({ "mode": "symbol_history", "path": "a.rs", "name": "alpha", "limit": 10 }),
             ))
             .await
-            .expect("git_log symbol"),
+            .expect("git symbol_history"),
     );
     let history = body.get("history").and_then(Value::as_array).expect("history");
     let modifieds = history
@@ -397,9 +391,42 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "alpha", "limit": 100 })))
+            .call_tool(call_params(
+                "git",
+                json!({
+                    "mode": "symbol_history",
+                    "path": "a.rs",
+                    "name": "alpha",
+                    "limit": 10,
+                    "hash_mode": "structural"
+                }),
+            ))
             .await
-            .expect("code_refs"),
+            .expect("git symbol_history(structural)"),
+    );
+    assert_eq!(
+        body.get("hash_mode").and_then(Value::as_str),
+        Some("structural"),
+        "structural hash_mode should be echoed back to the caller"
+    );
+    let history = body.get("history").and_then(Value::as_array).expect("history");
+    let modifieds = history
+        .iter()
+        .filter(|e| e.get("change").and_then(Value::as_str) == Some("modified"))
+        .count();
+    assert!(
+        modifieds >= 1,
+        "structural mode should also see the 'tweak alpha' literal change: {history:?}"
+    );
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "references", "name": "alpha", "limit": 100 }),
+            ))
+            .await
+            .expect("find_references"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     assert_eq!(hits.len(), 3, "expected 3 alpha() call sites: {body}");
@@ -421,9 +448,12 @@ async fn mcp_server_exercises_representative_tools() {
 
     let page1 = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "alpha", "limit": 2 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "references", "name": "alpha", "limit": 2 }),
+            ))
             .await
-            .expect("code_refs page1"),
+            .expect("find_references page1"),
     );
     let page1_hits = page1.get("hits").and_then(Value::as_array).expect("page1 hits");
     assert_eq!(page1_hits.len(), 2, "limit=2 → 2 hits on first page");
@@ -435,11 +465,11 @@ async fn mcp_server_exercises_representative_tools() {
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "name": "alpha", "limit": 2, "cursor": cursor1 }),
+                "code",
+                json!({ "mode": "references", "name": "alpha", "limit": 2, "cursor": cursor1 }),
             ))
             .await
-            .expect("code_refs page2"),
+            .expect("find_references page2"),
     );
     let page2_hits = page2.get("hits").and_then(Value::as_array).expect("page2 hits");
     assert_eq!(page2_hits.len(), 1, "remaining single hit on second page");
@@ -462,9 +492,12 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "path": "a.rs", "name": "alpha" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "callers", "path": "a.rs", "name": "alpha" }),
+            ))
             .await
-            .expect("code_refs with `path`"),
+            .expect("find_callers"),
     );
     let def = body.get("definition").expect("definition echoed");
     assert_eq!(
@@ -473,62 +506,63 @@ async fn mcp_server_exercises_representative_tools() {
         "definition should resolve to alpha"
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
-    assert_eq!(hits.len(), 3, "code_refs with `path` should see the same 3 sites");
+    assert_eq!(hits.len(), 3, "find_callers should see the same 3 sites");
 
     let page1 = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "path": "a.rs", "name": "alpha", "limit": 2 }),
+                "code",
+                json!({ "mode": "callers", "path": "a.rs", "name": "alpha", "limit": 2 }),
             ))
             .await
-            .expect("code_refs with `path` page1"),
+            .expect("find_callers page1"),
     );
     let page1_hits = page1.get("hits").and_then(Value::as_array).expect("page1 hits");
-    assert_eq!(page1_hits.len(), 2, "code_refs with `path` limit=2 → 2 hits");
+    assert_eq!(page1_hits.len(), 2, "find_callers limit=2 → 2 hits");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("code_refs with `path` first page must carry next_cursor")
+        .expect("find_callers first page must carry next_cursor")
         .to_string();
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "path": "a.rs",
+                "code",
+                json!({ "mode": "callers",
+                    "path": "a.rs",
                     "name": "alpha",
                     "limit": 2,
                     "cursor": cursor1,
                 }),
             ))
             .await
-            .expect("code_refs with `path` page2"),
+            .expect("find_callers page2"),
     );
     let page2_hits = page2.get("hits").and_then(Value::as_array).expect("page2 hits");
-    assert_eq!(page2_hits.len(), 1, "code_refs with `path` tail page → 1 hit");
+    assert_eq!(page2_hits.len(), 1, "find_callers tail page → 1 hit");
     assert!(
         page2.get("next_cursor").is_none(),
-        "code_refs with `path` second page must NOT have next_cursor: {page2}"
+        "find_callers second page must NOT have next_cursor: {page2}"
     );
 
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "name": "alpha", "relation": "definition", "path": "a.rs", "line": 1 }),
+                "code",
+                json!({ "mode": "definition", "path": "a.rs", "line": 1, "column": 0 }),
             ))
             .await
-            .expect("code_refs definition"),
+            .expect("goto_definition"),
     );
     assert_eq!(
         body.get("path").and_then(Value::as_str),
         Some("a.rs"),
-        "code_refs definition must echo the queried path: {body}"
+        "goto_definition must echo the queried path: {body}"
     );
     assert_eq!(
         body.get("line").and_then(Value::as_u64),
         Some(1),
-        "code_refs definition must echo the normalized 1-based line: {body}"
+        "goto_definition must echo the normalized 1-based line: {body}"
     );
     if let Some(def) = body.get("definition").filter(|d| !d.is_null()) {
         assert!(
@@ -541,14 +575,228 @@ async fn mcp_server_exercises_representative_tools() {
         );
     }
 
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "calls", "name": "inner", "direction": "callers", "max_depth": 2 }),
+            ))
+            .await
+            .expect("graph calls callers"),
+    );
+    let nodes = body.get("nodes").and_then(Value::as_array).expect("nodes");
+    let names: Vec<String> = nodes
+        .iter()
+        .filter_map(|n| n.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert!(
+        names.contains(&"inner".to_string()),
+        "call_graph callers must surface root `inner`: {names:?}"
+    );
+    assert!(
+        names.contains(&"middle".to_string()),
+        "call_graph callers must surface depth-1 `middle`: {names:?}"
+    );
+    assert!(
+        names.contains(&"outer".to_string()),
+        "call_graph callers must surface depth-2 `outer`: {names:?}"
+    );
+    assert_eq!(
+        nodes[0].get("name").and_then(Value::as_str),
+        Some("inner"),
+        "nodes[0] is the root"
+    );
+    let middle_idx = nodes
+        .iter()
+        .position(|n| n.get("name").and_then(Value::as_str) == Some("middle"))
+        .expect("middle node present");
+    let middle_edges: Vec<u64> = nodes[middle_idx]
+        .get("edges_to")
+        .and_then(Value::as_array)
+        .expect("middle.edges_to")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    assert!(
+        middle_edges.contains(&0),
+        "middle.edges_to should reference the root inner (index 0): got {middle_edges:?}"
+    );
+    let outer_idx = nodes
+        .iter()
+        .position(|n| n.get("name").and_then(Value::as_str) == Some("outer"))
+        .expect("outer node present");
+    let outer_edges: Vec<u64> = nodes[outer_idx]
+        .get("edges_to")
+        .and_then(Value::as_array)
+        .expect("outer.edges_to")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    assert!(
+        outer_edges.contains(&(middle_idx as u64)),
+        "outer.edges_to should reference middle (index {middle_idx}): got {outer_edges:?}"
+    );
+
+    // callees over codegraph: `caller()` (c.rs) invokes `alpha`, `zed`, and the undefined ~keep
+    // `other()`. Resolved in-repo callees surface; the unresolved external call carries no ~keep
+    // graph edge, so it is not a node — the resolved-only contract this migration locks in. ~keep
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "calls", "name": "caller", "direction": "callees", "max_depth": 1 }),
+            ))
+            .await
+            .expect("graph calls callees"),
+    );
+    let nodes = body.get("nodes").and_then(Value::as_array).expect("callee nodes");
+    let names: Vec<String> = nodes
+        .iter()
+        .filter_map(|n| n.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert_eq!(
+        nodes[0].get("name").and_then(Value::as_str),
+        Some("caller"),
+        "callees root is `caller`: {names:?}"
+    );
+    assert!(
+        names.contains(&"alpha".to_string()) && names.contains(&"zed".to_string()),
+        "callees must surface the resolved in-repo targets `alpha` and `zed`: {names:?}"
+    );
+    assert!(
+        !names.contains(&"other".to_string()),
+        "an unresolved external call (`other`) carries no graph edge and must not appear: {names:?}"
+    );
+
+    let sym = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "symbol", "include_churn": false }),
+            ))
+            .await
+            .expect("graph map symbol"),
+    );
+    let sym_nodes = sym.get("nodes").and_then(Value::as_array).expect("symbol nodes");
+    assert!(!sym_nodes.is_empty(), "symbol tier returns hub functions: {sym:?}");
+    assert_eq!(
+        sym_nodes[0].get("name").and_then(Value::as_str),
+        Some("alpha"),
+        "alpha (hub 3) must outrank the higher-fan-in but multiply-defined `zed` (hub 2): {sym:?}"
+    );
+    assert_eq!(
+        sym_nodes[0].get("fan_in").and_then(Value::as_u64),
+        Some(3),
+        "the raw fan_in count is still reported verbatim on the node: {sym:?}"
+    );
+    assert!(
+        sym_nodes
+            .iter()
+            .any(|n| n.get("name").and_then(Value::as_str) == Some("zed"))
+            && sym_nodes
+                .iter()
+                .find(|n| n.get("name").and_then(Value::as_str) == Some("zed"))
+                .and_then(|n| n.get("fan_in").and_then(Value::as_u64))
+                == Some(4),
+        "the `zed` decoy is present with its honest raw fan_in=4, just not ranked first: {sym:?}"
+    );
+    let sym_scores: Vec<f64> = sym_nodes
+        .iter()
+        .filter_map(|n| n.get("score").and_then(Value::as_f64))
+        .collect();
+    assert!(
+        sym_scores.windows(2).all(|w| w[0] >= w[1]),
+        "symbol-tier nodes must be emitted in non-increasing score order: {sym_scores:?}"
+    );
+
+    let filem = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "file", "include_churn": false }),
+            ))
+            .await
+            .expect("graph map file"),
+    );
+    let file_nodes = filem.get("nodes").and_then(Value::as_array).expect("file nodes");
+    let cycles = filem.get("cycles").and_then(Value::as_array).expect("cycles");
+    assert!(
+        !cycles.is_empty(),
+        "file tier must surface the cyc1<->cyc2 cycle: {filem:?}"
+    );
+    let label_by_id = |id: u64| -> String {
+        file_nodes
+            .iter()
+            .find(|n| n.get("id").and_then(Value::as_u64) == Some(id))
+            .and_then(|n| n.get("label").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let cycle_labels: Vec<String> = cycles
+        .iter()
+        .flat_map(|c| c.get("members").and_then(Value::as_array).expect("members").iter())
+        .filter_map(Value::as_u64)
+        .map(label_by_id)
+        .collect();
+    assert!(
+        cycle_labels.contains(&"cyc1.rs".to_string()) && cycle_labels.contains(&"cyc2.rs".to_string()),
+        "cycle members must include cyc1.rs + cyc2.rs: {cycle_labels:?}"
+    );
+
+    let filem2 = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "file", "include_churn": false }),
+            ))
+            .await
+            .expect("graph map file (repeat)"),
+    );
+    assert_eq!(
+        filem.get("nodes"),
+        filem2.get("nodes"),
+        "architecture_map file-tier node order must be deterministic across calls"
+    );
+
+    // Module tier is the DEFAULT granularity and the only path through the directory-rollup grouping
+    // (`assign_file_groups`); exercise it end-to-end for node emission + cross-call determinism.
+    let modm = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "module", "include_churn": false }),
+            ))
+            .await
+            .expect("graph map module"),
+    );
+    let mod_nodes = modm.get("nodes").and_then(Value::as_array).expect("module nodes");
+    assert!(!mod_nodes.is_empty(), "module tier must emit grouped nodes: {modm:?}");
+    let modm2 = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "module", "include_churn": false }),
+            ))
+            .await
+            .expect("graph map module (repeat)"),
+    );
+    assert_eq!(
+        modm.get("nodes"),
+        modm2.get("nodes"),
+        "architecture_map module-tier node order must be deterministic across calls"
+    );
+
     let page1 = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "a", "limit": 1 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 1 }),
+            ))
             .await
-            .expect("code_symbols page1"),
+            .expect("search_symbols page1"),
     );
     let page1_results = page1.get("results").and_then(Value::as_array).expect("page1 results");
-    assert_eq!(page1_results.len(), 1, "code_symbols limit=1 → 1 result");
+    assert_eq!(page1_results.len(), 1, "search_symbols limit=1 → 1 result");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
@@ -557,11 +805,11 @@ async fn mcp_server_exercises_representative_tools() {
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "code_symbols",
-                json!({ "name": "a", "limit": 1, "cursor": cursor1 }),
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 1, "cursor": cursor1 }),
             ))
             .await
-            .expect("code_symbols page2"),
+            .expect("search_symbols page2"),
     );
     let page2_results = page2.get("results").and_then(Value::as_array).expect("page2 results");
     assert_eq!(page2_results.len(), 1, "page2 must also have 1 result");
@@ -577,9 +825,12 @@ async fn mcp_server_exercises_representative_tools() {
 
     let unbudgeted = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "a", "limit": 100 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 100 }),
+            ))
             .await
-            .expect("code_symbols unbudgeted"),
+            .expect("search_symbols unbudgeted"),
     );
     let unbudgeted_len = unbudgeted
         .get("results")
@@ -593,11 +844,11 @@ async fn mcp_server_exercises_representative_tools() {
     let budgeted = decode_text(
         &service
             .call_tool(call_params(
-                "code_symbols",
-                json!({ "name": "a", "limit": 100, "max_tokens": 1 }),
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 100, "max_tokens": 1 }),
             ))
             .await
-            .expect("code_symbols budgeted"),
+            .expect("search_symbols budgeted"),
     );
     let budgeted_results = budgeted
         .get("results")
@@ -625,28 +876,31 @@ async fn mcp_server_exercises_representative_tools() {
 
     let page1 = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "limit": 4 })))
+            .call_tool(call_params("code", json!({ "mode": "files", "limit": 4 })))
             .await
-            .expect("find_files page1"),
+            .expect("list_files page1"),
     );
     let page1_files = page1.get("files").and_then(Value::as_array).expect("page1 files");
-    assert_eq!(page1_files.len(), 4, "find_files limit=4 → 4 files");
+    assert_eq!(page1_files.len(), 4, "list_files limit=4 → 4 files");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("find_files first page must carry next_cursor")
+        .expect("list_files first page must carry next_cursor")
         .to_string();
     let page2 = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "limit": 4, "cursor": cursor1 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "files", "limit": 4, "cursor": cursor1 }),
+            ))
             .await
-            .expect("find_files page2"),
+            .expect("list_files page2"),
     );
     let page2_files = page2.get("files").and_then(Value::as_array).expect("page2 files");
-    assert_eq!(page2_files.len(), 3, "find_files page2 → 3 remaining files: {page2}");
+    assert_eq!(page2_files.len(), 3, "list_files page2 → 3 remaining files: {page2}");
     assert!(
         page2.get("next_cursor").is_none(),
-        "find_files page2 must NOT carry next_cursor"
+        "list_files page2 must NOT carry next_cursor"
     );
     let p1_paths: Vec<&str> = page1_files
         .iter()
@@ -658,14 +912,17 @@ async fn mcp_server_exercises_representative_tools() {
         .collect();
     assert!(
         p2_paths.iter().all(|p| !p1_paths.contains(p)),
-        "find_files pages must not overlap: {p1_paths:?} vs {p2_paths:?}"
+        "list_files pages must not overlap: {p1_paths:?} vs {p2_paths:?}"
     );
 
     let page1 = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "a", "limit": 1 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 1 }),
+            ))
             .await
-            .expect("code_symbols pre-rescan"),
+            .expect("search_symbols pre-rescan"),
     );
     let stale_cursor = page1
         .get("next_cursor")
@@ -673,44 +930,57 @@ async fn mcp_server_exercises_representative_tools() {
         .expect("pre-rescan cursor")
         .to_string();
     let _ = service
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan"})))
         .await
         .expect("rescan");
-    let stale_response = refused(
-        &service,
-        "code_symbols",
-        json!({ "name": "a", "limit": 1, "cursor": stale_cursor }),
-    )
-    .await;
-    assert!(
-        stale_response.contains("changed since this cursor was issued"),
-        "rescan must invalidate in-memory code_symbols cursors: {stale_response}"
+    let stale_response = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "a", "limit": 1, "cursor": stale_cursor }),
+            ))
+            .await
+            .expect("search_symbols with stale cursor"),
+    );
+    assert_eq!(
+        stale_response.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "rescan must invalidate in-memory search_symbols cursors: {stale_response}"
     );
 
     let page1 = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "limit": 1 })))
+            .call_tool(call_params("code", json!({ "mode": "files", "limit": 1 })))
             .await
-            .expect("find_files pre-rescan"),
+            .expect("list_files pre-rescan"),
     );
     let stale_cursor = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("find_files pre-rescan cursor")
+        .expect("list_files pre-rescan cursor")
         .to_string();
     let _ = service
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan"})))
         .await
         .expect("rescan");
-    let stale_response = refused(&service, "find_files", json!({ "limit": 1, "cursor": stale_cursor })).await;
-    assert!(
-        stale_response.contains("changed since this cursor was issued"),
-        "rescan must invalidate in-memory find_files cursors: {stale_response}"
+    let stale_response = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "files", "limit": 1, "cursor": stale_cursor }),
+            ))
+            .await
+            .expect("list_files with stale cursor"),
+    );
+    assert_eq!(
+        stale_response.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "rescan must invalidate in-memory list_files cursors: {stale_response}"
     );
 
     let body = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "query": "cy1" })))
+            .call_tool(call_params("code", json!({ "mode": "find", "query": "cy1" })))
             .await
             .expect("find_files(cy1)"),
     );
@@ -735,14 +1005,18 @@ async fn mcp_server_exercises_representative_tools() {
         Some(1),
         "find_files('cy1') returned must be exactly 1: {body}"
     );
-    assert!(
-        body.get("truncated").is_none() && body.get("next_cursor").is_none(),
-        "find_files('cy1') is one whole page, and a listing has no `truncated`: {body}"
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "find_files('cy1') must not be truncated: {body}"
     );
 
     let body = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "query": "zzzznonexistentqueryxyz" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "find", "query": "zzzznonexistentqueryxyz" }),
+            ))
             .await
             .expect("find_files(no match)"),
     );
@@ -760,8 +1034,8 @@ async fn mcp_server_exercises_representative_tools() {
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "find_files",
-                json!({ "query": "rs", "language": "python" }),
+                "code",
+                json!({ "mode": "find", "query": "rs", "language": "python" }),
             ))
             .await
             .expect("find_files(language filter)"),
@@ -774,7 +1048,7 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("find_files", json!({ "query": "d" })))
+            .call_tool(call_params("code", json!({ "mode": "find", "query": "d" })))
             .await
             .expect("find_files(d)"),
     );
@@ -787,38 +1061,44 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "no_such_callee_anywhere" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "references", "name": "no_such_callee_anywhere" }),
+            ))
             .await
-            .expect("code_refs(missing)"),
+            .expect("find_references(missing)"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     assert!(hits.is_empty(), "unknown callee should yield no hits");
 
     let body = decode_text(
         &service
-            .call_tool(call_params("git_blame", json!({ "path": "a.rs" })))
+            .call_tool(call_params("git", json!({ "mode": "blame", "path": "a.rs" })))
             .await
-            .expect("git_blame"),
+            .expect("git blame"),
     );
     let hunks = body.get("hunks").and_then(Value::as_array).expect("hunks");
     assert!(!hunks.is_empty(), "blame should return hunks on a real file");
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_grep", json!({ "pattern": "pub fn" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "grep", "pattern": "pub fn", "include_context": false }),
+            ))
             .await
-            .expect("code_grep"),
+            .expect("workspace_grep"),
     );
     let grep_hits = body.get("hits").and_then(Value::as_array).expect("hits");
     assert!(
         !grep_hits.is_empty(),
-        "code_grep for 'pub fn' should find hits in the fixture"
+        "workspace_grep for 'pub fn' should find hits in the fixture"
     );
     assert!(
         grep_hits
             .iter()
-            .all(|h| h.get("line").and_then(Value::as_u64).unwrap_or(0) >= 1),
-        "every grep hit must carry a 1-based line"
+            .all(|h| h.get("line_num").and_then(Value::as_u64).unwrap_or(0) >= 1),
+        "every grep hit must carry a 1-based line_num"
     );
     let total_matches = body
         .get("total_matches")
@@ -831,21 +1111,22 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_grep", json!({ "pattern": "pub fn", "limit": 1 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "grep", "pattern": "pub fn", "limit": 1, "include_context": false }),
+            ))
             .await
-            .expect("code_grep(limit=1)"),
+            .expect("workspace_grep(limit=1)"),
     );
+    let truncated = body.get("truncated").and_then(Value::as_bool).unwrap_or(false);
     let hits_with_limit = body.get("hits").and_then(Value::as_array).expect("hits");
     assert_eq!(hits_with_limit.len(), 1, "limit=1 should return exactly 1 hit");
-    assert!(
-        body.get("next_cursor").is_some_and(Value::is_string),
-        "limit=1 with multiple matches pages: {body}"
+    assert!(truncated, "limit=1 with multiple matches should set truncated=true");
+    assert_eq!(
+        body.get("truncation_reason").and_then(Value::as_str),
+        Some("limit"),
+        "a truncated grep must name the bound that cut it: {body}"
     );
-    assert!(
-        body.get("truncated").is_none(),
-        "a `limit` cut is paging, not truncation, and a false flag is left out: {body}"
-    );
-    assert!(body.get("truncated_reason").is_none(), "{body}");
     let capped_total = body
         .get("total_matches")
         .and_then(Value::as_u64)
@@ -855,211 +1136,578 @@ async fn mcp_server_exercises_representative_tools() {
         "`limit` caps hits, never the scan: the match count is the same as the unlimited call"
     );
 
-    let invalid = service
+    let invalid_result = service
         .call_tool(call_params(
-            "code_grep",
-            json!({ "pattern": "[invalid_regex(", "regex": true }),
+            "code",
+            json!({ "mode": "grep", "pattern": "[invalid_regex(" }),
         ))
-        .await
-        .expect("code_grep(invalid regex)");
-    let message = error_text(&invalid);
+        .await;
     assert!(
-        message.contains("invalid regex") && message.contains("Drop `regex`"),
-        "an invalid regex must be reported with its fix: {message}"
-    );
-    let literal = decode_text(
-        &service
-            .call_tool(call_params("code_grep", json!({ "pattern": "[invalid_regex(" })))
-            .await
-            .expect("code_grep(literal)"),
-    );
-    assert_eq!(
-        literal.get("hits").and_then(Value::as_array).map(Vec::len),
-        Some(0),
-        "without `regex` the same text is a literal search, not an error: {literal}"
+        invalid_result.is_err(),
+        "invalid regex should produce a protocol-level MCP error"
     );
 
     let _ = service
         .call_tool(call_params(
-            "memory_save",
-            json!({ "key": "smoke_key", "value": "hello" }),
+            "memory",
+            json!({ "mode": "put",  "key": "smoke_key", "value": "hello", "embed": false }),
         ))
         .await;
     let _ = service
-        .call_tool(call_params("memory_search", json!({ "key": "smoke_key" })))
+        .call_tool(call_params("memory", json!({ "mode": "get",  "key": "smoke_key" })))
         .await;
-    let listing = service
-        .call_tool(call_params("memory_search", json!({})))
-        .await
-        .expect("memory_search");
-    #[cfg(feature = "memory")]
-    let _ = listing;
-    #[cfg(not(feature = "memory"))]
-    {
-        let message = error_text(&listing);
-        assert!(
-            message.contains("`memory_search` needs the `memory` Cargo feature"),
-            "memory_search without the memory feature must name the missing feature: {message}"
-        );
-    }
+    let _ = service.call_tool(call_params("memory", json!({ "mode": "list"}))).await;
+    let _ = service
+        .call_tool(call_params("memory", json!({ "mode": "delete",  "key": "smoke_key" })))
+        .await;
+    let _ = service
+        .call_tool(call_params("memory", json!({ "mode": "documents",  "query": "hello" })))
+        .await;
 
     #[cfg(not(feature = "code-search"))]
     {
-        let result = service
-            .call_tool(call_params("code_search", json!({ "query": "hello" })))
-            .await
-            .expect("code_search");
-        let message = error_text(&result);
+        let sc = service
+            .call_tool(call_params("code", json!({ "mode": "semantic", "query": "hello" })))
+            .await;
         assert!(
-            message.contains("`code_search` needs the `code-search` Cargo feature"),
-            "code_search without the code-search feature must name the missing feature: {message}"
+            sc.is_err(),
+            "search_code without the code-search feature must return an MCP error"
+        );
+        let gc = service
+            .call_tool(call_params("code", json!({ "mode": "chunk", "path": "src/lib.rs" })))
+            .await;
+        assert!(
+            gc.is_err(),
+            "get_chunk without the code-search feature must return an MCP error"
         );
     }
     #[cfg(feature = "code-search")]
     {
-        for args in [
-            json!({ "query": "hello" }),
-            json!({ "query": "hello", "lane": "keyword" }),
-            json!({ "query": "hello", "lane": "hybrid" }),
-        ] {
-            let result = service
-                .call_tool(call_params("code_search", args.clone()))
-                .await
-                .expect("code_search");
-            // No embedding model on the test host is a legitimate isError; a success must be well formed.
-            if result.is_error != Some(true) {
-                let body = decode_text(&result);
+        let sc = service
+            .call_tool(call_params("code", json!({ "mode": "semantic", "query": "hello" })))
+            .await;
+        if let Ok(result) = &sc {
+            let body = decode_text(result);
+            assert_eq!(
+                body.get("query").and_then(Value::as_str),
+                Some("hello"),
+                "search_code must echo the input query field: {body}"
+            );
+            assert!(
+                body.get("hits").and_then(Value::as_array).is_some(),
+                "search_code response must carry a hits array (may be empty): {body}"
+            );
+        }
+
+        let gc = service
+            .call_tool(call_params("code", json!({ "mode": "chunk", "path": "a.rs" })))
+            .await;
+        if let Ok(result) = &gc {
+            let body = decode_text(result);
+            assert!(
+                body.get("path").is_some() && body.get("text").is_some(),
+                "get_chunk success response must carry path + text: {body}"
+            );
+        }
+
+        let kw = service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "semantic", "query": "hello", "lane": "keyword" }),
+            ))
+            .await;
+        if let Ok(result) = &kw {
+            let body = decode_text(result);
+            assert_eq!(
+                body.get("query").and_then(Value::as_str),
+                Some("hello"),
+                "the keyword lane must echo the query field: {body}"
+            );
+            assert!(
+                body.get("hits").and_then(Value::as_array).is_some(),
+                "the keyword lane response must carry a hits array: {body}"
+            );
+        }
+
+        let bad_mode = service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "semantic", "query": "hello", "lane": "bogus" }),
+            ))
+            .await;
+        assert!(
+            bad_mode.is_err(),
+            "`code` mode=\"semantic\" must reject an unknown lane with an MCP error"
+        );
+
+        let hy = service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "semantic", "query": "hello", "lane": "hybrid", "rerank": false, "rerank_preset": "bge-reranker-base" }),
+            ))
+            .await;
+        if let Ok(result) = &hy {
+            let body = decode_text(result);
+            assert_eq!(
+                body.get("query").and_then(Value::as_str),
+                Some("hello"),
+                "hybrid search_code must echo the query field: {body}"
+            );
+            assert!(
+                body.get("hits").and_then(Value::as_array).is_some(),
+                "hybrid search_code response must carry a hits array: {body}"
+            );
+        }
+    }
+
+    #[cfg(feature = "documents")]
+    {
+        let json_result = service
+            .call_tool(call_params("memory", json!({ "mode": "documents",  "query": "hello" })))
+            .await;
+        let toon_result = service
+            .call_tool(call_params(
+                "memory",
+                json!({ "mode": "documents",  "query": "hello", "format": "toon" }),
+            ))
+            .await;
+        if let (Ok(json_resp), Ok(toon_resp)) = (&json_result, &toon_result) {
+            let json_body = decode_text(json_resp);
+            if json_body != Value::Null {
+                let toon_raw = toon_resp
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let toon_body: Value = serde_toon::from_str(&toon_raw).expect("toon body deserializes to JSON value");
                 assert_eq!(
-                    body.get("query").and_then(Value::as_str),
-                    Some("hello"),
-                    "code_search {args} must echo the input query field: {body}"
+                    json_body.get("query"),
+                    toon_body.get("query"),
+                    "TOON and JSON responses must echo the same query field"
                 );
-                assert!(
-                    body.get("hits").and_then(Value::as_array).is_some(),
-                    "code_search {args} response must carry a hits array (may be empty): {body}"
+                let json_hits = json_body
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let toon_hits = toon_body
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                assert_eq!(
+                    json_hits, toon_hits,
+                    "TOON and JSON responses must carry the same hit count"
                 );
             }
         }
-
-        let bad_lane = service
-            .call_tool(call_params("code_search", json!({ "query": "hello", "lane": "bogus" })))
-            .await
-            .expect("code_search(bogus lane)");
-        let message = error_text(&bad_lane);
-        assert!(
-            message.contains("`lane` must be one of `hybrid`, `semantic`, `keyword`") && message.contains("bogus"),
-            "code_search must reject an unknown lane: {message}"
-        );
     }
-
-    let docs = service
-        .call_tool(call_params("docs_search", json!({ "query": "hello" })))
-        .await
-        .expect("docs_search");
-    #[cfg(feature = "documents")]
-    let _ = docs;
     #[cfg(not(feature = "documents"))]
     {
-        let message = error_text(&docs);
-        assert!(
-            message.contains("`docs_search` needs the `documents` Cargo feature"),
-            "docs_search without the documents feature must name the missing feature: {message}"
-        );
+        let _ = service
+            .call_tool(call_params(
+                "memory",
+                json!({ "mode": "documents",  "query": "hello", "format": "toon" }),
+            ))
+            .await;
     }
 
     #[cfg(feature = "memory")]
     {
         for i in 0..3 {
-            // The note is durable before `memory_save` embeds it. Where no embedding model is
-            // available the save still succeeds and says the note is not embedded: an error here
-            // would report a write that happened as one that did not.
-            let saved = service
+            let _ = service
                 .call_tool(call_params(
-                    "memory_save",
-                    json!({ "key": format!("paging_key_{i}"),
+                    "memory",
+                    json!({ "mode": "put",
+                        "key": format!("paging_key_{i}"),
                         "value": format!("v{i}"),
+                        "embed": false,
                     }),
                 ))
                 .await
-                .expect("memory_save");
-            assert_ne!(saved.is_error, Some(true), "a saved note is a success: {saved:?}");
-            let saved = decode_text(&saved);
-            match saved.get("embedded").and_then(Value::as_bool) {
-                Some(true) => assert!(saved.get("notice").is_none(), "{saved}"),
-                Some(false) => assert!(
-                    saved
-                        .get("notice")
-                        .and_then(Value::as_str)
-                        .is_some_and(|notice| notice.contains("the note is saved")),
-                    "a note that could not be embedded says so: {saved}"
-                ),
-                None => panic!("memory_save must report `embedded`: {saved}"),
-            }
+                .expect("memory_put");
         }
         let page1 = decode_text(
             &service
                 .call_tool(call_params(
-                    "memory_search",
-                    json!({ "prefix": "paging_key_", "limit": 2 }),
+                    "memory",
+                    json!({ "mode": "list",  "prefix": "paging_key_", "limit": 2 }),
                 ))
                 .await
-                .expect("memory_search page1"),
+                .expect("memory_list page1"),
         );
         let page1_entries = page1.get("entries").and_then(Value::as_array).expect("page1 entries");
-        assert_eq!(page1_entries.len(), 2, "memory_search limit=2 → 2 entries");
+        assert_eq!(page1_entries.len(), 2, "memory_list limit=2 → 2 entries");
         let cursor1 = page1
             .get("next_cursor")
             .and_then(Value::as_str)
-            .expect("memory_search first page must carry next_cursor")
+            .expect("memory_list first page must carry next_cursor")
             .to_string();
         let page2 = decode_text(
             &service
                 .call_tool(call_params(
-                    "memory_search",
-                    json!({ "prefix": "paging_key_",
+                    "memory",
+                    json!({ "mode": "list",
+                        "prefix": "paging_key_",
                         "limit": 2,
                         "cursor": cursor1,
                     }),
                 ))
                 .await
-                .expect("memory_search page2"),
+                .expect("memory_list page2"),
         );
         let page2_entries = page2.get("entries").and_then(Value::as_array).expect("page2 entries");
-        assert_eq!(page2_entries.len(), 1, "memory_search page2 → 1 remaining");
+        assert_eq!(page2_entries.len(), 1, "memory_list page2 → 1 remaining");
         assert!(
             page2.get("next_cursor").is_none(),
-            "memory_search page2 must NOT carry next_cursor: {page2}"
+            "memory_list page2 must NOT carry next_cursor: {page2}"
+        );
+    }
+
+    #[cfg(feature = "memory")]
+    {
+        let _ = service
+            .call_tool(call_params(
+                "memory",
+                json!({ "mode": "put",
+                    "key": "audit_probe",
+                    "value": "a memory note with no code refs",
+                    "embed": false,
+                }),
+            ))
+            .await
+            .expect("memory_put audit_probe");
+
+        let body = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "audit",  "key": "audit_probe" })))
+                .await
+                .expect("memory_audit single-key"),
+        );
+        assert_eq!(
+            body.get("audited").and_then(Value::as_u64),
+            Some(1),
+            "memory_audit single-key must report audited=1: {body}"
+        );
+        let results = body.get("results").and_then(Value::as_array).expect("results");
+        assert_eq!(results.len(), 1, "single-key audit must return one result");
+        assert_eq!(
+            results[0].get("state").and_then(Value::as_str),
+            Some("unverified"),
+            "empty-provenance memory must audit as unverified: {results:?}"
+        );
+
+        let dry_body = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "audit",  "key": "audit_probe", "dry_run": true }),
+                ))
+                .await
+                .expect("memory_audit dry_run"),
+        );
+        assert_eq!(
+            dry_body.get("audited").and_then(Value::as_u64),
+            Some(1),
+            "dry_run audit must still report audited=1: {dry_body}"
+        );
+
+        let range_body = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "audit",  "limit": 50 })))
+                .await
+                .expect("memory_audit range"),
+        );
+        let range_audited = range_body.get("audited").and_then(Value::as_u64).expect("audited");
+        assert!(
+            range_audited >= 1,
+            "range audit must cover at least the audit_probe key: {range_body}"
+        );
+
+        let _ = service
+            .call_tool(call_params(
+                "memory",
+                json!({ "mode": "delete",  "key": "audit_probe" }),
+            ))
+            .await
+            .expect("memory_delete audit_probe");
+    }
+
+    #[cfg(feature = "memory")]
+    {
+        let mine_body = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "mine"})))
+                .await
+                .expect("proposals_mine default"),
+        );
+        assert!(
+            mine_body.get("mined").and_then(Value::as_u64).is_some(),
+            "proposals_mine must return `mined` field: {mine_body}"
+        );
+        assert_eq!(
+            mine_body.get("window_inspected").and_then(Value::as_u64),
+            Some(200),
+            "proposals_mine must echo window_inspected=200 (default): {mine_body}"
+        );
+        assert!(
+            mine_body.get("skipped_bulk").and_then(Value::as_u64).is_some(),
+            "proposals_mine must return `skipped_bulk` field: {mine_body}"
+        );
+
+        let list_body = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "proposals",  "kind": "skill", "limit": 50 }),
+                ))
+                .await
+                .expect("proposals_list after default mine"),
+        );
+        assert_eq!(
+            list_body.get("total").and_then(Value::as_u64),
+            Some(0),
+            "proposals_list must return total=0 after a no-candidate mine: {list_body}"
+        );
+        assert_eq!(
+            list_body.get("truncated").and_then(Value::as_bool),
+            Some(false),
+            "proposals_list must return truncated=false for an empty list: {list_body}"
+        );
+        assert!(
+            list_body.get("proposals").and_then(Value::as_array).map(Vec::is_empty) == Some(true),
+            "proposals array must be empty: {list_body}"
+        );
+
+        let mine_low = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "mine",
+                        "min_support": 1,
+                        "min_confidence": 0.1,
+                        "max_files_per_commit": 10,
+                        "window": 50,
+                    }),
+                ))
+                .await
+                .expect("proposals_mine min_support=1"),
+        );
+        let mined_low = mine_low.get("mined").and_then(Value::as_u64).unwrap_or(0);
+        assert!(
+            mined_low >= 1,
+            "proposals_mine(min_support=1) must mine the fixture's co-change cluster: {mine_low}"
+        );
+
+        let list2 = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "proposals",  "limit": 10 })))
+                .await
+                .expect("proposals_list after low-threshold mine"),
+        );
+        let proposals = list2
+            .get("proposals")
+            .and_then(Value::as_array)
+            .expect("proposals array");
+        assert_eq!(
+            proposals.len() as u64,
+            mined_low,
+            "proposals_list count must match mined count: {list2}"
+        );
+        let accept_id = proposals[0]
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("accept id")
+            .to_string();
+        let accept_files: Vec<String> = proposals[0]
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("proposal files")
+            .iter()
+            .filter_map(|f| f.as_str().map(String::from))
+            .collect();
+        assert!(
+            !accept_files.is_empty(),
+            "a co-change proposal must carry at least one file: {list2}"
+        );
+
+        let accept_body = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "accept",  "id": accept_id })))
+                .await
+                .expect("proposal_accept"),
+        );
+        assert_eq!(
+            accept_body.get("accepted").and_then(Value::as_bool),
+            Some(true),
+            "proposal_accept must return accepted=true: {accept_body}"
+        );
+        let memory_key = accept_body
+            .get("memory_key")
+            .and_then(Value::as_str)
+            .expect("memory_key from proposal_accept")
+            .to_string();
+        assert!(
+            memory_key.starts_with("skill/cochange-"),
+            "auto-derived key must start with skill/cochange-: {memory_key}"
+        );
+
+        let audit_live = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "audit",  "key": &memory_key })))
+                .await
+                .expect("memory_audit after accept"),
+        );
+        let live_results = audit_live
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("live audit results");
+        assert_eq!(
+            live_results.len(),
+            1,
+            "memory_audit must return one result for the accepted key: {audit_live}"
+        );
+        assert_eq!(
+            live_results[0].get("state").and_then(Value::as_str),
+            Some("verified"),
+            "freshly accepted skill (all files present) must audit as verified: {audit_live}"
+        );
+
+        let probe_file = accept_files[0].clone();
+        let probe_abs = root.join(&probe_file);
+        let saved = std::fs::read(&probe_abs).expect("read probe file before delete");
+        std::fs::remove_file(&probe_abs).expect("remove probe file");
+        let _ = service
+            .call_tool(call_params("admin", json!({ "mode": "rescan"})))
+            .await
+            .expect("rescan after file deletion");
+        let stale_audit = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "audit",  "key": &memory_key, "dry_run": true }),
+                ))
+                .await
+                .expect("memory_audit stale wedge"),
+        );
+        let stale_results = stale_audit
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("stale audit results");
+        assert_eq!(stale_results.len(), 1, "stale audit must have one result");
+        assert_eq!(
+            stale_results[0].get("state").and_then(Value::as_str),
+            Some("stale"),
+            "memory_audit must return state=stale after a referenced file is deleted: \
+             {stale_results:?} (file: {probe_file})"
+        );
+
+        std::fs::write(&probe_abs, &saved).expect("restore probe file");
+        let _ = service
+            .call_tool(call_params("admin", json!({ "mode": "rescan"})))
+            .await
+            .expect("rescan after restore");
+        let _ = service
+            .call_tool(call_params("memory", json!({ "mode": "delete",  "key": &memory_key })))
+            .await;
+
+        let mine_e = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "mine",
+                        "min_support": 1,
+                        "min_confidence": 0.1,
+                        "max_files_per_commit": 10,
+                        "window": 50,
+                    }),
+                ))
+                .await
+                .expect("proposals_mine for reject test"),
+        );
+        let mined_e = mine_e.get("mined").and_then(Value::as_u64).unwrap_or(0);
+        assert!(
+            mined_e >= 1,
+            "re-mine must regenerate the cluster (git history is immutable): {mine_e}"
+        );
+        let list_e = decode_text(
+            &service
+                .call_tool(call_params("memory", json!({ "mode": "proposals",  "limit": 10 })))
+                .await
+                .expect("proposals_list for reject"),
+        );
+        let reject_id = list_e["proposals"][0]
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("reject id")
+            .to_string();
+        let reject_body = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "reject",  "id": reject_id, "reason": "smoke-test rejection" }),
+                ))
+                .await
+                .expect("proposal_reject"),
+        );
+        assert_eq!(
+            reject_body.get("rejected").and_then(Value::as_bool),
+            Some(true),
+            "proposal_reject must return rejected=true: {reject_body}"
+        );
+        let mine_after = decode_text(
+            &service
+                .call_tool(call_params(
+                    "memory",
+                    json!({ "mode": "mine",
+                        "min_support": 1,
+                        "min_confidence": 0.1,
+                        "max_files_per_commit": 10,
+                        "window": 50,
+                    }),
+                ))
+                .await
+                .expect("proposals_mine after reject"),
+        );
+        let mined_after = mine_after.get("mined").and_then(Value::as_u64).unwrap_or(0);
+        assert!(
+            mined_after < mined_e,
+            "re-mine after reject must produce fewer candidates (tombstone suppressed): \
+             mined_after={mined_after} mined_e={mined_e}"
         );
     }
 
     let body = decode_text(
         &service
-            .call_tool(call_params("index_rescan", json!({})))
+            .call_tool(call_params("admin", json!({ "mode": "rescan"})))
             .await
             .expect("rescan"),
     );
     let scanned = body.get("scanned").and_then(Value::as_u64).expect("scanned");
     assert!(scanned > 0, "rescan should walk at least the fixture files");
 
-    // `full` did nothing `{}` does not do, and silently discarded `paths` beside it. It is not an
-    // argument: a call that passes it is told so instead of being run as something else.
-    let refused = service
-        .call_tool(call_params(
-            "index_rescan",
-            json!({ "full": true, "paths": ["does-not-exist.rs"] }),
-        ))
-        .await
-        .expect("a tool result");
-    assert_eq!(refused.is_error, Some(true), "{refused:?}");
-    let message = error_text(&refused);
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "admin",
+                json!({ "mode": "rescan",  "full": true, "paths": ["does-not-exist.rs"] }),
+            ))
+            .await
+            .expect("rescan full"),
+    );
+    let scanned_full = body.get("scanned").and_then(Value::as_u64).expect("scanned (full)");
     assert!(
-        message.contains("full") && message.contains("paths"),
-        "the refusal names the unknown field and the accepted one: {message}"
+        scanned_full > 0,
+        "rescan {{full:true}} must force a full working-tree scan even with a paths scope, \
+         got scanned={scanned_full}"
     );
 
     let body = decode_text(
         &service
-            .call_tool(call_params("index_rescan", json!({ "paths": ["a.rs"] })))
+            .call_tool(call_params("admin", json!({ "mode": "rescan",  "paths": ["a.rs"] })))
             .await
             .expect("rescan scoped"),
     );
@@ -1073,14 +1721,188 @@ async fn mcp_server_exercises_representative_tools() {
          got all-zero report {body}"
     );
 
+    let _ = service
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "symbols", "needle": "Beta", "limit": 5 }),
+        ))
+        .await
+        .expect("search_symbols to seed a sub-millisecond telemetry row");
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params("admin", json!({ "mode": "telemetry",  "window": "all" })))
+            .await
+            .expect("telemetry_summary"),
+    );
+    let total_calls = body.get("total_calls").and_then(Value::as_u64).expect("total_calls");
+    assert!(
+        total_calls >= 4,
+        "telemetry_summary should see at least the prior fixture calls (admin:status/outline/search_symbols/recent_changes), got {total_calls}"
+    );
+    let per_tool = body.get("per_tool").and_then(Value::as_array).expect("per_tool array");
+    assert!(!per_tool.is_empty(), "per_tool histogram must not be empty");
+
+    let recent = body.get("recent").and_then(Value::as_array).expect("recent array");
+    assert!(!recent.is_empty(), "recent calls must not be empty");
+    for call in recent {
+        assert!(
+            call.get("elapsed_us").and_then(Value::as_u64).is_some(),
+            "every telemetry row must carry an `elapsed_us` reading, got {call}"
+        );
+    }
+    const SUB_MS_TOOLS: [&str; 5] = [
+        "code:find",
+        "code:references",
+        "code:symbols",
+        "code:grep",
+        "code:outline",
+    ];
+    let sub_ms: Vec<u64> = recent
+        .iter()
+        .filter(|c| {
+            c.get("tool")
+                .and_then(Value::as_str)
+                .is_some_and(|t| SUB_MS_TOOLS.contains(&t))
+        })
+        .filter_map(|c| c.get("elapsed_us").and_then(Value::as_u64))
+        .collect();
+    assert!(
+        !sub_ms.is_empty(),
+        "fixture must exercise at least one sub-millisecond tool: {recent:?}"
+    );
+    assert!(
+        sub_ms.iter().any(|&us| us > 0),
+        "every sub-millisecond tool recorded 0 — telemetry is truncating to milliseconds: {sub_ms:?}"
+    );
+    let savings_note = body.get("savings_note").and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        savings_note.contains("estimate") || savings_note.contains("heuristic"),
+        "savings_note must disclose the heuristic nature: {savings_note:?}"
+    );
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params("admin", json!({ "mode": "cache_stats"})))
+            .await
+            .expect("cache_stats"),
+    );
+    let blob_count = body.get("blob_count").and_then(Value::as_u64).expect("blob_count");
+    assert!(
+        blob_count >= 1,
+        "freshly-scanned fixture should have blobs on disk: {body}"
+    );
+    assert!(
+        body.get("blob_accounting_ok").and_then(Value::as_bool).unwrap_or(false),
+        "orphan accounting must have run after a clean scan: {body}"
+    );
+    let per_view = body
+        .get("per_view_file_count")
+        .and_then(Value::as_array)
+        .expect("per_view_file_count array");
+    assert!(!per_view.is_empty(), "the working view should be listed: {body}");
+
+    let u = |k: &str| body.get(k).and_then(Value::as_u64).unwrap_or_default();
+    let total = u("total_bytes");
+    let component_sum = u("blobs_bytes")
+        + u("views_bytes")
+        + u("lance_bytes")
+        + u("git_cache_bytes")
+        + u("telemetry_bytes")
+        + u("git_history_bytes");
+    assert_eq!(
+        total,
+        component_sum + u("other_bytes"),
+        "total_bytes must reconcile to components + other: {body}"
+    );
+    assert!(
+        total >= component_sum,
+        "total_bytes must be at least the component sum: {body}"
+    );
+    assert!(
+        body.get("git_history_bytes").and_then(Value::as_u64).is_some(),
+        "git_history_bytes field must be present: {body}"
+    );
+    assert_eq!(
+        body.get("blob_accounting_ok").and_then(Value::as_bool),
+        Some(true),
+        "blob_accounting_ok must be true on a clean scan: {body}"
+    );
+    if let Some(rss) = body.get("rss_bytes").and_then(Value::as_u64) {
+        assert!(rss > 0, "rss_bytes, when reported, is the live server RSS: {body}");
+    }
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params("admin", json!({ "mode": "gc"})))
+            .await
+            .expect("cache_gc"),
+    );
+    assert_eq!(
+        body.get("removed").and_then(Value::as_u64),
+        Some(0),
+        "no orphaned blobs to reclaim on a clean scan: {body}"
+    );
+    assert_eq!(
+        body.get("bytes_freed").and_then(Value::as_u64),
+        Some(0),
+        "zero bytes freed when nothing is orphaned: {body}"
+    );
+    let scanned = body.get("scanned").and_then(Value::as_u64).expect("scanned");
+    assert!(scanned >= 1, "GC should have inspected blob files: {body}");
+
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "relation": "implementations", "name": "Drawable", "limit": 100 }),
+                "admin",
+                json!({ "mode": "cache_clear",  "component": "telemetry" }),
             ))
             .await
-            .expect("code_refs implementations(Drawable)"),
+            .expect("cache_clear(telemetry)"),
+    );
+    assert_eq!(
+        body.get("component").and_then(Value::as_str),
+        Some("telemetry"),
+        "echoes the cleared component: {body}"
+    );
+    assert_eq!(
+        body.get("cleared").and_then(Value::as_bool),
+        Some(true),
+        "telemetry clear should succeed: {body}"
+    );
+
+    let err = service
+        .call_tool(call_params(
+            "admin",
+            json!({ "mode": "cache_clear",  "component": "blobs" }),
+        ))
+        .await;
+    assert!(
+        err.is_err(),
+        "clearing `blobs` without confirm=true must be rejected, got: {err:?}"
+    );
+
+    for component in ["views", "all"] {
+        let err = service
+            .call_tool(call_params(
+                "admin",
+                json!({ "mode": "cache_clear",  "component": component, "confirm": true }),
+            ))
+            .await;
+        assert!(
+            err.is_err(),
+            "clearing `{component}` in-process must be refused (deletes the live index), got: {err:?}"
+        );
+    }
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "implementations", "trait_name": "Drawable", "limit": 100 }),
+            ))
+            .await
+            .expect("find_implementations(Drawable)"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     let impl_types: Vec<&str> = hits
@@ -1089,26 +1911,26 @@ async fn mcp_server_exercises_representative_tools() {
         .collect();
     assert!(
         impl_types.contains(&"Beta"),
-        "code_refs implementations(Drawable) must include Beta from a.rs: {impl_types:?}"
+        "find_implementations(Drawable) must include Beta from a.rs: {impl_types:?}"
     );
     assert!(
         impl_types.contains(&"Rectangle"),
-        "code_refs implementations(Drawable) must include Rectangle from b.ts: {impl_types:?}"
+        "find_implementations(Drawable) must include Rectangle from b.ts: {impl_types:?}"
     );
     assert!(
         hits.iter()
-            .all(|h| h.get("line").and_then(Value::as_u64).unwrap_or(0) >= 1),
-        "every code_refs implementations hit must carry a 1-based line"
+            .all(|h| h.get("start_row").and_then(Value::as_u64).unwrap_or(0) >= 1),
+        "every find_implementations hit must carry a 1-based start_row"
     );
 
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "relation": "implementations", "name": "Foo", "limit": 100 }),
+                "code",
+                json!({ "mode": "implementations", "trait_name": "Foo", "limit": 100 }),
             ))
             .await
-            .expect("code_refs implementations(Foo)"),
+            .expect("find_implementations(Foo)"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     let impl_types: Vec<&str> = hits
@@ -1117,17 +1939,17 @@ async fn mcp_server_exercises_representative_tools() {
         .collect();
     assert!(
         impl_types.contains(&"Bar"),
-        "code_refs implementations(Foo) must include Bar from d.py: {impl_types:?}"
+        "find_implementations(Foo) must include Bar from d.py: {impl_types:?}"
     );
 
     let impl_page1 = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "relation": "implementations", "name": "Drawable", "limit": 1 }),
+                "code",
+                json!({ "mode": "implementations", "trait_name": "Drawable", "limit": 1 }),
             ))
             .await
-            .expect("code_refs implementations page1"),
+            .expect("find_implementations page1"),
     );
     let impl_page1_hits = impl_page1
         .get("hits")
@@ -1141,16 +1963,16 @@ async fn mcp_server_exercises_representative_tools() {
     let impl_cursor1 = impl_page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("code_refs implementations first page must carry next_cursor when ≥2 implementors exist")
+        .expect("find_implementations first page must carry next_cursor when ≥2 implementors exist")
         .to_string();
     let impl_page2 = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "relation": "implementations", "name": "Drawable", "limit": 1, "cursor": impl_cursor1 }),
+                "code",
+                json!({ "mode": "implementations", "trait_name": "Drawable", "limit": 1, "cursor": impl_cursor1 }),
             ))
             .await
-            .expect("code_refs implementations page2"),
+            .expect("find_implementations page2"),
     );
     let impl_page2_hits = impl_page2
         .get("hits")
@@ -1159,7 +1981,7 @@ async fn mcp_server_exercises_representative_tools() {
     assert_eq!(
         impl_page2_hits.len(),
         1,
-        "code_refs implementations page2 must return the remaining hit"
+        "find_implementations page2 must return the remaining hit"
     );
     let impl_key_of = |h: &Value| -> (String, String) {
         (
@@ -1170,23 +1992,46 @@ async fn mcp_server_exercises_representative_tools() {
     assert_ne!(
         impl_key_of(&impl_page1_hits[0]),
         impl_key_of(&impl_page2_hits[0]),
-        "code_refs implementations pages must not overlap"
+        "find_implementations pages must not overlap"
     );
 
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "name": "lph", "match": "substring", "limit": 100 }),
+                "code",
+                json!({ "mode": "implementations", "trait_name": "Drawable", "language": "rust", "limit": 100 }),
             ))
             .await
-            .expect("code_refs(substring)"),
+            .expect("find_implementations(language=rust)"),
+    );
+    let hits = body.get("hits").and_then(Value::as_array).expect("hits");
+    let impl_types: Vec<&str> = hits
+        .iter()
+        .filter_map(|h| h.get("impl_type").and_then(Value::as_str))
+        .collect();
+    assert!(
+        impl_types.contains(&"Beta"),
+        "rust-filtered Drawable must include Beta: {impl_types:?}"
+    );
+    assert!(
+        !impl_types.contains(&"Rectangle"),
+        "rust-filtered Drawable must not include Rectangle (TypeScript): {impl_types:?}"
+    );
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "references", "name": "lph", "limit": 100 }),
+            ))
+            .await
+            .expect("find_references(substring)"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     assert_eq!(
         hits.len(),
         3,
-        "code_refs(\"lph\") must return the 3 alpha() call sites via substring: {body}"
+        "find_references(\"lph\") must return the 3 alpha() call sites via substring: {body}"
     );
     assert!(
         hits.iter()
@@ -1197,11 +2042,11 @@ async fn mcp_server_exercises_representative_tools() {
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "relation": "implementations", "name": "raw", "match": "substring", "limit": 100 }),
+                "code",
+                json!({ "mode": "implementations", "trait_name": "raw", "limit": 100 }),
             ))
             .await
-            .expect("code_refs implementations(substring)"),
+            .expect("find_implementations(substring)"),
     );
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
     let impl_types: Vec<&str> = hits
@@ -1210,11 +2055,11 @@ async fn mcp_server_exercises_representative_tools() {
         .collect();
     assert!(
         impl_types.contains(&"Beta"),
-        "code_refs implementations(\"raw\") must include Beta via substring on \"Drawable\": {impl_types:?}"
+        "find_implementations(\"raw\") must include Beta via substring on \"Drawable\": {impl_types:?}"
     );
     assert!(
         impl_types.contains(&"Rectangle"),
-        "code_refs implementations(\"raw\") must include Rectangle via substring on \"Drawable\": {impl_types:?}"
+        "find_implementations(\"raw\") must include Rectangle via substring on \"Drawable\": {impl_types:?}"
     );
     assert_eq!(
         body.get("trait_name").and_then(Value::as_str),
@@ -1224,26 +2069,176 @@ async fn mcp_server_exercises_representative_tools() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "", "limit": 100 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "", "limit": 100 }),
+            ))
             .await
-            .expect("code_symbols(empty)"),
+            .expect("search_symbols(empty)"),
     );
     let results = body.get("results").and_then(Value::as_array).expect("results");
     assert!(
         results.is_empty(),
-        "code_symbols with empty needle must return 0 results, got {results:?}"
+        "search_symbols with empty needle must return 0 results, got {results:?}"
     );
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_read", json!({ "path": "a.rs", "symbol": "alpha" })))
+            .call_tool(call_params("admin", json!({ "mode": "compress",  "path": "a.rs" })))
             .await
-            .expect("code_read(path=a.rs, symbol=alpha)"),
+            .expect("compress(path=a.rs)"),
+    );
+    assert_eq!(
+        body.get("strategy").and_then(Value::as_str),
+        Some("structural"),
+        "code-file compress must use strategy=structural: {body}"
+    );
+    let original_bytes = body
+        .get("original_bytes")
+        .and_then(Value::as_u64)
+        .expect("original_bytes");
+    let compressed_bytes = body
+        .get("compressed_bytes")
+        .and_then(Value::as_u64)
+        .expect("compressed_bytes");
+    assert!(original_bytes > 0, "original_bytes must be positive for a.rs: {body}");
+    assert!(
+        compressed_bytes > 0,
+        "compressed_bytes must be positive for a non-empty outline: {body}"
+    );
+    let output = body.get("output").and_then(Value::as_str).expect("output");
+    assert!(
+        output.contains("alpha") || output.contains("Beta"),
+        "structural output must reference indexed symbols: {output:?}"
+    );
+    assert!(
+        !output.contains("let _ = 1"),
+        "structural output must NOT include function body literals: {output:?}"
+    );
+    let tokens_counted = body
+        .get("tokens_counted")
+        .and_then(Value::as_bool)
+        .expect("tokens_counted");
+    assert_eq!(
+        tokens_counted,
+        cfg!(feature = "documents"),
+        "tokens_counted must track the documents feature"
+    );
+    let tokens_note = body.get("tokens_note").and_then(Value::as_str).expect("tokens_note");
+    if cfg!(feature = "documents") {
+        assert!(
+            tokens_note.contains("tokenizer"),
+            "real-count note must mention the tokenizer: {tokens_note:?}"
+        );
+    } else {
+        assert!(
+            tokens_note.contains("bytes/4"),
+            "heuristic note must disclose bytes/4: {tokens_note:?}"
+        );
+    }
+    let original_tokens = body
+        .get("original_tokens")
+        .and_then(Value::as_u64)
+        .expect("original_tokens");
+    let compressed_tokens = body
+        .get("compressed_tokens")
+        .and_then(Value::as_u64)
+        .expect("compressed_tokens");
+    let tokens_reduced = body
+        .get("tokens_reduced")
+        .and_then(Value::as_u64)
+        .expect("tokens_reduced");
+    assert_eq!(
+        tokens_reduced,
+        original_tokens.saturating_sub(compressed_tokens),
+        "tokens_reduced must equal original - compressed"
+    );
+
+    let prose = "It is worth noting that this is a test paragraph.\n\n\
+                 It is worth noting that this is a test paragraph.\n\n\
+                 The code runs correctly.";
+    let body = decode_text(
+        &service
+            .call_tool(call_params("admin", json!({ "mode": "compress",  "text": prose })))
+            .await
+            .expect("compress(text prose)"),
+    );
+    assert_eq!(
+        body.get("strategy").and_then(Value::as_str),
+        Some("lexical"),
+        "prose compress must use strategy=lexical: {body}"
+    );
+    let prose_compressed = body
+        .get("compressed_bytes")
+        .and_then(Value::as_u64)
+        .expect("compressed_bytes");
+    let prose_original = body
+        .get("original_bytes")
+        .and_then(Value::as_u64)
+        .expect("original_bytes");
+    assert!(
+        prose_compressed < prose_original,
+        "lexical pass must reduce size for a repeated-filler prose input: {prose_original} → {prose_compressed}"
+    );
+    let prose_tokens_counted = body
+        .get("tokens_counted")
+        .and_then(Value::as_bool)
+        .expect("tokens_counted");
+    assert_eq!(
+        prose_tokens_counted,
+        cfg!(feature = "documents"),
+        "tokens_counted must track the documents feature"
+    );
+    let prose_orig_tokens = body
+        .get("original_tokens")
+        .and_then(Value::as_u64)
+        .expect("original_tokens");
+    let prose_comp_tokens = body
+        .get("compressed_tokens")
+        .and_then(Value::as_u64)
+        .expect("compressed_tokens");
+    let prose_reduced = body
+        .get("tokens_reduced")
+        .and_then(Value::as_u64)
+        .expect("tokens_reduced");
+    assert_eq!(
+        prose_reduced,
+        prose_orig_tokens.saturating_sub(prose_comp_tokens),
+        "tokens_reduced must equal original - compressed"
+    );
+
+    let err = service
+        .call_tool(call_params(
+            "admin",
+            json!({ "mode": "compress",  "text": "hello", "path": "a.rs" }),
+        ))
+        .await;
+    assert!(
+        err.is_err(),
+        "compress with both text and path must be rejected: {err:?}"
+    );
+
+    let err = service
+        .call_tool(call_params("admin", json!({ "mode": "compress"})))
+        .await;
+    assert!(
+        err.is_err(),
+        "compress with neither text nor path must be rejected: {err:?}"
+    );
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "expand", "path": "a.rs", "name": "alpha" }),
+            ))
+            .await
+            .expect("expand(path=a.rs, name=alpha)"),
     );
     assert_eq!(
         body.get("name").and_then(Value::as_str),
         Some("alpha"),
-        "code_read must echo the resolved name: {body}"
+        "expand must echo the resolved name: {body}"
     );
     assert_eq!(
         body.get("kind").and_then(Value::as_str),
@@ -1257,52 +2252,170 @@ async fn mcp_server_exercises_representative_tools() {
     );
     assert!(
         expand_body.contains("let _ = 1"),
-        "expanded body must include the function body literal : {expand_body:?}"
+        "expanded body must include the function body literal (compress omits it, expand includes it): {expand_body:?}"
     );
-    let line = body.get("line").and_then(Value::as_u64).expect("line");
-    let end_line = body.get("end_line").and_then(Value::as_u64).expect("end_line");
-    assert_eq!(line, 1, "alpha is defined on the first line (1-based): {body}");
-    assert!(end_line >= line, "end_line must be >= line: {body}");
-    assert!(
-        body.get("truncated").is_none(),
-        "a small function is not truncated, and a false `truncated` is left out: {body}"
+    let start_row = body.get("start_row").and_then(Value::as_u64).expect("start_row");
+    let end_row = body.get("end_row").and_then(Value::as_u64).expect("end_row");
+    assert!(start_row >= 1, "start_row must be one-based: {body}");
+    assert!(end_row >= start_row, "end_row must be >= start_row: {body}");
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "small function must not be truncated: {body}"
     );
 
-    let missing = service
+    let err = service
         .call_tool(call_params(
-            "code_read",
-            json!({ "path": "a.rs", "symbol": "nonexistent_symbol_xyz" }),
+            "code",
+            json!({ "mode": "expand", "path": "a.rs", "name": "nonexistent_symbol_xyz" }),
         ))
-        .await
-        .expect("code_read(unknown symbol)");
-    let message = error_text(&missing);
-    assert!(
-        message.contains("no symbol `nonexistent_symbol_xyz` in `a.rs`") && message.contains("alpha (line 1)"),
-        "an unknown symbol must be refused naming the symbols the file does have: {message}"
+        .await;
+    assert!(err.is_err(), "expand with unknown symbol must be rejected: {err:?}");
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "expand", "path": "a.rs", "symbol": "alpha" }),
+            ))
+            .await
+            .expect("expand(path=a.rs, symbol=alpha via alias)"),
+    );
+    assert_eq!(
+        body.get("name").and_then(Value::as_str),
+        Some("alpha"),
+        "expand via `symbol` alias must resolve correctly: {body}"
     );
 
     let body = decode_text(
         &service
             .call_tool(call_params(
-                "code_read",
-                json!({ "path": "a.rs", "line": 1, "end_line": 2 }),
+                "admin",
+                json!({ "mode": "delta",
+                    "old": "alpha\nbeta\ngamma\n",
+                    "new": "alpha\nbeta2\ngamma\ndelta\n",
+                }),
             ))
             .await
-            .expect("code_read(line span)"),
+            .expect("delta(old, new)"),
     );
     assert_eq!(
-        (
-            body.get("line").and_then(Value::as_u64),
-            body.get("end_line").and_then(Value::as_u64),
-            body.get("total_lines").and_then(Value::as_u64),
-        ),
-        (Some(1), Some(2), Some(7)),
-        "a span read echoes its 1-based inclusive span and the file's line count: {body}"
+        body.get("changed").and_then(Value::as_bool),
+        Some(true),
+        "differing inputs must report changed=true: {body}"
     );
-    let span = body.get("body").and_then(Value::as_str).expect("span body");
+    assert_eq!(
+        body.get("bailed").and_then(Value::as_bool),
+        Some(false),
+        "small inputs must not bail: {body}"
+    );
+    assert_eq!(
+        body.get("added").and_then(Value::as_u64),
+        Some(2),
+        "beta2 + delta are the two adds: {body}"
+    );
+    assert_eq!(
+        body.get("removed").and_then(Value::as_u64),
+        Some(1),
+        "beta is the single deletion: {body}"
+    );
+    let delta_output = body.get("output").and_then(Value::as_str).expect("output");
     assert!(
-        span.contains("pub fn alpha") && span.contains("pub struct Beta") && !span.contains("impl Beta"),
-        "a span read returns exactly the requested lines: {span:?}"
+        delta_output.starts_with("+2/-1"),
+        "delta output must lead with the +A/-R header: {delta_output:?}"
+    );
+
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "admin",
+                json!({ "mode": "delta",  "old": "same\n", "new": "same\n" }),
+            ))
+            .await
+            .expect("delta(identical)"),
+    );
+    assert_eq!(
+        body.get("changed").and_then(Value::as_bool),
+        Some(false),
+        "identical inputs must report changed=false: {body}"
+    );
+
+    std::fs::write(root.join("checkpoint_probe.txt"), b"probe\n").unwrap();
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "admin",
+                json!({ "mode": "checkpoint",  "text": "We decided to use rayon.\nerror: build failed\n" }),
+            ))
+            .await
+            .expect("checkpoint(text)"),
+    );
+    assert_eq!(
+        body.get("decisions").and_then(Value::as_array),
+        Some(&vec![Value::String("We decided to use rayon.".to_string())]),
+        "checkpoint must extract the decision line: {body}"
+    );
+    assert_eq!(
+        body.get("errors").and_then(Value::as_array),
+        Some(&vec![Value::String("error: build failed".to_string())]),
+        "checkpoint must extract the error line: {body}"
+    );
+    let files_changed: Vec<&str> = body
+        .get("files_changed")
+        .and_then(Value::as_array)
+        .expect("files_changed")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        files_changed.contains(&"checkpoint_probe.txt"),
+        "files_changed must come from this repo's git working tree: {files_changed:?}"
+    );
+
+    let log = "{\"tool\":\"Read\",\"target\":\"a.rs\",\"bytes\":100}\n\
+               {\"tool\":\"Read\",\"target\":\"a.rs\",\"bytes\":100}\n";
+    let body = decode_text(
+        &service
+            .call_tool(call_params("admin", json!({ "mode": "waste",  "log": log })))
+            .await
+            .expect("detect_waste(log)"),
+    );
+    let findings = body.get("findings").and_then(Value::as_array).expect("findings");
+    assert_eq!(
+        findings.len(),
+        1,
+        "two redundant reads of one target must yield exactly one finding: {body}"
+    );
+    let finding = &findings[0];
+    assert_eq!(
+        finding.get("kind").and_then(Value::as_str),
+        Some("redundant_read"),
+        "finding kind: {finding}"
+    );
+    assert_eq!(
+        finding.get("target").and_then(Value::as_str),
+        Some("a.rs"),
+        "finding target: {finding}"
+    );
+    assert_eq!(
+        finding.get("count").and_then(Value::as_u64),
+        Some(2),
+        "finding count: {finding}"
+    );
+    assert_eq!(
+        finding.get("estimated_waste_bytes").and_then(Value::as_u64),
+        Some(100),
+        "waste is the bytes of every read after the first: {finding}"
+    );
+    assert_eq!(
+        body.get("total_estimated_waste_bytes").and_then(Value::as_u64),
+        Some(100),
+        "total_estimated_waste_bytes: {body}"
+    );
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "well under MAX_FINDINGS must not truncate: {body}"
     );
 
     let _ = service.cancel().await;
@@ -1311,8 +2424,9 @@ async fn mcp_server_exercises_representative_tools() {
 /// Build a multi-commit fixture used by the git-iterator pagination tests.
 ///
 /// Layout: a single `paged.rs` file rewritten across 5 commits, each modifying the
-/// body of `paged()`. That gives `git_log` ≥ 5 commits to page over, with or without a
-/// `path`, and ≥ 5 "modified" entries for the symbol history. The last commit in the helper rewrites only line 1 so
+/// body of `paged()`. That gives `recent_changes` and `commits_touching` ≥ 5
+/// commits to page over, `find_commits_by_path` ≥ 5 matches, and `symbol_history`
+/// ≥ 5 "modified" entries. The last commit in the helper rewrites only line 1 so
 /// `paged.rs` blame partitions into ≥ 2 distinct hunks.
 fn build_paging_repo() -> TempDir {
     basemind::store::init_isolated_cache();
@@ -1358,37 +2472,48 @@ fn commit_shas(body: &Value) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_recent_paginates_with_stable_cursor() {
     let (_dir, service) = spawn_paging_server().await;
-    wait_for_git_history(&service).await;
     let page1 = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "limit": 2 })))
+            .call_tool(call_params("git", json!({ "mode": "recent", "limit": 2 })))
             .await
-            .expect("git_log page1"),
+            .expect("git recent page1"),
     );
     let p1_shas = commit_shas(&page1);
-    assert_eq!(p1_shas.len(), 2, "git_log limit=2 → 2 commits");
+    assert_eq!(p1_shas.len(), 2, "git recent limit=2 → 2 commits");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("git_log page1 must carry next_cursor")
+        .expect("git recent page1 must carry next_cursor")
         .to_string();
     let page2 = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "limit": 2, "cursor": &cursor1 })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "recent", "limit": 2, "cursor": cursor1 }),
+            ))
             .await
-            .expect("git_log page2"),
+            .expect("git recent page2"),
     );
     let p2_shas = commit_shas(&page2);
-    assert_eq!(p2_shas.len(), 2, "git_log page2 → 2 more commits");
+    assert_eq!(p2_shas.len(), 2, "git recent page2 → 2 more commits");
     assert!(
         p2_shas.iter().all(|s| !p1_shas.contains(s)),
-        "git_log pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
+        "git recent pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
     );
-    let bogus = rebound(&cursor1, &basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF));
-    let stale = refused(&service, "git_log", json!({ "limit": 2, "cursor": bogus })).await;
-    assert!(
-        stale.contains("changed since this cursor was issued"),
-        "a cursor from another HEAD is an error, not an empty page: {stale}"
+    let bogus = basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF);
+    let stale = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "recent", "limit": 2, "cursor": bogus }),
+            ))
+            .await
+            .expect("git recent stale"),
+    );
+    assert_eq!(
+        stale.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "bogus snapshot must surface cursor_invalidated: {stale}"
     );
     let _ = service.cancel().await;
 }
@@ -1396,78 +2521,154 @@ async fn git_recent_paginates_with_stable_cursor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_touching_paginates_with_stable_cursor() {
     let (_dir, service) = spawn_paging_server().await;
-    wait_for_git_history(&service).await;
     let page1 = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "path": "paged.rs", "limit": 2 })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "touching", "path": "paged.rs", "limit": 2 }),
+            ))
             .await
-            .expect("git_log path page1"),
+            .expect("git touching page1"),
     );
     let p1_shas = commit_shas(&page1);
-    assert_eq!(p1_shas.len(), 2, "git_log path page1 → 2 commits");
+    assert_eq!(p1_shas.len(), 2, "git touching page1 → 2 commits");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("git_log path must carry next_cursor")
+        .expect("git touching must carry next_cursor")
         .to_string();
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "git_log",
-                json!({ "path": "paged.rs", "limit": 2, "cursor": &cursor1 }),
+                "git",
+                json!({ "mode": "touching", "path": "paged.rs", "limit": 2, "cursor": cursor1 }),
             ))
             .await
-            .expect("git_log path page2"),
+            .expect("git touching page2"),
     );
     let p2_shas = commit_shas(&page2);
-    assert_eq!(p2_shas.len(), 2, "git_log path page2 → 2 more commits");
+    assert_eq!(p2_shas.len(), 2, "git touching page2 → 2 more commits");
     assert!(
         p2_shas.iter().all(|s| !p1_shas.contains(s)),
-        "git_log path pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
+        "git touching pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
     );
-    let bogus = rebound(&cursor1, &basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF));
-    let stale = refused(
-        &service,
-        "git_log",
-        json!({ "path": "paged.rs", "limit": 2, "cursor": bogus }),
-    )
-    .await;
-    assert!(
-        stale.contains("changed since this cursor was issued"),
-        "a cursor from another HEAD is an error, not an empty page: {stale}"
+    let bogus = basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF);
+    let stale = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "touching", "path": "paged.rs", "limit": 2, "cursor": bogus }),
+            ))
+            .await
+            .expect("git touching stale"),
+    );
+    assert_eq!(
+        stale.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "bogus snapshot must surface cursor_invalidated: {stale}"
     );
     let _ = service.cancel().await;
 }
 
-/// Wait (bounded) until `git_log` answers from the git-history index, which the server builds after
-/// it starts. A `git_log` cursor counts in the list it was issued on, and one issued on the live walk
-/// is refused once the index answers, so a test of stable paging pages after that point. An index
-/// that never comes up fails the test: the server is meant to build it, unless `BASEMIND_GH_INDEX=0`
-/// turns it off, and then every page is the live walk.
-async fn wait_for_git_history(service: &rmcp::service::RunningService<rmcp::RoleClient, ()>) {
-    if std::env::var("BASEMIND_GH_INDEX").is_ok_and(|value| value == "0") {
-        return;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        let probe = decode_text(
-            &service
-                .call_tool(call_params("git_log", json!({ "query": "step" })))
-                .await
-                .expect("git_log query"),
-        );
-        if probe.get("truncated").is_none() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    panic!("the git-history index did not come up within 60 s of `serve` starting");
+/// `git` mode `churn` aggregates the churn window. The paging fixture touches `paged.rs` in all 5
+/// commits, so it must rank first with `commits_touching == 5`. Exercises the tool end-to-end
+/// through the real `serve` subprocess (whichever of the git-history index / live-walk path is
+/// active — both must agree).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_churn_ranks_the_churned_file_first() {
+    let (_dir, service) = spawn_paging_server().await;
+    let body = decode_text(
+        &service
+            .call_tool(call_params("git", json!({ "mode": "churn", "window": 50, "top_k": 5 })))
+            .await
+            .expect("git churn"),
+    );
+    let files = body
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("git churn returns a files array");
+    assert!(!files.is_empty(), "git churn returns entries: {body}");
+    let top = &files[0];
+    assert_eq!(
+        top.get("path").and_then(Value::as_str),
+        Some("paged.rs"),
+        "paged.rs is the most-churned file: {body}"
+    );
+    assert_eq!(
+        top.get("commits_touching").and_then(Value::as_u64),
+        Some(5),
+        "paged.rs was touched in all 5 commits: {body}"
+    );
+    let _ = service.cancel().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_by_path_paginates_with_stable_cursor() {
+    let (_dir, service) = spawn_paging_server().await;
+    let page1 = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "by_path", "pattern": "paged\\.rs", "window": 50, "limit": 2 }),
+            ))
+            .await
+            .expect("git by_path page1"),
+    );
+    let p1_shas = commit_shas(&page1);
+    assert_eq!(p1_shas.len(), 2, "git by_path page1 → 2 commits: {page1}");
+    let cursor1 = page1
+        .get("next_cursor")
+        .and_then(Value::as_str)
+        .expect("git by_path must carry next_cursor")
+        .to_string();
+    let page2 = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({
+                    "mode": "by_path",
+                    "pattern": "paged\\.rs",
+                    "window": 50,
+                    "limit": 2,
+                    "cursor": cursor1,
+                }),
+            ))
+            .await
+            .expect("git by_path page2"),
+    );
+    let p2_shas = commit_shas(&page2);
+    assert!(!p2_shas.is_empty(), "git by_path page2 must have ≥ 1 commit: {page2}");
+    assert!(
+        p2_shas.iter().all(|s| !p1_shas.contains(s)),
+        "git by_path pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
+    );
+    let bogus = basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF);
+    let stale = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({
+                    "mode": "by_path",
+                    "pattern": "paged\\.rs",
+                    "window": 50,
+                    "limit": 2,
+                    "cursor": bogus,
+                }),
+            ))
+            .await
+            .expect("git by_path stale"),
+    );
+    assert_eq!(
+        stale.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "bogus snapshot must surface cursor_invalidated: {stale}"
+    );
+    let _ = service.cancel().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn git_symbol_history_paginates_with_stable_cursor() {
     let (_dir, service) = spawn_paging_server().await;
-    wait_for_git_history(&service).await;
     let history_shas = |body: &Value| -> Vec<String> {
         body.get("history")
             .and_then(Value::as_array)
@@ -1481,54 +2682,63 @@ async fn git_symbol_history_paginates_with_stable_cursor() {
     let page1 = decode_text(
         &service
             .call_tool(call_params(
-                "git_log",
-                json!({ "path": "paged.rs", "symbol": "paged", "limit": 2 }),
+                "git",
+                json!({ "mode": "symbol_history", "path": "paged.rs", "name": "paged", "limit": 2 }),
             ))
             .await
-            .expect("git_log symbol page1"),
+            .expect("git symbol_history page1"),
     );
     let p1_shas = history_shas(&page1);
-    assert_eq!(p1_shas.len(), 2, "git_log symbol page1 → 2 entries: {page1}");
+    assert_eq!(p1_shas.len(), 2, "git symbol_history page1 → 2 entries: {page1}");
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("git_log symbol must carry next_cursor")
+        .expect("git symbol_history must carry next_cursor")
         .to_string();
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "git_log",
+                "git",
                 json!({
+                    "mode": "symbol_history",
                     "path": "paged.rs",
-                    "symbol": "paged",
+                    "name": "paged",
                     "limit": 2,
-                    "cursor": &cursor1,
+                    "cursor": cursor1,
                 }),
             ))
             .await
-            .expect("git_log symbol page2"),
+            .expect("git symbol_history page2"),
     );
     let p2_shas = history_shas(&page2);
-    assert!(!p2_shas.is_empty(), "git_log symbol page2 must have ≥ 1 entry: {page2}");
+    assert!(
+        !p2_shas.is_empty(),
+        "git symbol_history page2 must have ≥ 1 entry: {page2}"
+    );
     assert!(
         p2_shas.iter().all(|s| !p1_shas.contains(s)),
-        "git_log symbol pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
+        "git symbol_history pages must not overlap: {p1_shas:?} vs {p2_shas:?}"
     );
-    let bogus = rebound(&cursor1, &basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF));
-    let stale = refused(
-        &service,
-        "git_log",
-        json!({
-            "path": "paged.rs",
-            "symbol": "paged",
-            "limit": 2,
-            "cursor": bogus,
-        }),
-    )
-    .await;
-    assert!(
-        stale.contains("changed since this cursor was issued"),
-        "a cursor from another HEAD is an error, not an empty page: {stale}"
+    let bogus = basemind::testing::encode_in_memory_cursor(0, 0xDEAD_BEEF);
+    let stale = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({
+                    "mode": "symbol_history",
+                    "path": "paged.rs",
+                    "name": "paged",
+                    "limit": 2,
+                    "cursor": bogus,
+                }),
+            ))
+            .await
+            .expect("git symbol_history stale"),
+    );
+    assert_eq!(
+        stale.get("cursor_invalidated"),
+        Some(&Value::Bool(true)),
+        "bogus snapshot must surface cursor_invalidated: {stale}"
     );
     let _ = service.cancel().await;
 }
@@ -1548,91 +2758,53 @@ fn split_blame_lines(root: &std::path::Path) {
 async fn git_blame_paginates_by_start_line() {
     let (dir, service) = spawn_paging_server().await;
     split_blame_lines(dir.path());
-    let _ = service.call_tool(call_params("index_rescan", json!({}))).await;
+    let _ = service
+        .call_tool(call_params("admin", json!({ "mode": "rescan"})))
+        .await;
     let page1 = decode_text(
         &service
-            .call_tool(call_params("git_blame", json!({ "path": "paged.rs", "limit": 1 })))
+            .call_tool(call_params(
+                "git",
+                json!({ "mode": "blame", "path": "paged.rs", "limit": 1 }),
+            ))
             .await
-            .expect("git_blame page1"),
+            .expect("git blame page1"),
     );
     let p1_hunks = page1
         .get("hunks")
         .and_then(Value::as_array)
-        .expect("git_blame page1 hunks");
-    assert_eq!(p1_hunks.len(), 1, "git_blame limit=1 → 1 hunk: {page1}");
+        .expect("git blame page1 hunks");
+    assert_eq!(p1_hunks.len(), 1, "git blame limit=1 → 1 hunk: {page1}");
     let p1_start: Vec<u64> = p1_hunks
         .iter()
-        .filter_map(|h| h.get("line").and_then(Value::as_u64))
+        .filter_map(|h| h.get("start_line").and_then(Value::as_u64))
         .collect();
     let cursor1 = page1
         .get("next_cursor")
         .and_then(Value::as_str)
-        .expect("git_blame must carry next_cursor when more hunks remain")
+        .expect("git blame must carry next_cursor when more hunks remain")
         .to_string();
     let page2 = decode_text(
         &service
             .call_tool(call_params(
-                "git_blame",
-                json!({ "path": "paged.rs", "limit": 1, "cursor": &cursor1 }),
+                "git",
+                json!({ "mode": "blame", "path": "paged.rs", "limit": 1, "cursor": cursor1 }),
             ))
             .await
-            .expect("git_blame page2"),
+            .expect("git blame page2"),
     );
     let p2_hunks = page2
         .get("hunks")
         .and_then(Value::as_array)
-        .expect("git_blame page2 hunks");
-    assert!(!p2_hunks.is_empty(), "git_blame page2 must have ≥ 1 hunk: {page2}");
+        .expect("git blame page2 hunks");
+    assert!(!p2_hunks.is_empty(), "git blame page2 must have ≥ 1 hunk: {page2}");
     let p2_start: Vec<u64> = p2_hunks
         .iter()
-        .filter_map(|h| h.get("line").and_then(Value::as_u64))
+        .filter_map(|h| h.get("start_line").and_then(Value::as_u64))
         .collect();
-    assert_eq!(
-        p1_start.len(),
-        p1_hunks.len(),
-        "every page1 hunk carries a `line`: {page1}"
-    );
-    assert_eq!(
-        p2_start.len(),
-        p2_hunks.len(),
-        "every page2 hunk carries a `line`: {page2}"
-    );
     assert!(
         p2_start.iter().all(|s| !p1_start.contains(s)),
-        "git_blame pages must not overlap by line: {p1_start:?} vs {p2_start:?}"
-    );
-
-    let suspect = page1.get("suspect_sha").and_then(Value::as_str).expect("suspect_sha");
-    let revision = u32::from_str_radix(&suspect[..8], 16).expect("hex sha");
-    let past_the_end = rebound(&cursor1, &basemind::testing::encode_in_memory_cursor(9_999, revision));
-    let page_empty = decode_text(
-        &service
-            .call_tool(call_params(
-                "git_blame",
-                json!({ "path": "paged.rs", "limit": 1, "cursor": past_the_end }),
-            ))
-            .await
-            .expect("git_blame cursor past end"),
-    );
-    assert_eq!(
-        page_empty.get("hunks").and_then(Value::as_array).map(Vec::len),
-        Some(0),
-        "a cursor past the last hunk is an empty page: {page_empty}"
-    );
-    assert!(
-        page_empty.get("next_cursor").is_none(),
-        "an exhausted blame carries no next_cursor: {page_empty}"
-    );
-    let other_revision = rebound(&cursor1, &basemind::testing::encode_in_memory_cursor(1, revision ^ 1));
-    let stale = refused(
-        &service,
-        "git_blame",
-        json!({ "path": "paged.rs", "limit": 1, "cursor": other_revision }),
-    )
-    .await;
-    assert!(
-        stale.contains("changed since this cursor was issued"),
-        "a blame cursor from another revision is refused: {stale}"
+        "git blame pages must not overlap by start_line: {p1_start:?} vs {p2_start:?}"
     );
     let _ = service.cancel().await;
 }
@@ -1641,33 +2813,59 @@ async fn git_blame_paginates_by_start_line() {
 async fn git_blame_symbol_paginates_by_start_line() {
     let (dir, service) = spawn_paging_server().await;
     split_blame_lines(dir.path());
-    let _ = service.call_tool(call_params("index_rescan", json!({}))).await;
+    let _ = service
+        .call_tool(call_params("admin", json!({ "mode": "rescan"})))
+        .await;
     let page1 = decode_text(
         &service
             .call_tool(call_params(
-                "git_blame",
-                json!({ "path": "paged.rs", "symbol": "paged", "limit": 1 }),
+                "git",
+                json!({ "mode": "blame_symbol", "path": "paged.rs", "name": "paged", "limit": 1 }),
             ))
             .await
-            .expect("git_blame symbol page1"),
+            .expect("git blame_symbol page1"),
     );
     let p1_hunks = page1
         .get("hunks")
         .and_then(Value::as_array)
-        .expect("git_blame symbol page1 hunks");
-    assert_eq!(p1_hunks.len(), 1, "git_blame symbol limit=1 → 1 hunk: {page1}");
+        .expect("git blame_symbol page1 hunks");
+    assert_eq!(p1_hunks.len(), 1, "git blame_symbol limit=1 → 1 hunk: {page1}");
     let p1_start = p1_hunks
         .iter()
-        .filter_map(|h| h.get("line").and_then(Value::as_u64))
+        .filter_map(|h| h.get("start_line").and_then(Value::as_u64))
         .next()
-        .expect("git_blame symbol page1 start_line");
+        .expect("git blame_symbol page1 start_line");
     assert!(
         p1_start >= 1,
-        "git_blame symbol start_line should be 1-based, got {p1_start}"
+        "git blame_symbol start_line should be 1-based, got {p1_start}"
+    );
+    let huge_cursor = basemind::testing::encode_in_memory_cursor(9_999, 0);
+    let page_empty = decode_text(
+        &service
+            .call_tool(call_params(
+                "git",
+                json!({
+                    "mode": "blame_symbol",
+                    "path": "paged.rs",
+                    "name": "paged",
+                    "limit": 1,
+                    "cursor": huge_cursor,
+                }),
+            ))
+            .await
+            .expect("git blame_symbol cursor past end"),
+    );
+    let empty_hunks = page_empty
+        .get("hunks")
+        .and_then(Value::as_array)
+        .expect("git blame_symbol empty page hunks");
+    assert!(
+        empty_hunks.is_empty(),
+        "git blame_symbol with cursor past end should be empty: {page_empty}"
     );
     assert!(
-        page1.get("next_cursor").is_none(),
-        "the symbol's one hunk is the whole answer, so there is no next page: {page1}"
+        page_empty.get("next_cursor").is_none(),
+        "git blame_symbol exhausted page must NOT carry next_cursor"
     );
     let _ = service.cancel().await;
 }
@@ -1698,7 +2896,10 @@ async fn reranks_search_results() {
     let service = ().serve(transport).await.expect("rmcp handshake");
 
     let no_rerank = service
-        .call_tool(call_params("docs_search", json!({ "query": "function" })))
+        .call_tool(call_params(
+            "memory",
+            json!({ "mode": "documents",  "query": "function" }),
+        ))
         .await;
     if let Ok(ref resp) = no_rerank {
         let body = decode_text(resp);
@@ -1730,8 +2931,9 @@ async fn reranks_search_results() {
 
     let reranked = service
         .call_tool(call_params(
-            "docs_search",
-            json!({ "query": "function",
+            "memory",
+            json!({ "mode": "documents",
+                "query": "function",
             }),
         ))
         .await;
@@ -1780,8 +2982,9 @@ async fn summarizes_via_extractive_default() {
 
     let result = service
         .call_tool(call_params(
-            "docs_search",
-            json!({ "query": "test",
+            "memory",
+            json!({ "mode": "documents",
+                "query": "test",
                 "limit": 5,
             }),
         ))
@@ -1789,13 +2992,6 @@ async fn summarizes_via_extractive_default() {
 
     match &result {
         Ok(resp) => {
-            if resp.is_error == Some(true) {
-                let message = error_text(resp);
-                assert!(
-                    !message.contains("unknown field"),
-                    "summarization params must be accepted: {message}"
-                );
-            }
             let body = decode_text(resp);
             if let Some(hits) = body.get("hits").and_then(Value::as_array) {
                 for hit in hits {
@@ -1816,128 +3012,52 @@ async fn summarizes_via_extractive_default() {
                 }
             }
         }
-        Err(e) => panic!("docs_search must answer with a tool result: {e:?}"),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("unknown field"),
+                "summarization params must deserialize: {msg}"
+            );
+        }
     }
 
     let _ = service.cancel().await;
 }
 
-/// A `docs_search` test checks nothing without an embedding model, so being unable to load one is
-/// a failure, not a pass. Where no model can be loaded (an offline machine), setting
-/// `BASEMIND_TEST_ALLOW_NO_EMBEDDER` turns it into a reported skip.
-#[cfg(feature = "documents")]
-fn skip_without_embedder(what: &str) {
-    assert!(
-        std::env::var_os("BASEMIND_TEST_ALLOW_NO_EMBEDDER").is_some(),
-        "{what}. Nothing was checked. Set BASEMIND_TEST_ALLOW_NO_EMBEDDER=1 to skip this test where no \
-         embedding model can be loaded."
-    );
-    eprintln!("SKIP (BASEMIND_TEST_ALLOW_NO_EMBEDDER): {what}");
-}
-
-/// `docs_search` hits carry their document's keywords, and the `keywords` filter keeps the documents
-/// that have one, including a document ranked past `limit`. The metadata is looked up in the
-/// document map: a document is not in the code file map.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "documents")]
-async fn docs_search_attaches_keywords_and_filters_on_them() {
+async fn search_documents_accepts_post_filter_params() {
     let dir = build_repo();
     let root = dir.path();
-    for name in ["one", "two", "three", "four"] {
-        std::fs::write(
-            root.join(format!("{name}.md")),
-            "# Harbour\n\nThe harbour pilots guide ships into the harbour. The harbour tides set the harbour \
-             timetable, and the harbour master signs the harbour log.\n",
-        )
-        .unwrap();
-    }
-    std::fs::write(
-        root.join("airship.md"),
-        "# Zeppelin\n\nA zeppelin is an airship. The zeppelin hangar holds one zeppelin, and the zeppelin crew \
-         moors the zeppelin at the mast beside the harbour.\n",
-    )
-    .unwrap();
-    let mut cfg = basemind::config::default_for_root(root);
-    cfg.documents.enabled = true;
-    cfg.documents.keywords.enabled = true;
-    let _ = basemind::lang::ensure_grammars().expect("grammar bootstrap");
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut store = basemind::store::Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
-            basemind::scanner::scan(
-                root,
-                &mut store,
-                &cfg,
-                basemind::scanner::ScanSource::WorkingTree,
-                basemind::scanner::EmbedMode::Inline,
-            )
-            .expect("scan");
-        });
-    });
+    run_scan(root);
 
     let transport = basemind::mcp::serve_in_memory(root, "working")
         .await
         .expect("in-memory serve");
     let service = ().serve(transport).await.expect("rmcp handshake");
 
-    let unfiltered = service
-        .call_tool(call_params("docs_search", json!({ "query": "harbour", "limit": 10 })))
-        .await
-        .expect("docs_search");
-    if unfiltered.is_error == Some(true) {
-        skip_without_embedder(&format!(
-            "docs_search could not run (no embedding model?): {}",
-            error_text(&unfiltered)
-        ));
-        let _ = service.cancel().await;
-        return;
-    }
-    let body = decode_text(&unfiltered);
-    let hits = body["hits"].as_array().expect("hits");
-    if hits.is_empty() {
-        skip_without_embedder(&format!("the scan produced no document vectors: {body}"));
-        let _ = service.cancel().await;
-        return;
-    }
-    assert_eq!(hits.len(), 5, "one chunk per document: {body}");
-    for hit in hits {
-        assert!(
-            hit["keywords"].as_array().is_some_and(|keywords| !keywords.is_empty()),
-            "every hit carries its document's keywords: {hit}"
-        );
-    }
+    let result = service
+        .call_tool(call_params(
+            "memory",
+            json!({ "mode": "documents",
+                "query": "test",
+                "limit": 10,
+                "entity_category": "person",
+                "keywords_contains": "foo",
+            }),
+        ))
+        .await;
 
-    let filtered = decode_text(
-        &service
-            .call_tool(call_params(
-                "docs_search",
-                json!({ "query": "harbour", "limit": 1, "keywords": "zeppelin" }),
-            ))
-            .await
-            .expect("docs_search"),
-    );
-    let paths: Vec<&str> = filtered["hits"]
-        .as_array()
-        .expect("hits")
-        .iter()
-        .map(|hit| hit["path"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(
-        paths,
-        ["airship.md"],
-        "the one document with that keyword, whatever its rank for the query: {filtered}"
-    );
-
-    let unmatched = decode_text(
-        &service
-            .call_tool(call_params(
-                "docs_search",
-                json!({ "query": "harbour", "keywords": "no-document-has-this-keyword" }),
-            ))
-            .await
-            .expect("docs_search"),
-    );
-    assert_eq!(unmatched["hits"], json!([]), "{unmatched}");
+    match &result {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("unknown field"),
+                "post-filter params must deserialize: {msg}"
+            );
+        }
+    }
 
     let _ = service.cancel().await;
 }
@@ -2189,6 +3309,229 @@ async fn comms_inbox_wait_delivers_then_times_out() {
     let _ = serve.await;
 }
 
+/// End-to-end MCP contract for the `shell` domain tool through a real
+/// `basemind serve` child process. The child binary carries the
+/// `--__internal-daemon` intercept, so mode `spawn` actually re-execs basemind
+/// as the embedded rmux daemon. `BASEMIND_SHELLS_SOCKET` sandboxes that daemon on
+/// a per-test temp socket so parallel runs and the user's environment never
+/// collide.
+///
+/// Proves the wired surface: `spawn` → poll `capture` until the sentinel
+/// appears → `kill`.
+#[cfg(all(feature = "shells", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_tools_spawn_capture_kill_through_mcp() {
+    use std::time::{Duration, Instant};
+
+    let dir = build_repo();
+    let root = dir.path();
+    run_scan(root);
+
+    std::fs::write(
+        root.join("basemind.toml"),
+        b"\"$schema\" = \"v1\"\n\n[shells]\nvisual = \"headless\"\n",
+    )
+    .expect("write headless shells config");
+
+    // SAFETY: single-threaded test setup before the in-process server touches rmux; this is the ~keep
+    // only shells test in the binary, so no sibling test observes these vars concurrently. ~keep
+    //   - BASEMIND_SHELLS_SOCKET sandboxes the embedded daemon on a per-test socket. ~keep
+    //   - point_sdk_daemon_at makes the embedded rmux daemon re-exec the real `basemind` binary; ~keep
+    //     `current_exe()` here is the test harness, which cannot host the daemon (the child-process ~keep
+    //     serve used to supply this via `main`). ~keep
+    unsafe {
+        std::env::set_var("BASEMIND_SHELLS_SOCKET", dir.path().join("shells.sock"));
+        basemind::shells::daemon::point_sdk_daemon_at(std::path::Path::new(env!("CARGO_BIN_EXE_basemind")));
+        // The embedded rmux daemon is a cold re-exec of the ~1 GB `--features full` debug binary; ~keep
+        // paging it in on a busy machine can exceed the rmux SDK's 5 s default startup deadline (a warm ~keep
+        // binary answers in ~50 ms). Production re-execs the already-resident daemon binary, so this ~keep
+        // generous timeout only accommodates the test's cold-start; it never masks a real hang. ~keep
+        std::env::set_var("RMUX_SDK_TIMEOUT_MS", "60000");
+    }
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let spawned = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "spawn", "command": "echo basemind-hi", "cwd": "." }),
+        ))
+        .await
+        .expect("shell spawn call");
+    let spawned = decode_text(&spawned);
+    let session_id = spawned
+        .get("session_id")
+        .and_then(Value::as_str)
+        .expect("session_id in shell spawn response")
+        .to_string();
+    let attach_command = spawned
+        .get("attach_command")
+        .and_then(Value::as_str)
+        .expect("attach_command in shell spawn response");
+    assert!(
+        attach_command.contains("--__internal-attach ")
+            && attach_command.contains("--socket ")
+            && attach_command.contains("--size "),
+        "attach_command should be a basemind internal-attach re-exec line: {spawned:?}"
+    );
+
+    let escaped = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "spawn", "command": "true", "cwd": "../../../etc" }),
+        ))
+        .await;
+    assert!(
+        escaped.is_err(),
+        "shell mode=spawn must reject a cwd escaping the repository root: {escaped:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let listed = service
+            .call_tool(call_params("shell", json!({ "mode": "list" })))
+            .await
+            .expect("shell list call while waiting for completion");
+        let completed = decode_text(&listed)
+            .get("sessions")
+            .and_then(Value::as_array)
+            .is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    session.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                        && session.get("alive").and_then(Value::as_bool) == Some(false)
+                })
+            });
+        if completed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the one-line shell command to complete"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let captured = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "capture", "session_id": session_id, "lines": 1 }),
+        ))
+        .await
+        .expect("capture completed one-line shell command");
+    assert_eq!(
+        decode_text(&captured).get("text").and_then(Value::as_str),
+        Some("basemind-hi"),
+        "shell capture must preserve the only output row after completion"
+    );
+
+    let oversized = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "capture", "session_id": session_id, "lines": 501 }),
+        ))
+        .await;
+    assert!(
+        oversized.is_err(),
+        "shell capture must reject an unbounded line request"
+    );
+
+    let killed = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "kill", "session_id": session_id }),
+        ))
+        .await
+        .expect("shell kill call");
+    let killed = decode_text(&killed);
+    assert_eq!(
+        killed.get("killed").and_then(Value::as_bool),
+        Some(true),
+        "shell mode=kill should report killed=true for a live session: {killed:?}"
+    );
+
+    let second = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "kill", "session_id": session_id }),
+        ))
+        .await;
+    assert!(second.is_err(), "killing an already-forgotten session_id should error");
+
+    let _ = service.cancel().await;
+}
+
+/// Every advertised `shell` mode validates its arguments before touching the shell daemon: the
+/// mode is in the advertised schema's enum, a field belonging to another mode is refused, and a
+/// mode run without its required field names the exact `mode`/field pair.
+///
+/// No daemon is sandboxed here on purpose — every assertion is a rejection, so nothing reaches
+/// rmux. That is what makes this test cheap enough to cover all six modes.
+#[cfg(all(feature = "shells", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_tool_validates_every_mode_before_running_it() {
+    let dir = build_repo();
+    let root = dir.path();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let tools = service.list_all_tools().await.expect("list tools");
+    let shell = tools
+        .iter()
+        .find(|t| t.name == "shell")
+        .expect("the shell tool is advertised");
+    let modes = shell
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("mode"))
+        .and_then(|m| m.get("enum"))
+        .and_then(Value::as_array)
+        .expect("shell advertises a flat mode enum");
+    for expected in ["spawn", "send", "capture", "kill", "list", "broadcast"] {
+        assert!(
+            modes.iter().any(|m| m.as_str() == Some(expected)),
+            "shell mode enum is missing {expected:?}: {modes:?}"
+        );
+    }
+
+    // `lines` belongs to `capture`; silently ignoring it on a `send` would read to an agent as a
+    // send that also captured output.
+    let foreign = service
+        .call_tool(call_params(
+            "shell",
+            json!({ "mode": "send", "session_id": "bmsh-nope", "text": "x", "lines": 5 }),
+        ))
+        .await;
+    let foreign = format!("{foreign:?}");
+    assert!(
+        foreign.contains("lines"),
+        "shell mode=send must reject the capture-only `lines`: {foreign}"
+    );
+
+    for (mode, field) in [
+        ("spawn", "command"),
+        ("send", "session_id"),
+        ("capture", "session_id"),
+        ("kill", "session_id"),
+        ("broadcast", "session_ids"),
+    ] {
+        let missing = service.call_tool(call_params("shell", json!({ "mode": mode }))).await;
+        let missing = format!("{missing:?}");
+        assert!(
+            missing.contains(field) && missing.contains(mode),
+            "shell mode={mode} without `{field}` must name the pair: {missing}"
+        );
+    }
+
+    let _ = service.cancel().await;
+}
+
 /// Agent lifecycle modes stay in the flat schema and reject fields belonging to another mode
 /// before a cleanup can reach the broker.
 #[cfg(all(feature = "comms", unix))]
@@ -2262,8 +3605,8 @@ async fn spawn_serve(root: &Path, lean: Option<&str>) -> rmcp::service::RunningS
     ().serve(transport).await.expect("rmcp handshake")
 }
 
-/// Security regression: `index_rescan` must reject a `paths` entry that escapes the repository root
-/// via `..` traversal. It takes raw strings (not `RelPath`), and before the fix
+/// Security regression: `rescan` must reject a `paths` entry that escapes the repository root via
+/// `..` traversal. `rescan` takes raw strings (not `RelPath`), and before the fix
 /// `state.root.join("../../etc/passwd")` fed a traversal path into the scanner — which, with
 /// `scan.respect_gitignore = false`, read and indexed a file outside the repo. A valid in-repo
 /// path must still be accepted.
@@ -2276,33 +3619,26 @@ async fn rescan_rejects_paths_escaping_the_repo_root() {
 
     let escaping = service
         .call_tool(call_params(
-            "index_rescan",
-            json!({ "paths": ["../../../../../../etc/passwd"] }),
+            "admin",
+            json!({ "mode": "rescan",  "paths": ["../../../../../../etc/passwd"] }),
         ))
-        .await
-        .expect("index_rescan(escaping path)");
-    let message = error_text(&escaping);
+        .await;
     assert!(
-        message.contains("escapes the repository root"),
-        "index_rescan must reject a path that escapes the repo root: {message}"
+        escaping.is_err(),
+        "rescan must reject a path that escapes the repo root, got: {escaping:?}"
     );
 
     let ok = service
-        .call_tool(call_params("index_rescan", json!({ "paths": ["a.rs"] })))
-        .await
-        .expect("index_rescan(in-repo path)");
-    assert_ne!(
-        ok.is_error,
-        Some(true),
-        "index_rescan must accept a valid in-repo path, got: {ok:?}"
-    );
+        .call_tool(call_params("admin", json!({ "mode": "rescan",  "paths": ["a.rs"] })))
+        .await;
+    assert!(ok.is_ok(), "rescan must accept a valid in-repo path, got: {ok:?}");
 
     let _ = service.cancel().await;
 }
 
-/// `serve` auto-scans an empty index on boot; `index_status` must report that indexing state separately
+/// `serve` auto-scans an empty index on boot; `status` must report that indexing state separately
 /// from query latency. Starting serve on a FRESH (unscanned) repo triggers the boot scan; polling
-/// `index_status` must converge to `indexing: false` with an `index_build_ms` recording the build cost.
+/// `status` must converge to `indexing: false` with an `index_build_ms` recording the build cost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_auto_scan_reports_index_build_ms_on_status() {
     let dir = build_repo();
@@ -2314,7 +3650,7 @@ async fn serve_auto_scan_reports_index_build_ms_on_status() {
     let mut settled: Option<Value> = None;
     for _ in 0..600 {
         let result = service
-            .call_tool(call_params("index_status", json!({})))
+            .call_tool(call_params("admin", json!({ "mode": "status"})))
             .await
             .expect("status");
         let v = decode_text(&result);
@@ -2335,20 +3671,21 @@ async fn serve_auto_scan_reports_index_build_ms_on_status() {
     let _ = service.cancel().await;
 }
 
-/// No verb tool advertises an `output_schema`: the response structs nest, schemars emits nested
-/// structs as `$ref` into `$defs` (the construct the Anthropic input_schema subset rejects silently
-/// and registry-wide, GH #50), and inlining them would put `tools/list` over its byte ceiling.
+/// W5 slice 3: the lean MCP surface is STRICTLY opt-in.
+///
+/// * `BASEMIND_MCP_LEAN=1` → exactly the three wrapper tools are advertised, and
+///   `invoke_tool { search_symbols }` returns the same payload as a direct `search_symbols` call.
+/// * flag UNSET → the full surface is advertised unchanged (well over the three wrappers, and
+///   `search_symbols` is callable directly).
+/// SEP-2106 allows exactly ONE `output_schema` per tool, and every one of the nine domain tools has
+/// modes returning differently-shaped responses — so none of them advertises one. Expressing the
+/// union would mean nested structs, which schemars emits as `$ref` into `$defs`, the construct the
+/// Anthropic input_schema subset rejects silently and registry-wide (GH #50).
 ///
 /// This asserts the absence deliberately rather than leaving it untested: a well-meaning "add the
 /// output schema back" change would look like an improvement and take the whole registry down.
-/// The rest of what every verb-tool definition carries is asserted alongside: a description with a
-/// worked example, and annotations that tell a host which two tools write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_tool_advertises_an_output_schema() {
-    use basemind::mcp::params::VERB_TOOLS;
-
-    const WRITING_TOOLS: [&str; 2] = ["memory_save", "index_rescan"];
-
+async fn tools_advertise_output_schema() {
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
@@ -2356,49 +3693,18 @@ async fn no_tool_advertises_an_output_schema() {
     let server = spawn_serve(root, None).await;
     let tools = server.list_all_tools().await.expect("list tools");
 
-    for name in WRITING_TOOLS {
-        assert!(
-            VERB_TOOLS.contains(&name),
-            "`{name}` is expected among the verb tools: {VERB_TOOLS:?}"
-        );
-    }
-    for name in VERB_TOOLS {
-        let tool = tools
+    let schema_of = |name: &str| {
+        tools
             .iter()
-            .find(|t| t.name.as_ref() == *name)
-            .unwrap_or_else(|| panic!("verb tool `{name}` must be advertised"));
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("tool {name} present in full surface"))
+            .output_schema
+            .clone()
+    };
+    for domain in ["code", "admin", "git", "graph", "memory"] {
         assert!(
-            tool.output_schema.is_none(),
-            "`{name}` must NOT advertise an output_schema"
-        );
-        let description = tool.description.as_deref().unwrap_or_default();
-        assert!(
-            !description.trim().is_empty() && description.contains("Example:"),
-            "`{name}` must carry a description with a worked example: {description:?}"
-        );
-        let annotations = tool
-            .annotations
-            .as_ref()
-            .unwrap_or_else(|| panic!("`{name}` must carry ToolAnnotations"));
-        assert_eq!(
-            annotations.destructive_hint,
-            Some(false),
-            "`{name}` destroys nothing and must say so"
-        );
-        assert_eq!(
-            annotations.read_only_hint,
-            Some(!WRITING_TOOLS.contains(name)),
-            "only {WRITING_TOOLS:?} write; `{name}` advertises the wrong read_only_hint"
-        );
-        assert_eq!(
-            annotations.idempotent_hint,
-            Some(true),
-            "repeating `{name}` with the same arguments changes nothing further"
-        );
-        assert_eq!(
-            annotations.open_world_hint,
-            Some(false),
-            "`{name}` reads and writes only this machine's index"
+            schema_of(domain).is_none(),
+            "the consolidated `{domain}` tool must NOT advertise a single output_schema for its modes"
         );
     }
 
@@ -2411,18 +3717,13 @@ async fn no_tool_advertises_an_output_schema() {
         .collect();
     assert!(
         with_schema.is_empty(),
-        "no tool may advertise an output_schema: {with_schema:?}"
+        "no domain tool may advertise an output_schema (SEP-2106 allows one, and each has many \
+         response shapes): {with_schema:?}"
     );
 
     let _ = server.cancel().await;
 }
 
-/// W5 slice 3: the lean MCP surface is STRICTLY opt-in.
-///
-/// * `BASEMIND_MCP_LEAN=1` → exactly the three wrapper tools are advertised, and
-///   `invoke_tool { code_symbols }` returns the same payload as a direct `code_symbols` call.
-/// * flag UNSET → the full surface is advertised unchanged (the verb tools, and `code_symbols` is
-///   callable directly).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
     let dir = build_repo();
@@ -2432,37 +3733,68 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
     let full = spawn_serve(root, None).await;
     let full_tools = full.list_all_tools().await.expect("list tools (full)");
     let full_names: Vec<&str> = full_tools.iter().map(|t| t.name.as_ref()).collect();
-    // The surface is the verb tools plus `agents` under `comms`. Hosts load every
-    // schema on every session, so a count that creeps up is a regression, not growth: asserted as
-    // a ceiling plus the always-on names, rather than a floor that any addition would satisfy.
-    let ceiling = basemind::mcp::params::VERB_TOOLS.len() + 1;
+    // The surface is eleven domain tools at most (fewer when `crawl` / `comms` / `shells` / `documents` are off),
+    // which is the whole point of the consolidation: hosts defer tools and surface them by keyword
+    // search, so a count that creeps back up is a regression, not growth. Asserted as a ceiling
+    // plus the always-on names, rather than a floor that a re-flattening would still satisfy.
     assert!(
-        full_tools.len() <= ceiling,
-        "the surface must stay at {ceiling} tools or fewer, got {}: {full_names:?}",
+        full_tools.len() <= 11,
+        "the surface must stay at eleven domain tools or fewer, got {}: {full_names:?}",
         full_tools.len()
     );
-    for verb in basemind::mcp::params::VERB_TOOLS {
+    for domain in ["code", "graph", "git", "memory", "admin"] {
         assert!(
-            full_names.contains(verb),
-            "default surface must advertise the always-on `{verb}` tool: {full_names:?}"
+            full_names.contains(&domain),
+            "default surface must advertise the always-on `{domain}` tool: {full_names:?}"
         );
     }
-    for &removed in basemind::mcp::params::RETIRED_TOOLS {
-        assert!(
-            !full_names.contains(&removed),
-            "the removed mode-dispatched `{removed}` tool must not be advertised: {full_names:?}"
-        );
-    }
+    assert!(
+        full_names.contains(&"code"),
+        "default surface lists the `code` domain tool: {full_names:?}"
+    );
     assert!(
         !full_names.contains(&"invoke_tool"),
         "default surface must NOT expose the lean wrappers: {full_names:?}"
     );
 
+    let annotations_of = |name: &str| {
+        full_tools
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("tool {name} present in full surface"))
+            .annotations
+            .clone()
+            .unwrap_or_else(|| panic!("tool {name} must carry ToolAnnotations"))
+    };
+    // `code` is the one domain whose every mode is a read, so its annotation union stays read-only.
+    assert_eq!(
+        annotations_of("code").read_only_hint,
+        Some(true),
+        "every `code` mode is a read, so the tool must advertise read_only_hint=true"
+    );
+    // `admin` (formerly `rescan` / `cache_clear` / … as distinct tools) bundles both read-only modes
+    // (`status`) and destructive ones (`rescan`, `cache_clear`) behind one tool, so its ONE set of
+    // annotations is read_only_hint=false / destructive_hint=true for the whole tool — including its
+    // read-only modes. This is an intentional consequence of consolidation, not a regression: a host
+    // that gates on tool-level annotations must treat the whole `admin` tool as mutating.
+    assert_eq!(
+        annotations_of("admin").read_only_hint,
+        Some(false),
+        "the consolidated `admin` tool must advertise read_only_hint=false"
+    );
+    assert_eq!(
+        annotations_of("admin").destructive_hint,
+        Some(true),
+        "the consolidated `admin` tool must advertise destructive_hint=true"
+    );
     let direct = decode_text(
         &full
-            .call_tool(call_params("code_symbols", json!({ "name": "Greet", "limit": 10 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "symbols", "needle": "Greet", "limit": 10 }),
+            ))
             .await
-            .expect("direct code_symbols"),
+            .expect("direct search_symbols"),
     );
     let _ = full.cancel().await;
 
@@ -2486,19 +3818,19 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
     assert!(
         listed
             .iter()
-            .any(|t| t.get("name").and_then(Value::as_str) == Some("code_symbols")),
-        "lean list_tools should surface the real `code_symbols` tool: {listing}"
+            .any(|t| t.get("name").and_then(Value::as_str) == Some("code")),
+        "lean list_tools should surface the real `code` domain tool: {listing}"
     );
 
     let schema = decode_text(
         &lean
-            .call_tool(call_params("get_tool_schema", json!({ "tool_name": "code_symbols" })))
+            .call_tool(call_params("get_tool_schema", json!({ "tool_name": "code" })))
             .await
             .expect("lean get_tool_schema"),
     );
     assert_eq!(
         schema.get("name").and_then(Value::as_str),
-        Some("code_symbols"),
+        Some("code"),
         "schema echoes the tool name: {schema}"
     );
     assert!(
@@ -2511,8 +3843,8 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
             .call_tool(call_params(
                 "invoke_tool",
                 json!({
-                    "tool_name": "code_symbols",
-                    "tool_input": { "name": "Greet", "limit": 10 }
+                    "tool_name": "code",
+                    "tool_input": { "mode": "symbols", "needle": "Greet", "limit": 10 }
                 }),
             ))
             .await
@@ -2527,12 +3859,12 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
             .remove("elapsed_us");
         assert!(
             removed.is_some_and(|v| v.as_u64().is_some()),
-            "{label} code_symbols response must carry an `elapsed_us` reading"
+            "{label} code:symbols response must carry an `elapsed_us` reading"
         );
     }
     assert_eq!(
         via_invoke, direct,
-        "invoke_tool result must match a direct code_symbols call (latency field aside)"
+        "invoke_tool result must match a direct search_symbols call (latency field aside)"
     );
 
     let bad = lean
@@ -2543,25 +3875,14 @@ async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
         .await;
     assert!(bad.is_err(), "invoke_tool rejects unknown tool names");
 
-    let inexact = lean
-        .call_tool(call_params(
-            "invoke_tool",
-            json!({ "tool_name": "code_symbols", "tool_input": { "mode": "symbols", "name": "Greet" } }),
-        ))
-        .await
-        .expect("lean invoke_tool with a leftover mode");
-    let message = error_text(&inexact);
-    assert!(
-        message.contains("unknown field `mode`"),
-        "the wrapped tool's own argument check must run through invoke_tool: {message}"
-    );
-
     let _ = lean.cancel().await;
 }
 
 /// 0.8.0: the server advertises reusable prompt templates and renders them with arguments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prompts_are_listed_and_rendered_with_arguments() {
+    use rmcp::model::GetPromptRequestParams;
+
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
@@ -2587,72 +3908,29 @@ async fn prompts_are_listed_and_rendered_with_arguments() {
         args.iter().map(|a| &a.name).collect::<Vec<_>>()
     );
 
-    async fn render(
-        server: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        name: &'static str,
-        arguments: Value,
-    ) -> String {
-        let mut request = rmcp::model::GetPromptRequestParams::new(name);
-        if let Some(arguments) = arguments.as_object().filter(|arguments| !arguments.is_empty()) {
-            request = request.with_arguments(arguments.clone());
-        }
-        let rendered = server
-            .get_prompt(request)
-            .await
-            .unwrap_or_else(|error| panic!("get_prompt {name}: {error}"));
-        assert!(
-            !rendered.messages.is_empty(),
-            "rendered `{name}` must carry at least one message"
-        );
-        rendered
-            .messages
-            .iter()
-            .filter_map(|m| match &m.content {
-                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<String>()
-    }
-
-    // Every tool a prompt routes to must be one the server advertises.
-    let advertised = server.list_all_tools().await.expect("list tools");
-    let expectations: [(&'static str, Value, &[&str]); 4] = [
-        (
-            "trace-symbol",
-            json!({ "symbol": "Greeter" }),
-            &["Greeter", "code_symbols", "code_refs", "git_blame"],
-        ),
-        (
-            "explain-file",
-            json!({ "path": "a.rs" }),
-            &["a.rs", "code_outline", "code_read"],
-        ),
-        (
-            "onboard-repo",
-            json!({}),
-            &["index_status", "git_log", "find_files", "code_outline"],
-        ),
-        ("review-working-tree", json!({}), &["git_diff", "git_blame", "git_log"]),
-    ];
-    for (name, arguments, mentions) in expectations {
-        let body = render(&server, name, arguments).await;
-        for mention in mentions {
-            assert!(
-                body.contains(mention),
-                "rendered `{name}` must mention `{mention}`, got: {body}"
-            );
-        }
-        for tool in mentions.iter().filter(|mention| mention.contains('_')) {
-            assert!(
-                advertised.iter().any(|t| t.name.as_ref() == *tool),
-                "`{name}` routes to `{tool}`, which the server does not advertise"
-            );
-        }
-        assert!(
-            !body.contains(" mode `"),
-            "rendered `{name}` must not route to a removed mode-dispatched tool: {body}"
-        );
-    }
+    let rendered = server
+        .get_prompt(
+            GetPromptRequestParams::new("trace-symbol")
+                .with_arguments(serde_json::json!({ "symbol": "Greeter" }).as_object().unwrap().clone()),
+        )
+        .await
+        .expect("get_prompt trace-symbol");
+    assert!(
+        !rendered.messages.is_empty(),
+        "rendered prompt must carry at least one message"
+    );
+    let body = rendered
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        body.contains("Greeter") && body.contains("`code` mode `symbols`"),
+        "rendered trace-symbol must interpolate the symbol and route to a real tool+mode, got: {body}"
+    );
 
     let _ = server.cancel().await;
 }
@@ -2703,7 +3981,7 @@ async fn completes_prompt_arguments_from_the_code_map() {
     let _ = server.cancel().await;
 }
 
-/// `index_rescan` emits progress notifications when the client supplies a progress token, carries the
+/// `rescan` emits progress notifications when the client supplies a progress token, carries the
 /// summary counts in the tool result, and no longer advertises the (SEP-2577 deprecated) logging
 /// capability. Uses a capturing client handler to observe the notifications.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2738,7 +4016,7 @@ async fn rescan_emits_progress_and_no_logging() {
         .expect("in-memory serve");
     let server = capture.serve(transport).await.expect("rmcp handshake");
 
-    let mut params = call_params("index_rescan", json!({}));
+    let mut params = call_params("admin", json!({ "mode": "rescan"}));
     rmcp::model::RequestParamsMeta::set_progress_token(
         &mut params,
         rmcp::model::ProgressToken(NumberOrString::String("rescan-1".into())),
@@ -2831,28 +4109,31 @@ async fn latency_tools_report_microsecond_elapsed_us() {
 
     let search = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "paged" })))
+            .call_tool(call_params("code", json!({ "mode": "symbols", "needle": "paged" })))
             .await
-            .expect("code_symbols"),
+            .expect("search_symbols"),
     );
     assert!(
         search.get("total").and_then(Value::as_u64).unwrap_or(0) >= 1,
         "fixture should match the `paged` symbol: {search}"
     );
-    assert_sane_elapsed_us("code_symbols", &search);
+    assert_sane_elapsed_us("search_symbols", &search);
 
     let recent = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "limit": 2 })))
+            .call_tool(call_params("git", json!({ "mode": "recent", "limit": 2 })))
             .await
-            .expect("git_log"),
+            .expect("recent_changes"),
     );
     assert_eq!(commit_shas(&recent).len(), 2, "fixture has 5 commits; asked for 2");
-    assert_stamped("git_log", &recent);
+    assert_stamped("recent_changes", &recent);
 
     let outline = decode_text(
         &service
-            .call_tool(call_params("code_outline", json!({ "path": "paged.rs" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "outline", "path": "paged.rs", "l2": true }),
+            ))
             .await
             .expect("outline"),
     );
@@ -2876,12 +4157,10 @@ async fn latency_tools_report_microsecond_elapsed_us() {
 /// keys the old client doesn't know.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn elapsed_us_is_additive_for_older_clients() {
-    /// A verbatim copy of the pre-`elapsed_us` `code_symbols` response shape.
+    /// A verbatim copy of the pre-`elapsed_us` `search_symbols` response shape.
     #[derive(serde::Deserialize)]
     struct LegacySearchResponse {
         total: usize,
-        // Left out when false since the verb tools (docs/UPGRADING.md, Response fields).
-        #[serde(default)]
         truncated: bool,
         results: Vec<Value>,
     }
@@ -2896,9 +4175,9 @@ async fn elapsed_us_is_additive_for_older_clients() {
 
     let search = decode_text(
         &service
-            .call_tool(call_params("code_symbols", json!({ "name": "paged" })))
+            .call_tool(call_params("code", json!({ "mode": "symbols", "needle": "paged" })))
             .await
-            .expect("code_symbols"),
+            .expect("search_symbols"),
     );
     assert!(
         search.get("elapsed_us").is_some(),
@@ -2912,9 +4191,9 @@ async fn elapsed_us_is_additive_for_older_clients() {
 
     let recent = decode_text(
         &service
-            .call_tool(call_params("git_log", json!({ "limit": 2 })))
+            .call_tool(call_params("git", json!({ "mode": "recent", "limit": 2 })))
             .await
-            .expect("git_log"),
+            .expect("recent_changes"),
     );
     let legacy: LegacyRecentChangesResponse =
         serde_json::from_value(recent).expect("an older client must still deserialize the git response");
@@ -2949,13 +4228,13 @@ fn build_wide_repo(files: usize, rare_token: &str) -> TempDir {
     dir
 }
 
-/// Regression: `code_grep` must scan the whole indexed corpus, not the first
+/// Regression: `workspace_grep` must scan the whole indexed corpus, not the first
 /// `limit * 8` files.
 ///
 /// The old bound was a files-VISITED cap, which is the wrong bound for a linear content scan:
 /// a default `limit = 100` grep visited 2000 files of a 68 k-file monorepo (2.9 %, in path order)
 /// and returned a fast, confident, wrong zero for any token that lived past the cut. `limit` caps
-/// HITS; the corpus is always fully scanned (subject to the `language` / `path` filters).
+/// HITS; the corpus is always fully scanned (subject to the `language` / `path_contains` filters).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_grep_finds_a_rare_token_past_the_old_scan_cap() {
     const RARE: &str = "OptimizationStatusZQX";
@@ -2966,9 +4245,12 @@ async fn workspace_grep_finds_a_rare_token_past_the_old_scan_cap() {
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_grep", json!({ "pattern": RARE })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "grep", "pattern": RARE, "include_context": false }),
+            ))
             .await
-            .expect("code_grep"),
+            .expect("workspace_grep"),
     );
 
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
@@ -2992,8 +4274,9 @@ async fn workspace_grep_finds_a_rare_token_past_the_old_scan_cap() {
         Some(1),
         "exactly one file contains the rare token: {body}"
     );
-    assert!(
-        body.get("truncated").is_none(),
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(false),
         "every match was returned, so nothing was truncated: {body}"
     );
 
@@ -3017,14 +4300,15 @@ async fn paging_a_grep_one_hit_at_a_time_reconstructs_the_whole_result() {
     let whole = decode_text(
         &service
             .call_tool(call_params(
-                "code_grep",
-                json!({ "pattern": "pub fn", "limit": 1000, "max_tokens": 100000 }),
+                "code",
+                json!({ "mode": "grep", "pattern": "pub fn", "include_context": false, "limit": 1000 }),
             ))
             .await
-            .expect("code_grep(unpaged)"),
+            .expect("workspace_grep(unpaged)"),
     );
-    assert!(
-        whole.get("truncated").is_none(),
+    assert_eq!(
+        whole.get("truncated").and_then(Value::as_bool),
+        Some(false),
         "limit=1000 covers the fixture, so the baseline must be complete: {whole}"
     );
     let expected: Vec<(String, u64)> = grep_keys(&whole);
@@ -3036,15 +4320,15 @@ async fn paging_a_grep_one_hit_at_a_time_reconstructs_the_whole_result() {
     let mut paged: Vec<(String, u64)> = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..(expected.len() + 1) {
-        let mut args = json!({ "pattern": "pub fn", "limit": 1 });
+        let mut args = json!({ "mode": "grep", "pattern": "pub fn", "include_context": false, "limit": 1 });
         if let Some(c) = &cursor {
             args["cursor"] = Value::String(c.clone());
         }
         let page = decode_text(
             &service
-                .call_tool(call_params("code_grep", args))
+                .call_tool(call_params("code", args))
                 .await
-                .expect("code_grep (page)"),
+                .expect("code grep (page)"),
         );
         paged.extend(grep_keys(&page));
         match page.get("next_cursor").and_then(Value::as_str) {
@@ -3061,7 +4345,7 @@ async fn paging_a_grep_one_hit_at_a_time_reconstructs_the_whole_result() {
     let _ = service.cancel().await;
 }
 
-/// `(path, line)` of every hit in a grep response, in response order.
+/// `(path, line_num)` of every hit in a grep response, in response order.
 fn grep_keys(body: &Value) -> Vec<(String, u64)> {
     body.get("hits")
         .and_then(Value::as_array)
@@ -3070,23 +4354,23 @@ fn grep_keys(body: &Value) -> Vec<(String, u64)> {
         .map(|h| {
             (
                 h.get("path").and_then(Value::as_str).unwrap_or_default().to_string(),
-                h.get("line").and_then(Value::as_u64).unwrap_or_default(),
+                h.get("line_num").and_then(Value::as_u64).unwrap_or_default(),
             )
         })
         .collect()
 }
 
-/// **P0 contract, at the MCP surface.** `code_refs` pinned to a definition by `path` must never
-/// present a resolution-limited subset as the complete caller set.
+/// **P0 contract, at the MCP surface.** `find_callers` must never present a resolution-limited
+/// subset as the complete caller set.
 ///
 /// The fixture is the shape that broke in production: `pkg/mod.py` defines `target` and calls it
 /// itself (so intra-file resolution "succeeds"), while two other files reach it through
 /// `from pkg import mod` + `mod.target()` — a module-object import, which binds a module rather than
 /// the function, so the cross-file join has no export to bind and those callers are invisible to
-/// resolution. The pinned lookup used to return only the resolvable subset with no truncation flag; an
+/// resolution. `find_callers` used to return only the resolvable subset with no truncation flag; an
 /// agent asking "what calls this?" before a refactor got a confident, precise-looking, wrong answer.
 ///
-/// The name scan is the sound floor, so `code_refs` with and without `path` must AGREE on the count
+/// The name scan is the sound floor, so `find_callers` and `find_references` must AGREE on the count
 /// for this unambiguous name, and `resolved_total` may only ever be a subset of `total`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn find_callers_never_reports_a_resolution_limited_subset_as_complete() {
@@ -3123,9 +4407,12 @@ async fn find_callers_never_reports_a_resolution_limited_subset_as_complete() {
 
     let references = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "target", "limit": 500 })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "references", "name": "target", "limit": 500 }),
+            ))
             .await
-            .expect("code_refs"),
+            .expect("find_references"),
     );
     let reference_total = references.get("total").and_then(Value::as_u64).expect("total");
     assert_eq!(
@@ -3136,16 +4423,16 @@ async fn find_callers_never_reports_a_resolution_limited_subset_as_complete() {
     let callers = decode_text(
         &service
             .call_tool(call_params(
-                "code_refs",
-                json!({ "path": "pkg/mod.py", "name": "target", "limit": 500 }),
+                "code",
+                json!({ "mode": "callers", "path": "pkg/mod.py", "name": "target", "limit": 500 }),
             ))
             .await
-            .expect("code_refs with `path`"),
+            .expect("find_callers"),
     );
     assert_eq!(
         callers.get("total").and_then(Value::as_u64),
         Some(reference_total),
-        "code_refs with `path` must agree with the unpinned name scan — never a subset: {callers}"
+        "find_callers must agree with find_references on an unambiguous name — never a subset: {callers}"
     );
     let hits = callers.get("hits").and_then(Value::as_array).expect("hits");
     let paths: Vec<&str> = hits
@@ -3167,28 +4454,23 @@ async fn find_callers_never_reports_a_resolution_limited_subset_as_complete() {
     let _ = service.cancel().await;
 }
 
-/// Call a verb tool with arguments it must refuse and return the refusal an agent reads.
-async fn refused(
-    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    tool: &'static str,
-    args: Value,
-) -> String {
-    let result = service
-        .call_tool(call_params(tool, args.clone()))
-        .await
-        .unwrap_or_else(|error| panic!("`{tool}` {args} must answer with a tool result, got {error}"));
-    error_text(&result)
-}
-
-/// The argument contract of the code and index verb tools: an argument the tool does not take is
-/// refused naming the field it most likely meant and the accepted set, a missing required field is
-/// named, and an argument shape with no meaning is refused naming the shapes that have one. Every
-/// refusal is an `isError` tool result, never a JSON-RPC error and never a call that ran with the
-/// stray argument ignored.
+/// ADR-0001/0002: `architecture_map`'s `edges` param is live (calls/imports/inherits) and
+/// every edge carries a provenance tag + numeric confidence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_and_index_tools_reject_inexact_arguments() {
-    let dir = build_repo();
+async fn architecture_map_emits_typed_provenance_edges() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
     let root = dir.path();
+    std::fs::write(
+        root.join("core.rs"),
+        "pub fn engine() {}\npub fn helper() { engine(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.rs"),
+        "use crate::core::engine;\npub fn run() { engine(); helper(); }\n",
+    )
+    .unwrap();
     run_scan(root);
 
     let transport = basemind::mcp::serve_in_memory(root, "working")
@@ -3196,95 +4478,1063 @@ async fn code_and_index_tools_reject_inexact_arguments() {
         .expect("in-memory serve");
     let service = ().serve(transport).await.expect("rmcp handshake");
 
-    let tools = service.list_all_tools().await.expect("list tools");
-    for &removed in basemind::mcp::params::RETIRED_TOOLS {
-        assert!(
-            tools.iter().all(|t| t.name.as_ref() != removed),
-            "the mode-dispatched `{removed}` tool must no longer be advertised"
-        );
+    let body = decode_text(
+        &service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "map", "granularity": "file", "edges": "all", "include_churn": false}),
+            ))
+            .await
+            .expect("architecture_map"),
+    );
+    let edges = body.get("edges").and_then(Value::as_array).expect("edges array");
+    assert!(!edges.is_empty(), "file tier should have inter-file edges: {body}");
+
+    // Every edge carries a provenance tag on the fixed ladder and a matching confidence.
+    for e in edges {
+        let prov = e.get("provenance").and_then(Value::as_str).expect("edge provenance");
+        let conf = e.get("confidence").and_then(Value::as_f64).expect("edge confidence");
+        match prov {
+            "extracted" => assert_eq!(conf, 1.0),
+            "inferred" => assert_eq!(conf, 0.5),
+            "ambiguous" => assert_eq!(conf, 0.2),
+            other => panic!("unexpected provenance tag {other:?} in {e}"),
+        }
     }
 
-    let message = refused(&service, "code_grep", json!({ "pattern": "x", "glob": "*.rs" })).await;
+    // `edges: "all"` surfaces the previously-dead import lane, not just calls.
+    let has_import = edges
+        .iter()
+        .any(|e| e.get("kind").and_then(Value::as_str) == Some("imports"));
     assert!(
-        message.contains("`code_grep`: unknown field `glob`, did you mean `path`?"),
-        "an unknown field must be named with the field it most likely meant: {message}"
-    );
-    assert!(
-        message.contains("Accepted fields:") && message.contains("`pattern` (required)") && message.contains("`regex`"),
-        "an unknown field must list the accepted set: {message}"
-    );
-
-    let message = refused(&service, "code_grep", json!({ "mode": "grep", "pattern": "x" })).await;
-    assert!(
-        message.contains("unknown field `mode`") && message.contains("each operation is its own tool"),
-        "a leftover `mode` must explain the new surface: {message}"
-    );
-
-    let message = refused(&service, "code_grep", json!({})).await;
-    assert!(
-        message.contains("missing field `pattern`") && message.contains("`pattern` (required)"),
-        "a missing required field must be named: {message}"
-    );
-
-    let message = refused(&service, "code_grep", json!({ "pattern": "x", "path": "*.rs" })).await;
-    assert!(
-        message.contains("`path` is a substring") && message.contains("not a glob"),
-        "a glob passed as `path` must be refused, not matched against nothing: {message}"
-    );
-
-    let message = refused(&service, "code_read", json!({ "path": "a.rs" })).await;
-    assert!(
-        message.contains("neither `symbol` nor `line` was given") && message.contains("pass {path, symbol}"),
-        "code_read with neither selector must name the accepted shapes: {message}"
-    );
-    let message = refused(
-        &service,
-        "code_read",
-        json!({ "path": "a.rs", "symbol": "alpha", "end_line": 2 }),
-    )
-    .await;
-    assert!(
-        message.contains("`end_line` applies only to a line span") && message.contains("pass {path, symbol}"),
-        "code_read with a symbol and a span end must name the accepted shapes: {message}"
-    );
-
-    let message = refused(&service, "code_refs", json!({ "name": "alpha", "line": 3 })).await;
-    assert!(
-        message.contains("`line` needs `path`") && message.contains("accepted shapes:"),
-        "code_refs must refuse a line with no file to look in: {message}"
-    );
-    let message = refused(&service, "code_refs", json!({ "name": "alpha", "column": 3 })).await;
-    assert!(
-        message.contains("`column` applies only to relation `definition`") && message.contains("accepted shapes:"),
-        "code_refs must refuse a column outside relation `definition`: {message}"
-    );
-    let message = refused(&service, "code_refs", json!({ "name": "alpha", "relation": "users" })).await;
-    assert!(
-        message.contains("`relation` must be one of") && message.contains("`importers`") && message.contains("users"),
-        "an unknown relation must list the accepted ones: {message}"
-    );
-
-    let message = refused(&service, "index_status", json!({ "mode": "status" })).await;
-    assert!(
-        message.contains("`index_status`: unknown field `mode`") && message.contains("Accepted fields: none"),
-        "index_status takes no arguments and must say so: {message}"
-    );
-    let message = refused(&service, "index_rescan", json!({ "component": "blobs" })).await;
-    assert!(
-        message.contains("unknown field `component`") && message.contains("`paths`") && !message.contains("`full`"),
-        "index_rescan must refuse a field it does not take and list the one it does: {message}"
+        has_import,
+        "edges=all must surface import edges beyond calls: {edges:?}"
     );
 
     let _ = service.cancel().await;
 }
 
-/// The argument contract of `memory_save` and `memory_search`, mirroring the code and git coverage.
-///
-/// Argument exactness is checked before the feature gate, so the unknown-field and missing-field
-/// refusals hold in every build; the selector conflict is decided in the body, which a build
-/// without `--features memory` replaces with the missing-feature answer.
+/// Assert every edge in a traversal payload carries a provenance tag on the fixed ladder with
+/// a matching confidence, and that its `from`/`to` index valid nodes.
+fn assert_graph_edges_well_formed(body: &Value) {
+    let nodes = body.get("nodes").and_then(Value::as_array).expect("nodes array");
+    let edges = body.get("edges").and_then(Value::as_array).expect("edges array");
+    for e in edges {
+        let prov = e.get("provenance").and_then(Value::as_str).expect("edge provenance");
+        let conf = e.get("confidence").and_then(Value::as_f64).expect("edge confidence");
+        match prov {
+            "extracted" => assert_eq!(conf, 1.0),
+            "inferred" => assert_eq!(conf, 0.5),
+            "ambiguous" => assert_eq!(conf, 0.2),
+            other => panic!("unexpected provenance tag {other:?} in {e}"),
+        }
+        let from = e.get("from").and_then(Value::as_u64).expect("edge from") as usize;
+        let to = e.get("to").and_then(Value::as_u64).expect("edge to") as usize;
+        assert!(
+            from < nodes.len() && to < nodes.len(),
+            "edge endpoints index into nodes: {e}"
+        );
+    }
+}
+
+/// ADR-0003: the `neighbors`, `path`, and `subgraph` traversal tools walk the shared code-graph
+/// and report typed, provenance-tagged edges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn memory_tools_reject_inexact_arguments() {
+async fn traversal_tools_walk_the_shared_graph() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    // Call chain across files: run -> helper -> engine. ~keep
+    std::fs::write(
+        root.join("core.rs"),
+        "pub fn engine() {}\npub fn helper() { engine(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.rs"),
+        "use crate::core::helper;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    // neighbors(helper, both): reaches engine (helper->engine) and run (run->helper). ~keep
+    let neighbors = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "neighbors", "name": "helper", "direction": "both", "depth": 2, "edges": "all"}),
+        ))
+        .await
+        .expect("neighbors");
+    assert_structured_matches_text(&neighbors);
+    let body = decode_text(&neighbors);
+    let nodes = body.get("nodes").and_then(Value::as_array).expect("nodes");
+    assert_eq!(
+        nodes[0].get("name").and_then(Value::as_str),
+        Some("helper"),
+        "root is the first node: {body}"
+    );
+    let reached: Vec<&str> = nodes
+        .iter()
+        .filter_map(|n| n.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(reached.contains(&"engine"), "helper should reach engine: {reached:?}");
+    assert!(
+        reached.contains(&"run"),
+        "run should reach helper (incoming): {reached:?}"
+    );
+    assert_graph_edges_well_formed(&body);
+
+    // path(run -> engine): the confidence-weighted route run -> helper -> engine. ~keep
+    let path = service
+        .call_tool(call_params(
+            "graph",
+            json!({"mode": "path", "from": "run", "to": "engine", "edges": "calls"}),
+        ))
+        .await
+        .expect("path");
+    let body = decode_text(&path);
+    assert_eq!(
+        body.get("found").and_then(Value::as_bool),
+        Some(true),
+        "route found: {body}"
+    );
+    let names: Vec<&str> = body
+        .get("nodes")
+        .and_then(Value::as_array)
+        .expect("path nodes")
+        .iter()
+        .filter_map(|n| n.get("name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(names, vec!["run", "helper", "engine"], "ordered path: {body}");
+    let edge_count = body
+        .get("edges")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(edge_count, names.len() - 1, "one edge between each pair of path nodes");
+    // path reports scan truncation like its siblings — a small fixture never hits the cap.
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(false),
+        "path exposes truncated=false on a complete scan: {body}"
+    );
+    assert_graph_edges_well_formed(&body);
+
+    // subgraph(helper): a readable neighborhood; nodes carry a centrality score.
+    let subgraph = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "subgraph", "name": "helper", "depth": 2, "edges": "all", "max_nodes": 10}),
+        ))
+        .await
+        .expect("subgraph");
+    let body = decode_text(&subgraph);
+    let nodes = body.get("nodes").and_then(Value::as_array).expect("subgraph nodes");
+    assert!(!nodes.is_empty(), "subgraph has nodes: {body}");
+    assert!(
+        nodes.iter().all(|n| n.get("centrality").is_some()),
+        "every subgraph node carries a centrality score: {body}"
+    );
+    assert_graph_edges_well_formed(&body);
+
+    // edges="contains" honors the containment lane — it must not silently degrade to calls-only.
+    let contains = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "neighbors", "name": "engine", "direction": "both", "edges": "contains"}),
+        ))
+        .await
+        .expect("neighbors contains");
+    let body = decode_text(&contains);
+    let has_contains = body
+        .get("edges")
+        .and_then(Value::as_array)
+        .map(|es| {
+            es.iter()
+                .any(|e| e.get("kind").and_then(Value::as_str) == Some("contains"))
+        })
+        .unwrap_or(false);
+    assert!(has_contains, "edges=contains must yield a containment edge: {body}");
+
+    // A bogus edges value is rejected, not silently coerced to a different lane set.
+    let bogus = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "neighbors", "name": "engine", "edges": "nonsense"}),
+        ))
+        .await;
+    assert!(
+        bogus.is_err(),
+        "an invalid edges value must be an error, not a silent default"
+    );
+
+    // Unresolved-name contract (stated in each tool's description): an unknown symbol yields an
+    // empty result, never an error — so an agent can probe freely without exception handling.
+    let missing = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "neighbors", "name": "does_not_exist_zzz"}),
+        ))
+        .await
+        .expect("neighbors on an unknown name returns Ok, not an error");
+    assert!(
+        decode_text(&missing)
+            .get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.is_empty()),
+        "neighbors of an unresolved name is empty"
+    );
+    let missing = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "subgraph", "name": "does_not_exist_zzz"}),
+        ))
+        .await
+        .expect("subgraph on an unknown name returns Ok, not an error");
+    assert!(
+        decode_text(&missing)
+            .get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.is_empty()),
+        "subgraph of an unresolved name is empty"
+    );
+    let missing = service
+        .call_tool(call_params(
+            "graph",
+            json!({"mode": "path", "from": "does_not_exist_zzz", "to": "engine"}),
+        ))
+        .await
+        .expect("path from an unknown source returns Ok, not an error");
+    assert_eq!(
+        decode_text(&missing).get("found").and_then(Value::as_bool),
+        Some(false),
+        "path from an unresolved source is not found, not an error"
+    );
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0004: the `communities` tool clusters the shared code-graph into de-facto modules with
+/// deterministic, LLM-free labels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn communities_cluster_the_shared_graph() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    // Two clusters: a math module (add/mul/compute) and a text module (upper/lower/render), each
+    // internally wired, joined by a single cross-cluster call.
+    std::fs::write(
+        root.join("math.rs"),
+        "pub fn add() {}\npub fn mul() { add(); }\npub fn compute() { add(); mul(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("text.rs"),
+        "pub fn upper() {}\npub fn lower() { upper(); }\npub fn render() { upper(); lower(); }\n",
+    )
+    .unwrap();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let communities = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "communities", "algorithm": "label_propagation", "edges": "all"}),
+        ))
+        .await
+        .expect("communities");
+    assert_structured_matches_text(&communities);
+    let body = decode_text(&communities);
+    assert_eq!(
+        body.get("algorithm").and_then(Value::as_str),
+        Some("label_propagation"),
+        "algorithm is echoed: {body}"
+    );
+    let list = body.get("communities").and_then(Value::as_array).expect("communities");
+    assert!(!list.is_empty(), "at least one community detected: {body}");
+    for c in list {
+        assert!(
+            c.get("label").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
+            "every community has a non-empty label: {c}"
+        );
+        let members = c.get("members").and_then(Value::as_array).expect("members");
+        assert!(!members.is_empty(), "community has members: {c}");
+        assert!(
+            members.iter().all(|m| m.get("centrality").is_some()),
+            "every member carries a centrality score: {c}"
+        );
+    }
+
+    // Louvain is the opt-in higher-quality algorithm; it must also run and echo its name.
+    let louvain = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "communities", "algorithm": "louvain"}),
+        ))
+        .await
+        .expect("communities louvain");
+    let body = decode_text(&louvain);
+    assert_eq!(
+        body.get("algorithm").and_then(Value::as_str),
+        Some("louvain"),
+        "louvain algorithm echoed: {body}"
+    );
+
+    // max_communities=1 caps the returned list below the detected count and flags truncated.
+    let capped = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "communities", "algorithm": "label_propagation", "max_communities": 1}),
+        ))
+        .await
+        .expect("communities capped");
+    let body = decode_text(&capped);
+    let returned = body
+        .get("communities")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let detected = body.get("num_communities").and_then(Value::as_u64).unwrap_or(0);
+    assert_eq!(returned, 1, "capped to one community: {body}");
+    assert!(detected >= 2, "the two modules are distinct, so ≥2 detected: {body}");
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(true),
+        "capping the community list flags truncated: {body}"
+    );
+
+    // An invalid algorithm is rejected, not silently defaulted.
+    let bogus = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "communities", "algorithm": "kmeans"}),
+        ))
+        .await;
+    assert!(bogus.is_err(), "an invalid algorithm must be an error");
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0005: the `graph_export` tool renders the shared code-graph into text formats over one
+/// canonical payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_export_renders_every_format() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("core.rs"),
+        "pub fn engine() {}\npub fn helper() { engine(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.rs"),
+        "use crate::core::helper;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    // node_link: the response body carries valid node-link JSON as a string.
+    let export = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "format": "node_link", "edges": "all"}),
+        ))
+        .await
+        .expect("graph_export node_link");
+    assert_structured_matches_text(&export);
+    let body = decode_text(&export);
+    assert_eq!(body.get("format").and_then(Value::as_str), Some("node_link"), "{body}");
+    assert!(
+        body.get("node_count").and_then(Value::as_u64).unwrap_or(0) >= 3,
+        "nodes: {body}"
+    );
+    let content = body.get("content").and_then(Value::as_str).expect("content");
+    let doc: Value = serde_json::from_str(content).expect("content is valid node-link JSON");
+    assert!(
+        doc.get("nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    );
+    assert!(doc.get("links").and_then(Value::as_array).is_some());
+
+    // Each remaining format renders and echoes its name with a recognizable header/keyword.
+    for (fmt, needle) in [
+        ("dot", "digraph basemind"),
+        ("mermaid", "graph LR"),
+        ("graphml", "<graphml"),
+        ("cypher", "CREATE ("),
+        ("html", "<!doctype html>"),
+        ("svg", "<svg xmlns="),
+    ] {
+        let out = service
+            .call_tool(call_params("graph", json!({ "mode": "export", "format": fmt})))
+            .await
+            .unwrap_or_else(|_| panic!("graph_export {fmt}"));
+        let body = decode_text(&out);
+        assert_eq!(body.get("format").and_then(Value::as_str), Some(fmt), "{body}");
+        let content = body.get("content").and_then(Value::as_str).unwrap_or("");
+        assert!(content.contains(needle), "format {fmt} missing {needle:?}: {content}");
+    }
+
+    // max_nodes=2 caps the view below the node count, flags truncated, and every edge endpoint
+    // stays within the remapped node range.
+    let capped = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "format": "node_link", "edges": "all", "max_nodes": 2}),
+        ))
+        .await
+        .expect("graph_export capped");
+    let body = decode_text(&capped);
+    let node_count = body.get("node_count").and_then(Value::as_u64).unwrap_or(0);
+    assert!(node_count <= 2, "capped to max_nodes: {body}");
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(true),
+        "capping flags truncated: {body}"
+    );
+    let doc: Value = serde_json::from_str(body.get("content").and_then(Value::as_str).unwrap()).unwrap();
+    for link in doc.get("links").and_then(Value::as_array).into_iter().flatten() {
+        for end in ["source", "target"] {
+            let idx = link.get(end).and_then(Value::as_u64).unwrap();
+            assert!(idx < node_count, "edge {end} {idx} in range after cap: {link}");
+        }
+    }
+
+    // write: true persists the rendered content to the cache and returns its path; the inline
+    // content is still returned, and the on-disk file matches it byte-for-byte.
+    let written = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "format": "svg", "write": true}),
+        ))
+        .await
+        .expect("graph_export write");
+    let body = decode_text(&written);
+    let output_path = body
+        .get("output_path")
+        .and_then(Value::as_str)
+        .expect("output_path present when write=true");
+    assert!(
+        output_path.ends_with(".svg"),
+        "export named by format extension: {output_path}"
+    );
+    let on_disk = std::fs::read_to_string(output_path).expect("export file exists on disk");
+    let inline = body.get("content").and_then(Value::as_str).expect("content");
+    assert_eq!(on_disk, inline, "written file matches inline content");
+    assert!(on_disk.contains("<svg xmlns="), "written file is the SVG document");
+
+    // Without write, no file path is returned.
+    let unwritten = service
+        .call_tool(call_params("graph", json!({ "mode": "export", "format": "svg"})))
+        .await
+        .expect("graph_export no-write");
+    assert!(
+        decode_text(&unwritten).get("output_path").is_none(),
+        "output_path omitted when write is not set"
+    );
+
+    // An invalid format is rejected, not silently defaulted.
+    let bogus = service
+        .call_tool(call_params("graph", json!({ "mode": "export", "format": "nonesuch"})))
+        .await;
+    assert!(bogus.is_err(), "an unsupported format must be an error");
+
+    let _ = service.cancel().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_export_bounds_unfocused_dense_views_by_default() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    let mut source = String::new();
+    for caller in 0..32 {
+        source.push_str(&format!("pub fn function_{caller}() {{"));
+        for callee in 0..32 {
+            if caller != callee {
+                source.push_str(&format!(" function_{callee}();"));
+            }
+        }
+        source.push_str(" }\n");
+    }
+    std::fs::write(root.join("dense.rs"), source).expect("write dense graph fixture");
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let bounded = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "format": "mermaid", "write": false }),
+        ))
+        .await
+        .expect("bounded graph export");
+    let body = decode_text(&bounded);
+    let edge_count = body.get("edge_count").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let edge_count_total = body.get("edge_count_total").and_then(Value::as_u64).unwrap_or(0);
+    assert!(
+        edge_count <= 200,
+        "unfocused export must apply the safe default edge cap: {body}"
+    );
+    assert!(
+        edge_count_total > edge_count,
+        "export must report the pre-cap edge total: {body}"
+    );
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(true),
+        "the response must disclose the default cap: {body}"
+    );
+
+    let explicitly_bounded = service
+        .call_tool(call_params(
+            "graph",
+            json!({
+                "mode": "export",
+                "format": "mermaid",
+                "write": false,
+                "max_edges": 7
+            }),
+        ))
+        .await
+        .expect("graph export accepts an explicit max_edges cap");
+    let body = decode_text(&explicitly_bounded);
+    let edge_count = body.get("edge_count").and_then(Value::as_u64).unwrap_or(u64::MAX);
+    let edge_count_total = body.get("edge_count_total").and_then(Value::as_u64).unwrap_or(0);
+    assert!(
+        edge_count <= 7,
+        "explicit max_edges must tighten the export cap: {body}"
+    );
+    assert!(
+        edge_count_total > edge_count,
+        "explicit cap must preserve the pre-cap total: {body}"
+    );
+    assert_eq!(
+        body.get("truncated").and_then(Value::as_bool),
+        Some(true),
+        "the response must disclose the explicit cap: {body}"
+    );
+
+    for mode in ["display", "open"] {
+        let bounded = service
+            .call_tool(call_params(
+                "graph",
+                json!({
+                    "mode": mode,
+                    "format": "svg",
+                    "open": false,
+                    "max_edges": 7
+                }),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("graph {mode} accepts max_edges: {error}"));
+        let body = decode_text(&bounded);
+        let edge_count = body.get("edge_count").and_then(Value::as_u64).unwrap_or(u64::MAX);
+        let edge_count_total = body.get("edge_count_total").and_then(Value::as_u64).unwrap_or(0);
+        assert!(edge_count <= 7, "graph {mode} must apply max_edges: {body}");
+        assert!(
+            edge_count_total > edge_count,
+            "graph {mode} must report the pre-cap total: {body}"
+        );
+        assert_eq!(
+            body.get("truncated").and_then(Value::as_bool),
+            Some(true),
+            "graph {mode} must disclose the cap: {body}"
+        );
+    }
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0007: the `display` tool renders a *visual* view, always writes it to the export cache, and
+/// (with `open: false`, the headless/test path) degrades to export-only without spawning a viewer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn display_writes_visual_view_and_degrades_without_opening() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(
+        root.join("core.rs"),
+        "pub fn engine() {}\npub fn helper() { engine(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app.rs"),
+        "use crate::core::helper;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    // Default format is html; open:false takes the export-only path (never launches a viewer in CI).
+    let shown = service
+        .call_tool(call_params("graph", json!({ "mode": "display", "open": false})))
+        .await
+        .expect("display html");
+    assert_structured_matches_text(&shown);
+    let body = decode_text(&shown);
+    assert_eq!(
+        body.get("format").and_then(Value::as_str),
+        Some("html"),
+        "default format html: {body}"
+    );
+    assert_eq!(
+        body.get("displayed").and_then(Value::as_bool),
+        Some(false),
+        "open:false does not launch a viewer: {body}"
+    );
+    assert_eq!(
+        body.get("method").and_then(Value::as_str),
+        Some("export"),
+        "degrades to export-only: {body}"
+    );
+    assert!(
+        body.get("node_count").and_then(Value::as_u64).unwrap_or(0) >= 3,
+        "nodes: {body}"
+    );
+    // The product is the file, not inline bytes: output_path is always present and content is not.
+    assert!(
+        body.get("content").is_none(),
+        "display does not return rendered bytes inline: {body}"
+    );
+    let output_path = body
+        .get("output_path")
+        .and_then(Value::as_str)
+        .expect("output_path always present");
+    assert!(
+        output_path.ends_with(".html"),
+        "html export named by extension: {output_path}"
+    );
+    let on_disk = std::fs::read_to_string(output_path).expect("export file exists on disk");
+    assert!(
+        on_disk.contains("<!doctype html>"),
+        "written file is the interactive HTML page"
+    );
+
+    // svg is the other accepted visual format.
+    let svg = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "display", "format": "svg", "open": false}),
+        ))
+        .await
+        .expect("display svg");
+    let body = decode_text(&svg);
+    assert_eq!(body.get("format").and_then(Value::as_str), Some("svg"), "{body}");
+    assert!(
+        body.get("output_path")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.ends_with(".svg")),
+        "svg export path: {body}"
+    );
+
+    // A graph *data* format is rejected — display shows a picture; graph_export returns the data.
+    let rejected = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "display", "format": "node_link", "open": false}),
+        ))
+        .await;
+    assert!(
+        rejected.is_err(),
+        "a non-visual format must be rejected, not silently rendered"
+    );
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0009: a `// WHY:` comment citing an ADR surfaces a rationale node with an `annotates` edge to
+/// the code it precedes and a `cites` edge to the decision record. Extraction populates
+/// `l1.rationale` at scan time; `graph_export edges="rationale"` renders both edge kinds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rationale_lane_surfaces_annotates_and_cites_edges() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("docs/adr")).unwrap();
+    std::fs::write(root.join("docs/adr/0001-graph.md"), b"# ADR-0001: graph\n").unwrap();
+    std::fs::write(
+        root.join("core.rs"),
+        b"// WHY: keep the lock scope tight; see ADR-0001\npub fn engine() {}\n",
+    )
+    .unwrap();
+    basemind::lang::ensure_grammars().expect("grammar bootstrap");
+    let cfg = basemind::config::default_for_root(root);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut store = basemind::store::Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
+            basemind::scanner::scan(
+                root,
+                &mut store,
+                &cfg,
+                basemind::scanner::ScanSource::WorkingTree,
+                basemind::scanner::EmbedMode::Inline,
+            )
+            .expect("scan");
+        });
+    });
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let export = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "edges": "rationale", "format": "node_link" }),
+        ))
+        .await
+        .expect("graph_export rationale");
+    assert_structured_matches_text(&export);
+    let body = decode_text(&export);
+    let content = body.get("content").and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        content.contains("annotates"),
+        "the rationale lane must annotate the engine fn: {content}"
+    );
+    assert!(
+        content.contains("cites"),
+        "the ADR-0001 citation must produce a cites edge to the decision record: {content}"
+    );
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0008: a scanned document that cites an indexed source file surfaces a `Documents` edge in the
+/// shared code-graph. The document tier writes the doc→code link at scan time; the serve cache-warm
+/// path reloads it, and `graph_export edges="documents"` renders the resulting edge.
+#[cfg(feature = "documents")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn documents_lane_surfaces_doc_to_code_edges() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(root.join("core.rs"), b"pub fn engine() {}\n").unwrap();
+    // SVG, not .md/.txt/.csv: those have tree-sitter grammars and route to the code tier, while SVG
+    // is xberg-extractable yet grammar-less, so it lands in the document tier (same choice bug_44 /
+    // scan_smoke make). Its text cites the indexed `core.rs`, producing a path-citation doc link.
+    std::fs::write(
+        root.join("notes.svg"),
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\">\n\
+          <text>The engine lives in core.rs and drives the whole pipeline.</text>\n\
+          </svg>\n",
+    )
+    .unwrap();
+
+    // Embedding-free doc scan: doc links are keyword / path-citation heuristics over chunk text and
+    // do not depend on an ONNX embedding model being present in the test environment.
+    let mut cfg = basemind::config::default_for_root(root);
+    cfg.documents.embed = false;
+    basemind::lang::ensure_grammars().expect("grammar bootstrap");
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut store = basemind::store::Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
+            basemind::scanner::scan(
+                root,
+                &mut store,
+                &cfg,
+                basemind::scanner::ScanSource::WorkingTree,
+                basemind::scanner::EmbedMode::Inline,
+            )
+            .expect("scan");
+        });
+    });
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let export = service
+        .call_tool(call_params(
+            "graph",
+            json!({ "mode": "export", "edges": "documents", "format": "node_link" }),
+        ))
+        .await
+        .expect("graph_export documents");
+    assert_structured_matches_text(&export);
+    let body = decode_text(&export);
+    let edge_count = body.get("edge_count").and_then(Value::as_u64).unwrap_or(0);
+    assert!(
+        edge_count >= 1,
+        "the documents lane must surface a doc→code edge for the core.rs citation: {body}"
+    );
+    let content = body.get("content").and_then(Value::as_str).unwrap_or_default();
+    assert!(
+        content.contains("documents"),
+        "the rendered graph must carry a documents edge: {content}"
+    );
+
+    let _ = service.cancel().await;
+}
+
+/// ADR-0008 regression: the doc↔code lane must SURVIVE an unscoped rescan. Before the fix only the
+/// boot cache-warm attached `doc_links`; an unscoped `scan_and_refresh` rebuilt the `MapCache` bare, so
+/// the `documents` lane silently went empty after the first rescan. `doc_links_cache::attach_async`
+/// now reattaches the persisted links on that path. This test fails on the pre-fix tree.
+#[cfg(feature = "documents")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn documents_lane_survives_unscoped_rescan() {
+    basemind::store::init_isolated_cache();
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(root.join("core.rs"), b"pub fn engine() {}\n").unwrap();
+    std::fs::write(
+        root.join("notes.svg"),
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\">\n\
+          <text>The engine lives in core.rs and drives the whole pipeline.</text>\n\
+          </svg>\n",
+    )
+    .unwrap();
+    let mut cfg = basemind::config::default_for_root(root);
+    cfg.documents.embed = false;
+    basemind::lang::ensure_grammars().expect("grammar bootstrap");
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut store = basemind::store::Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
+            basemind::scanner::scan(
+                root,
+                &mut store,
+                &cfg,
+                basemind::scanner::ScanSource::WorkingTree,
+                basemind::scanner::EmbedMode::Inline,
+            )
+            .expect("scan");
+        });
+    });
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let doc_edges = json!({ "mode": "export", "edges": "documents", "format": "node_link" });
+
+    // Baseline: the boot cache-warm attached the persisted link.
+    let before = service
+        .call_tool(call_params("graph", doc_edges.clone()))
+        .await
+        .expect("graph_export documents (before)");
+    let edges_before = decode_text(&before)
+        .get("edge_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(edges_before >= 1, "baseline documents edge missing after warm");
+
+    // An unscoped rescan rebuilds the whole MapCache — the path that used to wipe doc_links.
+    let _ = service
+        .call_tool(call_params("admin", json!({ "mode": "rescan"})))
+        .await
+        .expect("rescan");
+
+    let after = service
+        .call_tool(call_params("graph", doc_edges))
+        .await
+        .expect("graph_export documents (after)");
+    let edges_after = decode_text(&after)
+        .get("edge_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    assert!(edges_after >= 1, "the documents lane was wiped by an unscoped rescan");
+
+    let _ = service.cancel().await;
+}
+
+/// Per-mode contract for the consolidated `workspace` tool.
+///
+/// The five modes' bodies all talk to the comms broker daemon, which a hermetic smoke run has no
+/// business spawning — so what is asserted here is the layer that runs BEFORE the daemon round-trip
+/// and is exactly the layer consolidation introduced: `mode` is required, every mode is advertised,
+/// a field belonging to another mode is rejected rather than ignored, and a mode that needs
+/// `repo_id` / `name` names the missing pair instead of failing anonymously downstream.
+///
+/// A refusal reaches the caller two ways — `Lenient` renders a parameter-shape failure as an
+/// `is_error` result, while a helper-level rejection is a `-32602` — so [`refusal`] normalizes both
+/// to the message text and every assertion is made on the wording an agent actually reads.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_tool_validates_every_mode_before_touching_the_registry() {
+    /// The refusal text of a call that must not have succeeded, whichever way it was refused.
+    fn refusal(result: Result<CallToolResult, rmcp::service::ServiceError>, context: &str) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true), "{context} must be refused: {result:?}");
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
+
+    let dir = build_repo();
+    let root = dir.path();
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let tools = service.list_all_tools().await.expect("list tools");
+    let workspace = tools
+        .iter()
+        .find(|t| t.name == "workspace")
+        .expect("the `workspace` domain tool must be advertised under --features comms");
+    let schema = serde_json::to_string(&workspace.input_schema).expect("serialize inputSchema");
+    for mode in ["workspaces", "worktrees", "branches", "claim", "release"] {
+        assert!(
+            schema.contains(&format!("\"{mode}\"")),
+            "`workspace` inputSchema must advertise mode `{mode}`: {schema}"
+        );
+    }
+
+    // `mode` is required: an omitted mode errors, it never silently picks an operation.
+    let message = refusal(
+        service.call_tool(call_params("workspace", json!({}))).await,
+        "an omitted mode",
+    );
+    assert!(
+        message.contains("missing field `mode`"),
+        "an omitted mode must name the field: {message}"
+    );
+
+    let message = refusal(
+        service
+            .call_tool(call_params("workspace", json!({ "mode": "worktree" })))
+            .await,
+        "an unknown mode",
+    );
+    assert!(
+        message.contains("worktrees") && message.contains("claim"),
+        "an unknown mode must list the accepted set: {message}"
+    );
+
+    // mode `workspaces` takes neither `repo_id` nor `name` — a stray field is rejected, not ignored.
+    let message = refusal(
+        service
+            .call_tool(call_params(
+                "workspace",
+                json!({ "mode": "workspaces", "repo_id": "path:/nowhere" }),
+            ))
+            .await,
+        "mode `workspaces` with a stray `repo_id`",
+    );
+    assert!(
+        message.contains("mode `workspaces` does not accept") && message.contains("`repo_id`"),
+        "mode `workspaces` must name the field it rejected: {message}"
+    );
+
+    // modes `worktrees` / `branches` require `repo_id` and reject `name`.
+    for mode in ["worktrees", "branches"] {
+        let message = refusal(
+            service
+                .call_tool(call_params("workspace", json!({ "mode": mode })))
+                .await,
+            "a repo_id-less list mode",
+        );
+        assert!(
+            message.contains(&format!("mode=\"{mode}\" requires `repo_id`")),
+            "mode `{mode}` must name the missing `repo_id`: {message}"
+        );
+
+        let message = refusal(
+            service
+                .call_tool(call_params(
+                    "workspace",
+                    json!({ "mode": mode, "repo_id": "path:/nowhere", "name": "(main)" }),
+                ))
+                .await,
+            "a list mode given `name`",
+        );
+        assert!(
+            message.contains("`name`"),
+            "mode `{mode}` must reject `name` rather than ignore it: {message}"
+        );
+    }
+
+    // modes `claim` / `release` require both `repo_id` and `name`.
+    for mode in ["claim", "release"] {
+        let message = refusal(
+            service
+                .call_tool(call_params("workspace", json!({ "mode": mode, "name": "(main)" })))
+                .await,
+            "a repo_id-less claim/release",
+        );
+        assert!(
+            message.contains(&format!("mode=\"{mode}\" requires `repo_id`")),
+            "mode `{mode}` must name the missing `repo_id`: {message}"
+        );
+
+        let message = refusal(
+            service
+                .call_tool(call_params(
+                    "workspace",
+                    json!({ "mode": mode, "repo_id": "path:/nowhere" }),
+                ))
+                .await,
+            "a name-less claim/release",
+        );
+        assert!(
+            message.contains(&format!("mode=\"{mode}\" requires `name`")),
+            "mode `{mode}` must name the missing `name`: {message}"
+        );
+    }
+
+    let _ = service.cancel().await;
+}
+
+/// Per-mode contract for the consolidated `admin` tool: `mode` is required, every mode is
+/// advertised in the input schema, a field belonging to another mode is rejected rather than
+/// ignored, and a mode that needs a field it did not receive names the exact `mode`/field pair.
+///
+/// A refusal reaches the caller two ways — `Lenient` renders a parameter-shape failure as an
+/// `is_error` result, while a helper-level rejection is a `-32602` — so [`refusal`] normalizes both
+/// to the message text and every assertion is made on the wording an agent actually reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tool_validates_every_mode_before_running_it() {
+    /// The refusal text of a call that must not have succeeded, whichever way it was refused.
+    fn refusal(result: Result<CallToolResult, rmcp::service::ServiceError>, context: &str) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true), "{context} must be refused: {result:?}");
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
+
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
@@ -3295,63 +5545,267 @@ async fn memory_tools_reject_inexact_arguments() {
     let service = ().serve(transport).await.expect("rmcp handshake");
 
     let tools = service.list_all_tools().await.expect("list tools");
-    assert!(
-        tools.iter().all(|t| t.name.as_ref() != "memory"),
-        "the mode-dispatched `memory` tool must no longer be advertised"
-    );
-    for tool in ["memory_save", "memory_search", "docs_search"] {
+    let admin = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "admin")
+        .expect("the `admin` domain tool must always be advertised");
+    let schema = serde_json::to_string(&admin.input_schema).expect("serialize inputSchema");
+    for mode in [
+        "status",
+        "repo",
+        "rescan",
+        "cache_stats",
+        "gc",
+        "cache_clear",
+        "telemetry",
+        "compress",
+        "delta",
+        "checkpoint",
+        "waste",
+    ] {
         assert!(
-            tools.iter().any(|t| t.name.as_ref() == tool),
-            "`{tool}` must be advertised in every build"
+            schema.contains(&format!("\"{mode}\"")),
+            "`admin` inputSchema must advertise mode `{mode}`: {schema}"
         );
     }
 
-    let message = refused(&service, "memory_search", json!({ "q": "x" })).await;
+    // `mode` is required: an omitted mode errors, it never silently picks an operation.
+    let message = refusal(
+        service.call_tool(call_params("admin", json!({}))).await,
+        "an omitted mode",
+    );
     assert!(
-        message.contains("`memory_search`: unknown field `q`, did you mean `query`?")
-            && message.contains("Accepted fields:")
-            && message.contains("`prefix`"),
-        "an unknown field must be named with the field it most likely meant: {message}"
+        message.contains("missing field `mode`"),
+        "an omitted mode must name the field: {message}"
     );
 
-    let message = refused(&service, "memory_save", json!({ "key": "k" })).await;
+    // An unknown mode names every accepted spelling.
+    let message = refusal(
+        service
+            .call_tool(call_params("admin", json!({ "mode": "reindex" })))
+            .await,
+        "an unknown mode",
+    );
     assert!(
-        message.contains("missing field `value`") && message.contains("`value` (required)"),
-        "memory_save must name the missing `value`: {message}"
+        message.contains("rescan") && message.contains("cache_clear"),
+        "an unknown mode must list the accepted set: {message}"
     );
 
-    let message = refused(
-        &service,
-        "memory_save",
-        json!({ "key": "k", "value": "v", "embed": false }),
-    )
-    .await;
+    // mode `status` takes no sibling fields — a stray field is rejected, not ignored.
+    let message = refusal(
+        service
+            .call_tool(call_params("admin", json!({ "mode": "status", "paths": ["a.rs"] })))
+            .await,
+        "mode `status` with a stray `paths`",
+    );
     assert!(
-        message.contains("unknown field `embed`"),
-        "the removed `embed` switch must be refused, not ignored: {message}"
+        message.contains("`admin` mode `status` does not accept") && message.contains("`paths`"),
+        "mode `status` must name the field it rejected: {message}"
     );
 
-    let message = refused(&service, "memory_search", json!({ "query": "x", "key": "k" })).await;
+    // A field belonging to a DIFFERENT mode (not just an arbitrary unknown one) is also rejected,
+    // never silently dropped: `component` belongs to `cache_clear`, not `rescan`.
+    let message = refusal(
+        service
+            .call_tool(call_params("admin", json!({ "mode": "rescan", "component": "blobs" })))
+            .await,
+        "mode `rescan` given a `cache_clear` field",
+    );
+    assert!(
+        message.contains("`admin` mode `rescan` does not accept") && message.contains("`component`"),
+        "mode `rescan` must reject a sibling mode's field rather than ignore it: {message}"
+    );
+
+    // `delta` requires both `old` and `new` — the missing one is named exactly.
+    let message = refusal(
+        service
+            .call_tool(call_params("admin", json!({ "mode": "delta", "old": "a" })))
+            .await,
+        "a `new`-less delta",
+    );
+    assert!(
+        message.contains("`admin` mode=\"delta\" requires `new`"),
+        "mode `delta` must name the missing `new`: {message}"
+    );
+
+    // `checkpoint` requires `text`.
+    let message = refusal(
+        service
+            .call_tool(call_params("admin", json!({ "mode": "checkpoint" })))
+            .await,
+        "a text-less checkpoint",
+    );
+    assert!(
+        message.contains("`admin` mode=\"checkpoint\" requires `text`"),
+        "mode `checkpoint` must name the missing `text`: {message}"
+    );
+
+    let _ = service.cancel().await;
+}
+
+/// Per-mode contract for the consolidated `memory` tool, mirroring the `admin` and `workspace`
+/// coverage above: `mode` is required, every mode is advertised, a field belonging to another mode
+/// is rejected rather than ignored, and a mode missing a required field names the exact pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_tool_validates_every_mode_before_running_it() {
+    /// The refusal text of a call that must not have succeeded, whichever way it was refused.
+    fn refusal(result: Result<CallToolResult, rmcp::service::ServiceError>, context: &str) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true), "{context} must be refused: {result:?}");
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
+
+    let dir = build_repo();
+    let root = dir.path();
+    run_scan(root);
+
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let tools = service.list_all_tools().await.expect("list tools");
+    let memory = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "memory")
+        .expect("the `memory` domain tool must always be advertised");
+    let schema = serde_json::to_string(&memory.input_schema).expect("serialize inputSchema");
+    for mode in [
+        "put",
+        "get",
+        "list",
+        "search",
+        "delete",
+        "audit",
+        "documents",
+        "mine",
+        "proposals",
+        "accept",
+        "reject",
+    ] {
+        assert!(
+            schema.contains(&format!("\"{mode}\"")),
+            "`memory` inputSchema must advertise mode `{mode}`: {schema}"
+        );
+    }
+
+    // `mode` is required: an omitted mode errors, it never silently picks an operation.
+    let message = refusal(
+        service.call_tool(call_params("memory", json!({}))).await,
+        "an omitted mode",
+    );
+    assert!(
+        message.contains("missing field `mode`"),
+        "an omitted mode must name the field: {message}"
+    );
+
+    // An unknown mode names every accepted spelling.
+    let message = refusal(
+        service
+            .call_tool(call_params("memory", json!({ "mode": "recall" })))
+            .await,
+        "an unknown mode",
+    );
+    assert!(
+        message.contains("put") && message.contains("get") && message.contains("delete"),
+        "an unknown mode must list the accepted set: {message}"
+    );
+
+    // A field belonging to a DIFFERENT mode is rejected, not silently ignored: `window` belongs to
+    // `mine`, not `get`.
+    let message = refusal(
+        service
+            .call_tool(call_params(
+                "memory",
+                json!({ "mode": "get", "key": "k", "window": 10 }),
+            ))
+            .await,
+        "mode `get` given a `mine` field",
+    );
+    assert!(
+        message.contains("`memory` mode `get` does not accept") && message.contains("`window`"),
+        "mode `get` must reject a sibling mode's field rather than ignore it: {message}"
+    );
+
+    // `put` requires both `key` and `value` — the missing one is named exactly. `require()` only ~keep
+    // runs inside `run_memory_ops`, which is itself gated on `--features memory`: a build without it ~keep
+    // answers with the feature-gate message for every mode before ever reaching `require()`, so the ~keep
+    // exact-field wording is only checked on a `--features memory` build. ~keep
+    let message = refusal(
+        service
+            .call_tool(call_params("memory", json!({ "mode": "put", "key": "k" })))
+            .await,
+        "a value-less put",
+    );
     if cfg!(feature = "memory") {
         assert!(
-            message.contains("`query`, `key` and `prefix` are alternatives") && message.contains("pass at most one of"),
-            "memory_search with two selectors must name the accepted shapes: {message}"
+            message.contains("`memory`: mode=\"put\" requires `value`"),
+            "mode `put` must name the missing `value`: {message}"
         );
     } else {
         assert!(
-            message.contains("`memory_search` needs the `memory` Cargo feature"),
-            "without --features memory, memory_search must name the missing feature: {message}"
+            message.contains("requires the `memory` feature"),
+            "without --features memory, mode `put` must name the missing feature: {message}"
+        );
+    }
+
+    // `search` requires `query`, same feature-gate caveat as `put` above.
+    let message = refusal(
+        service
+            .call_tool(call_params("memory", json!({ "mode": "search" })))
+            .await,
+        "a query-less search",
+    );
+    if cfg!(feature = "memory") {
+        assert!(
+            message.contains("`memory`: mode=\"search\" requires `query`"),
+            "mode `search` must name the missing `query`: {message}"
+        );
+    } else {
+        assert!(
+            message.contains("requires the `memory` feature"),
+            "without --features memory, mode `search` must name the missing feature: {message}"
         );
     }
 
     let _ = service.cancel().await;
 }
 
-/// The argument contract of the git verb tools, mirroring the code and memory coverage: unknown
-/// and missing fields are named, and every combination of filters with no meaning is refused
-/// naming the shapes that have one. A filter that was ignored would read as a log scoped by it.
+/// Per-mode contract for the consolidated `git` tool, mirroring the `admin` / `workspace` /
+/// `memory` coverage above: every mode is advertised, `mode` is required, a field belonging to
+/// another mode is rejected rather than ignored, and a mode missing a required field names the
+/// exact `mode`/field pair.
+///
+/// Consolidation moved twelve operations from tool names into `mode`. Coverage has to be asserted
+/// on the modes or it silently stops covering them — `tools/list` would still show one healthy
+/// `git` tool while any number of its modes were unreachable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn git_tools_reject_inexact_arguments() {
+async fn git_tool_validates_every_mode_before_running_it() {
+    /// The refusal text of a call that must not have succeeded, whichever way it was refused.
+    fn refusal(result: Result<CallToolResult, rmcp::service::ServiceError>, context: &str) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true), "{context} must be refused: {result:?}");
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
+
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
@@ -3362,182 +5816,216 @@ async fn git_tools_reject_inexact_arguments() {
     let service = ().serve(transport).await.expect("rmcp handshake");
 
     let tools = service.list_all_tools().await.expect("list tools");
+    let git = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "git")
+        .expect("the `git` domain tool must always be advertised");
+    let schema = serde_json::to_string(&git.input_schema).expect("serialize inputSchema");
+    for mode in [
+        "status",
+        "recent",
+        "touching",
+        "by_path",
+        "churn",
+        "diff",
+        "diff_outline",
+        "blame",
+        "blame_symbol",
+        "symbol_history",
+        "search",
+        "show",
+    ] {
+        assert!(
+            schema.contains(&format!("\"{mode}\"")),
+            "`git` inputSchema must advertise mode `{mode}`: {schema}"
+        );
+    }
+
+    // `mode` is required: an omitted mode errors, it never silently picks an operation.
+    let message = refusal(
+        service.call_tool(call_params("git", json!({}))).await,
+        "an omitted mode",
+    );
     assert!(
-        tools.iter().all(|t| t.name.as_ref() != "git"),
-        "the mode-dispatched `git` tool must no longer be advertised"
+        message.contains("missing field `mode`"),
+        "an omitted mode must name the field: {message}"
     );
 
-    let message = refused(&service, "git_blame", json!({ "path": "a.rs", "line_start": 1 })).await;
+    // An unknown mode names the accepted spellings.
+    let message = refusal(
+        service.call_tool(call_params("git", json!({ "mode": "log" }))).await,
+        "an unknown mode",
+    );
     assert!(
-        message.contains("`git_blame`: unknown field `line_start`, did you mean `line`?")
-            && message.contains("Accepted fields:")
-            && message.contains("`path` (required)"),
-        "an unknown field must be named with the field it most likely meant: {message}"
+        message.contains("recent") && message.contains("blame_symbol"),
+        "an unknown mode must list the accepted set: {message}"
     );
 
-    let message = refused(&service, "git_blame", json!({})).await;
+    // mode `status` takes no sibling fields — a stray field is rejected, not ignored.
+    let message = refusal(
+        service
+            .call_tool(call_params("git", json!({ "mode": "status", "path": "a.rs" })))
+            .await,
+        "mode `status` with a stray `path`",
+    );
     assert!(
-        message.contains("missing field `path`") && message.contains("`path` (required)"),
-        "git_blame must name the missing `path`: {message}"
+        message.contains("`git` mode `status` does not accept") && message.contains("`path`"),
+        "mode `status` must name the field it rejected: {message}"
     );
 
-    let message = refused(&service, "git_blame", json!({ "path": "a.rs", "end_line": 3 })).await;
-    assert!(
-        message.contains("`end_line` needs `line`") && message.contains("accepted shapes:"),
-        "git_blame must refuse a span with no start: {message}"
+    // A field belonging to a DIFFERENT mode is rejected, never silently dropped: `rev` belongs to
+    // `blame` / `diff_outline`, not `recent`. Ignoring it would read as a log at that revision.
+    let message = refusal(
+        service
+            .call_tool(call_params("git", json!({ "mode": "recent", "rev": "HEAD" })))
+            .await,
+        "mode `recent` given a `blame` field",
     );
-    let message = refused(
-        &service,
-        "git_blame",
-        json!({ "path": "a.rs", "symbol": "alpha", "end_line": 3 }),
-    )
-    .await;
     assert!(
-        message.contains("`end_line` applies only to a line span") && message.contains("accepted shapes:"),
-        "git_blame must refuse a symbol combined with a span: {message}"
+        message.contains("`git` mode `recent` does not accept") && message.contains("`rev`"),
+        "mode `recent` must reject a sibling mode's field rather than ignore it: {message}"
     );
 
-    let message = refused(&service, "git_log", json!({ "rev": "HEAD", "path": "a.rs" })).await;
-    assert!(
-        message.contains("`git_log`: `rev` shows one commit and combines with no other filter")
-            && message.contains("accepted shapes:"),
-        "git_log must refuse `rev` combined with another filter: {message}"
+    // `blame` cannot run without `path` — the missing field is named with its mode.
+    let message = refusal(
+        service.call_tool(call_params("git", json!({ "mode": "blame" }))).await,
+        "a path-less blame",
     );
-
-    let message = refused(&service, "git_log", json!({ "symbol": "alpha" })).await;
     assert!(
-        message.contains("`symbol` needs the `path` of the file defining it") && message.contains("accepted shapes:"),
-        "git_log must refuse a symbol history with no file: {message}"
-    );
-
-    let message = refused(&service, "git_log", json!({ "query": "tweak", "path": "a.rs" })).await;
-    assert!(
-        message.contains("do not combine with `path`") && message.contains("accepted shapes:"),
-        "git_log must refuse a history search scoped to a path: {message}"
-    );
-
-    let message = refused(&service, "git_diff", json!({ "from": "HEAD" })).await;
-    assert!(
-        message.contains("`git_diff`: a diff needs the `path` of one file") && message.contains("accepted shapes:"),
-        "git_diff must refuse revisions with no file: {message}"
-    );
-
-    let message = refused(&service, "git_diff", json!({ "path": "a.rs", "rev_old": "HEAD~1" })).await;
-    assert!(
-        message.contains("unknown field `rev_old`, did you mean `from`?"),
-        "the old revision spelling must be refused with its replacement: {message}"
+        message.contains("`git` mode=\"blame\" requires `path`"),
+        "mode `blame` must name the missing `path`: {message}"
     );
 
     let _ = service.cancel().await;
 }
 
-#[cfg(feature = "code-search")]
+/// Per-mode contract for the consolidated `graph` tool: every one of its nine modes is advertised,
+/// `mode` is required, a field belonging to another mode is rejected rather than ignored, and a
+/// mode missing a required field names the exact `mode`/field pair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a cached embedding model and BASEMIND_INDEX_LAYERED=1"]
-async fn layered_semantic_mcp_falls_back_after_standalone_mutation() {
-    use basemind::lance::LanceStore;
-
-    assert_eq!(std::env::var("BASEMIND_INDEX_LAYERED").as_deref(), Ok("1"));
-    basemind::store::init_isolated_cache();
-    let dir = tempfile::tempdir().unwrap();
-    let canonical = dir.path().canonicalize().unwrap();
-    let root = canonical.as_path();
-    std::fs::write(
-        root.join("basemind.toml"),
-        "\"$schema\" = \"v1\"\n[code_search]\nenabled = true\nembed = true\n[documents]\nenabled = false\nembed = false\n",
-    )
-    .unwrap();
-    git(root, &["init", "-q"]);
-    std::fs::write(
-        root.join("lib.rs"),
-        "/// Parse a configuration file into a typed configuration.\npub fn parse_configuration() -> usize { 42 }\n",
-    )
-    .unwrap();
-    git(root, &["add", "lib.rs"]);
-    git(root, &["-c", "commit.gpgsign=false", "commit", "-qm", "fixture"]);
-    let scan = Command::new(env!("CARGO_BIN_EXE_basemind"))
-        .current_dir(root)
-        .args(["scan", "--no-git-history"])
-        .output()
-        .unwrap();
-    assert!(scan.status.success(), "{}", String::from_utf8_lossy(&scan.stderr));
-
-    let trace_path = dir.path().join("route.log");
-    let trace_file = std::fs::File::create(&trace_path).unwrap();
-    tracing_subscriber::fmt()
-        .with_env_filter("basemind::lance::shared_snapshot=debug")
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(trace_file))
-        .try_init()
-        .unwrap();
-    let service = spawn_serve(root, None).await;
-    let request = || {
-        call_params(
-            "code_search",
-            json!({ "query":"parse a configuration file","lane":"semantic"}),
-        )
-    };
-    let initial = decode_text(&service.call_tool(request()).await.unwrap());
-    assert!(
-        initial["hits"].as_array().is_some_and(|hits| !hits.is_empty()),
-        "{initial}\n{}\n{}",
-        String::from_utf8_lossy(&scan.stdout),
-        std::fs::read_to_string(&trace_path).unwrap()
-    );
-
-    let trace = || std::fs::read_to_string(&trace_path).unwrap();
-    let shared_hits = || trace().matches("using verified shared Lance snapshot").count();
-    assert_eq!(shared_hits(), 1, "{}", trace());
-
-    let scope = basemind::git::scope_key(&basemind::git::Repo::discover(root).unwrap());
-    let lance_dir = basemind::store::workspace_cache_dir(root).join(basemind::store::LANCE_DIR);
-    tokio::task::spawn_blocking(move || {
-        let metadata: Value = serde_json::from_slice(&std::fs::read(lance_dir.join("meta.json")).unwrap()).unwrap();
-        let dim = metadata["dim"].as_u64().unwrap().try_into().unwrap();
-        let lance = LanceStore::open(&lance_dir, dim, metadata["embedding_model"].as_str().unwrap()).unwrap();
-        let paths = ["lib.rs"].map(str::to_owned);
-        lance.delete_code_chunks_for_paths(&scope, &paths).unwrap();
-    })
-    .await
-    .unwrap();
-    let after = decode_text(&service.call_tool(request()).await.unwrap());
-    assert_eq!(after["hits"], json!([]), "{after}");
-    assert_eq!(shared_hits(), 1, "{}", trace());
-    service.cancel().await.unwrap();
-}
-
-/// The stdio relay re-sends a request in flight when the daemon is replaced, but only for a tool
-/// someone decided is safe to run twice. A tool added to the server without that decision is
-/// failed on every restart if it reads and must never be listed by default if it writes, so
-/// advertising one fails here until it is put in one of the lists in `basemind::mcp::replay`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_advertised_tool_has_a_replay_decision() {
-    use basemind::mcp::replay::{NEVER_REPLAY_TOOLS, REPLAY_BY_MODE_TOOLS, REPLAY_SAFE_TOOLS, decisions};
+async fn graph_tool_validates_every_mode_before_running_it() {
+    /// The refusal text of a call that must not have succeeded, whichever way it was refused.
+    fn refusal(result: Result<CallToolResult, rmcp::service::ServiceError>, context: &str) -> String {
+        match result {
+            Err(error) => error.to_string(),
+            Ok(result) => {
+                assert_eq!(result.is_error, Some(true), "{context} must be refused: {result:?}");
+                result
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
 
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
-    let server = spawn_serve(root, None).await;
-    let tools = server.list_all_tools().await.expect("list tools");
-    assert!(tools.len() >= REPLAY_SAFE_TOOLS.len(), "the server lists its tools");
 
-    for tool in &tools {
-        assert_eq!(
-            decisions(&tool.name),
-            1,
-            "`{}` is advertised and must be in exactly one of REPLAY_SAFE_TOOLS, NEVER_REPLAY_TOOLS and \
-             REPLAY_BY_MODE_TOOLS (src/mcp/replay.rs): decide whether the relay may send it twice",
-            tool.name
+    let transport = basemind::mcp::serve_in_memory(root, "working")
+        .await
+        .expect("in-memory serve");
+    let service = ().serve(transport).await.expect("rmcp handshake");
+
+    let tools = service.list_all_tools().await.expect("list tools");
+    let graph = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "graph")
+        .expect("the `graph` domain tool must always be advertised");
+    let schema = serde_json::to_string(&graph.input_schema).expect("serialize inputSchema");
+    for mode in [
+        "calls",
+        "neighbors",
+        "path",
+        "subgraph",
+        "communities",
+        "map",
+        "export",
+        "display",
+        "open",
+    ] {
+        assert!(
+            schema.contains(&format!("\"{mode}\"")),
+            "`graph` inputSchema must advertise mode `{mode}`: {schema}"
         );
     }
-    let advertised = |name: &&str| tools.iter().any(|tool| tool.name == **name);
-    for listed in REPLAY_SAFE_TOOLS.iter().chain(NEVER_REPLAY_TOOLS) {
-        assert!(advertised(listed), "`{listed}` has a replay decision and is not a tool");
-    }
-    if cfg!(feature = "comms") {
-        for listed in REPLAY_BY_MODE_TOOLS {
-            assert!(advertised(listed), "`{listed}` has a replay decision and is not a tool");
-        }
-    }
-    server.cancel().await.expect("shut down");
+
+    // `mode` is required: an omitted mode errors, it never silently picks an operation.
+    let message = refusal(
+        service.call_tool(call_params("graph", json!({}))).await,
+        "an omitted mode",
+    );
+    assert!(
+        message.contains("missing field `mode`"),
+        "an omitted mode must name the field: {message}"
+    );
+
+    // An unknown mode names the accepted spellings.
+    let message = refusal(
+        service
+            .call_tool(call_params("graph", json!({ "mode": "callgraph" })))
+            .await,
+        "an unknown mode",
+    );
+    assert!(
+        message.contains("calls") && message.contains("communities"),
+        "an unknown mode must list the accepted set: {message}"
+    );
+
+    // A field belonging to a DIFFERENT mode is rejected, never silently dropped: `name` belongs to
+    // `calls` / `neighbors` / `subgraph`, not to `communities`. Ignoring it would read to an agent
+    // as a clustering scoped to that symbol.
+    let message = refusal(
+        service
+            .call_tool(call_params("graph", json!({ "mode": "communities", "name": "alpha" })))
+            .await,
+        "mode `communities` given a `subgraph` field",
+    );
+    assert!(
+        message.contains("`graph` mode `communities` does not accept") && message.contains("`name`"),
+        "mode `communities` must reject a sibling mode's field rather than ignore it: {message}"
+    );
+
+    // `calls` walks the call lane only — an `edges` lane selector is rejected, not quietly ignored.
+    let message = refusal(
+        service
+            .call_tool(call_params(
+                "graph",
+                json!({ "mode": "calls", "name": "alpha", "edges": "all" }),
+            ))
+            .await,
+        "mode `calls` with a stray `edges`",
+    );
+    assert!(
+        message.contains("`graph` mode `calls` does not accept") && message.contains("`edges`"),
+        "mode `calls` must name the field it rejected: {message}"
+    );
+
+    // `calls` requires `name` — the missing field is named with its mode.
+    let message = refusal(
+        service
+            .call_tool(call_params("graph", json!({ "mode": "calls" })))
+            .await,
+        "a name-less calls walk",
+    );
+    assert!(
+        message.contains("`graph` mode=\"calls\" requires `name`"),
+        "mode `calls` must name the missing `name`: {message}"
+    );
+
+    // `path` requires both ends — the missing one is named exactly.
+    let message = refusal(
+        service
+            .call_tool(call_params("graph", json!({ "mode": "path", "from": "alpha" })))
+            .await,
+        "a `to`-less path",
+    );
+    assert!(
+        message.contains("`graph` mode=\"path\" requires `to`"),
+        "mode `path` must name the missing `to`: {message}"
+    );
+
+    let _ = service.cancel().await;
 }

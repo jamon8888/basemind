@@ -4,9 +4,9 @@
 //! `src/index/`), living user-globally under `<data_dir>/comms/`. It mirrors the operational
 //! shape of `crate::store::Store`: an exclusive advisory flock (`acquire_lock`) so only one
 //! daemon writes, and a `meta`-keyspace schema-version row checked against
-//! `COMMS_SCHEMA_VER` — an older stored version wipes the store and the daemon
+//! `COMMS_SCHEMA_VER` — a mismatch wipes the store and the daemon
 //! rebuilds from scratch (comms history is durable-but-disposable scratch, not a source of
-//! truth); a newer one fails the open and is left untouched.
+//! truth).
 //!
 //! ## Two-tier message storage
 //!
@@ -21,7 +21,7 @@
 //! `cursors`, and `agents`. `thread_members` is the durable member set (drives inbox + creator
 //! authorization); `thread_subs` mirrors it for the notification-stream fan-out.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
@@ -42,7 +42,7 @@ pub use idempotency::{IDEMPOTENCY_TTL, MAX_IDEMPOTENCY_KEY_BYTES, PostOutcome, v
 
 const META_SCHEMA_VER: &[u8] = b"schema_ver";
 const META_LAST_MAINTENANCE: &[u8] = b"last_maintenance_micros";
-pub(super) const STORE_DIR: &str = "store.fjall";
+const STORE_DIR: &str = "store.fjall";
 const LOCK_FILE: &str = ".lock";
 
 /// Default retention for thread messages. The daemon's periodic prune sweep deletes any message
@@ -93,18 +93,6 @@ pub enum CommsStoreError {
     /// Another daemon already holds the store lock.
     #[error("another basemind comms daemon holds the lock on {0}")]
     Locked(PathBuf),
-    /// The on-disk store carries a schema newer than `COMMS_SCHEMA_VER`. Never wiped: it belongs to
-    /// a newer basemind sharing this cache.
-    #[error(
-        "comms store written by a newer basemind (schema {stored}); this binary understands \
-         {current} — upgrade basemind"
-    )]
-    NewerSchema {
-        /// Schema version found on disk.
-        stored: u32,
-        /// Schema version this binary reads and writes.
-        current: u32,
-    },
 }
 
 /// Outcome of resolving a legacy id or compact message reference.
@@ -142,7 +130,7 @@ pub struct CommsStore {
     /// Serializes keyed posts so a retry racing its original cannot both pass the dedup lookup.
     post_lock: std::sync::Mutex<()>,
     /// Held for the lifetime of the store; released on drop (Draining → Stopped).
-    _lock: crate::store_lock::LockGuard,
+    _lock: File,
 }
 
 impl CommsStore {
@@ -160,8 +148,8 @@ impl CommsStore {
             .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok().map(i64::from_be_bytes)))
     }
     /// Open (or create) the comms store under `comms_dir`, taking the exclusive advisory
-    /// flock. An OLDER on-disk schema version wipes the `store.fjall/` directory and rebuilds it
-    /// empty; a NEWER one is left untouched and fails with [`CommsStoreError::NewerSchema`].
+    /// flock. On a schema-version mismatch the `store.fjall/` directory is wiped and rebuilt
+    /// empty.
     pub fn open(comms_dir: &Path) -> Result<Self, CommsStoreError> {
         std::fs::create_dir_all(comms_dir).map_err(|source| CommsStoreError::Io {
             path: comms_dir.to_path_buf(),
@@ -180,12 +168,6 @@ impl CommsStore {
             .get(META_SCHEMA_VER)?
             .and_then(|bytes| <[u8; 4]>::try_from(&bytes[..]).ok())
             .map(u32::from_be_bytes);
-        if let Some(stored) = on_disk_ver.filter(|ver| *ver > COMMS_SCHEMA_VER) {
-            return Err(CommsStoreError::NewerSchema {
-                stored,
-                current: COMMS_SCHEMA_VER,
-            });
-        }
         if matches!(on_disk_ver, Some(ver) if ver != COMMS_SCHEMA_VER) {
             drop(meta);
             drop(db);
@@ -288,33 +270,6 @@ impl CommsStore {
         let bytes = rmp_serde::to_vec_named(membership)?;
         self.thread_members.insert(&key, &bytes)?;
         self.thread_subs.insert(&key, &bytes)?;
-        Ok(())
-    }
-
-    /// Join an existing thread at its current high-water mark without advancing an existing member.
-    pub fn join_thread(&self, mut thread: Thread, agent: AgentId) -> Result<(), CommsStoreError> {
-        if self.is_member(&thread.id, &agent)? {
-            return Ok(());
-        }
-        let key = keys::thread_agent(thread.id.as_str(), agent.as_str());
-        let cursor = keys::cursor_key(agent.as_str(), thread.id.as_str());
-        let seq = self.current_seq(&thread.id)?;
-        let membership = Membership {
-            agent_id: agent.clone(),
-            thread: thread.id.clone(),
-            created_at: now_micros(),
-        };
-        if !thread.members.contains(&agent) {
-            thread.members.push(agent);
-        }
-        let bytes = rmp_serde::to_vec_named(&membership)?;
-        let thread_bytes = rmp_serde::to_vec_named(&thread)?;
-        let mut batch = self.db.batch();
-        batch.insert(&self.thread_members, key.as_slice(), bytes.as_slice());
-        batch.insert(&self.thread_subs, key, bytes);
-        batch.insert(&self.cursors, cursor, seq.to_be_bytes());
-        batch.insert(&self.threads, keys::thread_key(thread.id.as_str()), thread_bytes);
-        batch.commit()?;
         Ok(())
     }
 
@@ -438,18 +393,18 @@ impl CommsStore {
         limit: usize,
         since_micros: Option<i64>,
     ) -> Result<HistoryPage, CommsStoreError> {
-        use std::ops::Bound::{Excluded, Included};
-
-        let start = keys::message_by_thread(thread.as_str(), after_seq);
-        let end = keys::message_by_thread(thread.as_str(), u64::MAX);
+        let prefix = keys::messages_by_thread_prefix(thread.as_str());
         let mut messages = Vec::new();
         let mut last_seq = after_seq;
         let mut more = false;
-        for guard in self.messages_by_thread.range((Excluded(start), Included(end))) {
+        for guard in self.messages_by_thread.prefix(&prefix) {
             let (k, v) = guard.into_inner()?;
             let Some((_, seq)) = keys::parse_message_by_thread(&k) else {
                 continue;
             };
+            if seq <= after_seq {
+                continue;
+            }
             let meta: MessageMeta = rmp_serde::from_slice(&v)?;
             if since_micros.is_some_and(|cutoff| meta.ts_micros < cutoff) {
                 last_seq = seq;
@@ -624,7 +579,6 @@ pub fn build_meta(
         id,
         thread,
         from,
-        from_name: None,
         ts_micros: now_micros(),
         subject,
         tags,
@@ -636,7 +590,7 @@ pub fn build_meta(
 
 /// Acquire the comms store's advisory `.lock` (exclusive flock, bounded retry). Mirrors
 /// `crate::store::acquire_lock`.
-fn acquire_lock(comms_dir: &Path) -> Result<crate::store_lock::LockGuard, CommsStoreError> {
+fn acquire_lock(comms_dir: &Path) -> Result<File, CommsStoreError> {
     let path = comms_dir.join(LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -650,7 +604,7 @@ fn acquire_lock(comms_dir: &Path) -> Result<crate::store_lock::LockGuard, CommsS
         })?;
     for attempt in 0..LOCK_ATTEMPTS {
         match file.try_lock_exclusive() {
-            Ok(()) => return Ok(crate::store_lock::LockGuard::held(file)),
+            Ok(()) => return Ok(file),
             Err(_) if attempt + 1 < LOCK_ATTEMPTS => std::thread::sleep(LOCK_BACKOFF),
             Err(_) => return Err(CommsStoreError::Locked(path)),
         }

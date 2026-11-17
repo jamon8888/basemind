@@ -13,8 +13,6 @@ use rmcp::model::CallToolResult;
 
 use super::cursor::Cursor;
 use super::helpers::{SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, elapsed_us, json_result};
-use super::helpers_calls_scan::SCAN_KEYS_EXAMINED_MAX;
-use super::helpers_refs_match::Matching;
 use super::index_route::IndexRoute;
 use super::types_impls::{FindImplementationsParams, FindImplementationsResponse, ImplementationHit};
 use crate::path::RelPath;
@@ -28,28 +26,6 @@ pub(crate) struct ImplScanPage {
     pub hit_keys: Vec<Vec<u8>>,
     /// Whether matches remain past this page; the cursor is the last hit's key.
     pub has_more: bool,
-    /// The last key examined, when the scan stopped at
-    /// [`SCAN_KEYS_EXAMINED_MAX`](super::helpers_calls_scan::SCAN_KEYS_EXAMINED_MAX) with room left
-    /// on the page; the cursor is then this key. Never set together with `has_more`.
-    pub stopped_after: Option<Vec<u8>>,
-}
-
-impl ImplScanPage {
-    /// Drop the hits `keep` rejects, with their keys; `total` shrinks by the same count and is then an
-    /// upper bound, as in `CallScanPage::retain`.
-    #[cfg(any(test, all(feature = "comms", any(unix, windows))))]
-    pub(super) fn retain(&mut self, keep: impl Fn(&ImplementationHit) -> bool) {
-        let mut index = 0;
-        while index < self.hits.len() {
-            if keep(&self.hits[index]) {
-                index += 1;
-                continue;
-            }
-            self.hits.remove(index);
-            self.hit_keys.remove(index);
-            self.total = self.total.saturating_sub(1);
-        }
-    }
 }
 
 /// Body of the `code` tool's `implementations` mode. Scans `implementations_by_trait` with a
@@ -64,12 +40,10 @@ pub(super) async fn run_find_implementations(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(SEARCH_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
     let cursor_bytes = params.cursor.as_ref().map(|c| c.decode_fjall()).transpose()?;
-    let matching = Matching::from_substring(params.substring);
     let page = route
         .scan_impls(
             cache,
             &params.trait_name,
-            matching,
             params.language.as_deref(),
             limit,
             cursor_bytes.as_deref(),
@@ -81,12 +55,11 @@ pub(super) async fn run_find_implementations(
         hits,
         hit_keys,
         has_more,
-        stopped_after,
     } = page;
     let next_cursor = if has_more {
         hit_keys.last().map(|k| Cursor::encode_fjall(k))
     } else {
-        stopped_after.as_deref().map(Cursor::encode_fjall)
+        None
     };
     let budget = super::budget::apply_budget(hits, params.max_tokens);
     let (hits, budgeted, next_cursor) = if budget.budgeted {
@@ -99,10 +72,8 @@ pub(super) async fn run_find_implementations(
 
     json_result(&FindImplementationsResponse {
         trait_name: params.trait_name,
-        matching: matching.as_str(),
         total,
-        truncated: total_is_partial,
-        truncated_reason: total_is_partial.then_some(super::types::SCAN_CAP),
+        total_is_partial,
         budgeted,
         hits,
         next_cursor,
@@ -115,47 +86,15 @@ pub(super) async fn run_find_implementations(
 /// is of the requested language, and a hit's `(row, col)` — are injected, because the session
 /// answers them from its in-RAM map while the daemon answers them from its store, and both must
 /// run this exact loop.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one scan loop shared by the session and the daemon, which differ in the two injected lookups"
-)]
 pub(crate) fn scan_impls_fjall(
-    idx: &dyn crate::index::view::IndexView,
+    idx: &crate::index::IndexDb,
     trait_name: &str,
-    matching: Matching,
     language: Option<&str>,
     limit: usize,
     cursor_after: Option<&[u8]>,
     language_matches: impl Fn(&RelPath, &str) -> bool,
     row_col: impl Fn(&RelPath, u32) -> (u32, u32),
 ) -> Result<ImplScanPage, McpError> {
-    scan_impls_examining(
-        idx,
-        trait_name,
-        matching,
-        language,
-        limit,
-        cursor_after,
-        language_matches,
-        row_col,
-        SCAN_KEYS_EXAMINED_MAX,
-    )
-}
-
-/// [`scan_impls_fjall`] with the examined-keys cap as an argument, so a test can reach it.
-#[allow(clippy::too_many_arguments, reason = "scan_impls_fjall plus the cap it fixes")]
-pub(super) fn scan_impls_examining(
-    idx: &dyn crate::index::view::IndexView,
-    trait_name: &str,
-    matching: Matching,
-    language: Option<&str>,
-    limit: usize,
-    cursor_after: Option<&[u8]>,
-    language_matches: impl Fn(&RelPath, &str) -> bool,
-    row_col: impl Fn(&RelPath, u32) -> (u32, u32),
-    examine_cap: usize,
-) -> Result<ImplScanPage, McpError> {
-    let examine_cap = examine_cap.max(1);
     let finder = memchr::memmem::Finder::new(trait_name.as_bytes());
     let lower: Bound<Vec<u8>> = match cursor_after {
         Some(k) => Bound::Excluded(k.to_vec()),
@@ -169,27 +108,30 @@ pub(super) fn scan_impls_examining(
     let mut has_more = false;
     let mut matched: usize = 0;
 
-    let wanted = trait_name;
-    let mut last_examined: Option<crate::index::view::IndexBytes> = None;
-    let mut stopped_after: Option<Vec<u8>> = None;
-    for (examined, guard) in idx.trait_keys_matching(trait_name, cursor_after, lower).enumerate() {
-        let (k, _) = guard.map_err(|e| McpError::internal_error(format!("impl index iter: {e}"), None))?;
-        // Checked on the key that follows the cap, so a scan that ends exactly there is complete.
-        if examined >= examine_cap {
-            total_is_partial = true;
-            stopped_after = last_examined.take().map(|key| key.to_vec());
-            break;
-        }
+    for guard in crate::index::name_dict::name_ordered_keys(
+        &idx.implementations_by_trait,
+        &idx.trait_names,
+        trait_name,
+        cursor_after,
+        lower,
+    ) {
+        let (k, _) = guard
+            .into_inner()
+            .map_err(|e| McpError::internal_error(format!("impl index iter: {e}"), None))?;
 
-        let accepted = crate::index::keys::parse_impl_by_trait(&k).filter(|(trait_name, _, rel, _)| {
-            finder.find(trait_name.as_bytes()).is_some()
-                && matching.accepts_trait(trait_name, wanted)
-                && language.is_none_or(|lang_filter| language_matches(rel, lang_filter))
-        });
-        let Some((trait_name, impl_type, rel, start_byte)) = accepted else {
-            last_examined = Some(k);
+        let Some((trait_name, impl_type, rel, start_byte)) = crate::index::keys::parse_impl_by_trait(&k) else {
             continue;
         };
+
+        if finder.find(trait_name.as_bytes()).is_none() {
+            continue;
+        }
+
+        if let Some(lang_filter) = language
+            && !language_matches(&rel, lang_filter)
+        {
+            continue;
+        }
 
         total += 1;
         matched += 1;
@@ -212,7 +154,6 @@ pub(super) fn scan_impls_examining(
             total_is_partial = true;
             break;
         }
-        last_examined = Some(k);
     }
     Ok(ImplScanPage {
         total,
@@ -220,17 +161,15 @@ pub(super) fn scan_impls_examining(
         hits,
         hit_keys,
         has_more,
-        stopped_after: if has_more { None } else { stopped_after },
     })
 }
 
 /// [`scan_impls_fjall`] with the session's environment: language from the in-RAM file view and
 /// `(row, col)` from the cached L1 outline.
 pub(crate) fn scan_impls_session(
-    idx: &dyn crate::index::view::IndexView,
+    idx: &crate::index::IndexDb,
     cache: &super::MapCache,
     trait_name: &str,
-    matching: Matching,
     language: Option<&str>,
     limit: usize,
     cursor_after: Option<&[u8]>,
@@ -238,7 +177,6 @@ pub(crate) fn scan_impls_session(
     scan_impls_fjall(
         idx,
         trait_name,
-        matching,
         language,
         limit,
         cursor_after,
@@ -273,7 +211,6 @@ pub(crate) fn scan_impls_in_ram(
     index: &InRamImplIndex,
     cache: &super::MapCache,
     trait_name: &str,
-    matching: Matching,
     language: Option<&str>,
     limit: usize,
     cursor_after: Option<&[u8]>,
@@ -290,15 +227,8 @@ pub(crate) fn scan_impls_in_ram(
     let mut total_is_partial = false;
     let mut has_more = false;
     let mut matched: usize = 0;
-    let mut stopped_after: Option<Vec<u8>> = None;
-    for (examined, entry) in index.entries[start..].iter().enumerate() {
-        if examined >= SCAN_KEYS_EXAMINED_MAX {
-            total_is_partial = true;
-            stopped_after = Some(index.entries[start + examined - 1].key.clone());
-            break;
-        }
-        if finder.find(entry.trait_name.as_bytes()).is_none() || !matching.accepts_trait(&entry.trait_name, trait_name)
-        {
+    for entry in &index.entries[start..] {
+        if finder.find(entry.trait_name.as_bytes()).is_none() {
             continue;
         }
         if let Some(lang) = language
@@ -331,7 +261,6 @@ pub(crate) fn scan_impls_in_ram(
         hits,
         hit_keys,
         has_more,
-        stopped_after: if has_more { None } else { stopped_after },
     }
 }
 

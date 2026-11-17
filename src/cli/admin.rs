@@ -1,11 +1,14 @@
-//! `basemind admin` — administrative commands with no MCP tool (`telemetry`, `tokens`, `eval`),
-//! plus the offline `cache` group. The index tools live under their own top-level commands:
-//! `status` (`index_status`) and `rescan` (`index_rescan`).
+//! `basemind admin` — the CLI half of the `admin` domain that has no better top-level home, plus the
+//! offline `cache` group.
+//!
+//! Real clap subcommands rather than a `--mode` flag, so each operation keeps its own `--help` and
+//! its own argument validation. The other `admin` modes live under their canonical command:
+//! `status`, `rescan`, `cache stats|gc|clear`, `delta`, `checkpoint` and `detect-waste`.
 //!
 //! The `cache` subcommands call `store_gc` directly (no server, no flock), which is the only way to
 //! clear `views` / `all`, the components that back the live index.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -16,14 +19,14 @@ use crate::mcp::BasemindServer;
 use crate::mcp::params::*;
 use crate::store_gc::{self, CacheComponent};
 
-use super::choices::TelemetryWindow;
+use super::choices::{CompressLevel, TelemetryWindow};
 use super::exit::CliExit;
 use super::render::{Emit, emit, render_human, render_json};
-use super::run_tool;
+use super::{resolve_path, run_tool};
 
 #[derive(Subcommand, Debug)]
 pub enum AdminCmd {
-    /// Index health plus repository identity (branch, HEAD sha). Same as `basemind status`.
+    /// Repository identity: workdir, branch, HEAD sha.
     Repo,
     /// Aggregate recorded tool calls into a usage and token-savings summary.
     Telemetry {
@@ -33,6 +36,24 @@ pub enum AdminCmd {
         /// Optional exact tool-name filter.
         #[arg(long)]
         tool: Option<String>,
+    },
+    /// Shrink content for re-use in a smaller context: a file's outline, or a prose pass.
+    Compress {
+        /// Indexed source file to compress structurally. Mutually exclusive with `--text`.
+        #[arg(long)]
+        path: Option<String>,
+        /// Prose to compress. Read from stdin when neither this nor `--path` is given.
+        #[arg(long)]
+        text: Option<String>,
+        /// Reduction intensity.
+        #[arg(long, value_enum)]
+        level: Option<CompressLevel>,
+        /// Soft token budget hint, echoed back in the response.
+        #[arg(long)]
+        target_tokens: Option<u32>,
+        /// Let the prose pass rewrite code blocks (they are preserved by default).
+        #[arg(long)]
+        no_preserve_code: bool,
     },
     /// Count tokens in text with the real o200k tokenizer and print just the integer (needs the
     /// `tokenizer` feature, which `documents` also includes). No `--json` envelope and no MCP
@@ -51,7 +72,8 @@ pub enum AdminCmd {
 }
 
 /// Count tokens in stdin and print just the integer, so a shell script can pipe straight into it.
-/// Bypasses the tool dispatch entirely: it is a CLI-only convenience over [`crate::mcp::tokens::count_tokens`], not an agent-facing operation.
+/// Bypasses the MCP tool dispatch entirely — there is no `AdminMode` for this, since it is a
+/// CLI-only convenience over [`crate::mcp::tokens::count_tokens`], not an agent-facing operation.
 #[cfg(feature = "tokenizer")]
 fn run_tokens(out: &mut impl Write) -> Result<()> {
     let text = read_stdin()?;
@@ -73,10 +95,7 @@ fn run_tokens(_out: &mut impl Write) -> Result<()> {
 }
 
 /// Read the whole of stdin as lossy UTF-8, so non-UTF-8 input never aborts the pipe.
-#[cfg(feature = "tokenizer")]
 fn read_stdin() -> Result<String> {
-    use std::io::Read;
-
     let mut raw = Vec::new();
     std::io::stdin().read_to_end(&mut raw).context("read stdin")?;
     Ok(String::from_utf8_lossy(&raw).into_owned())
@@ -84,23 +103,42 @@ fn read_stdin() -> Result<String> {
 
 /// Dispatch an `admin` subcommand through the in-process server.
 pub async fn run(server: &BasemindServer, cmd: AdminCmd, opts: &Emit, out: &mut impl Write) -> Result<()> {
-    let (tool, result) = match cmd {
-        AdminCmd::Repo => ("index_status", server.index_status_call(IndexStatusParams {}).await),
-        AdminCmd::Telemetry { window, tool } => (
-            "telemetry",
-            server
-                .telemetry_call(TelemetrySummaryParams {
-                    window: window.map(|w| w.as_str().to_string()),
-                    tool,
-                })
-                .await,
-        ),
+    let p = match cmd {
+        AdminCmd::Repo => AdminParams::new(AdminMode::Repo),
+        AdminCmd::Telemetry { window, tool } => AdminParams {
+            window: window.map(|w| w.as_str().to_string()),
+            tool,
+            ..AdminParams::new(AdminMode::Telemetry)
+        },
+        AdminCmd::Compress {
+            path,
+            text,
+            level,
+            target_tokens,
+            no_preserve_code,
+        } => {
+            let resolved = path.as_deref().map(|p| resolve_path(server, p));
+            let text = match (&resolved, text) {
+                (Some(_), text) => text,
+                (None, Some(text)) => Some(text),
+                (None, None) => Some(read_stdin()?),
+            };
+            AdminParams {
+                path: resolved,
+                text,
+                level: level.map(|l| l.as_str().to_string()),
+                target_tokens,
+                preserve_code: no_preserve_code.then_some(false),
+                ..AdminParams::new(AdminMode::Compress)
+            }
+        }
         AdminCmd::Tokens { .. } => return run_tokens(out),
         AdminCmd::Eval(args) => return crate::eval::run(server, &args, out).await,
     };
 
-    let r = run_tool(tool, result)?;
-    emit(tool, &r, opts, out)
+    let key = p.mode.telemetry_key();
+    let r = run_tool(key, server.admin_cli(p).await)?;
+    emit(key, &r, opts, out)
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,10 +173,11 @@ pub enum CacheCmd {
     },
 }
 
-/// `basemind status`: index health plus repository identity, the body of the `index_status` tool.
+/// Dispatch the top-level `status` command: index health for this workspace.
 pub async fn run_status(server: &BasemindServer, opts: &Emit, out: &mut impl Write) -> Result<()> {
-    let r = run_tool("index_status", server.index_status_call(IndexStatusParams {}).await)?;
-    emit("index_status", &r, opts, out)
+    let key = AdminMode::Status.telemetry_key();
+    let r = run_tool(key, server.admin_cli(AdminParams::new(AdminMode::Status)).await)?;
+    emit(key, &r, opts, out)
 }
 
 /// Dispatch a `cache` subcommand against the machine-global cache directories.
@@ -159,7 +198,7 @@ pub fn run_cache(root: &Path, cmd: CacheCmd, json: bool, out: &mut impl Write) -
             if json {
                 render_json(&value, out)
             } else {
-                render_human("cache_gc", &value, out)
+                render_human("admin:gc", &value, out)
             }
         }
         CacheCmd::Stats => {
@@ -168,7 +207,7 @@ pub fn run_cache(root: &Path, cmd: CacheCmd, json: bool, out: &mut impl Write) -
             if json {
                 render_json(&value, out)
             } else {
-                render_human("cache_stats", &value, out)
+                render_human("admin:cache_stats", &value, out)
             }
         }
         CacheCmd::Clear { component, yes } => {
@@ -179,21 +218,14 @@ pub fn run_cache(root: &Path, cmd: CacheCmd, json: bool, out: &mut impl Write) -
                 serde_json::json!({ "component": format!("views:{name}"), "cleared": true })
             } else {
                 let comp = CacheComponent::from_str(&component).map_err(|e| anyhow::anyhow!(e))?;
-                let report = store_gc::clear_component(&basemind_dir, comp)
+                store_gc::clear_component(&basemind_dir, comp)
                     .with_context(|| format!("clear cache component {component}"))?;
-                let mut value = serde_json::json!({ "component": comp.as_str(), "cleared": true });
-                if !report.spared_newer_blob_namespaces.is_empty() {
-                    value["spared_newer_blob_namespaces"] = serde_json::json!(report.spared_newer_blob_namespaces);
-                    value["note"] = serde_json::json!(
-                        "blob namespaces of a newer basemind were left in place; clear them with that version"
-                    );
-                }
-                value
+                serde_json::json!({ "component": comp.as_str(), "cleared": true })
             };
             if json {
                 render_json(&value, out)
             } else {
-                render_human("cache_clear", &value, out)
+                render_human("admin:cache_clear", &value, out)
             }
         }
     }
@@ -234,7 +266,7 @@ fn guard_clear(basemind_dir: &Path, component: &str, yes: bool) -> Result<()> {
         format!(
             "`blobs` is the MACHINE-GLOBAL extraction store ({}) shared by EVERY workspace on this machine; \
              clearing it forces all of them to re-extract on their next scan",
-            crate::store_layout::global_blobs_root().display()
+            crate::store::global_blobs_dir().display()
         )
     } else {
         format!("clear `{component}` under {}", basemind_dir.display())
@@ -252,5 +284,49 @@ fn guard_clear(basemind_dir: &Path, component: &str, yes: bool) -> Result<()> {
         Ok(())
     } else {
         Err(CliExit::usage("aborted: nothing was cleared"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser, Subcommand as _};
+
+    use super::AdminCmd;
+
+    #[derive(Parser)]
+    struct Harness {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    }
+
+    /// The CLI half of the parity contract, checked from this side too: every `admin` mode the MCP
+    /// tool advertises must resolve to a clap subcommand of the same (kebab-cased) name.
+    /// `tests/cli_parity/` proves the same thing end-to-end, but only for a build that ships the
+    /// binary — this one fails fast, in the file that owns the enum.
+    #[test]
+    fn should_expose_one_subcommand_per_advertised_admin_mode() {
+        let command = AdminCmd::augment_subcommands(Harness::command());
+        let names: Vec<String> = command.get_subcommands().map(|s| s.get_name().to_string()).collect();
+        // Modes whose CLI home is a top-level command (`tests/cli_parity/` maps them).
+        const TOP_LEVEL: &[&str] = &[
+            "status",
+            "rescan",
+            "cache_stats",
+            "gc",
+            "cache_clear",
+            "delta",
+            "checkpoint",
+            "waste",
+        ];
+        for mode in crate::mcp::mode::AdminMode::ALL_MODES
+            .iter()
+            .filter(|m| !TOP_LEVEL.contains(m))
+        {
+            let expected = mode.replace('_', "-");
+            assert!(
+                names.contains(&expected),
+                "`admin` mode `{mode}` has no `basemind admin {expected}` subcommand; got {names:?}"
+            );
+        }
     }
 }

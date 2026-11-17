@@ -12,7 +12,6 @@ use std::process::Command;
 
 use basemind::config::ConfigV1;
 use basemind::git::Repo;
-use basemind::index::view::IndexView;
 use basemind::scanner::{ScanSource, scan};
 use basemind::store::{Store, VIEW_STAGED, VIEW_WORKING};
 use tempfile::TempDir;
@@ -377,91 +376,4 @@ fn list_worktrees_reports_main_and_linked_with_branches() {
     assert!(d.detached, "--detach worktree reports detached HEAD");
     assert_eq!(d.branch, None, "detached HEAD has no branch");
     assert_eq!(d.head_sha.as_deref(), Some(head.as_str()));
-}
-
-/// Only a working-tree pass writes grep bloom rows, so the full-pass sweep (which deletes every row no
-/// manifest entry names) must not run on a git source: it would erase rows it cannot know are wanted.
-#[test]
-fn staged_and_rev_scans_do_not_sweep_grep_bloom_rows() {
-    let (dir, cfg) = init_repo();
-    let root = dir.path();
-    fs::write(root.join("a.rs"), b"pub fn clean_one() {}\n").unwrap();
-    run(root, &["add", "a.rs"]);
-    run(root, &["commit", "-qm", "init"]);
-    let repo = Repo::discover(root).unwrap();
-    let head_sha = repo.resolve_rev("HEAD").unwrap();
-    let rev_view = format!("rev-{}", &head_sha[..7]);
-
-    let plant = |store: &Store| {
-        let mut writer = store.index_db.as_ref().expect("index").writer();
-        writer.upsert_grep_bloom("orphan", basemind::index::grep_bloom::build_row(b"held by no file"));
-        writer.commit().expect("commit");
-    };
-    let planted = |store: &Store| {
-        store
-            .index_db
-            .as_ref()
-            .expect("index")
-            .view()
-            .grep_bloom_row("orphan")
-            .is_some()
-    };
-
-    let mut staged = Store::open(root, VIEW_STAGED).unwrap();
-    plant(&staged);
-    scan(
-        root,
-        &mut staged,
-        &cfg,
-        ScanSource::Staged(&repo),
-        basemind::scanner::EmbedMode::Inline,
-    )
-    .unwrap();
-    assert!(planted(&staged), "a staged scan must not sweep");
-    drop(staged);
-
-    let mut rev = Store::open(root, &rev_view).unwrap();
-    plant(&rev);
-    scan(
-        root,
-        &mut rev,
-        &cfg,
-        ScanSource::Rev {
-            repo: &repo,
-            sha: head_sha,
-        },
-        basemind::scanner::EmbedMode::Inline,
-    )
-    .unwrap();
-    assert!(planted(&rev), "a rev scan must not sweep");
-}
-
-/// A commit the history walk cannot read ends the walk with an error. Dropped, it ended the history
-/// at that commit, its ancestors never visited, and every list read as whole.
-#[test]
-fn a_commit_missing_from_the_object_store_fails_the_history_walk() {
-    let (dir, _cfg) = init_repo();
-    let root = dir.path();
-    for round in 0..3 {
-        fs::write(root.join("a.rs"), format!("pub fn round_{round}() {{}}\n")).unwrap();
-        run(root, &["add", "a.rs"]);
-        run(root, &["commit", "-qm", &format!("round {round}")]);
-    }
-    let middle = Command::new("git")
-        .args(["rev-parse", "HEAD~1"])
-        .current_dir(root)
-        .output()
-        .expect("git rev-parse");
-    let middle = String::from_utf8(middle.stdout).unwrap().trim().to_string();
-    fs::remove_file(root.join(".git/objects").join(&middle[..2]).join(&middle[2..])).expect("a loose commit");
-
-    let repo = Repo::discover(root).expect("repo discover");
-    let head = repo.resolve_rev("HEAD").expect("HEAD");
-    assert!(repo.log_paths(10, false).is_err(), "the recent-commits walk");
-    assert!(repo.log_for_path("a.rs", 10).is_err(), "a file's history");
-    assert!(
-        repo.log_window(&head, 0, 10, false).is_err(),
-        "a directory's history window"
-    );
-    assert!(repo.all_commit_shas().is_err(), "the git-history index build");
 }

@@ -12,71 +12,29 @@ decision instead of re-litigating it. They complement [`../ARCHITECTURE.md`](../
 
 ## Format
 
-Each ADR is one file, `NNNN-<kebab-slug>.md`, numbered in creation order from `0000` with no gaps.
-Copy [`0000-template.md`](0000-template.md) to start a new one. The template follows the
+Each ADR is one file, `NNNN-<kebab-slug>.md`, numbered in creation order. Copy
+[`0000-template.md`](0000-template.md) to start a new one. The template follows the
 Nygard/MADR shape:
 
-- **Front matter** — a YAML block at the top of the file holding the record's metadata:
-
-  ```yaml
-  ---
-  status: proposed
-  date: 2026-11-15
-  ---
-  ```
-
-  | Key | Value |
-  |---|---|
-  | `status` | `proposed`, `accepted`, `rejected`, `superseded`, `deprecated` or `withdrawn`, in lower case |
-  | `date` | the day the record was written, `YYYY-MM-DD` |
-  | `superseded-by` | on a superseded record, the successor's number as a quoted string: `"0017"` |
-  | `supersedes` | on the successor, the number it replaces (`"0011"`), or a list of them |
-  | `amends` | on an amending record, a list of the numbers it amends: `["0018"]` |
-
 - **Title** — `# ADR-NNNN: <decision>`
-- **Deciders**, **Related** — a bullet each under the title
+- **Status** — `Proposed` → `Accepted` → (optionally) `Superseded by ADR-MMMM` / `Deprecated`
 - **Context** — the forces at play: the problem, constraints, and what exists today
 - **Decision** — what we will do (active voice, present tense)
 - **Consequences** — what becomes easier and harder as a result; follow-on work
 - **Alternatives considered** — the options we rejected and why
 
-ADRs 0000–0020 predate the front matter and also carry `- **Status:**` and `- **Date:**` bullets
-under the title, some with a note on when and why the status changed. The front matter is the
-authoritative value; where a record has both, they must agree.
-
 ## Lifecycle
 
-1. Author the ADR as `status: proposed` and add its row to the index below.
-2. A maintainer (human) reviews and moves it to `status: accepted` (or requests changes).
-3. Implement against the accepted decision. An accepted record's decision is never edited. A later
-   ADR overrides it by superseding or amending it:
-   - **Supersede.** The new record carries `supersedes`; the old one gets `status: superseded` and
-     `superseded-by`, and nothing else in it changes.
-   - **Amend.** The new record carries `amends`; the old one stays `accepted`.
+1. Author the ADR as **Proposed**.
+2. A maintainer (human) reviews and moves it to **Accepted** (or requests changes).
+3. Implement against the Accepted decision. If a later ADR overrides it, mark the old one
+   **Superseded by ADR-MMMM** rather than editing its decision.
 
 Keep ADRs short — a decision, not a design doc. Link related ADRs by number.
 
-## Linting
-
-[adrlint](https://github.com/Goldziher/adrlint) checks the log. It runs inside poly, switched on by
-`[lint.markdown.adrlint]` in `poly.toml`, so there is nothing separate to install:
-
-```bash
-poly lint docs/adr
-```
-
-- Per record, also in the pre-commit hook: a title and a `## Context` section, no empty section,
-  one level-1 heading, valid YAML front matter and working in-document anchors.
-- Over the whole log, on a whole-tree run (`poly lint .`, which is what CI runs): it starts at
-  `0000`, has no gap and no duplicate number, and holds only `NNNN-<slug>.md` files plus this index.
-
-The MADR section names (`Decision Outcome`, `Considered Options`) are not required: the records
-keep `Decision` and `Alternatives considered`. adrlint does not check the `status` vocabulary, so
-keep to the values in the table above.
-
 ## Index
 
-ADRs 0001–0010 form one roadmap: give basemind a knowledge-graph capability layer
+The ADRs below (0001–0010) form one roadmap: give basemind a knowledge-graph capability layer
 (typed graph, traversal, communities), a rendering engine, an interactive UI, and document/rationale
 graph edges. They are sequenced by dependency — foundations first, then the capabilities built on
 them.
@@ -84,35 +42,31 @@ them.
 | ADR | Title | Status |
 |---|---|---|
 | [0000](0000-record-architecture-decisions.md) | Record architecture decisions | Accepted |
-| [0001](0001-unified-typed-code-graph.md) | Unified typed code-graph model | Superseded by ADR-0017 |
-| [0002](0002-edge-provenance-and-confidence.md) | Edge provenance and confidence | Superseded by ADR-0017 |
-| [0003](0003-graph-traversal-tools.md) | Graph traversal capabilities | Superseded by ADR-0017 |
-| [0004](0004-community-detection.md) | Community detection and deterministic labels | Superseded by ADR-0017 |
-| [0005](0005-rendering-engine.md) | Rendering engine — one payload, pluggable renderers | Superseded by ADR-0017 |
-| [0006](0006-interactive-ui-tauri.md) | Interactive UI — Tauri desktop app | Withdrawn |
-| [0007](0007-agent-launchable-display-tool.md) | Agent-launchable UI display tool | Superseded by ADR-0017 |
-| [0008](0008-documents-code-graph.md) | Documents ↔ code graph | Superseded by ADR-0017 |
-| [0009](0009-rationale-decision-nodes.md) | Rationale / decision nodes | Superseded by ADR-0017 |
-| [0010](0010-branch-integration-release-strategy.md) | Branch, integration & release strategy | Superseded by ADR-0026 |
-| [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign — consolidation into nine domains | Superseded by ADR-0018 |
-| [0012](0012-grep-content-prefilter.md) | Per-file trigram bloom prefilter for `code grep` | Accepted |
-| [0013](0013-comms-robustness-idempotency-replay.md) | Comms robustness: correlated requests, bounded waits, idempotent posts, relay replay | Accepted (amended by ADR-0021, ADR-0024, ADR-0030) |
-| [0014](0014-cli-mcp-parity-guard.md) | Executable CLI/MCP parity guard | Accepted (amended by ADR-0018, ADR-0023) |
-| [0015](0015-bounded-document-extraction.md) | Bound document extraction with a thread cap, tombstones and a phase budget | Proposed |
-| [0016](0016-shared-base-index-and-worktree-overlays.md) | Shared base index with per-worktree overlays | Superseded by ADR-0028 |
-| [0017](0017-surface-reduction.md) | Surface reduction — remove graph, web, shell, token-saving and review queue | Accepted (amended by ADR-0022) |
-| [0018](0018-mcp-verb-tools.md) | MCP surface — verb tools with exact schemas | Accepted (amended by ADR-0020, ADR-0022, ADR-0030) |
-| [0019](0019-library-crate-layering.md) | Library crate layering | Superseded by ADR-0023 |
-| [0020](0020-verb-tool-contract-amendments.md) | Verb-tool contract — no output schemas, always-load scope, kept domain tools | Accepted (amended by ADR-0021, ADR-0022, ADR-0030) |
-| [0021](0021-agent-comms-v2.md) | Agent comms v2 — stable identity, per-actor delivery, three deferred tools | Accepted (amended by ADR-0027, ADR-0030) |
-| [0022](0022-surface-adr-amendments.md) | Surface ADR amendments — as-built facts and a measurable value gate | Accepted (amended by ADR-0027, ADR-0030, ADR-0031) |
-| [0023](0023-library-crate-layering-revised.md) | Library crate layering, revised | Accepted (amended by ADR-0027, ADR-0032) |
-| [0024](0024-daemon-and-process-model.md) | Daemon and process model — rendezvous scoped by protocol generation | Accepted (amended by ADR-0028, ADR-0030) |
-| [0025](0025-store-versioning-and-durability.md) | Store versioning and durability policy | Accepted (amended by ADR-0028, ADR-0030) |
-| [0026](0026-release-and-branch-policy.md) | Release and branch policy — trunk-based, three breaking releases | Superseded by ADR-0027 |
-| [0027](0027-single-breaking-release.md) | Release and branch policy — trunk-based, one breaking release | Accepted |
-| [0028](0028-content-keyed-group-index.md) | One content-keyed index per repository group | Accepted |
-| [0029](0029-document-retrieval-pipeline-and-store.md) | Document retrieval pipeline and retrieval store | Accepted |
-| [0030](0030-as-built-daemon-wire-and-store-rules.md) | As-built rules — daemon generations, verb-tool wire contract, store durability | Accepted |
-| [0031](0031-value-gate-by-job.md) | Value gate by job — locating and reducing are judged differently | Accepted |
-| [0032](0032-layering-as-built.md) | Library crate layering as built — module table, schema validation, open edges | Accepted |
+| [0001](0001-unified-typed-code-graph.md) | Unified typed code-graph model | Accepted |
+| [0002](0002-edge-provenance-and-confidence.md) | Edge provenance and confidence | Accepted |
+| [0003](0003-graph-traversal-tools.md) | Graph traversal capabilities | Accepted |
+| [0004](0004-community-detection.md) | Community detection and deterministic labels | Accepted |
+| [0005](0005-rendering-engine.md) | Rendering engine — one payload, pluggable renderers | Accepted |
+| [0006](0006-interactive-ui-tauri.md) | Interactive UI — Tauri desktop app | Proposed |
+| [0007](0007-agent-launchable-display-tool.md) | Agent-launchable UI display tool | Proposed |
+| [0008](0008-documents-code-graph.md) | Documents ↔ code graph | Accepted |
+| [0009](0009-rationale-decision-nodes.md) | Rationale / decision nodes | Accepted |
+| [0010](0010-branch-integration-release-strategy.md) | Branch, integration & release strategy | Accepted |
+| [0011](0011-mcp-tool-surface-redesign.md) | MCP tool-surface redesign | Accepted |
+| [0012](0012-multi-lane-document-retrieval.md) | Multi-lane document retrieval — multi-lane, embeddings optional | Accepted |
+| [0012: grep](0012-grep-content-prefilter.md) | Per-file trigram bloom prefilter for code grep | Accepted |
+| [0013](0013-encryption-at-rest-comes-from-the-volume.md) | Encryption at rest comes from the volume, enforced as a deployment requirement | Accepted |
+| [0013: comms](0013-comms-robustness-idempotency-replay.md) | Correlated requests, bounded waits, idempotent posts and relay replay | Accepted |
+| [0014](0014-tier-routing-is-declared-by-the-caller.md) | Tier routing is declared by the caller, not inferred by basemind | Proposed |
+| [0014: parity](0014-cli-mcp-parity-guard.md) | Executable CLI/MCP parity guard | Accepted |
+| [0015: extraction](0015-bounded-document-extraction.md) | Bound document extraction with a thread cap, tombstones and a phase budget | Proposed |
+| [0015: privacy](0015-privacy-gateway-boundary.md) | Privacy gateway boundary | Accepted |
+
+Some existing ADRs share a numeric prefix. Link by full filename and title when
+referring to those decisions; the number alone is ambiguous. Status here mirrors
+the ADR text, while the [feature catalog](../agents/features.md) describes current
+implementation and limitations.
+
+Implementation specs live in [`../specs/`](../specs/). [ADR-0012: Multi-lane document retrieval](0012-multi-lane-document-retrieval.md)'s spec is
+[`../specs/0012-lexical-document-retrieval.md`](../specs/0012-lexical-document-retrieval.md). [ADR-0013: Encryption at rest comes from the volume](0013-encryption-at-rest-comes-from-the-volume.md)
+constrains that spec's §14.0 rather than adding a new one. [ADR-0014: Tier routing is declared by the caller](0014-tier-routing-is-declared-by-the-caller.md) governs which tier a path is indexed in, which is the question the spec's `documents` tier assumes rather than answers.

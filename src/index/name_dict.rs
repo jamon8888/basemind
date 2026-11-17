@@ -345,7 +345,7 @@ pub(crate) fn scan_prefixes(
     keyspace: &Keyspace,
     prefixes: Vec<Vec<u8>>,
     cursor_after: Option<Vec<u8>>,
-) -> impl Iterator<Item = super::view::KvResult> + '_ {
+) -> impl Iterator<Item = fjall::Guard> + '_ {
     prefixes.into_iter().flat_map(move |prefix| {
         let lower = match &cursor_after {
             // The cursor lies beyond this name's whole range.
@@ -361,7 +361,6 @@ pub(crate) fn scan_prefixes(
             .map(|lower| keyspace.range::<Vec<u8>, _>((lower, upper)))
             .into_iter()
             .flatten()
-            .map(super::view::kv)
     })
 }
 
@@ -374,13 +373,9 @@ pub(crate) fn name_ordered_keys<'a>(
     needle: &str,
     cursor_after: Option<&[u8]>,
     lower: Bound<Vec<u8>>,
-) -> super::view::KvIter<'a> {
+) -> Box<dyn Iterator<Item = fjall::Guard> + 'a> {
     match dict.matching_prefixes(keyspace, needle) {
         Some(prefixes) => Box::new(scan_prefixes(keyspace, prefixes, cursor_after.map(<[u8]>::to_vec))),
-        None => Box::new(
-            keyspace
-                .range::<Vec<u8>, _>((lower, Bound::Unbounded))
-                .map(super::view::kv),
-        ),
+        None => Box::new(keyspace.range::<Vec<u8>, _>((lower, Bound::Unbounded))),
     }
 }

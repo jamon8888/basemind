@@ -211,19 +211,7 @@ pub(super) async fn run_thread_history(
     params: ThreadHistoryParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = clamp_limit(params.limit);
-    use crate::comms::cursor::Cursor;
-
-    let cursor = match (params.cursor, params.after_seq) {
-        (Some(_), Some(_)) => {
-            return Err(McpError::invalid_params(
-                "history accepts either cursor or after_seq",
-                None,
-            ));
-        }
-        (Some(cursor), None) => Some(Cursor(cursor)),
-        (None, Some(seq)) => Some(Cursor::encode(params.thread.as_str(), seq)),
-        (None, None) => None,
-    };
+    let cursor = params.cursor.map(crate::comms::cursor::Cursor);
     let since = since_cutoff(params.since_hours);
     let handle = resolve_comms_client(state, params.as_agent).await?;
     let mut client = handle.lock().await;
@@ -340,7 +328,7 @@ pub(super) async fn run_inbox_wait(
     };
     // Dropping `client` on any exit (including cancellation) closes the link, and the broker reaps
     // the subscription with it.
-    let outcome = match client
+    let (timed_out, metas, unread, next_cursor) = match client
         .wait_inbox_unseen(
             remote,
             cwd,
@@ -361,23 +349,21 @@ pub(super) async fn run_inbox_wait(
     drop(client);
     {
         let mut waited = state.waited_messages.lock().await;
-        for row in &outcome.messages {
+        for row in &metas {
             waited.put(row.meta.id.clone(), ());
         }
     }
 
     let now = now_micros();
-    let messages: Vec<MessageFrontMatter> = outcome
-        .messages
+    let messages: Vec<MessageFrontMatter> = metas
         .iter()
         .map(|sm| MessageFrontMatter::from_seq_meta(sm, now))
         .collect();
     json_result(&InboxWaitResponse {
-        timed_out: outcome.timed_out(),
-        reason: outcome.reason.as_str().to_string(),
+        timed_out,
         total: messages.len(),
-        unread: outcome.unread,
+        unread,
         messages,
-        next_cursor: outcome.next_cursor,
+        next_cursor,
     })
 }

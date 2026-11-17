@@ -40,51 +40,24 @@ const DEFAULT_CACHE_BUDGET_MIB: u64 = 20 * 1024;
 /// remain unbounded when hot workspaces alone exceed the configured budget.
 const BUDGET_EVICTION_HOT_FLOOR: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// How much older than the probe a blob must be before the sweep after an eviction takes it for
-/// one the eviction orphaned: file systems that keep whole-second mtimes round a blob written just
-/// after the probe to just before it.
-const PROBE_MTIME_SLACK: Duration = Duration::from_secs(2);
-
-/// The slack the budget tests sweep with, whose blobs are all written within a second.
-#[cfg(test)]
-const TEST_PROBE_MTIME_SLACK: Duration = Duration::ZERO;
-
-/// The grace the sweep after an eviction gives unreferenced blobs. Budget eviction runs holding
-/// the daemon's blob-GC gate, so blobs the eviction orphaned can go at once without racing a scan
-/// the daemon runs. A scan in another process is outside that gate, and its fresh blobs are in no
-/// file map yet:
-///
-/// - while another process holds a workspace's writer lock, the ordinary grace period applies;
-/// - otherwise only blobs older than `probed`, the instant before the locks were looked at, go.
-///   Whatever a scan that started since has written is younger than that.
-fn orphan_grace(workspaces_dir: &Path, probed: SystemTime) -> Duration {
-    #[cfg(not(test))]
-    let slack = PROBE_MTIME_SLACK;
-    #[cfg(test)]
-    let slack = TEST_PROBE_MTIME_SLACK;
-    orphan_grace_with(workspaces_dir, probed, slack)
-}
-
-/// [`orphan_grace`] with `slack` for [`PROBE_MTIME_SLACK`].
-fn orphan_grace_with(workspaces_dir: &Path, probed: SystemTime, slack: Duration) -> Duration {
-    let foreign_writer = std::fs::read_dir(workspaces_dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| match crate::store::probe_writer_lock(&entry.path()) {
-                crate::store::WriterProbe::Free => false,
-                crate::store::WriterProbe::Held { holder } => holder.is_none_or(|meta| meta.pid != std::process::id()),
-            })
-    });
-    if foreign_writer {
-        crate::store_gc::blob_gc_grace()
-    } else {
-        probed.elapsed().unwrap_or(Duration::ZERO) + slack
-    }
-}
+/// Budget eviction runs under the daemon's global GC write lock, so blobs orphaned by a deliberate
+/// workspace eviction can be reclaimed immediately without racing an in-flight scan.
+const BUDGET_ORPHAN_GRACE: Duration = Duration::ZERO;
 
 /// Workspace directory containing Lance tables. Kept feature-independent because budget cleanup
 /// may inspect caches written by a richer binary than the one currently running.
 const LANCE_WORKSPACE_DIR: &str = "lance";
+
+/// Lance tables the cache budget may delete. Deliberately *not* `memory.lance`: it holds
+/// user-authored memory, and budget enforcement must never delete it.
+///
+/// These are literals rather than `crate::lance::schema::*` because that module is gated on
+/// `intelligence`, and a thinner binary must still be able to evict what a richer one wrote. The
+/// cost is that a renamed or added table is silently **omitted** — never deleted wrongly, but never
+/// evicted either, so the workspace never returns under budget and the leak has no symptom until
+/// someone goes looking for it. `lance_evictable_tables_match_the_schema_constants` closes that gap:
+/// it fails the build if this list and the real table names diverge.
+const LANCE_EVICTABLE_TABLES: &[&str] = &["documents", "doc_links", "code_chunks", "graph_entities", "graph_edges"];
 
 /// Filename of the persisted last-GC state, in the machine-global cache root (next to `blobs/`
 /// and `workspaces/`).
@@ -143,9 +116,7 @@ pub struct GcState {
     /// Cache budget applied by the most recent completed sweep.
     #[serde(default)]
     pub cache_budget_bytes: Option<u64>,
-    /// Measured cache footprint after the most recent completed budget pass. Over budget it leaves
-    /// out a newer basemind's workspaces; within budget it may count them (see
-    /// [`EvictReport::total_bytes_before`]).
+    /// Measured cache footprint after the most recent completed budget pass.
     #[serde(default)]
     pub cache_bytes_after: Option<u64>,
     /// Hot workspaces evicted after cold candidates were exhausted.
@@ -164,12 +135,9 @@ pub struct GcState {
 /// Result of one budget-enforcement pass.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EvictReport {
-    /// Combined cache footprint (workspaces + blobs) measured before eviction, without what a newer
-    /// basemind wrote. A pass that finds the cache within budget does not tell a newer basemind's
-    /// workspaces apart (that reads a view of every workspace) and counts them here.
+    /// Combined cache footprint (workspaces + blobs) measured before eviction.
     pub total_bytes_before: u64,
-    /// Combined cache footprint measured after the final eviction/reclamation step, counted as
-    /// [`Self::total_bytes_before`] is.
+    /// Combined cache footprint measured after the final eviction/reclamation step.
     pub total_bytes_after: u64,
     /// Workspace dirs evicted.
     pub evicted: usize,
@@ -341,19 +309,17 @@ pub(crate) fn read_gc_state_at(path: &Path) -> Option<GcState> {
 /// Locked workspaces remain protected. Each eviction immediately reclaims blobs that lost their
 /// final reference and remeasures the real footprint before selecting another victim.
 pub fn enforce_cache_budget(budget_bytes: u64) -> Result<EvictReport, GcError> {
-    enforce_cache_budget_at(
+    enforce_cache_budget_in(
         &cache_root().join(CACHE_DIR).join(WORKSPACES_DIR),
-        &crate::store_layout::global_blobs_root(),
         &global_blobs_dir(),
-        crate::extract::SCHEMA_VER,
         budget_bytes,
         BUDGET_EVICTION_HOT_FLOOR,
         cache_grace(),
     )
 }
 
-/// [`enforce_cache_budget`] against a per-fixture cache whose blob store is one flat directory.
-#[cfg(test)]
+/// [`enforce_cache_budget`] against explicit directories (tests pass a per-fixture cache and a
+/// zero hot floor).
 pub(crate) fn enforce_cache_budget_in(
     workspaces_dir: &Path,
     blobs_dir: &Path,
@@ -361,47 +327,7 @@ pub(crate) fn enforce_cache_budget_in(
     hot_floor: Duration,
     grace: Duration,
 ) -> Result<EvictReport, GcError> {
-    enforce_cache_budget_at(
-        workspaces_dir,
-        blobs_dir,
-        blobs_dir,
-        crate::extract::SCHEMA_VER,
-        budget_bytes,
-        hot_floor,
-        grace,
-    )
-}
-
-/// [`enforce_cache_budget`] against explicit directories. The footprint counts what this binary
-/// can free: the workspaces except those holding a newer basemind's view, and everything under
-/// `blobs_root` except the namespaces of a blob schema newer than `schema` (see
-/// [`cache_footprint`]). Blobs an eviction orphans are reclaimed
-/// in `blobs_dir`, the namespace the evicted workspaces of this version referenced.
-pub(crate) fn enforce_cache_budget_at(
-    workspaces_dir: &Path,
-    blobs_root: &Path,
-    blobs_dir: &Path,
-    schema: u16,
-    budget_bytes: u64,
-    hot_floor: Duration,
-    grace: Duration,
-) -> Result<EvictReport, GcError> {
-    // Within budget counting a newer basemind's workspaces, the cache is within it without them:
-    // telling them apart reads a view of every workspace, so only a cache over budget pays for it.
-    let raw = cache_footprint(workspaces_dir, blobs_root, schema, &[])?;
-    if raw <= budget_bytes {
-        return Ok(EvictReport {
-            total_bytes_before: raw,
-            total_bytes_after: raw,
-            ..EvictReport::default()
-        });
-    }
-    let mut newer = workspaces_of_a_newer_basemind(workspaces_dir);
-    let total = if newer.is_empty() {
-        raw
-    } else {
-        cache_footprint(workspaces_dir, blobs_root, schema, &newer)?
-    };
+    let total = cache_footprint(workspaces_dir, blobs_dir)?;
     let mut report = EvictReport {
         total_bytes_before: total,
         total_bytes_after: total,
@@ -411,7 +337,7 @@ pub(crate) fn enforce_cache_budget_at(
         return Ok(report);
     }
 
-    for candidate in eviction_candidates(workspaces_dir, &newer, hot_floor, grace)? {
+    for candidate in eviction_candidates(workspaces_dir, hot_floor, grace)? {
         if report.total_bytes_after <= budget_bytes {
             break;
         }
@@ -420,25 +346,17 @@ pub(crate) fn enforce_cache_budget_at(
             continue;
         }
         let bytes_before_candidate = report.total_bytes_after;
-        let size = match evict_workspace(&candidate.dir)? {
-            Eviction::Done(size) => size,
-            Eviction::Refused(reason) => {
-                report.locked_skipped += usize::from(reason == ProtectionReason::Locked);
-                report.protected.push(protected_entry(&candidate.dir, reason));
-                // A newer basemind wrote a view into it during the pass: its bytes are no longer
-                // this binary's to count either.
-                if reason == ProtectionReason::NewerVersion {
-                    newer.push(candidate.dir.clone());
-                    report.total_bytes_after = cache_footprint(workspaces_dir, blobs_root, schema, &newer)?;
-                }
-                continue;
-            }
+        let Some(size) = evict_workspace(&candidate.dir)? else {
+            report.locked_skipped += 1;
+            report
+                .protected
+                .push(protected_entry(&candidate.dir, ProtectionReason::Locked));
+            continue;
         };
-        let probed = SystemTime::now();
-        let reclaimed = gc_global_blobs_in(workspaces_dir, blobs_dir, orphan_grace(workspaces_dir, probed))?;
+        let reclaimed = gc_global_blobs_in(workspaces_dir, blobs_dir, BUDGET_ORPHAN_GRACE)?;
         report.blobs_removed += reclaimed.removed;
         report.blob_bytes_freed += reclaimed.bytes_freed;
-        report.total_bytes_after = cache_footprint(workspaces_dir, blobs_root, schema, &newer)?;
+        report.total_bytes_after = cache_footprint(workspaces_dir, blobs_dir)?;
         let measured_freed = bytes_before_candidate.saturating_sub(report.total_bytes_after);
         if size > 0 || reclaimed.bytes_freed > 0 {
             report.evicted += 1;
@@ -461,8 +379,7 @@ pub(crate) fn enforce_cache_budget_at(
             protected = report.protected.len(),
             protected_bytes = report.protected.iter().map(|ws| ws.bytes).sum::<u64>(),
             "cache exceeds its size budget but the remaining workspaces are in use (locked, most recently \
-             used, built within the grace window, or written by a newer basemind); keeping them. Raise \
-             BASEMIND_CACHE_BUDGET_MB to silence this"
+             used, or built within the grace window); keeping them. Raise BASEMIND_CACHE_BUDGET_MB to silence this"
         );
     }
     Ok(report)
@@ -482,7 +399,6 @@ fn protected_entry(dir: &Path, reason: ProtectionReason) -> ProtectedWorkspace {
 
 fn eviction_candidates(
     workspaces_dir: &Path,
-    newer: &[PathBuf],
     hot_floor: Duration,
     grace: Duration,
 ) -> Result<Vec<EvictionCandidate>, GcError> {
@@ -503,11 +419,7 @@ fn eviction_candidates(
         let (activity, has_views) = workspace_last_activity(&dir);
         let idle = now.duration_since(activity).unwrap_or(Duration::ZERO);
         // A workspace with no view left holds nothing worth protecting.
-        let protected = if newer.contains(&dir) {
-            Some(ProtectionReason::NewerVersion)
-        } else {
-            (has_views && idle < grace).then_some(ProtectionReason::RecentlyBuilt)
-        };
+        let protected = (has_views && idle < grace).then_some(ProtectionReason::RecentlyBuilt);
         candidates.push(EvictionCandidate {
             activity,
             hot: idle < hot_floor,
@@ -520,7 +432,7 @@ fn eviction_candidates(
     // however old it is and whatever the grace window says.
     if let Some(mru) = candidates
         .iter()
-        .filter(|candidate| candidate.has_views && !newer.contains(&candidate.dir))
+        .filter(|candidate| candidate.has_views)
         .max_by_key(|candidate| candidate.activity)
         .map(|candidate| candidate.dir.clone())
     {
@@ -532,108 +444,38 @@ fn eviction_candidates(
     Ok(candidates)
 }
 
-/// What became of a workspace picked for eviction.
-enum Eviction {
-    /// Its rebuildable state is gone; the bytes that freed.
-    Done(u64),
-    /// It was left whole.
-    Refused(ProtectionReason),
-}
-
-fn evict_workspace(dir: &Path) -> Result<Eviction, GcError> {
-    #[cfg(test)]
-    tests::before_evict(dir);
+fn evict_workspace(dir: &Path) -> Result<Option<u64>, GcError> {
     let Ok(lock) = acquire_lock(dir) else {
         tracing::debug!(workspace = %dir.display(), "over-budget workspace is locked; skipping");
-        return Ok(Eviction::Refused(ProtectionReason::Locked));
+        return Ok(None);
     };
-    if holds_a_newer_view(dir) {
-        tracing::debug!(workspace = %dir.display(), "over-budget workspace was written by a newer basemind; skipping");
-        return Ok(Eviction::Refused(ProtectionReason::NewerVersion));
-    }
     let before = dir_size(dir)?;
     for path in rebuildable_workspace_paths(dir) {
         remove_cache_path(&path)?;
     }
     let after = dir_size(dir)?;
     drop(lock);
-    Ok(Eviction::Done(before.saturating_sub(after)))
+    Ok(Some(before.saturating_sub(after)))
 }
 
-/// Whether a view of this workspace was written by a newer basemind. Such a view is that
-/// version's live index over blobs this binary cannot read, not cache this one may rebuild.
-fn holds_a_newer_view(workspace: &Path) -> bool {
-    let views = workspace.join(crate::store::VIEWS_DIR);
-    std::fs::read_dir(views).is_ok_and(|entries| entries.flatten().any(|view| view_is_newer(&view.path())))
-}
-
-/// Bytes of a file map that hold its header and first field.
-const FILE_MAP_HEAD_BYTES: u64 = 32;
-
-/// Whether the file map of `view_dir` was written by a newer basemind, from its first bytes: the
-/// map's first field is `schema_ver`, and a file map can run to many megabytes. A head of another
-/// shape is decoded whole, as [`crate::store::read_index`] does.
-fn view_is_newer(view_dir: &Path) -> bool {
-    use std::io::Read as _;
-    #[cfg(test)]
-    tests::VIEW_READS.with(|reads| reads.set(reads.get() + 1));
-    let mut head = Vec::new();
-    let read = std::fs::File::open(view_dir.join(crate::store::INDEX_FILE))
-        .and_then(|file| file.take(FILE_MAP_HEAD_BYTES).read_to_end(&mut head));
-    if read.is_err() {
-        return false;
-    }
-    match leading_schema_ver(&head) {
-        Some(found) => found > crate::extract::SCHEMA_VER,
-        None => matches!(
-            crate::store::read_index(view_dir),
-            Err(crate::store::StoreError::NewerSchema { .. })
-        ),
-    }
-}
-
-/// The value of a msgpack map's first entry when its key is `schema_ver` and the value an
-/// unsigned integer that fits a `u16`; `None` for any other head.
-fn leading_schema_ver(head: &[u8]) -> Option<u16> {
-    let entries = match *head.first()? {
-        0x80..=0x8f => head.get(1..)?,
-        0xde => head.get(3..)?,
-        0xdf => head.get(5..)?,
-        _ => return None,
-    };
-    let (len, key_and_rest) = match *entries.first()? {
-        marker @ 0xa0..=0xbf => (usize::from(marker & 0x1f), entries.get(1..)?),
-        0xd9 => (usize::from(*entries.get(1)?), entries.get(2..)?),
-        _ => return None,
-    };
-    if key_and_rest.get(..len)? != b"schema_ver" {
-        return None;
-    }
-    let value = key_and_rest.get(len..)?;
-    match *value.first()? {
-        small @ 0x00..=0x7f => Some(u16::from(small)),
-        0xcc => value.get(1).copied().map(u16::from),
-        0xcd => Some(u16::from_be_bytes([*value.get(1)?, *value.get(2)?])),
-        _ => None,
-    }
-}
-
-/// Derived state that can be rebuilt from source. Stable identity, the workspace marker and the
-/// per-repo-group `repos/<group>/` (the memory notes and their vector stores, a sibling of
-/// `workspaces/`, so never under `workspace`) are intentionally absent: budget enforcement must
-/// never rotate an agent's identity or delete user-authored memory.
-fn rebuildable_workspace_paths(workspace: &Path) -> [PathBuf; 8] {
+/// Derived state that can be rebuilt from source. Stable identity, the workspace marker, and the
+/// `memory.lance` table are intentionally absent: budget enforcement must never rotate an agent's
+/// identity or delete user-authored memory.
+fn rebuildable_workspace_paths(workspace: &Path) -> Vec<PathBuf> {
     let lance = workspace.join(LANCE_WORKSPACE_DIR);
-    [
+    let mut paths = vec![
         workspace.join(crate::store::VIEWS_DIR),
         workspace.join("git-cache"),
         workspace.join(crate::git_history::GIT_HISTORY_DIR),
         workspace.join("status.json"),
         workspace.join("telemetry.jsonl"),
-        lance.join("documents.lance"),
-        lance.join("code_chunks.lance"),
-        lance.join("doc_links.lance"),
-    ]
+    ];
+    paths.extend(
+        LANCE_EVICTABLE_TABLES
+            .iter()
+            .map(|table| lance.join(format!("{table}.lance"))),
+    );
+    paths
 }
 
 fn remove_cache_path(path: &Path) -> Result<(), GcError> {
@@ -650,43 +492,8 @@ fn remove_cache_path(path: &Path) -> Result<(), GcError> {
     })
 }
 
-/// The workspace dirs holding a view a newer basemind wrote, which [`evict_workspace`] refuses.
-/// Decided once per pass, and only by a pass over budget: each check reads every view's file map.
-fn workspaces_of_a_newer_basemind(workspaces_dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(workspaces_dir).map_or_else(
-        |_| Vec::new(),
-        |entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|dir| dir.is_dir() && holds_a_newer_view(dir))
-                .collect()
-        },
-    )
-}
-
-/// The bytes the budget is held against: the workspaces other than `newer`, and the blob store
-/// without the namespaces of a schema newer than `schema`. Both belong to a newer basemind sharing
-/// the cache. This binary never deletes them, so counting them would have it evict workspaces
-/// every cycle to make up for bytes no eviction can free.
-fn cache_footprint(workspaces_dir: &Path, blobs_root: &Path, schema: u16, newer: &[PathBuf]) -> Result<u64, GcError> {
-    let mut total = dir_size_or_zero(workspaces_dir)? + dir_size_or_zero(blobs_root)?;
-    for workspace in newer {
-        total = total.saturating_sub(dir_size_or_zero(workspace)?);
-    }
-    if blobs_root.exists() {
-        for entry in read_dir(blobs_root)?.flatten() {
-            let newer = entry
-                .file_name()
-                .to_str()
-                .and_then(crate::store_gc_namespaces::namespace_schema)
-                .is_some_and(|found| found > schema);
-            if newer && entry.path().is_dir() {
-                total = total.saturating_sub(dir_size(&entry.path())?);
-            }
-        }
-    }
-    Ok(total)
+fn cache_footprint(workspaces_dir: &Path, blobs_dir: &Path) -> Result<u64, GcError> {
+    Ok(dir_size_or_zero(workspaces_dir)? + dir_size_or_zero(blobs_dir)?)
 }
 
 /// Newest mtime among the files a scan always rewrites (`workspace.json`, `status.json`, each view's
@@ -730,8 +537,420 @@ fn dir_size_or_zero(dir: &Path) -> Result<u64, GcError> {
 }
 
 #[cfg(test)]
-#[path = "store_gc_budget_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::store::{FileEntry, INDEX_FILE, Index, VIEWS_DIR, ensure_workspace_marker};
+    use std::fs;
+
+    /// `LANCE_EVICTABLE_TABLES` is literals so a thinner binary can still evict what a richer one
+    /// wrote. The cost is that a renamed or added table is silently *omitted* — never evicted, never
+    /// reported, no symptom. This is the guard that makes the omission loud: it fails the build the
+    /// moment the eviction list and the real table names diverge.
+    #[cfg(feature = "intelligence")]
+    #[test]
+    fn lance_evictable_tables_match_the_schema_constants() {
+        #[cfg(feature = "code-search")]
+        use crate::lance::schema::CODE_CHUNKS_TABLE;
+        #[cfg(feature = "documents")]
+        use crate::lance::schema::DOC_LINKS_TABLE;
+        use crate::lance::schema::{DOCUMENTS_TABLE, MEMORY_TABLE};
+        #[cfg(feature = "graphrag")]
+        use crate::lance::schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE};
+
+        // `LANCE_EVICTABLE_TABLES` is intentionally feature-independent: a
+        // thinner binary may need to evict tables written by a richer binary.
+        let mut expected = vec![DOCUMENTS_TABLE];
+        #[cfg(feature = "code-search")]
+        expected.push(CODE_CHUNKS_TABLE);
+        #[cfg(not(feature = "code-search"))]
+        expected.push("code_chunks");
+        #[cfg(feature = "documents")]
+        expected.push(DOC_LINKS_TABLE);
+        #[cfg(not(feature = "documents"))]
+        expected.push("doc_links");
+        #[cfg(feature = "graphrag")]
+        expected.extend([GRAPH_ENTITIES_TABLE, GRAPH_EDGES_TABLE]);
+        #[cfg(not(feature = "graphrag"))]
+        expected.extend(["graph_entities", "graph_edges"]);
+
+        let mut actual: Vec<&str> = LANCE_EVICTABLE_TABLES.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+
+        assert_eq!(
+            actual, expected,
+            "LANCE_EVICTABLE_TABLES has drifted from the real table names. A table missing here is \
+             never evicted under cache pressure — the workspace never returns under budget and the \
+             leak is invisible. Update the list when a table is added or renamed."
+        );
+        assert!(
+            !LANCE_EVICTABLE_TABLES.contains(&MEMORY_TABLE),
+            "memory.lance holds user-authored memory and must never be evictable"
+        );
+    }
+
+    /// Seed `<workspaces>/<key>/` with a marker + a working view whose index references `stem`,
+    /// then force every activity-bearing file's mtime to `age` ago.
+    pub(super) fn seed_workspace_aged(workspaces_dir: &Path, key: &str, stem: &str, age: Duration) -> PathBuf {
+        let workspace_dir = workspaces_dir.join(key);
+        let working = workspace_dir.join(VIEWS_DIR).join("working");
+        fs::create_dir_all(&working).expect("mk workspace view");
+        let mut index = Index::empty();
+        index.files.insert(
+            crate::path::RelPath::from("src/main.rs"),
+            FileEntry {
+                hash_hex: stem.to_string(),
+                language: "rust".to_string(),
+                size_bytes: 2,
+                mtime: 0,
+                extract_epoch: crate::extract::EXTRACT_EPOCH,
+            },
+        );
+        fs::write(
+            working.join(INDEX_FILE),
+            rmp_serde::to_vec_named(&index).expect("encode index"),
+        )
+        .expect("write index");
+        ensure_workspace_marker(&workspace_dir, workspaces_dir);
+        drop(acquire_lock(&workspace_dir).expect("seed workspace lock files"));
+
+        let stamp = SystemTime::now() - age;
+        for file in [workspace_dir.join(WORKSPACE_MARKER_FILE), working.join(INDEX_FILE)] {
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .and_then(|f| f.set_modified(stamp))
+                .expect("age file");
+        }
+        workspace_dir
+    }
+
+    #[test]
+    fn under_budget_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+        let ws = seed_workspace_aged(&workspaces, "key-a", &"a".repeat(64), Duration::from_secs(9999));
+
+        let report = enforce_cache_budget_in(&workspaces, &blobs, u64::MAX, Duration::ZERO, Duration::ZERO)
+            .expect("enforce under budget");
+
+        assert_eq!(report.evicted, 0, "under budget must evict nothing");
+        assert_eq!(report.bytes_freed, 0);
+        assert!(report.total_bytes_before > 0, "footprint is measured");
+        assert_eq!(report.total_bytes_after, report.total_bytes_before);
+        assert!(ws.exists(), "workspace untouched");
+    }
+
+    #[test]
+    fn over_budget_prefers_a_cold_workspace_and_stops_before_a_hot_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+
+        let cold = seed_workspace_aged(
+            &workspaces,
+            "key-cold",
+            &"a".repeat(64),
+            Duration::from_secs(10 * 24 * 3600),
+        );
+        let warm = seed_workspace_aged(&workspaces, "key-warm", &"b".repeat(64), Duration::from_secs(60));
+
+        let total = dir_size(&workspaces).expect("size");
+        // Any successful cache eviction is sufficient. Directory inode accounting differs
+        // between filesystems, so do not predict the exact bytes a removed view will free.
+        let budget = total - 1;
+
+        let report = enforce_cache_budget_in(
+            &workspaces,
+            &blobs,
+            budget,
+            Duration::from_secs(24 * 3600),
+            Duration::ZERO,
+        )
+        .expect("enforce");
+
+        assert_eq!(report.evicted, 1, "one eviction suffices to reach the budget");
+        assert_eq!(report.hot_evicted, 0, "the cold candidate is preferred");
+        assert!(report.total_bytes_after <= budget, "the measured footprint converged");
+        assert!(cold.exists(), "the cold workspace keeps its metadata shell");
+        assert!(!cold.join(VIEWS_DIR).exists(), "the cold workspace payload is evicted");
+        assert!(warm.exists(), "the warmer workspace survives");
+        assert!(report.bytes_freed > 0, "the rebuildable payload is reclaimed");
+    }
+
+    #[test]
+    fn a_hot_workspace_is_evicted_when_it_is_the_only_way_to_converge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&workspaces).expect("mk workspaces");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+        let empty_footprint = 0;
+
+        let hot = seed_workspace_aged(&workspaces, "key-hot", &"a".repeat(64), Duration::from_secs(60));
+        // A strictly newer workspace holds the most-recently-used protection.
+        let _newest = seed_workspace_aged(&workspaces, "key-newest", &"b".repeat(64), Duration::ZERO);
+
+        let report = enforce_cache_budget_in(
+            &workspaces,
+            &blobs,
+            empty_footprint,
+            Duration::from_secs(24 * 3600),
+            Duration::ZERO,
+        )
+        .expect("enforce with hot floor");
+
+        assert_eq!(report.evicted, 1, "the hot floor is a preference, not a budget veto");
+        assert_eq!(report.hot_evicted, 1);
+        assert_eq!(report.protected.len(), 1, "the newest workspace is kept and reported");
+        assert!(
+            report.total_bytes_after < report.total_bytes_before,
+            "rebuildable bytes are reclaimed even when durable metadata prevents full convergence"
+        );
+        assert!(hot.exists(), "the workspace metadata shell preserves stable identity");
+        assert!(!hot.join(VIEWS_DIR).exists(), "only rebuildable view state is evicted");
+    }
+
+    #[test]
+    fn budget_eviction_preserves_identity_and_durable_memory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+        let workspace = seed_workspace_aged(&workspaces, "key-cold", &"a".repeat(64), Duration::from_secs(9999));
+        let _newest = seed_workspace_aged(&workspaces, "key-newest", &"b".repeat(64), Duration::from_secs(60));
+        fs::write(workspace.join(crate::comms::identity::AGENT_ID_FILE), b"session-stable").expect("agent id");
+        let memory = workspace.join(LANCE_WORKSPACE_DIR).join("memory.lance");
+        fs::create_dir_all(&memory).expect("memory table");
+        fs::write(memory.join("data.bin"), b"durable-memory").expect("memory data");
+
+        let report = enforce_cache_budget_in(&workspaces, &blobs, 1, Duration::ZERO, Duration::ZERO)
+            .expect("evict cache payload");
+
+        assert_eq!(report.evicted, 1);
+        assert_eq!(
+            fs::read_to_string(workspace.join(crate::comms::identity::AGENT_ID_FILE)).unwrap(),
+            "session-stable"
+        );
+        assert_eq!(fs::read(memory.join("data.bin")).unwrap(), b"durable-memory");
+        assert!(workspace.join(WORKSPACE_MARKER_FILE).exists(), "root marker survives");
+        assert!(!workspace.join(VIEWS_DIR).exists(), "rebuildable views are removed");
+    }
+
+    #[test]
+    fn reclaiming_an_evicted_workspaces_blobs_prevents_an_extra_eviction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+
+        let cold_stem = "c".repeat(64);
+        let cold = seed_workspace_aged(&workspaces, "key-cold", &cold_stem, Duration::from_secs(10 * 24 * 3600));
+        let warm = seed_workspace_aged(
+            &workspaces,
+            "key-warm",
+            &"d".repeat(64),
+            Duration::from_secs(2 * 24 * 3600),
+        );
+        let cold_blob = blobs.join(format!("{cold_stem}.fm.msgpack"));
+        fs::write(&cold_blob, vec![7_u8; 64 * 1024]).expect("write cold workspace blob");
+
+        let total = dir_size(&workspaces).unwrap() + dir_size(&blobs).unwrap();
+        let reclaimable = dir_size(&cold.join(VIEWS_DIR)).unwrap() + fs::metadata(&cold_blob).unwrap().len();
+        let budget = total - reclaimable + 1;
+
+        let report =
+            enforce_cache_budget_in(&workspaces, &blobs, budget, Duration::ZERO, Duration::ZERO).expect("enforce");
+
+        assert_eq!(
+            report.evicted, 1,
+            "blob reclamation should make a second eviction unnecessary"
+        );
+        assert_eq!(report.blobs_removed, 1);
+        assert_eq!(report.blob_bytes_freed, 64 * 1024);
+        assert!(report.total_bytes_after <= budget);
+        assert!(cold.exists(), "the evicted workspace keeps durable metadata");
+        assert!(!cold.join(VIEWS_DIR).exists());
+        assert!(
+            !cold_blob.exists(),
+            "the evicted workspace's orphan blob is reclaimed in the same pass"
+        );
+        assert!(
+            warm.exists(),
+            "the warmer workspace survives once the measured footprint converges"
+        );
+    }
+
+    #[test]
+    fn a_locked_workspace_is_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let blobs = tmp.path().join("blobs");
+        fs::create_dir_all(&blobs).expect("mk blobs");
+
+        let locked = seed_workspace_aged(&workspaces, "key-locked", &"a".repeat(64), Duration::from_secs(9999));
+        let _newest = seed_workspace_aged(&workspaces, "key-newest", &"b".repeat(64), Duration::from_secs(60));
+        let _held = acquire_lock(&locked).expect("hold the workspace lock");
+
+        let report = enforce_cache_budget_in(&workspaces, &blobs, 1, Duration::ZERO, Duration::ZERO).expect("enforce");
+
+        assert_eq!(report.locked_skipped, 1);
+        assert!(report.protected.iter().any(|ws| ws.reason == ProtectionReason::Locked));
+        assert!(report.total_bytes_after > 1, "the report exposes non-convergence");
+        assert!(locked.exists());
+    }
+
+    #[test]
+    fn gc_state_round_trips_and_tolerates_absence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("cache").join(GC_STATE_FILE);
+
+        assert!(read_gc_state_at(&path).is_none(), "absent state reads as None");
+
+        let report = GcReport {
+            scanned: 10,
+            removed: 3,
+            bytes_freed: 4096,
+            workspaces_reaped: 1,
+            workspace_bytes_freed: 2048,
+            workspaces_evicted: 2,
+            evicted_bytes_freed: 8192,
+            ..GcReport::default()
+        };
+        persist_gc_state_at(&path, &report);
+
+        let state = read_gc_state_at(&path).expect("state persisted");
+        assert!(state.at_epoch_secs > 0, "timestamp recorded");
+        assert_eq!(state.removed, 3);
+        assert_eq!(state.bytes_freed, 4096);
+        assert_eq!(state.workspaces_reaped, 1);
+        assert_eq!(state.workspaces_evicted, 2);
+        assert_eq!(state.evicted_bytes_freed, 8192);
+        assert_eq!(state.status, GcStatus::Completed);
+        assert_eq!(state.last_attempt_epoch_secs, state.at_epoch_secs);
+        assert_eq!(state.consecutive_degraded_cycles, 0);
+
+        fs::write(&path, b"{ not json").expect("corrupt");
+        assert!(read_gc_state_at(&path).is_none(), "corrupt state degrades to None");
+    }
+
+    #[test]
+    fn an_over_budget_sweep_is_persisted_as_degraded_until_a_healthy_sweep_completes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(GC_STATE_FILE);
+        let constrained = GcReport {
+            cache_budget_bytes: Some(100),
+            cache_bytes_after: Some(180),
+            locked_workspaces_skipped: 2,
+            hot_workspaces_evicted: 1,
+            ..GcReport::default()
+        };
+
+        persist_gc_state_at(&path, &constrained);
+
+        let degraded = read_gc_state_at(&path).expect("degraded state persisted");
+        assert_eq!(degraded.status, GcStatus::OverBudget);
+        assert_eq!(degraded.consecutive_degraded_cycles, 1);
+        assert_eq!(degraded.cache_budget_bytes, Some(100));
+        assert_eq!(degraded.cache_bytes_after, Some(180));
+        assert_eq!(degraded.locked_workspaces_skipped, 2);
+        assert_eq!(degraded.hot_workspaces_evicted, 1);
+        assert!(
+            degraded
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("80 bytes over budget")),
+            "the persisted diagnosis is actionable: {:?}",
+            degraded.detail
+        );
+
+        persist_gc_state_at(&path, &GcReport::default());
+
+        let recovered = read_gc_state_at(&path).expect("healthy state persisted");
+        assert_eq!(recovered.status, GcStatus::Completed);
+        assert_eq!(recovered.consecutive_degraded_cycles, 0);
+        assert_eq!(recovered.detail, None);
+    }
+
+    #[test]
+    fn failed_attempts_preserve_the_last_success_and_accumulate_until_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(GC_STATE_FILE);
+        let completed = GcReport {
+            scanned: 12,
+            removed: 4,
+            bytes_freed: 4096,
+            ..GcReport::default()
+        };
+        persist_gc_state_at(&path, &completed);
+        let completed_at = read_gc_state_at(&path).expect("completed state").at_epoch_secs;
+
+        persist_gc_error_at(&path, &GcError::Starved(Duration::from_secs(300)));
+        persist_gc_error_at(&path, &GcError::Join("maintenance worker panicked".to_owned()));
+
+        let failed = read_gc_state_at(&path).expect("failed state persisted");
+        assert_eq!(failed.status, GcStatus::Failed);
+        assert_eq!(failed.consecutive_degraded_cycles, 2);
+        assert_eq!(
+            failed.at_epoch_secs, completed_at,
+            "last successful timestamp is preserved"
+        );
+        assert_eq!(failed.scanned, 12, "last successful counters are preserved");
+        assert_eq!(failed.removed, 4);
+        assert_eq!(failed.bytes_freed, 4096);
+        assert!(
+            failed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("maintenance worker panicked")),
+            "the latest failure replaces the prior diagnosis: {:?}",
+            failed.detail
+        );
+    }
+
+    #[test]
+    fn legacy_gc_state_defaults_attempt_health_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(GC_STATE_FILE);
+        fs::write(
+            &path,
+            br#"{
+                "at_epoch_secs": 42,
+                "scanned": 5,
+                "removed": 1,
+                "bytes_freed": 128,
+                "workspaces_reaped": 0,
+                "workspace_bytes_freed": 0
+            }"#,
+        )
+        .expect("write legacy state");
+
+        let state = read_gc_state_at(&path).expect("legacy state remains readable");
+        assert_eq!(state.at_epoch_secs, 42);
+        assert_eq!(state.status, GcStatus::Completed);
+        assert_eq!(state.last_attempt_epoch_secs, 0);
+        assert_eq!(state.consecutive_degraded_cycles, 0);
+        assert_eq!(state.detail, None);
+    }
+
+    #[test]
+    fn cache_budget_env_parses_default_zero_and_garbage() {
+        const VAR: &str = CACHE_BUDGET_ENV;
+        // SAFETY: test-only env mutation; no other thread in this test binary reads this var
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(cache_budget_bytes(), Some(DEFAULT_CACHE_BUDGET_MIB * 1024 * 1024));
+        unsafe { std::env::set_var(VAR, "0") };
+        assert_eq!(cache_budget_bytes(), None, "0 disables enforcement");
+        unsafe { std::env::set_var(VAR, "512") };
+        assert_eq!(cache_budget_bytes(), Some(512 * 1024 * 1024));
+        unsafe { std::env::set_var(VAR, "not-a-number") };
+        assert_eq!(cache_budget_bytes(), None, "garbage disables enforcement (logged)");
+        unsafe { std::env::remove_var(VAR) };
+    }
+}
 
 #[cfg(test)]
 #[path = "store_gc_protect_tests.rs"]

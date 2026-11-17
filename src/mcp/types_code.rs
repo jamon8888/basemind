@@ -1,7 +1,15 @@
-//! Internal request shapes and response payloads of the code-search and read bodies.
+//! Request shape for the consolidated `code` domain tool, plus the semantic-search payloads.
 //!
-//! The wire arguments live in `types_tools.rs`; [`SearchCodeParams`], [`GetChunkParams`] and
-//! [`ExpandParams`] are what the bodies in `helpers_code_search.rs` / `helpers_expand.rs` take.
+//! [`CodeParams`] is what crosses the wire: one flat parameter object with a required [`CodeMode`]
+//! selecting the lookup and every per-mode field an optional sibling. The per-operation structs
+//! ([`SearchCodeParams`] / [`GetChunkParams`] here, `OutlineParams` / `SearchSymbolsParams` /
+//! `ListFilesParams` / `FindFilesParams` / `FindReferencesParams` / `FindCallersParams` /
+//! `GotoDefinitionParams` / `WorkspaceGrepParams` in `types.rs`, `FindImplementationsParams` in
+//! `types_impls.rs`, `ExpandParams` in `types_compress.rs`) stay as the helpers' internal shapes, so
+//! the bodies keep taking exactly the arguments they always did.
+//!
+//! `CodeParams` lives here rather than in `types.rs` because that file is already within ~90 lines
+//! of the 1000-line per-file cap `tests/max_lines.rs` enforces.
 //!
 //! The response structs are gated on `code-search` since only the feature-on helper bodies build
 //! them.
@@ -9,37 +17,172 @@
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
+use super::cursor::Cursor;
+use super::mode::CodeMode;
 use crate::path::RelPath;
 
+/// Wire parameters for the `code` tool.
+///
+/// Only `mode` is required. Every other field belongs to a subset of the modes and is rejected —
+/// not ignored — when passed to a mode that has no use for it (see
+/// [`super::mode::reject_unsupported`]); a mode that needs one names the exact `mode`/field pair.
+/// Per-mode defaults are resolved in the helper, not here, because they differ by mode (`limit`
+/// defaults to 100 for the symbol/reference scanners, 200 for the file listers, 10 for `semantic`).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CodeParams {
+    /// Which lookup to run.
+    pub mode: CodeMode,
+    /// Repo-relative path of the file to act on. Required by `outline`, `definition`, `callers`,
+    /// `expand` and `chunk`.
+    #[serde(default)]
+    pub path: Option<RelPath>,
+    /// Symbol name. `symbols` matches it as a case-sensitive SUBSTRING of every indexed symbol
+    /// name; `references` matches it against captured callee identifiers (also a substring, and
+    /// name-only — `Foo::bar()` and `bar()` both match `"bar"`); `callers` and `expand` match it
+    /// exactly against the definitions in `path`. Required by those four modes.
+    #[serde(default, alias = "needle", alias = "symbol", alias = "q")]
+    pub name: Option<String>,
+    /// Free-text query. `find` matches it as a fuzzy subsequence against every indexed code path;
+    /// `semantic` embeds / tokenizes it for retrieval. Required by both.
+    #[serde(default, alias = "text")]
+    pub query: Option<String>,
+    /// `grep` only. Rust regex syntax (`regex` crate). Required by that mode.
+    #[serde(default, alias = "regex", alias = "search")]
+    pub pattern: Option<String>,
+    /// `implementations` only. Trait / interface / base-class name, matched as a case-sensitive
+    /// substring. Required by that mode.
+    #[serde(default, alias = "trait", alias = "interface")]
+    pub trait_name: Option<String>,
+    /// `dependents` only. Module / import target (e.g. `"tokio::sync"`, `"react"`), matched as a
+    /// substring against each recorded import path. Required by that mode.
+    #[serde(default, alias = "import")]
+    pub module: Option<String>,
+    /// `symbols` / `callers` / `expand`. Symbol-kind filter: function, method, struct, enum, class,
+    /// interface, trait, type, const, module, macro.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// `grep` / `files` / `find` / `implementations`. Language filter (e.g. `"rust"`,
+    /// `"typescript"`), applied before matching.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// `grep` / `files`. Substring filter on the repo-relative path.
+    #[serde(default)]
+    pub path_contains: Option<String>,
+    /// `find` only. Path prefix applied before fuzzy scoring (e.g. `"src/mcp/"`).
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// `definition` only. 1-based line of the reference identifier. Required by that mode.
+    #[serde(default, alias = "row")]
+    pub line: Option<u32>,
+    /// `definition` only. 0-based byte column of the reference within the line. Default 0.
+    #[serde(default, alias = "col")]
+    pub column: Option<u32>,
+    /// `outline` only. Also return calls + doc comments (L2). Default false; falls back to empty
+    /// lists when no L2 blob exists for the file's current content.
+    #[serde(default)]
+    pub l2: Option<bool>,
+    /// `grep` only. Include one line of context before and after each hit. Default true.
+    #[serde(default)]
+    pub include_context: Option<bool>,
+    /// Result cap: `files`/`find` default 200 (max 5000), `semantic` 10 (max 100), others 100 (max 1000).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Token budget bounding the returned list; overflow is dropped and flagged `budgeted: true`.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
+    /// `"json"` (default) or `"toon"` (compact tabular).
+    #[serde(default, alias = "encoding")]
+    #[schemars(extend("enum" = ["json", "toon"]))]
+    pub format: Option<String>,
+    /// Resume token from the previous `next_cursor`.
+    #[serde(default)]
+    pub cursor: Option<Cursor>,
+    /// `semantic`: `hybrid` (default), `semantic` (vector only) or `keyword` (BM25 only).
+    #[serde(default, alias = "strategy")]
+    #[schemars(extend("enum" = ["hybrid", "semantic", "keyword"]))]
+    pub lane: Option<String>,
+    /// `semantic`: cross-encoder rerank of fused hits (default from config; first use downloads a model).
+    #[serde(default, alias = "reranker_enabled")]
+    pub rerank: Option<bool>,
+    /// `semantic` only. Reranker preset name (default `bge-reranker-base`).
+    #[serde(default, alias = "reranker_preset")]
+    pub rerank_preset: Option<String>,
+    /// `semantic` only. How many top fused hits to rerank.
+    #[serde(default, alias = "reranker_top_k")]
+    pub rerank_top_k: Option<usize>,
+    /// `chunk` only. The content-addressed chunk id from a `semantic` hit.
+    #[serde(default)]
+    pub chunk_id: Option<String>,
+    /// `chunk` only. The chunk's start byte offset from a `semantic` hit — an alternative to
+    /// `chunk_id`. Both may be omitted when the file holds a single chunk.
+    #[serde(default)]
+    pub byte_start: Option<u32>,
+}
+
+impl CodeParams {
+    /// A call carrying only `mode`. Callers set the fields their mode uses and leave the rest
+    /// `None`: the helper rejects a field belonging to another mode, so populating them blindly
+    /// would fail the call.
+    pub fn new(mode: CodeMode) -> Self {
+        Self {
+            mode,
+            path: None,
+            name: None,
+            query: None,
+            pattern: None,
+            trait_name: None,
+            module: None,
+            kind: None,
+            language: None,
+            path_contains: None,
+            path_prefix: None,
+            line: None,
+            column: None,
+            l2: None,
+            include_context: None,
+            limit: None,
+            max_tokens: None,
+            format: None,
+            cursor: None,
+            lane: None,
+            rerank: None,
+            rerank_preset: None,
+            rerank_top_k: None,
+            chunk_id: None,
+            byte_start: None,
+        }
+    }
+}
+
 /// Params for the `semantic` mode — hybrid / vector / BM25 retrieval over indexed code chunks.
-#[cfg(feature = "code-search")]
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchCodeParams {
+    #[serde(alias = "needle", alias = "pattern", alias = "q", alias = "text", alias = "search")]
     pub query: String,
     /// Max hits to return. Default 10, max 100.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Optional token budget bounding the returned `hits` list (best-first; sets `budgeted`).
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format: `"json"` (default) or `"toon"`. Overrides the `[documents.output] format`
     /// config knob for this call.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Retrieval lane: "hybrid" (RRF fusion of the vector + keyword + exact-symbol lanes — the
     /// default), "semantic" (vector KNN only), or "keyword" (native BM25 only). Hybrid degrades
     /// gracefully — it drops any lane that is unavailable (e.g. the vector lane without embeddings).
-    #[serde(default)]
+    #[serde(default, alias = "lane")]
     pub mode: Option<String>,
     /// Per-query override: run the cross-encoder rerank pass over the fused hits. Defaults to the
     /// `[code_search.reranker] enabled` config knob. The first rerank downloads an ONNX model.
-    #[serde(default)]
+    #[serde(default, alias = "rerank")]
     pub reranker_enabled: Option<bool>,
     /// Per-query override: the xberg reranker preset (e.g. `bge-reranker-base`).
-    #[serde(default)]
+    #[serde(default, alias = "rerank_preset")]
     pub reranker_preset: Option<String>,
     /// Per-query override: how many top fused hits to rerank.
-    #[serde(default)]
+    #[serde(default, alias = "rerank_top_k")]
     pub reranker_top_k: Option<usize>,
 }
 
@@ -73,11 +216,7 @@ pub(crate) struct CodeSearchHit {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     pub lang: String,
-    /// 1-based first line of the chunk.
-    #[serde(rename = "line", alias = "line_start")]
     pub line_start: u32,
-    /// 1-based last line of the chunk, inclusive.
-    #[serde(rename = "end_line", alias = "line_end")]
     pub line_end: u32,
     pub byte_start: u32,
     pub byte_end: u32,
@@ -108,40 +247,26 @@ pub(crate) struct CodeSearchHit {
     pub exact_rank: Option<u32>,
 }
 
-/// A retrieval lane that did not run for a query, and why.
 #[cfg(feature = "code-search")]
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
-pub(crate) struct LaneUnavailable {
-    pub lane: &'static str,
-    pub reason: String,
-}
-
-#[cfg(feature = "code-search")]
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SearchCodeResponse {
     pub query: String,
     /// True when a `max_tokens` budget dropped trailing `hits`. No cursor — raise `max_tokens`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
-    /// True when the ranking was cut by a hard bound, so better-matching hits may exist than the
-    /// ones that can be paged to. Narrow the query or the filters.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    /// What cut it: `depth` (the ranking goes on past the 100 hits that can be paged),
-    /// `rerank_top_k` (the reranker kept its `top_k` best).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<String>,
     pub hits: Vec<CodeSearchHit>,
-    /// Lanes that produced a ranking for this query: `vector`, `keyword`, `exact`.
-    pub lanes_ran: Vec<&'static str>,
-    /// Lanes that did NOT run, each with why. Non-empty means `hits` is a PARTIAL result from the
-    /// lanes that did run: a caller must be able to tell "searched and found nothing" from "could
-    /// not search". When NO lane runs the call is an error instead, so this is never a labelled
-    /// `[]`.
+    /// Lanes that did NOT run for this query — `"keyword"` and/or `"exact"`. Non-empty means `hits`
+    /// is a PARTIAL result from the lanes that did run, not the whole picture; an empty list means
+    /// every requested lane ran. Machine-readable on purpose: a caller must be able to tell
+    /// "searched and found nothing" from "could not search", which a prose-only notice does not
+    /// allow. When NO lane runs the call is an error instead, so this is never a labelled `[]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub lanes_unavailable: Vec<LaneUnavailable>,
+    pub degraded_lanes: Vec<String>,
+    /// Why `degraded_lanes` could not run, in one human-readable clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
     /// Server-side handler latency in microseconds — the tool body's own execution (index / vector
-    /// search + response construction), excluding MCP transport, argument
+    /// search / graph walk + response construction), excluding MCP transport, argument
     /// deserialization, and response serialization. A first call against a cold server also
     /// includes index warm-up; such responses carry a `notice`. See
     /// [`crate::mcp::helpers::timing`] for the full contract.
@@ -170,90 +295,10 @@ pub(crate) struct GetChunkResponse {
     pub byte_end: u32,
     pub text: String,
     /// Server-side handler latency in microseconds — the tool body's own execution (index / vector
-    /// search + response construction), excluding MCP transport, argument
+    /// search / graph walk + response construction), excluding MCP transport, argument
     /// deserialization, and response serialization. A first call against a cold server also
     /// includes index warm-up; such responses carry a `notice`. See
     /// [`crate::mcp::helpers::timing`] for the full contract.
     #[serde(default)]
     pub elapsed_us: u64,
-}
-
-/// Parameters for the `expand` MCP tool.
-///
-/// Resolves one symbol by `name` (and optionally `kind`) in the file's L1 outline, then
-/// reads the source file from disk and returns the raw bytes in `[start_byte..end_byte]`.
-/// When more than one symbol matches `name` (e.g. overloads), the tool returns an error
-/// listing the matches so the caller can disambiguate by supplying `kind`.
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct ExpandParams {
-    /// Repo-relative path of the indexed source file.
-    pub path: RelPath,
-    /// Symbol name to expand. Matched exactly (case-sensitive) against the L1 outline.
-    pub name: String,
-    /// Optional kind filter to disambiguate when `name` matches multiple symbols
-    /// (e.g. `"function"`, `"method"`, `"struct"`, …). Same values as `search_symbols`.
-    #[serde(default)]
-    pub kind: Option<String>,
-    /// 1-based line inside the definition meant, when several in the file share the name.
-    #[serde(default)]
-    pub line: Option<u32>,
-}
-
-/// Response from the `expand` MCP tool.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct ExpandResponse {
-    /// Repo-relative path of the file that was read.
-    pub path: String,
-    /// Resolved symbol name.
-    pub name: String,
-    /// Resolved symbol kind (e.g. `"function"`, `"struct"`).
-    pub kind: String,
-    /// 1-based first line of the symbol.
-    pub line: u32,
-    /// 1-based last line of the returned body, inclusive: the symbol's last line unless `truncated`.
-    pub end_line: u32,
-    /// Raw source text of the symbol body (`file_bytes[start_byte..end_byte]`).
-    pub body: String,
-    /// Byte length of the returned body (before any truncation).
-    pub bytes: usize,
-    /// `true` when the body was cut at the 128 KiB size cap, after its last whole line that fits;
-    /// absent otherwise.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    /// `size_cap` whenever `truncated` is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
-    /// Bytes of the symbol left out of `body` (bytes, where `omitted` elsewhere counts items).
-    /// Read on with a line span from `end_line + 1`.
-    #[serde(skip_serializing_if = "super::types::is_zero")]
-    pub omitted_bytes: usize,
-    /// The file changed since it was indexed, so the symbol was located by parsing the working-tree
-    /// file; the other tools describe the indexed content until `index_rescan`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub stale: bool,
-}
-
-/// Response of a `code_read` line-span read.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct ReadSpanResponse {
-    pub path: String,
-    /// 1-based first line returned.
-    pub line: u32,
-    /// 1-based last line returned, inclusive: clamped to the file, and to what fits when `truncated`.
-    pub end_line: u32,
-    pub total_lines: u32,
-    pub body: String,
-    /// Byte length of the span before any truncation.
-    pub bytes: usize,
-    /// `true` when the body was cut at the 128 KiB size cap, after its last whole line that fits;
-    /// absent otherwise.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    /// `size_cap` whenever `truncated` is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
-    /// Bytes of the span left out of `body` (bytes, where `omitted` elsewhere counts items). Read
-    /// on from `end_line + 1`; one line longer than the cap cannot be read past it.
-    #[serde(skip_serializing_if = "super::types::is_zero")]
-    pub omitted_bytes: usize,
 }

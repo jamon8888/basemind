@@ -1,5 +1,3 @@
-mod main_rescan;
-use main_rescan::cmd_rescan;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -7,23 +5,18 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use basemind::config::overrides::DocumentsCliOverrides;
-use basemind::config::{self, Config};
+use basemind::config::{self, Config, DocumentsCliOverrides};
 use basemind::render::{self, Verbosity};
 use basemind::store::{LockHolder, Store};
 use basemind::watcher::{BatchKind, WatchBatch};
 
 mod comms_cli;
-#[cfg(all(feature = "comms", any(unix, windows)))]
-mod comms_stop;
 mod doctor_cli;
 mod lang_cli;
-#[cfg(all(feature = "comms", any(unix, windows)))]
-mod relay_refusal;
-#[cfg(all(feature = "comms", any(unix, windows)))]
-mod serve_relay;
+mod scan_args;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod stdio_relay;
+use scan_args::{RescanArgs, ScanArgs};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,10 +43,10 @@ struct Cli {
     no_color: bool,
 
     /// Emit machine-readable JSON instead of the human-readable rendering. Applies to the tool
-    /// subcommands (code / git / memory / admin / status / cache), the
+    /// subcommands (code / git / graph / memory / web / shell / admin / status / cache), the
     /// coordination groups (agents / workspace / comms / daemon) and doctor. It is ignored, with a
     /// warning, on init / scan / rescan / watch / hook / lang / completions / man / statusline /
-    /// serve.
+    /// serve and the stdin filters (compress-output / delta / checkpoint / detect-waste).
     #[arg(long, global = true)]
     json: bool,
 
@@ -68,6 +61,9 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+// The top-level dispatch enum lives for the process lifetime and is matched once;
+// boxing its largest variant would trade ergonomics for nothing.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Initialize (or refresh) basemind onboarding: write basemind.toml, gitignore the cache, and
     /// inject a "prefer basemind over grep/read/git" rules block. Re-runnable and idempotent.
@@ -79,19 +75,35 @@ enum Cmd {
     Rescan(RescanArgs),
     /// Long-running watcher; keeps the code map current as files change.
     Watch,
-    /// Read the code map: outline, symbols, read, grep, search, refs, find (plus shorthands).
+    /// Read the code map: outline, symbols, grep, files, find, definition, references, callers,
+    /// implementations, dependents, expand, semantic, chunk.
     #[command(subcommand)]
     Code(basemind::cli::code::CodeCmd),
     /// Git history / blame / diff queries.
     #[command(subcommand)]
     Git(basemind::cli::git::GitCmd),
+    /// Navigate the code graph (calls, neighbors, path, subgraph, communities, map, export, …).
+    #[command(subcommand)]
+    Graph(basemind::cli::graph::GraphCmd),
     /// Shared agent memory + document search (needs `--features memory,documents`).
     #[command(subcommand)]
     Memory(basemind::cli::memory::MemoryCmd),
-    /// Repository identity, telemetry, token counting and retrieval evaluation.
+    /// On-demand web ingestion (needs `--features crawl`).
+    #[command(subcommand)]
+    Web(basemind::cli::web::WebCmd),
+    /// Headless agent shell sessions: spawn / send / capture / kill / list / broadcast
+    /// (needs `--features shells`).
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    #[command(subcommand)]
+    Shell(basemind::cli::shell::ShellCmd),
+    /// Repository identity, telemetry, compression, token counting and retrieval evaluation.
     #[command(subcommand)]
     Admin(basemind::cli::admin::AdminCmd),
-    /// Manage the git pre-commit hook that runs `basemind scan --staged`.
+    /// Encrypted PII rehydration map operations: encrypt, decrypt, find, forget, inspect.
+    #[cfg(feature = "documents")]
+    #[command(subcommand)]
+    Vault(basemind::cli::vault::VaultCmd),
+    /// Install a pre-commit hook that runs `basemind scan --staged`.
     Hook {
         #[command(subcommand)]
         action: basemind::cli::hook::HookCmd,
@@ -113,16 +125,35 @@ enum Cmd {
         #[command(subcommand)]
         action: LangCmd,
     },
+    /// Compress verbose command output read from stdin into a compact summary,
+    /// failing open (raw passthrough) on errors and preserving credentials.
+    CompressOutput(basemind::textcompress::cli::CompressOutputArgs),
+    /// Emit a compact `+N/-M` line-diff from a prior file version (`--old`) to
+    /// new content read from stdin — the stateless delta re-read primitive.
+    Delta(basemind::textcompress::cli::DeltaArgs),
+    /// Extract a compact, credential-safe checkpoint (decisions / errors /
+    /// changed files) from session text read from stdin; changed files come
+    /// from the git working tree, not the text.
+    Checkpoint(basemind::textcompress::cli::CheckpointArgs),
+    /// Flag wasteful tool usage (redundant reads, repeated queries, oversized
+    /// reads) from a JSON-Lines tool-call log read from stdin. Pure analysis.
+    DetectWaste(basemind::textcompress::cli::DetectWasteArgs),
     /// Run an MCP server for a stdio client: ensure the daemon (the real server) is up, then relay
     /// this process's stdin/stdout to it. HTTP-native clients skip this and dial the daemon URL
     /// directly (see `daemon ensure`).
     Serve,
+    /// Detect CPU feature flags (AVX2, AVX, SSE, NEON) for ONNX model compatibility.
+    /// Prints JSON to stdout and exits. No server needed.
+    CpuFeatures,
     /// Print a compact one-line summary of the daemon's currently-hot workspaces, for a shell
     /// statusline. Fast and silent: prints nothing and exits 0 when no daemon is running.
     Statusline,
     /// Manage the machine-global caches (gc / stats / clear). Offline path.
     #[command(subcommand)]
     Cache(basemind::cli::admin::CacheCmd),
+    /// Redact arbitrary text using the same pipeline as document extraction.
+    #[cfg(feature = "documents")]
+    Redact(basemind::cli::redact::RedactArgs),
     /// Manage the user-global agent-comms broker daemon (needs `--features comms`).
     #[cfg(all(feature = "comms", any(unix, windows)))]
     Comms {
@@ -136,8 +167,8 @@ enum Cmd {
         #[command(subcommand)]
         action: basemind::cli::agents::AgentsCmd,
     },
-    /// Machine-registry listings: workspaces / worktrees / branches (needs `--features comms`).
-    /// Talks to the broker daemon directly, like `comms`.
+    /// Machine-registry coordination: workspaces / worktrees / branches / advisory claims (needs
+    /// `--features comms`). Talks to the broker daemon directly, like `comms`.
     #[cfg(all(feature = "comms", any(unix, windows)))]
     Workspace {
         #[command(subcommand)]
@@ -172,18 +203,18 @@ enum CommsLifecycleCmd {
     Daemon,
     /// Ensure the daemon is running (spawn if needed); noop when already alive.
     Start,
-    /// Ask the running daemon to drain and stop. With `--all`, stop EVERY live daemon of this
-    /// version's protocol generation on this machine, not just the one for the current comms dir.
+    /// Ask the running daemon to drain and stop. With `--all`, stop EVERY live daemon registered on
+    /// this machine (reclaims a pile-up), not just the one for the current comms dir.
     Stop {
-        /// Stop every live daemon of this protocol generation on this machine, not just the current one.
+        /// Stop every live daemon on this machine, not just the current one.
         #[arg(long)]
         all: bool,
     },
     /// Report the daemon's pid / version / uptime / room + subscriber counts.
     Status,
-    /// List every live daemon of this version's protocol generation on this machine (pid / comms
-    /// dir / version / uptime) and flag any pile-up over the ceiling. Prunes dead registry entries
-    /// as a side effect. Reports process liveness only unless --probe is given.
+    /// List every live daemon registered on this machine (pid / comms dir / version / uptime) and
+    /// flag any pile-up over the ceiling. Prunes dead registry entries as a side effect. Reports
+    /// process liveness only unless --probe is given.
     Doctor {
         /// Also ask each comms daemon whether it can actually serve, and report the verdict per
         /// row. Off by default so the plain report stays RPC-free and safe on a wedged machine.
@@ -193,60 +224,6 @@ enum CommsLifecycleCmd {
         #[arg(long)]
         clear_fatal: bool,
     },
-    /// Remove rendezvous directories no daemon uses: other protocol generations' and the files
-    /// releases up to 0.33 left in the comms directory, when unlocked and idle for 30 days.
-    Cleanup {
-        /// List what would be removed, with sizes, and remove nothing.
-        #[arg(long)]
-        dry_run: bool,
-        /// Idle days after which an unlocked rendezvous is removed. With 0, the comms store of
-        /// another release, messages included, is removed as soon as no daemon of it is running.
-        #[arg(long, value_name = "DAYS", default_value_t = 30)]
-        older_than: u64,
-    },
-}
-
-#[derive(clap::Args, Debug)]
-struct ScanArgs {
-    /// Index the git staging area instead of the working tree. Used by the
-    /// pre-commit hook so the cache reflects what's about to be committed.
-    /// Mutually exclusive with --rev.
-    #[arg(long, conflicts_with = "rev")]
-    staged: bool,
-    /// Index the tree at the given revision (HEAD, branch name, sha, HEAD~3).
-    /// Written as the `rev-<sha7>` view in the machine-global workspace cache, separate from the
-    /// working-tree view.
-    #[arg(long, value_name = "REV")]
-    rev: Option<String>,
-    /// Prepare and verify the experimental shared base against the working index.
-    #[arg(long, conflicts_with_all = ["staged", "rev"])]
-    verify_shared_base: bool,
-    /// Skip building the git-history index after the scan (overrides config). The history tools
-    /// then fall back to the live walk. Equivalent to `BASEMIND_GH_INDEX=0`.
-    #[arg(long)]
-    no_git_history: bool,
-    /// Wipe and fully rebuild the git-history index instead of incrementally syncing it. Use after
-    /// a history rewrite if revalidation didn't already trigger a rebuild.
-    #[arg(long)]
-    rebuild_git_history: bool,
-    /// Document-tier overrides. Every flag in this group corresponds to a
-    /// `[documents.…]` TOML key and a `BASEMIND_DOCUMENTS_…` env var.
-    #[command(flatten)]
-    documents: DocumentsCliOverrides,
-}
-
-#[derive(clap::Args, Debug)]
-struct RescanArgs {
-    /// Repo-relative paths to re-index incrementally. When omitted the entire working tree is
-    /// re-indexed, skipping unchanged files. Paths are forward-slash with no leading `/`.
-    #[arg(value_name = "PATH")]
-    paths: Vec<String>,
-    /// Skip building the git-history index after the rescan (overrides config).
-    #[arg(long)]
-    no_git_history: bool,
-    /// Wipe and fully rebuild the git-history index instead of incrementally syncing it.
-    #[arg(long)]
-    rebuild_git_history: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -292,6 +269,10 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     basemind::alloc_tag::retag_heap_pages();
     let process_started = std::time::Instant::now();
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    if let Some(result) = basemind::shells::intercept_internal_reexec() {
+        return result;
+    }
     let cli = Cli::parse();
     let verbosity = Verbosity::from_flags(cli.quiet, cli.verbose);
 
@@ -354,8 +335,19 @@ fn run() -> Result<()> {
             dispatch(basemind::cli::ToolCmd::Code(c))
         }
         Cmd::Git(g) => dispatch(basemind::cli::ToolCmd::Git(g)),
+        Cmd::Graph(g) => {
+            let _ = basemind::lang::ensure_grammars();
+            dispatch(basemind::cli::ToolCmd::Graph(g))
+        }
         Cmd::Memory(m) => dispatch(basemind::cli::ToolCmd::Memory(m)),
+        Cmd::Web(w) => dispatch(basemind::cli::ToolCmd::Web(w)),
+        #[cfg(all(feature = "shells", any(unix, windows)))]
+        Cmd::Shell(s) => dispatch(basemind::cli::ToolCmd::Shell(s)),
         Cmd::Admin(a) => dispatch(basemind::cli::ToolCmd::Admin(a)),
+        #[cfg(feature = "documents")]
+        Cmd::Vault(v) => dispatch(basemind::cli::ToolCmd::Vault(v)),
+        #[cfg(feature = "documents")]
+        Cmd::Redact(args) => dispatch(basemind::cli::ToolCmd::Redact(args)),
         Cmd::Hook { action } => basemind::cli::hook::run(&root, action),
         Cmd::Doctor => doctor_cli::cmd_doctor(&root, json),
         Cmd::Status => {
@@ -376,6 +368,11 @@ fn run() -> Result<()> {
             LangCmd::Install => lang_cli::cmd_lang_install(&root, verbosity, no_color),
             LangCmd::Clean => lang_cli::cmd_lang_clean(),
         },
+        Cmd::CompressOutput(args) => basemind::textcompress::cli::run(&args),
+        Cmd::Delta(args) => basemind::textcompress::cli::run_delta(&args),
+        Cmd::Checkpoint(args) => basemind::textcompress::cli::run_checkpoint(&root, &args),
+        Cmd::DetectWaste(args) => basemind::textcompress::cli::run_detect_waste(&args),
+        Cmd::CpuFeatures => basemind::cli::cpu_features::run(&mut std::io::stdout()),
         Cmd::Serve => cmd_serve(&root, &view),
         Cmd::Cache(action) => basemind::cli::run_cache(&root, action, json),
         // An explicit `--root` selects the per-repo line for that (resolved) workspace; bare
@@ -399,14 +396,26 @@ fn run() -> Result<()> {
 fn warn_ignored_global_flags(cmd: &Cmd, json: bool, view: &str) {
     let consumes_json = matches!(
         cmd,
-        Cmd::Code(_) | Cmd::Git(_) | Cmd::Memory(_) | Cmd::Admin(_) | Cmd::Cache(_) | Cmd::Status | Cmd::Doctor
+        Cmd::Code(_)
+            | Cmd::Git(_)
+            | Cmd::Graph(_)
+            | Cmd::Memory(_)
+            | Cmd::Web(_)
+            | Cmd::Admin(_)
+            | Cmd::Cache(_)
+            | Cmd::Status
+            | Cmd::Doctor
     );
+    #[cfg(feature = "documents")]
+    let consumes_json = consumes_json || matches!(cmd, Cmd::Vault(_));
     #[cfg(all(feature = "comms", any(unix, windows)))]
     let consumes_json = consumes_json
         || matches!(
             cmd,
             Cmd::Comms { .. } | Cmd::Agents { .. } | Cmd::Workspace { .. } | Cmd::Daemon { .. }
         );
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    let consumes_json = consumes_json || matches!(cmd, Cmd::Shell(_));
     let consumes_view = consumes_json || matches!(cmd, Cmd::Serve);
 
     if json && !consumes_json {
@@ -446,7 +455,7 @@ fn guard_workspace_root(root: &std::path::Path) -> Result<PathBuf> {
 /// the layered merger. Used by `scan` / `serve` to flow `#[command(flatten)]`
 /// flags down to the resolved config.
 fn load_or_default_with(root: &std::path::Path, cli: Option<DocumentsCliOverrides>) -> Result<Config> {
-    match config::overrides::load_with_overrides(root, None, cli) {
+    match config::load_with_overrides(root, None, cli) {
         Ok(loaded) => Ok(loaded.config),
         Err(config::ConfigError::NotFound(_)) => {
             tracing::info!("no basemind.toml; using defaults");
@@ -558,7 +567,7 @@ fn scan_streaming(
     cancel: &basemind::scanner::ScanCancel,
 ) -> std::result::Result<basemind::scanner::ScanReport, basemind::scanner::ScanError> {
     let mut observer = render::ScanLineObserver::new(no_color, verbosity);
-    let report = basemind::scanner::scan_with_observer(
+    basemind::scanner::scan_with_observer(
         root,
         store,
         config,
@@ -566,9 +575,7 @@ fn scan_streaming(
         basemind::scanner::EmbedMode::Inline,
         cancel,
         &mut observer,
-    );
-    observer.finish();
-    report
+    )
 }
 
 /// Turn an interrupted scan into the exit-`130` error after printing what did land. The scan stops
@@ -613,7 +620,6 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
             return interrupted(&mut out, &report, verbosity, "scan --staged");
         }
         render::render_summary(&mut out, &report.stats, verbosity);
-        render::render_phase_peaks(&mut out, &report.phase_peaks, verbosity);
         return Ok(());
     }
     if let Some(rev_spec) = &args.rev {
@@ -640,28 +646,11 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
             return interrupted(&mut out, &report, verbosity, "scan --rev");
         }
         render::render_summary(&mut out, &report.stats, verbosity);
-        render::render_phase_peaks(&mut out, &report.phase_peaks, verbosity);
         return Ok(());
     }
 
     if let Some(notice) = writer_collision_notice(root) {
         return Err(basemind::cli::exit::CliExit::busy(notice));
-    }
-    #[cfg(unix)]
-    if basemind::store::Store::rebuild_migrated_working_view(root, &config, &cancel)? {
-        eprintln!("Rebuilt the standalone working index.");
-        sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
-        return Ok(());
-    }
-    let shared_index = std::env::var_os("BASEMIND_INDEX_LAYERED").is_some_and(|value| value == "1");
-    if shared_index
-        && !args.verify_shared_base
-        && (basemind::store_base::has_published_dirty_worktree(root, &config).unwrap_or(false)
-            || basemind::store_base::refresh_local_worktree(root, &config, LockHolder::Scan).unwrap_or(false))
-    {
-        eprintln!("Shared worktree index ready.");
-        sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
-        return Ok(());
     }
     let mut store = open_store_for_write(root, basemind::store::VIEW_WORKING, "scan", LockHolder::Scan)?;
     let report = scan_streaming(
@@ -678,52 +667,85 @@ fn cmd_scan(root: &std::path::Path, args: &ScanArgs, verbosity: Verbosity, no_co
         return interrupted(&mut out, &report, verbosity, "scan");
     }
     render::render_summary(&mut out, &report.stats, verbosity);
-    render::render_phase_peaks(&mut out, &report.phase_peaks, verbosity);
-    if args.verify_shared_base {
-        match basemind::store_base::open_clean_worktree(root, &config) {
-            Ok(Some(base)) => {
-                let standalone = store.index_view().context("working index missing after scan")?;
-                basemind::index::verify_shared_base(&base, &standalone)?;
-                eprintln!("Shared base matches the standalone working index.");
-            }
-            Ok(None) => {
-                eprintln!("Shared base unavailable for this worktree or scan policy. Using the standalone index.")
-            }
-            Err(error) => eprintln!("Shared base unavailable: {error:#}. Using the standalone index."),
-        }
-    }
-    if shared_index
-        && report.stats.read_failed == 0
-        && report.stats.extract_failed == 0
-        && let Err(error) = basemind::store_base::record_promotion(root, &config)
-    {
-        tracing::debug!(%error, "shared index promotion marker failed");
-    }
-    if shared_index
-        && let Some(reference) = store.index_view()
-        && let Err(error) = basemind::store_base::publish_dirty_worktree(root, &config, &reference)
-    {
-        tracing::debug!(%error, "shared overlay publication failed");
-    }
-    if shared_index && let Err(error) = basemind::store_base::retire_old_generations(root) {
-        tracing::debug!(%error, "shared base retention failed");
-    }
     reclaim_after_scan(&mut out, &report.stats, std::mem::take(&mut store.reset_stale_schema));
-    #[cfg(unix)]
-    let reclaim = std::env::var_os("BASEMIND_INDEX_RECLAIM_BACKUP").is_some_and(|value| value == "1");
-    #[cfg(unix)]
-    if shared_index
-        && args.verify_shared_base
-        && report.stats.read_failed == 0
-        && report.stats.extract_failed == 0
-        && store.retire_verified_working_view(&config, reclaim)?
-    {
-        if reclaim {
-            eprintln!("Verified shared generation activated; standalone backup reclaimed.");
-        } else {
-            eprintln!("Verified shared generation activated; standalone backup retained for rollback.");
+    sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
+    Ok(())
+}
+
+fn cmd_rescan(root: &std::path::Path, args: &RescanArgs, verbosity: Verbosity, no_color: bool) -> Result<()> {
+    let root = &guard_workspace_root(root)?;
+    let full = args.full || args.paths.is_empty();
+    // ~keep Validate before touching any lock or daemon, so a bad path is a clean exit 2.
+    let abs = if full {
+        Vec::new()
+    } else {
+        basemind::cli::rescan::resolve_paths(root, &args.paths)?
+    };
+    let mut out = render::stdout(no_color);
+    // ~keep A running daemon is the sole index writer: hand it the scan instead of opening a second,
+    // ~keep unlocked-by-it writer. Never fall through to a local scan after a daemon failure.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    if basemind::cli::rescan::daemon_is_up() {
+        use std::io::Write as _;
+        let report = basemind::cli::rescan::rescan_via_daemon(root, (!full).then_some(abs), full)?;
+        let _ = writeln!(
+            out,
+            "rescan via daemon: {} scanned, {} updated, {} docs indexed, {} removed ({} ms)",
+            report.scanned, report.updated, report.docs_indexed, report.removed, report.elapsed_ms
+        );
+        if report.docs_degraded > 0 || report.doc_timeouts > 0 {
+            let _ = writeln!(
+                out,
+                "docs_degraded {}  doc_timeouts {} (see [documents] markdown_chunk_max_bytes)",
+                report.docs_degraded, report.doc_timeouts
+            );
         }
+        if report.docs_text_fallback > 0 {
+            let _ = writeln!(
+                out,
+                "docs_text_fallback {} (of docs_degraded: read as plain text after a structured-extraction failure)",
+                report.docs_text_fallback
+            );
+        }
+        return Ok(());
     }
+    let cancel = basemind::cli::interrupt::install();
+    bootstrap_grammars(verbosity, no_color)?;
+    let config = load_or_default(root)?;
+    if let Some(notice) = writer_collision_notice(root) {
+        return Err(basemind::cli::exit::CliExit::busy(notice));
+    }
+    let mut store = open_store_for_write(root, basemind::store::VIEW_WORKING, "rescan", LockHolder::Rescan)?;
+
+    let report = if full {
+        scan_streaming(
+            no_color,
+            verbosity,
+            basemind::scanner::ScanSource::WorkingTree,
+            root,
+            &mut store,
+            &config,
+            &cancel,
+        )
+        .context("rescan (full)")?
+    } else {
+        let mut observer = render::ScanLineObserver::new(no_color, verbosity);
+        basemind::scanner::scan_paths_with_observer(
+            root,
+            &mut store,
+            &config,
+            &abs,
+            basemind::scanner::EmbedMode::Inline,
+            &cancel,
+            &mut observer,
+        )
+        .context("rescan (paths)")?
+    };
+    if report.cancelled {
+        return interrupted(&mut out, &report, verbosity, "rescan");
+    }
+    render::render_summary(&mut out, &report.stats, verbosity);
+    reclaim_after_scan(&mut out, &report.stats, std::mem::take(&mut store.reset_stale_schema));
     sync_git_history_after_scan(root, !args.no_git_history, args.rebuild_git_history, &mut out);
     Ok(())
 }
@@ -825,17 +847,162 @@ fn cmd_serve(root: &std::path::Path, view: &str) -> Result<()> {
     {
         // No in-process fallback: relaying is the only path. If it fails the client sees a clear
         // error rather than silently degrading to a fragile pipe-bound server.
-        serve_relay::try_serve_relay(root, view).context(
+        try_serve_relay(root, view).context(
             "relay to the basemind daemon failed; run `basemind daemon ensure` to check the daemon, \
              then retry",
         )
     }
     #[cfg(not(all(feature = "comms", any(unix, windows))))]
     {
-        let _ = root;
+        try_serve_in_process(root, view)
+    }
+}
+
+/// Run the legal/minimal profile's MCP server directly over stdio. Full builds use the daemon
+/// relay above; keeping this fallback independent of `comms` gives document-focused release
+/// binaries a real transport without pulling in the broker, agents, or workspace domains.
+#[cfg(not(all(feature = "comms", any(unix, windows))))]
+fn try_serve_in_process(root: &std::path::Path, view: &str) -> Result<()> {
+    use rmcp::ServiceExt;
+
+    let (store, read_only) = match Store::open_with_holder(root, view, LockHolder::Serve) {
+        Ok(store) => (store, false),
+        Err(error) if error.is_lock_contention() => (Store::open_read_only(root, view)?, true),
+        Err(error) => return Err(anyhow::Error::new(error).context("open store")),
+    };
+    let config = Arc::new(config::load_or_default_logged(root));
+    let repo = basemind::git::Repo::discover(root).ok().map(Arc::new);
+    let git_cache = Arc::new(
+        basemind::git_cache::GitCache::open(&basemind::store::workspace_cache_dir(root), 1024, false)
+            .context("open git cache")?,
+    );
+    // The server's background facilities (serve watcher, auto-scan, blob GC) capture the current
+    // Tokio handle at construction, so the runtime must exist and be entered before the server is
+    // built; constructing it first panicked with "there is no reactor running".
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let _runtime_guard = runtime.enter();
+    let server = basemind::mcp::BasemindServer::new_with_options(
+        store,
+        root.to_path_buf(),
+        config,
+        repo,
+        git_cache,
+        basemind::mcp::ServerOptions {
+            read_only,
+            ..basemind::mcp::ServerOptions::default()
+        },
+    );
+    runtime.block_on(async {
+        let running = server
+            .serve(rmcp::transport::stdio())
+            .await
+            .context("MCP stdio handshake")?;
+        running.waiting().await.context("MCP stdio server")?;
+        Ok(())
+    })
+}
+
+/// Keep the MCP host's stdio pipes alive across daemon replacement. The protocol-aware relay tracks
+/// initialization and in-flight request IDs, allowing it to reconnect without asking Codex or
+/// Claude to recreate the MCP process.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+fn try_serve_relay(root: &std::path::Path, view: &str) -> Result<()> {
+    use basemind::comms::identity;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    runtime.block_on(async move {
+        let agent = identity::mcp_session_agent_id(root);
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let view = view.to_owned();
+        let stream = open_relay_connection(canonical_root.clone(), view.clone(), agent.clone()).await?;
+
+        tracing::info!(
+            pid = std::process::id(),
+            view = %view,
+            root = %canonical_root.display(),
+            "basemind serve: persistent relay connected"
+        );
+        stdio_relay::run(tokio::io::stdin(), tokio::io::stdout(), stream, move || {
+            open_relay_connection(canonical_root.clone(), view.clone(), agent.clone())
+        })
+        .await
+        .context("run persistent daemon relay")
+    })
+}
+
+#[cfg(all(feature = "comms", unix))]
+type RelayStream = tokio::net::UnixStream;
+
+#[cfg(all(feature = "comms", windows))]
+type RelayStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(all(feature = "comms", any(unix, windows)))]
+async fn open_relay_connection(
+    root: PathBuf,
+    view: String,
+    agent: basemind::comms::ids::AgentId,
+) -> Result<RelayStream> {
+    use basemind::comms::{relay, singleton};
+
+    let paths = singleton::resolve_paths().context("resolve comms paths")?;
+    singleton::ensure_daemon(&paths).await.context("ensure daemon")?;
+    let mut stream = relay_connect_stream(&paths.socket_path)
+        .await
+        .context("connect to daemon socket")?;
+    let hello = relay::RelayHello {
+        relay_proto_ver: relay::RELAY_PROTO_VER,
+        root,
+        view,
+        agent,
+    };
+    let welcome = relay::client_handshake(&mut stream, &hello)
+        .await
+        .context("relay handshake")?;
+    if welcome.relay_proto_ver != relay::RELAY_PROTO_VER {
         anyhow::bail!(
-            "`basemind serve` needs the comms daemon to host the MCP server; rebuild with \
-             `--features comms` (the stdio MCP server is served by relaying to that daemon)."
-        )
+            "daemon relay-proto {} != client {}",
+            welcome.relay_proto_ver,
+            relay::RELAY_PROTO_VER
+        );
+    }
+    if !welcome.accepted {
+        anyhow::bail!("daemon declined relay: {:?}", welcome.code);
+    }
+    Ok(stream)
+}
+
+/// Dial the daemon's relay endpoint: a Unix-domain socket on unix.
+#[cfg(all(feature = "comms", unix))]
+async fn relay_connect_stream(socket_path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(socket_path).await
+}
+
+/// Dial the daemon's relay endpoint: a named pipe on Windows, retrying while the pipe is busy.
+#[cfg(all(feature = "comms", windows))]
+async fn relay_connect_stream(
+    socket_path: &std::path::Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        match ClientOptions::new().open(socket_path) {
+            Ok(client) => return Ok(client),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+            Err(source) => return Err(source),
+        }
     }
 }

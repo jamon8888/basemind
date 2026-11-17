@@ -9,51 +9,59 @@
 //! Transport: stdio (the canonical MCP transport). Spawn via `basemind serve`.
 
 pub(crate) mod admission;
-pub mod agent_tools;
 mod background;
 mod budget;
+mod codegraph;
+mod community;
 mod completions;
 pub(crate) mod cursor;
-mod cursor_bind;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod daemon_forward;
-mod freshness;
+mod doc_links_cache;
+mod file_url;
+mod graph_html;
+mod graph_svg;
+mod graph_view;
 mod helpers;
 mod helpers_admin;
+mod helpers_archmap;
+
 mod helpers_calls;
-#[cfg(test)]
-mod helpers_calls_resolved_tests;
 mod helpers_calls_scan;
-#[cfg(test)]
-pub(crate) use helpers_calls_scan::scan_calls_by_name;
-#[cfg(test)]
-pub(crate) use helpers_refs_match::Matching;
 mod helpers_code;
 #[cfg(feature = "code-search")]
 mod helpers_code_search;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod helpers_comms;
+mod helpers_community;
+mod helpers_compress;
 #[cfg(feature = "documents")]
 mod helpers_documents;
-mod helpers_expand;
 mod helpers_files;
-mod helpers_filters;
 mod helpers_fingerprint;
 mod helpers_git;
-mod helpers_git_by_path;
 mod helpers_git_file;
 mod helpers_git_show;
+#[cfg(feature = "memory")]
+mod helpers_governance;
+mod helpers_graph;
+mod helpers_graphview;
 mod helpers_grep;
-mod helpers_grep_text;
 mod helpers_impls;
 mod helpers_intel;
 mod helpers_memory;
-#[cfg(any(feature = "code-search", feature = "documents", test))]
-mod helpers_page;
-mod helpers_pick;
-mod helpers_refs_match;
-mod helpers_symbols;
+#[cfg(feature = "memory")]
+mod helpers_proposals;
+#[cfg(all(feature = "comms", any(unix, windows)))]
+mod helpers_registry;
+#[cfg(all(feature = "shells", any(unix, windows)))]
+mod helpers_shells;
 mod helpers_telemetry;
+mod helpers_traverse;
+#[cfg(feature = "documents")]
+mod helpers_vault;
+#[cfg(feature = "crawl")]
+mod helpers_web;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod host;
 mod identity;
@@ -64,64 +72,89 @@ pub(crate) mod index_read;
 mod index_route;
 #[cfg(test)]
 mod index_route_tests;
-#[cfg(test)]
-mod index_view_tests;
+mod kneedle;
 mod l1_cache;
-#[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
-mod lance_cell;
 mod lean;
-#[cfg(all(feature = "comms", any(unix, windows)))]
 mod lenient;
 mod map_fingerprint;
 #[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
 mod memory;
 #[cfg(feature = "memory")]
 pub(crate) mod memory_ops;
-mod memory_vectors;
 pub mod mode;
+#[cfg(feature = "ner-candle")]
+mod ner_windowing;
 mod notifications;
-pub mod offline;
-mod outline_cache;
 mod prompts;
-mod ranked_cache;
-pub mod replay;
+#[cfg(feature = "memory")]
+pub(crate) mod proposals_ops;
 mod resources;
 mod router_cache;
+mod safe_resources;
 pub(crate) mod savings;
 mod server_handler;
 mod shared_state;
 mod state;
-mod strict;
 mod tasks;
 mod telemetry;
 mod term_index;
 pub(crate) mod tokens;
-mod tool_contract;
 mod tools;
 mod tools_admin;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod tools_comms;
 mod tools_git;
+mod tools_graph;
 mod tools_memory;
+#[cfg(feature = "documents")]
+mod tools_redact;
+#[cfg(feature = "documents")]
+mod tools_redact_timeout;
+#[cfg(all(feature = "comms", any(unix, windows)))]
+mod tools_registry;
+#[cfg(all(feature = "shells", any(unix, windows)))]
+mod tools_shells;
+#[cfg(feature = "documents")]
+mod tools_vault;
+#[cfg(feature = "crawl")]
+mod tools_web;
 pub(crate) mod toon;
+mod traverse;
 mod types;
+mod types_admin;
+mod types_archmap;
 mod types_code;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub(crate) mod types_comms;
+mod types_community;
+mod types_compress;
 mod types_documents;
 mod types_git;
+pub(crate) mod types_governance;
+mod types_graph;
+mod types_graphview;
 mod types_impls;
 pub(crate) mod types_memory;
-mod types_tools;
+#[cfg(all(feature = "comms", any(unix, windows)))]
+pub(crate) mod types_registry;
+#[cfg(all(feature = "shells", any(unix, windows)))]
+mod types_shells;
+mod types_traverse;
+#[cfg(feature = "documents")]
+pub(crate) mod types_vault;
+#[cfg(feature = "crawl")]
+mod types_web;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::task_manager::TaskManager;
 
 use crate::extract::FileMapL1;
+use crate::lang::LangId;
 use crate::store::Store;
 
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -129,7 +162,7 @@ pub(crate) use host::HostBackend;
 #[cfg(all(feature = "test-support", feature = "comms", any(unix, windows)))]
 pub use in_memory::serve_in_memory_daemon_writer;
 #[cfg(feature = "test-support")]
-pub use in_memory::{serve_in_memory, serve_in_memory_lean, serve_in_memory_with_task_threshold};
+pub use in_memory::{serve_in_memory, serve_in_memory_lean};
 pub(crate) use shared_state::SharedReadStack;
 pub(crate) use state::{Lifecycle, MapCache, ServerState};
 
@@ -148,26 +181,59 @@ impl HostedReadStack {
     }
 }
 
-/// Public re-export of every tool `*Params` type, so the in-process CLI (`src/cli/`) can build
-/// tool arguments and call the same `*_call` bodies the `#[tool]` shims call. This is the
-/// parity-by-construction surface: the CLI runs the identical tool code an MCP client would reach.
+/// Public re-export of every tool `*Params` type plus the `Parameters` wrapper, so the
+/// in-process CLI (`src/cli/`) can build tool arguments and call the `#[tool]` methods
+/// directly. This is the parity-by-construction surface: the CLI runs the identical tool
+/// code an MCP client would dispatch.
 pub mod params {
     pub use rmcp::handler::server::wrapper::Parameters;
 
-    pub(crate) use super::strict::parse as parse_args;
-    pub use super::types::{FindCommitsByPathParams, HotFilesParams, TelemetrySummaryParams};
-    pub use super::types_code::GetChunkParams;
-    pub use super::types_memory::{MemoryDeleteParams, Visibility};
-    #[cfg(feature = "test-support")]
-    pub use super::types_tools::check_arguments;
-    pub use super::types_tools::{
-        CodeGrepParams, CodeOutlineParams, CodeReadParams, CodeRefsParams, CodeSearchParams, CodeSymbolsParams,
-        DocsSearchParams, FindFilesToolParams, GitBlameParams, GitDiffParams, GitLogParams, IndexRescanParams,
-        IndexStatusParams, MemorySaveParams, MemorySearchToolParams, RETIRED_TOOLS, VERB_TOOLS,
+    pub(crate) use super::lenient::Lenient;
+
+    pub use super::mode::AdminMode;
+    pub use super::mode::CodeMode;
+    pub use super::mode::GitMode;
+    pub use super::mode::GraphMode;
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    pub use super::mode::ShellMode;
+    pub use super::mode::WebMode;
+    #[cfg(feature = "documents")]
+    pub use super::tools_redact::RedactTextParams;
+    pub use super::types::{
+        BlameFileParams, BlameSymbolParams, CommitsTouchingParams, DependentsParams, DiffFileParams, DiffOutlineParams,
+        FindCallersParams, FindCommitsByPathParams, FindFilesParams, FindReferencesParams, GotoDefinitionParams,
+        HotFilesParams, ListFilesParams, OutlineParams, RecentChangesParams, RepoInfoParams, RescanParams,
+        SearchDocumentsParams, SearchGitHistoryParams, SearchSymbolsParams, StatusParams, SymbolHistoryParams,
+        TelemetrySummaryParams, WorkingTreeStatusParams, WorkspaceGrepParams,
     };
+    pub use super::types_admin::{AdminParams, CacheClearParams, CacheGcParams, CacheStatsParams};
+    pub use super::types_code::CodeParams;
+    pub use super::types_git::GitParams;
+    pub use super::types_governance::{
+        MemoryAuditParams, ProposalAcceptParams, ProposalRejectParams, ProposalsListParams, ProposalsMineParams,
+    };
+    pub use super::types_graph::{CallGraphParams, GraphParams};
+    pub use super::types_impls::FindImplementationsParams;
+    pub use super::types_memory::{
+        MemoryDeleteParams, MemoryGetParams, MemoryListParams, MemoryPutParams, MemorySearchParams, Visibility,
+    };
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    pub use super::types_shells::{ShellEnv, ShellParams};
+    #[cfg(feature = "crawl")]
+    pub use super::types_web::WebParams;
 }
 
 pub use params::Parameters;
+
+/// In-memory cache for `symbol_history`-style workflows: given a blob's git OID and the
+/// language we'd extract with, hold onto the parsed `FileMapL1` and the source bytes so
+/// repeated visits to the same blob (across commits, modes, or tool calls) skip the
+/// tree-sitter parse entirely. Memory-only — blob OIDs are content-addressed and immutable,
+/// so cache invalidation is implicit (a new blob = a new key).
+///
+/// Cap chosen to bound steady-state memory at a few MB for typical repositories: 512
+/// entries × ~few KiB per `FileMapL1` + Arc'd source = on the order of 1–10 MiB.
+pub(crate) const OUTLINE_CACHE_CAP: usize = 512;
 
 /// Per-category LRU capacity for a daemon-hosted workspace's git cache (commit_files, log, blame).
 /// Matches the `basemind serve --git-cache-mem` default (1024): the daemon holds one git cache per
@@ -181,7 +247,7 @@ pub(crate) struct OutlineEntry {
     pub source: Arc<Vec<u8>>,
 }
 
-pub(crate) use outline_cache::OutlineCache;
+pub(crate) type OutlineCache = Mutex<LruCache<(gix::ObjectId, LangId), Arc<OutlineEntry>>>;
 
 /// Shared MCP server state. `ToolRouter<Self>` is Clone (Arc inside), so we hold it directly
 /// on the struct as the `#[tool_handler]` macro expects.
@@ -195,7 +261,7 @@ pub struct BasemindServer {
     /// Reusable prompt templates (`prompts/list` + `prompts/get`). Built by the
     /// `#[prompt_router]` macro in [`prompts`]; `list_prompts` / `get_prompt` delegate here.
     prompt_router: PromptRouter<Self>,
-    /// SEP-2663 Tasks extension executor. Slow tools (see [`tasks::SLOW_CALLS`]) offload their work
+    /// SEP-2663 Tasks extension executor. Slow tools (see [`tasks::SLOW_TOOLS`]) offload their work
     /// here for task-capable clients; cheaply cloneable and shared across every clone of the server.
     tasks: TaskManager,
     /// Bounds allocation-heavy calls while allowing control/comms traffic to bypass the queue.
@@ -214,9 +280,10 @@ pub struct BasemindServer {
 /// additive and defaulted so callers that only care about `background` stay terse.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerOptions {
-    /// When true, spawn the empty-index auto-scan, the view watcher thread, and
-    /// the background blob GC. When false, the server is a pure one-shot query
-    /// handle: it preloads the in-RAM map cache and nothing else.
+    /// When true, spawn the empty-index auto-scan (or, on a populated index served with the live
+    /// watcher, the startup catch-up scan), the view watcher thread, and the background blob GC.
+    /// When false, the server is a pure one-shot query handle: it preloads the in-RAM map cache and
+    /// nothing else.
     pub background: bool,
     /// When true (and `background` is on, and the served view is the working
     /// view), spawn a live filesystem watcher that funnels changed paths into
@@ -327,7 +394,7 @@ impl BasemindServer {
             None,
         );
         // ~keep Boot decisions depend on the opened store, so compute them before it moves into the stack.
-        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options);
+        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options, config.documents.enabled);
         let shared = Arc::new(SharedReadStack::new(
             store,
             root,
@@ -360,8 +427,8 @@ impl BasemindServer {
             )),
             #[cfg(all(feature = "comms", any(unix, windows)))]
             delivery_probe: tokio::sync::Mutex::new(state::DeliveryProbe::default()),
+            log_level: std::sync::atomic::AtomicU8::new(notifications::DEFAULT_LOG_ORDINAL),
             lean: std::sync::atomic::AtomicBool::new(lean::lean_mode_enabled()),
-            task_threshold_ms: std::sync::atomic::AtomicU64::new(tasks::TASK_THRESHOLD.as_millis() as u64),
         });
         Self::spawn_comms_presence(&state);
         let mut watcher = None;
@@ -372,7 +439,8 @@ impl BasemindServer {
                     Err(_) => false,
                 }
             };
-            let watcher_guard = if options.watch && (options.daemon_writer || !options.read_only) && view_is_working {
+            let live_watch = options.watch && (options.daemon_writer || !options.read_only) && view_is_working;
+            let watcher_guard = if live_watch {
                 background::spawn_serve_watcher(Arc::clone(&state))
             } else {
                 background::spawn_view_watcher(Arc::clone(&state))
@@ -385,10 +453,16 @@ impl BasemindServer {
                 if defer_warm {
                     background::spawn_cache_warm(Arc::clone(&state));
                 }
-                let gc_state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    background::run_background_gc(gc_state).await;
-                });
+                if live_watch {
+                    // The live watcher only sees changes made after it is armed: catch up on whatever
+                    // changed while no serve held this index (the catch-up runs the blob GC after it).
+                    background::spawn_catch_up_scan(Arc::clone(&state));
+                } else {
+                    let gc_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        background::run_background_gc(gc_state).await;
+                    });
+                }
             }
         }
         Self {
@@ -401,16 +475,51 @@ impl BasemindServer {
         }
     }
 
-    /// How long an offload-eligible call may run before it is answered with a task handle.
-    pub(crate) fn task_threshold(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.state.task_threshold_ms.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
     /// Whether this server advertises the lean three-tool surface. Resolved once at construction
     /// (see [`ServerState::lean`]) and read here per request, so the decision is per-server rather
     /// than a global-env read.
     pub(crate) fn lean_enabled(&self) -> bool {
         self.state.lean.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True when the served workspace is protected — it carries a `safe/` mirror — and this
+    /// process is not the privacy gateway's own.
+    ///
+    /// Read per request rather than cached at construction: the gateway writes the mirror
+    /// after basemind may already be running, and the mirror's presence is what turns the
+    /// boundary on. The check is a single `symlink_metadata` on `<root>/safe`, which is
+    /// cheaper than the tool call it guards.
+    pub(crate) fn workspace_protected(&self) -> bool {
+        !crate::protected::gateway_capable() && crate::protected::is_protected(&self.state.shared.root)
+    }
+
+    /// True when `name` is a tool this server withholds from the agent.
+    ///
+    /// Withheld inside a protected workspace: `redact_text` returns the token→original
+    /// table and every detection in the clear, and `vault` encrypts, decrypts and searches
+    /// that table. Both stay available to the gateway itself (see
+    /// [`crate::protected::GATEWAY_ENV`]) and to every workspace without a mirror.
+    pub(crate) fn withholds_tool(&self, name: &str) -> bool {
+        self.workspace_protected() && crate::protected::is_withheld_tool(name)
+    }
+
+    /// The protected-workspace refusal for a shared-tier `memory` call, `None` when the
+    /// call passes (the workspace is unprotected, or the call is scoped to the agent's
+    /// own individual entries).
+    ///
+    /// The single seam both surfaces gate through — the direct handler
+    /// (`server_handler`) and the lean wrapper (`lean`) — so the rule lives in one place
+    /// and cannot silently diverge between paths (the lean envelope nests the Arguments
+    /// under `tool_input`; the caller does that unpacking and hands only the map in).
+    pub(crate) fn protected_memory_refusal(
+        &self,
+        arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        if self.workspace_protected() {
+            crate::protected::memory_shared_refusal(arguments)
+        } else {
+            None
+        }
     }
 
     /// Assemble the full tool router (every feature-gated tool group). Pure and argument-free —
@@ -420,13 +529,30 @@ impl BasemindServer {
     /// `OnceLock` and hands back a clone. This is the one-time builder the cache calls into.
     fn assemble_router() -> ToolRouter<Self> {
         #[allow(unused_mut)]
-        let mut router =
-            Self::tool_router_core() + Self::tool_router_git() + Self::tool_router_memory() + Self::tool_router_admin();
+        let mut router = Self::tool_router_core()
+            + Self::tool_router_graph()
+            + Self::tool_router_git()
+            + Self::tool_router_memory()
+            + Self::tool_router_admin();
+        #[cfg(feature = "crawl")]
+        {
+            router += Self::tool_router_web();
+        }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         {
             router += Self::tool_router_comms();
+            router += Self::tool_router_registry();
         }
-        tool_contract::finalize_router(router)
+        #[cfg(all(feature = "shells", any(unix, windows)))]
+        {
+            router += Self::tool_router_shells();
+        }
+        #[cfg(feature = "documents")]
+        {
+            router += Self::tool_router_vault();
+            router += Self::tool_router_redact_text();
+        }
+        router
     }
 
     /// Build a per-connection server that SHARES a workspace's [`SharedReadStack`] rather than
@@ -499,8 +625,7 @@ impl BasemindServer {
         use anyhow::Context as _;
 
         let view = crate::store::VIEW_WORKING;
-        let mut store =
-            crate::store::Store::open_read_only_no_index(root, view).context("open hosted read stack store")?;
+        let store = crate::store::Store::open_read_only_no_index(root, view).context("open hosted read stack store")?;
         debug_assert!(
             store.index_db.is_none(),
             "hosted read stack must be index-less so MapCache builds in-RAM call/impl indexes"
@@ -510,11 +635,6 @@ impl BasemindServer {
             crate::config::daemon::load_daemon(root)
                 .map_err(|error| anyhow::Error::new(error).context("load hosted workspace config"))?,
         );
-        if std::env::var_os("BASEMIND_INDEX_LAYERED").is_some_and(|value| value == "1")
-            && let Err(error) = crate::store_base::hydrate_cold_store(&mut store, &config)
-        {
-            tracing::debug!(%error, "hosted shared worktree manifest unavailable");
-        }
         let repo = crate::git::Repo::discover(root).ok().map(Arc::new);
         let git_cache = Arc::new(
             crate::git_cache::GitCache::open(&basemind_dir, HOSTED_GIT_CACHE_MEM, true)
@@ -537,7 +657,7 @@ impl BasemindServer {
             &options,
             Some(git_history_host),
         );
-        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options);
+        let (needs_initial_scan, defer_warm) = shared_state::boot_plan(&store, &options, config.documents.enabled);
         let shared = Arc::new(SharedReadStack::new(
             store,
             root.to_path_buf(),
@@ -603,13 +723,13 @@ impl BasemindServer {
                 .inspect_err(|error| tracing::warn!(%error, "git-history: bad agent id; tools will live-walk"))
                 .ok()?;
             if let Some(host) = git_history_host {
-                return Some(Arc::new(crate::git_history::remote::hosted_index(
+                return Some(Arc::new(crate::git_history::GitHistoryIndex::hosted(
                     root.to_path_buf(),
                     agent,
                     host,
                 )));
             }
-            return Some(Arc::new(crate::git_history::remote::remote_index(
+            return Some(Arc::new(crate::git_history::GitHistoryIndex::remote(
                 root.to_path_buf(),
                 agent,
             )));
@@ -646,7 +766,7 @@ impl BasemindServer {
         // ~keep A daemon-hosted handle syncs in-process through the seam (the daemon's own build lock),
         // ~keep never over the socket back to itself.
         #[cfg(all(feature = "comms", any(unix, windows)))]
-        if let Some(host) = crate::git_history::remote::history_host(index) {
+        if let Some(host) = index.history_host() {
             let root = state.shared.root.clone();
             tokio::spawn(async move {
                 match host
@@ -657,10 +777,6 @@ impl BasemindServer {
                     Err(error) => tracing::warn!(%error, "git-history in-process sync failed; history tools live-walk"),
                 }
             });
-            return;
-        }
-        #[cfg(all(feature = "comms", any(unix, windows)))]
-        if index.forwarder().is_some_and(|forwarder| forwarder.hosts_in_process()) {
             return;
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -726,9 +842,6 @@ impl BasemindServer {
 mod lazy_cache_tests;
 
 #[cfg(test)]
-mod tool_contract_tests;
-
-#[cfg(test)]
 mod map_cache_tests {
     use super::*;
     use std::fs;
@@ -767,24 +880,6 @@ mod map_cache_tests {
         let rescanning = types::LifecycleNotice::for_state(Lifecycle::Rescanning).expect("rescan notice");
         assert_eq!(rescanning.state, "rescanning");
         assert!(!rescanning.retry, "rescan results are usable, no retry required");
-    }
-
-    /// A degraded `status.json` (the daemon's mark on a workspace whose index it is rebuilding) puts
-    /// the "index rebuilding" notice on reads; a clean sidecar or none at all does not.
-    #[test]
-    fn degraded_scan_status_yields_the_index_rebuilding_notice() {
-        use crate::store::{ScanHealth, StatusSidecar};
-        let dir = tempfile::tempdir().expect("tempdir");
-        crate::store::write_status_sidecar(dir.path(), 5, 5, &ScanHealth::partial("index rebuilding", 0, 0));
-        let degraded = crate::store::read_status_sidecar(dir.path());
-        let notice = types::LifecycleNotice::for_scan_status(degraded.as_ref()).expect("degraded notice");
-        assert_eq!(notice.state, "index_rebuilding");
-        assert!(notice.retry && notice.message.contains("index rebuilding"));
-
-        crate::store::write_status_sidecar(dir.path(), 5, 5, &ScanHealth::complete());
-        let clean: Option<StatusSidecar> = crate::store::read_status_sidecar(dir.path());
-        assert!(types::LifecycleNotice::for_scan_status(clean.as_ref()).is_none());
-        assert!(types::LifecycleNotice::for_scan_status(None).is_none());
     }
 
     /// A read-only session whose reference projections were truncated by the outline budget reports

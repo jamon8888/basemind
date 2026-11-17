@@ -96,7 +96,7 @@ agents inbox {as_agent: "security"}  # read security's inbox
 ## Requirements
 
 <Aside type="note">
-comms is an opt-in feature that gates the `agents` tool. Build with `--features
+comms is an opt-in feature that gates the `agents` and `workspace` tools. Build with `--features
 comms` (or `full`) to include it.
 </Aside>
 
@@ -127,15 +127,10 @@ The broker is built so a stalled or restarted daemon does not lose or duplicate 
 - **New-message notices.** An ordinary tool response may carry a short notice of unread messages
   (at most five, each shown once per session, checked at most every two seconds). Use `agents inbox`
   for the full list.
-- **Diagnostics.** The daemon's output goes to `daemon.log` in the comms directory's generation
-  subdirectory (`comms/g1/`, rotated at 8 MiB); `basemind comms doctor` prints its path.
-- **Several installed versions.** Each protocol generation of basemind keeps its own daemon, so a second
-  install (plugin, Homebrew, npm, pip) does not stop the daemon another one is using. Agents on
-  different generations do not see each other's threads. Within a generation a daemon that is
-  serving sessions is never killed by another version: the newer one is used, or the command fails
-  with a message saying which basemind to update.
+- **Diagnostics.** The daemon's output goes to `daemon.log` in the comms directory (rotated at
+  8 MiB); `basemind comms doctor` prints its path.
 
-The protocol (version 5) correlates every request with a reply id, so a late reply to an abandoned request
+Protocol version 4 correlates every request with a reply id, so a late reply to an abandoned request
 is discarded instead of being mistaken for the next answer. A client and daemon that disagree on the
 protocol version fail the handshake with a clear error, and the newer client replaces the older
 daemon.

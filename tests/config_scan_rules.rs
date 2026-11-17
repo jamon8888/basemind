@@ -256,15 +256,13 @@ fn embed_policy_is_recorded_and_tracks_config_changes() {
 
 #[cfg(feature = "code-search")]
 mod code_chunks {
-    use basemind::index::view::IndexView;
-
     use super::*;
 
     fn bm25_docs(store: &Store) -> u64 {
         store
             .index_db
             .as_ref()
-            .and_then(|db| db.view().bm25_stats())
+            .and_then(|db| db.bm25_stats())
             .map_or(0, |(n, _)| n)
     }
 
@@ -461,7 +459,6 @@ mod documents {
         // Which settings the stored blob was extracted under. (Chunk counts are not asserted: xberg
         // sizes chunks from the embedding preset when one is set, so `max_characters` alone need not
         // change them.)
-        use basemind::extract::doc::DocBlobs;
         let digest_of = |store: &Store| {
             let entry = store.lookup_doc("table.eml").expect("tracked").clone();
             store

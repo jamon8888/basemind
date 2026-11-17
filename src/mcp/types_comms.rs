@@ -41,8 +41,8 @@ pub struct AgentsParams {
     /// `thread_start`: extra member agent ids (you are added automatically).
     #[serde(default)]
     pub members: Option<Vec<AgentId>>,
-    /// `message`: compact `message_ref` or legacy `id` of the front-matter row whose body to read.
-    #[serde(default, rename = "message_ref", alias = "message_id", alias = "id")]
+    /// `message`: id of the front-matter row whose body to read.
+    #[serde(default, alias = "id")]
     pub message_id: Option<String>,
     /// `ack`: message ids to acknowledge.
     #[serde(default)]
@@ -81,9 +81,6 @@ pub struct AgentsParams {
     /// Resume token from the previous `next_cursor` (history, inbox, wait).
     #[serde(default)]
     pub cursor: Option<String>,
-    /// History only. Return messages after this per-thread sequence number. Mutually exclusive with cursor.
-    #[serde(default)]
-    pub after_seq: Option<u64>,
     /// Page size for history / inbox (default 100, max 1000).
     #[serde(default)]
     pub limit: Option<u32>,
@@ -448,9 +445,6 @@ pub struct ThreadHistoryParams {
     /// Resume token from a previous page's `next_cursor` (opaque string).
     #[serde(default)]
     pub cursor: Option<String>,
-    /// History only. Return messages after this per-thread sequence number. Mutually exclusive with cursor.
-    #[serde(default)]
-    pub after_seq: Option<u64>,
     /// Maximum messages to return (default 100, max 1000).
     #[serde(default)]
     pub limit: Option<u32>,
@@ -474,9 +468,6 @@ pub(crate) struct MessageFrontMatter {
     pub thread: String,
     /// Authoring agent.
     pub from: String,
-    /// Registered display name at post time, when supplied.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_name: Option<String>,
     /// Short human subject line.
     pub subject: String,
     /// Post time, microseconds since the unix epoch.
@@ -504,7 +495,6 @@ impl MessageFrontMatter {
             id: meta.id.clone(),
             thread: meta.thread.as_str().to_string(),
             from: meta.from.as_str().to_string(),
-            from_name: meta.from_name.clone(),
             subject: meta.subject.clone(),
             ts_micros: meta.ts_micros,
             age_secs: ((now_micros - meta.ts_micros) / 1_000_000).max(0),
@@ -652,13 +642,8 @@ pub struct InboxWaitParams {
 /// Response for mode `wait`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct InboxWaitResponse {
-    /// True when the call returned with nothing new because `timeout_secs` elapsed or the broker
-    /// link closed; `reason` tells the two apart.
+    /// True when the call returned because `timeout_secs` elapsed with nothing new to report.
     pub timed_out: bool,
-    /// Why the call returned: `message` (unread rows are in `messages`), `timeout`, `discovery`
-    /// (a thread became discoverable; `messages` is empty, see mode `thread_list`), or `shutdown`
-    /// (the broker is stopping or the link closed; call again to reconnect).
-    pub reason: String,
     /// Number of messages in this page.
     pub total: usize,
     /// Count of unread messages remaining after this page.

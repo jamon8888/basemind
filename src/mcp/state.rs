@@ -21,6 +21,8 @@ pub(crate) const DELIVERED_NOTIFICATION_CAP: usize = 4_096;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub(crate) const COMMS_CLIENT_CAP: usize = 32;
 
+#[cfg(feature = "documents")]
+use super::codegraph;
 use super::{SharedReadStack, helpers_calls, helpers_impls, l1_cache, map_fingerprint, types};
 use crate::extract::FileMapL1;
 use crate::store::Store;
@@ -60,16 +62,16 @@ pub(crate) struct ServerState {
     /// abandoned probe can never desynchronise or head-of-line-block the shared `comms_clients`.
     #[cfg(all(feature = "comms", any(unix, windows)))]
     pub(crate) delivery_probe: tokio::sync::Mutex<DeliveryProbe>,
+    /// Minimum logging severity the client asked for via `logging/setLevel`, as an ordinal
+    /// (see [`super::notifications::level_ordinal`]). Defaults to `Info`. Checked before every log
+    /// emit so the server honors the client's verbosity preference. Per-connection.
+    pub(crate) log_level: std::sync::atomic::AtomicU8,
     /// Whether this server advertises the lean three-tool surface (see [`super::lean`]). Resolved
     /// ONCE at construction from `BASEMIND_MCP_LEAN` (the value does not change mid-session), so the
     /// decision is stable and per-server rather than a per-request global-env read — which lets
     /// several servers with different surfaces coexist in one process (integration tests). The
     /// in-memory test serve overrides it directly.
     pub(crate) lean: std::sync::atomic::AtomicBool,
-    /// Milliseconds an offload-eligible call may run before it becomes a task
-    /// ([`super::tasks::TASK_THRESHOLD`]). Per-server so the in-memory test serve can lower it to
-    /// exercise the task path without a genuinely slow call.
-    pub(crate) task_threshold_ms: std::sync::atomic::AtomicU64,
 }
 
 /// A lazily-initialised, shared handle to one identity's broker client. The cell is what a slow connect
@@ -113,8 +115,8 @@ impl ServerState {
             )),
             #[cfg(all(feature = "comms", any(unix, windows)))]
             delivery_probe: tokio::sync::Mutex::new(DeliveryProbe::default()),
+            log_level: std::sync::atomic::AtomicU8::new(super::notifications::DEFAULT_LOG_ORDINAL),
             lean: std::sync::atomic::AtomicBool::new(super::lean::lean_mode_enabled()),
-            task_threshold_ms: std::sync::atomic::AtomicU64::new(super::tasks::TASK_THRESHOLD.as_millis() as u64),
         }
     }
 }
@@ -163,7 +165,7 @@ impl ServerState {
         Lifecycle::from_flags(
             self.shared.initial_scan_active.load(Relaxed),
             self.shared.cache_warming.load(Relaxed),
-            self.shared.rescan_active.load(Relaxed),
+            self.shared.rescan_active.load(Relaxed) || self.shared.catch_up_active.load(Relaxed),
         )
     }
 
@@ -215,11 +217,14 @@ impl ServerState {
                     .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
                     .unwrap_or(false);
                 let budget = l1_cache::budget_bytes_from(&self.shared.config.resources);
-                let cache = if multi_thread {
+                let mut cache = if multi_thread {
                     tokio::task::block_in_place(|| MapCache::build(&store, budget))
                 } else {
                     MapCache::build(&store, budget)
                 };
+                // Attach persisted doc↔code links (ADR-0008) before publish; `attach_async` offloads
+                // the LanceStore read to a blocking thread so its block_on never nests on the reactor.
+                super::doc_links_cache::attach_async(&mut cache, &store, &self.shared.config, &self.shared.scope).await;
                 let files = cache.len();
                 let cache = Arc::new(cache);
                 self.shared.cache.store(Arc::clone(&cache));
@@ -232,40 +237,20 @@ impl ServerState {
             .await;
     }
 
-    /// The `index_rebuilding` notice while the workspace's `status.json` records a partial scan or an
-    /// uncommitted resolve pass. The daemon marks it when it opens a workspace whose fjall index was
-    /// wiped or is empty over a populated file map, and a session that does not hold the index
-    /// (`daemon_writer`, daemon-hosted) cannot see that any other way.
-    fn index_rebuilding_notice(&self) -> Option<types::LifecycleNotice> {
-        let status = crate::store::read_status_sidecar(&crate::store::workspace_cache_dir(&self.shared.root));
-        types::LifecycleNotice::for_scan_status(status.as_ref())
-    }
-
     /// A [`LifecycleNotice`](types::LifecycleNotice) to attach to a tool response, or `None` when
     /// [`Ready`](Lifecycle::Ready). Lets every read tool label a possibly-incomplete result with the
     /// server state + an actionable message, so an agent knows to retry rather than concluding "empty".
-    /// The notice for a workspace nothing has been scanned into, so an empty answer is never read
-    /// as "no matches". Judged on the store's file map, not the in-RAM map, which is also empty
-    /// before a lazy build. `None` while another task holds the store lock.
-    fn empty_index_notice(&self) -> Option<types::LifecycleNotice> {
-        let store = self.shared.store.try_read().ok()?;
-        (store.index.files.is_empty() && store.index.doc_files.is_empty()).then(types::LifecycleNotice::empty_index)
-    }
-
     pub(crate) fn lifecycle_notice(&self) -> Option<types::LifecycleNotice> {
-        types::LifecycleNotice::for_state(self.lifecycle())
-            .or_else(|| self.index_rebuilding_notice())
-            .or_else(|| self.empty_index_notice())
-            .or_else(|| {
-                // A read-only session whose projected call/impl indexes were capped answers reference
-                // queries from a truncated set. Reported through the same channel as the warming/
-                // rescanning states so a caller never reads an incomplete result as "no matches".
-                self.shared
-                    .cache
-                    .load()
-                    .projections_capped()
-                    .then(types::LifecycleNotice::projections_capped)
-            })
+        types::LifecycleNotice::for_state(self.lifecycle()).or_else(|| {
+            // A read-only session whose projected call/impl indexes were capped answers reference
+            // queries from a truncated set. Reported through the same channel as the warming/
+            // rescanning states so a caller never reads an incomplete result as "no matches".
+            self.shared
+                .cache
+                .load()
+                .projections_capped()
+                .then(types::LifecycleNotice::projections_capped)
+        })
     }
 }
 
@@ -277,7 +262,8 @@ pub(crate) struct MapCache {
     /// rescan is a refcount bump rather than a rebuild.
     l1: Arc<l1_cache::L1Cache>,
     /// In-RAM callee index: the LAST-RESORT fallback for a session that has neither a Fjall index
-    /// nor a daemon to forward `references` / `callers` to.
+    /// nor a daemon to forward `references` / `callers` to, and the backing for the whole-corpus
+    /// graph walks (`call_graph`, the architecture map), which cannot afford a round trip per file.
     /// Built on first use ([`calls_projection`](Self::calls_projection)) and never otherwise, so a
     /// daemon-backed session that only asks point queries holds none of it.
     calls: std::sync::OnceLock<helpers_calls::InRamCallIndex>,
@@ -293,14 +279,23 @@ pub(crate) struct MapCache {
     /// warm) and patched rather than rebuilt by [`with_delta`](Self::with_delta). Backs the
     /// substring sweeps of `symbols` and `dependents`.
     terms: std::sync::OnceLock<Arc<super::term_index::TermIndex>>,
+    /// Persisted document→code links (ADR-0008), loaded from the LanceDB document store by the async
+    /// cache-warm path ([`super::background::spawn_cache_warm`]) and the view watcher. Empty until
+    /// loaded; the codegraph `documents` lane reads it. Preserved across incremental
+    /// [`with_delta`](Self::with_delta) rescans. `Arc<[_]>` so a scoped rescan carries the links
+    /// forward with a refcount bump, not a deep clone of the whole vector.
+    #[cfg(feature = "documents")]
+    pub(crate) doc_links: std::sync::Arc<[codegraph::DocLink]>,
     /// Every path of the document tier (markdown, config, data, PDFs ...), sorted. The code map
     /// holds code only, so decision records (`docs/adr/*.md`) and path citations to prose / config
     /// files resolve against this set instead of [`Self::files`]. Projected straight from the index
     /// (no blob or LanceDB read), so it is rebuilt with every cache build and delta.
+    #[cfg(feature = "documents")]
     pub(crate) doc_paths: std::sync::Arc<[crate::path::RelPath]>,
 }
 
 /// The sorted document-tier paths of `store`'s index.
+#[cfg(feature = "documents")]
 fn doc_paths_of(store: &Store) -> std::sync::Arc<[crate::path::RelPath]> {
     let mut paths: Vec<crate::path::RelPath> = store.index.doc_files.keys().cloned().collect();
     paths.sort_unstable();
@@ -318,7 +313,7 @@ impl MapCache {
     /// and charged against the same budget.
     pub(crate) fn build(store: &Store, budget_bytes: u64) -> Self {
         let files = l1_cache::FileIndexView::build(store);
-        let l1 = Arc::new(l1_cache::L1Cache::from_store(store, budget_bytes));
+        let l1 = Arc::new(l1_cache::L1Cache::new(store.blobs_dir.clone(), budget_bytes));
         Self {
             fingerprint: map_fingerprint::index_fingerprint(store),
             files,
@@ -326,6 +321,9 @@ impl MapCache {
             calls: Default::default(),
             impls: Default::default(),
             terms: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_links: Default::default(),
+            #[cfg(feature = "documents")]
             doc_paths: doc_paths_of(store),
         }
     }
@@ -343,13 +341,16 @@ impl MapCache {
             calls: Default::default(),
             impls: Default::default(),
             terms: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_links: Default::default(),
+            #[cfg(feature = "documents")]
             doc_paths: Default::default(),
         }
     }
 
-    /// Build a cache over a synthetic, blob-less corpus. Test-only seam: hand-built outlines that
-    /// no scan produced have no store to be read back from, so they are seeded straight into the
-    /// L1 cache.
+    /// Build a cache over a synthetic, blob-less corpus. Test-only seam: the graph lanes are
+    /// exercised against hand-built outlines that no scan produced, so there is no store to read
+    /// them back from and they are seeded straight into the L1 cache.
     #[cfg(test)]
     pub(crate) fn from_synthetic(files: Vec<(crate::path::RelPath, FileMapL1)>) -> Self {
         let l1 = Arc::new(l1_cache::L1Cache::new(std::path::PathBuf::new(), 0));
@@ -360,7 +361,6 @@ impl MapCache {
                 hash_hex: hash_hex.as_str().into(),
                 language: map.language.as_str().into(),
                 size_bytes: map.size_bytes,
-                mtime_ns: 0,
             };
             l1.seed(&hash_hex, Arc::new(map));
             metas.push((path, meta));
@@ -372,6 +372,9 @@ impl MapCache {
             calls: Default::default(),
             impls: Default::default(),
             terms: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_links: Default::default(),
+            #[cfg(feature = "documents")]
             doc_paths: Default::default(),
         }
     }
@@ -414,13 +417,15 @@ impl MapCache {
     }
 
     /// Whether `path` is one of the indexed files. Answered from the symbol-free view, so it costs
-    /// no blob read.
-    #[cfg(test)]
+    /// no blob read. Gated on the features whose lanes ask the question (see
+    /// [`l1_cache::FileIndexView::contains`]).
+    #[cfg(any(test, feature = "documents", feature = "memory"))]
     pub(crate) fn contains(&self, path: &crate::path::RelPath) -> bool {
         self.files.contains(path)
     }
 
     /// Whether `path` is a tracked document (non-code file in the document tier).
+    #[cfg(feature = "documents")]
     pub(crate) fn contains_doc(&self, path: &crate::path::RelPath) -> bool {
         self.doc_paths.binary_search(path).is_ok()
     }
@@ -446,13 +451,6 @@ impl MapCache {
     pub(crate) fn get(&self, path: &crate::path::RelPath) -> Option<Arc<FileMapL1>> {
         let meta = self.files.get(path)?;
         self.l1.load(&meta.hash_hex)
-    }
-
-    /// The decoded outline of the content `hash_hex`, whichever path holds it. Outlines are keyed
-    /// by content, so this is the outline of an index entry however old this snapshot's file view
-    /// is next to the store the entry came from.
-    pub(crate) fn outline_of_content(&self, hash_hex: &str) -> Option<Arc<FileMapL1>> {
-        self.l1.load(hash_hex)
     }
 
     /// The term index, building it from one corpus stream on first use. Later calls (and the
@@ -532,6 +530,9 @@ impl MapCache {
             calls: Default::default(),
             impls: Default::default(),
             terms: Default::default(),
+            #[cfg(feature = "documents")]
+            doc_links: std::sync::Arc::clone(&self.doc_links),
+            #[cfg(feature = "documents")]
             doc_paths: doc_paths_of(store),
         };
         if let Some(terms) = self.terms.get() {

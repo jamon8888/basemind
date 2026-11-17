@@ -22,11 +22,11 @@ pub struct IndexWriter {
     /// same way. Callers batch against [`Self::staged_bytes`]; see
     /// `scanner_index_batch::WorkerIndexBatch`.
     staged_bytes: u64,
-    /// Test-only fault seam: make the next [`Self::upsert_file`] (or `upsert_bm25_file`) stage its
-    /// deletes and inserts and *then* fail. The real failures have exactly that shape — a fjall read
-    /// error inside `stage_deletes_for`, an `rmp_serde` encode error inside `stage_inserts_for` — and
-    /// neither is reachable from a test, so without this seam the caller's "bytes staged by a failed
-    /// upsert still count" invariant cannot be exercised at all.
+    /// Test-only fault seam: make the next [`Self::upsert_file`] stage its deletes and inserts and
+    /// *then* fail. The real failures have exactly that shape — a fjall read error inside
+    /// `stage_deletes_for`, an `rmp_serde` encode error inside `stage_inserts_for` — and neither is
+    /// reachable from a test, so without this seam the caller's "bytes staged by a failed upsert
+    /// still count" invariant cannot be exercised at all.
     #[cfg(test)]
     pub(crate) fail_after_staging: bool,
 }
@@ -141,22 +141,18 @@ impl IndexWriter {
 
     /// Drop every index entry for `rel`. Used when a file is removed from the scan set.
     pub fn remove_file(&mut self, rel: &RelPath) -> Result<(), IndexError> {
-        self.stage_deletes_for(rel)
+        self.stage_deletes_for(rel)?;
+        let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
+        stage_remove(batch, staged_bytes, &db.grep_bloom, rel.as_bytes().to_vec());
+        Ok(())
     }
 
-    /// Store the grep bloom `row` (built by [`super::grep_bloom::build_row`] from the bytes the
-    /// scanner already holds) under the content hash `hash_hex`. Keyed by content alone, so the insert
-    /// overwrites an identical row and no delete is staged; the row outlives any one path and is
-    /// dropped by [`IndexDb::sweep_grep_bloom`]. Counted against the staged-byte budget like every
-    /// other entry.
-    pub fn upsert_grep_bloom(&mut self, hash_hex: &str, row: Vec<u8>) {
+    /// Replace `rel`'s grep bloom row with `row` (built by [`super::grep_bloom::build_row`] from the
+    /// bytes the scanner already holds). Keyed by path alone, so the insert overwrites the previous
+    /// row and no delete is staged. Counted against the staged-byte budget like every other entry.
+    pub fn upsert_grep_bloom(&mut self, rel: &RelPath, row: Vec<u8>) {
         let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
-        stage_insert(batch, staged_bytes, &db.grep_bloom, hash_hex.as_bytes().to_vec(), row);
-    }
-
-    pub(super) fn remove_grep_bloom(&mut self, key: &[u8]) {
-        let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
-        stage_remove(batch, staged_bytes, &db.grep_bloom, key.to_vec());
+        stage_insert(batch, staged_bytes, &db.grep_bloom, rel.as_bytes().to_vec(), row);
     }
 
     /// Replace the resolved-reference edges whose *use* is in `use_rel` with those derived from
@@ -192,22 +188,18 @@ impl IndexWriter {
         self.stage_resolved_deletes_for(use_rel)
     }
 
-    /// Atomically replace the file's forward rows and upsert its content-addressed postings.
+    /// Replace the BM25 keyword postings for `rel`'s chunks with those in `postings`. Reads the
+    /// file's existing forward entries first to derive the `code_bm25_postings` keys for deletion,
+    /// then stages the fresh postings in the same batch. Atomic. Mirrors the `calls_by_path` →
+    /// `calls_by_callee` dual-partition pattern for the code-search keyword lane.
     #[cfg(feature = "code-search")]
     pub fn upsert_bm25_file(&mut self, rel: &RelPath, postings: &[ChunkPosting]) -> Result<(), IndexError> {
         self.stage_bm25_deletes_for(rel)?;
         self.stage_bm25_inserts_for(rel, postings)?;
-        #[cfg(test)]
-        if self.fail_after_staging {
-            return Err(IndexError::Io {
-                path: rel.to_path_buf(),
-                source: std::io::Error::other("injected bm25 upsert failure after staging"),
-            });
-        }
         Ok(())
     }
 
-    /// Drop the file's forward rows. Shared postings are retired after the scanner commits all paths.
+    /// Drop every BM25 posting for `rel`'s chunks. Used when a source file leaves the scan set.
     #[cfg(feature = "code-search")]
     pub fn remove_bm25_file(&mut self, rel: &RelPath) -> Result<(), IndexError> {
         self.stage_bm25_deletes_for(rel)
@@ -252,46 +244,6 @@ impl IndexWriter {
         Ok(())
     }
 
-    /// Record one importer's stitch outcome: each `(local_start, def_path, def_start)` binding into
-    /// `import_targets`, and `probes` (every path the resolver consulted for the importer) into
-    /// `importers_by_probe`, plus the manifest row [`Self::stage_import_probe_deletes_for`] later
-    /// uses to remove them. Like [`Self::upsert_cross_file_edge`] it stages no delete: the importer's
-    /// previous rows were purged by the `upsert_resolved_file` that preceded the stitch.
-    #[cfg(any(feature = "code-intel-js", feature = "code-intel-stack"))]
-    pub fn upsert_import_probes(
-        &mut self,
-        importer: &RelPath,
-        targets: &[(u32, RelPath, u32)],
-        probes: &[keys::ProbeHash],
-    ) {
-        let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
-        for (local_start, def_path, def_start) in targets {
-            stage_insert(
-                batch,
-                staged_bytes,
-                &db.import_targets,
-                keys::import_target(importer, *local_start),
-                keys::import_target_value(def_path, *def_start),
-            );
-        }
-        for hash in probes {
-            stage_insert(
-                batch,
-                staged_bytes,
-                &db.importers_by_probe,
-                keys::importer_by_probe(hash, importer),
-                Vec::<u8>::new(),
-            );
-        }
-        stage_insert(
-            batch,
-            staged_bytes,
-            &db.import_targets,
-            keys::import_target(importer, keys::PROBE_MANIFEST_START),
-            keys::probe_manifest_value(probes),
-        );
-    }
-
     /// Flush this batch to disk atomically. Consumes the writer.
     ///
     /// `WriteBatch::commit` journals every staged item, then applies it to the memtables and runs
@@ -300,25 +252,8 @@ impl IndexWriter {
     /// by bytes rather than by file count samples that signal an order of magnitude more often on
     /// entry-dense files, and bounds the journal write burst to the same budget.
     pub fn commit(self) -> Result<(), IndexError> {
-        #[cfg(test)]
-        if self.db.fault.take_injected_commit_failure() {
-            return Err(IndexError::Io {
-                path: std::path::PathBuf::new(),
-                source: std::io::Error::other("injected commit failure"),
-            });
-        }
-        let result = self.batch.commit().map_err(IndexError::from);
-        if let Err(error) = &result {
-            self.db.record_commit_error(error);
-        }
-        result
-    }
-
-    #[cfg(test)]
-    pub(super) fn commit_overlay(mut self, sequence_key: &[u8], sequence: u64) -> Result<(), IndexError> {
-        self.batch.insert(&self.db.meta, sequence_key, sequence.to_be_bytes());
-        self.batch = self.batch.durability(Some(fjall::PersistMode::SyncAll));
-        self.commit()
+        self.batch.commit()?;
+        Ok(())
     }
 
     fn stage_deletes_for(&mut self, rel: &RelPath) -> Result<(), IndexError> {
@@ -402,7 +337,6 @@ impl IndexWriter {
     /// Stage deletes for every resolved edge whose use is in `use_rel`. Scans `refs_by_path`
     /// under the file prefix, reconstructs each companion `refs_by_def` key, and removes both.
     fn stage_resolved_deletes_for(&mut self, use_rel: &RelPath) -> Result<(), IndexError> {
-        self.stage_import_probe_deletes_for(use_rel)?;
         let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
         let prefix = keys::refs_by_path_prefix(use_rel);
         let mut found: Vec<(Vec<u8>, RelPath, u32, u32)> = Vec::new();
@@ -424,42 +358,45 @@ impl IndexWriter {
         Ok(())
     }
 
-    /// Stage deletes for the `import_targets` rows of `importer` and the `importers_by_probe` rows
-    /// its manifest names. An importer whose edges are re-resolved is always re-stitched afterwards
-    /// (and so re-probed), and a removed importer must leave no rows behind.
-    fn stage_import_probe_deletes_for(&mut self, importer: &RelPath) -> Result<(), IndexError> {
-        let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
-        let manifest_key = keys::import_target(importer, keys::PROBE_MANIFEST_START);
-        for guard in db.import_targets.prefix(keys::import_targets_prefix(importer)) {
-            let (k, v) = guard.into_inner()?;
-            if k.as_ref() == manifest_key.as_slice() {
-                for hash in keys::parse_probe_manifest(&v) {
-                    let probe_key = keys::importer_by_probe(&hash, importer);
-                    stage_remove(batch, staged_bytes, &db.importers_by_probe, probe_key);
-                }
-            }
-            stage_remove(batch, staged_bytes, &db.import_targets, (*k).to_vec());
-        }
-        Ok(())
-    }
-
+    /// Stage deletes for every BM25 posting of `rel`'s chunks. Scans `code_bm25_by_path` under the
+    /// file prefix; each forward value carries `doclen:u32_be ‖ msgpack(Vec<String> terms)`, so the
+    /// companion `code_bm25_postings` keys are reconstructed from the decoded term list.
     #[cfg(feature = "code-search")]
     fn stage_bm25_deletes_for(&mut self, rel: &RelPath) -> Result<(), IndexError> {
         let (db, batch, staged_bytes) = (&self.db, &mut self.batch, &mut self.staged_bytes);
-        for guard in db.code_bm25_by_path.prefix(keys::code_bm25_by_path_prefix(rel)) {
-            stage_remove(batch, staged_bytes, &db.code_bm25_by_path, guard.key()?.to_vec());
+        let prefix = keys::code_bm25_by_path_prefix(rel);
+        let mut found: Vec<(Vec<u8>, String, Vec<String>)> = Vec::new();
+        for guard in db.code_bm25_by_path.prefix(prefix) {
+            let (k, v) = guard.into_inner()?;
+            let Some((_rel, chunk_id)) = keys::parse_code_bm25_by_path(&k) else {
+                continue;
+            };
+            let terms: Vec<String> = if v.len() >= 4 {
+                match rmp_serde::from_slice::<Vec<String>>(&v[4..]) {
+                    Ok(terms) => terms,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %rel,
+                            error = %e,
+                            "index: failed to decode BM25 term list during delete staging — skipping entry"
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            found.push(((*k).to_vec(), chunk_id, terms));
+        }
+        for (path_key, chunk_id, terms) in found {
+            stage_remove(batch, staged_bytes, &db.code_bm25_by_path, path_key);
+            for term in terms {
+                if let Some(posting_key) = keys::code_bm25_posting(&term, &chunk_id) {
+                    stage_remove(batch, staged_bytes, &db.code_bm25_postings, posting_key);
+                }
+            }
         }
         Ok(())
-    }
-
-    #[cfg(feature = "code-search")]
-    pub(super) fn remove_bm25_posting(&mut self, key: &[u8]) {
-        stage_remove(
-            &mut self.batch,
-            &mut self.staged_bytes,
-            &self.db.code_bm25_postings,
-            key.to_vec(),
-        );
     }
 
     /// Stage inserts for `rel`'s BM25 postings: one `code_bm25_postings` entry per `(term, chunk)`
@@ -480,8 +417,7 @@ impl IndexWriter {
                     );
                 }
             }
-            let mut term_names: Vec<&str> = posting.terms.iter().map(|(t, _)| t.as_str()).collect();
-            term_names.sort_unstable();
+            let term_names: Vec<&str> = posting.terms.iter().map(|(t, _)| t.as_str()).collect();
             let terms_bytes = rmp_serde::to_vec(&term_names)?;
             let mut value = Vec::with_capacity(4 + terms_bytes.len());
             value.extend_from_slice(&posting.doclen.to_be_bytes());

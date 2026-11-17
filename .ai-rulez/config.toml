@@ -1,50 +1,49 @@
-version = "5.0"
+version = "4.0"
 name = "basemind"
 description = "Code-map MCP server + scanner — pure-Rust, content-addressed, Fjall-backed inverted index."
 gitignore = true
-gitignore_exclude = ["opencode.json"]
 
-default_layers = ["plugins"]
-presets = ["claude", "cursor", "codex", "gemini", "kimi", "opencode", "factory", "hermes", "pi", "copilot"]
+presets = ["claude", "codex"]
 
 builtins = ["rust", "cicd", "documentation", "observability", "default-commands"]
 
-# Gemini CLI and OpenCode reject the Claude aliases (`sonnet`/`opus`) the agents declare, so give
-# those presets their own sonnet-tier default; agents that need the opus tier override per agent.
-[defaults.model_by_preset]
-gemini = "flash"
-opencode = "anthropic/claude-sonnet-5-5"
+[plugin]
+name = "basemind"
+version = "0.38.0"
+display_name = "basemind"
+description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, on-demand web crawl, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
+homepage = "https://github.com/Goldziher/basemind"
+repository = "https://github.com/Goldziher/basemind"
+license = "MIT"
+category = "developer-tools"
+keywords = ["mcp", "agent-context", "rag", "code-map", "tree-sitter"]
+tags = ["mcp", "code-intelligence", "rag", "tree-sitter", "git", "embeddings"]
+runtimes = ["hermes"]
+content_root = "."
+
+[plugin.author]
+name = "Na'aman Hirschfeld"
+email = "nhirschfeld@gmail.com"
+url = "https://github.com/Goldziher"
+
+[plugin.hermes]
+source = "pip-package-hermes/basemind_hermes_plugin/hermes.py"
+requires_python = ">=3.9"
+
 
 [[mcp_servers]]
 name = "ai-rulez"
 description = "Manage AI governance config via MCP."
-command = "ai-rulez"
-args = ["mcp"]
+command = "npx"
+args = ["-y", "ai-rulez@latest", "mcp"]
 
-[mcp]
-self_server_command = ["ai-rulez", "mcp"]
+[[marketplaces]]
+name = "basemind"
+source = "Goldziher/basemind"
+type = "github"
 
-[codex]
-project_doc_max_bytes = 65536
-
-# The generator honours per-preset `<preset>_model` agent frontmatter, but AR303 does not know it.
-[lint]
-allowed_keys = ["gemini_model", "opencode_model"]
-# The local adr-immutability rule replaces the builtin one: ADRs here live flat in docs/adr/.
-allow_overrides = ["adr-immutability"]
-
-[lint.load_budgets]
-"codex-agents-chain" = 65536
-
-# AR701 compares descriptions across every generated runtime bundle, where one authored skill
-# legitimately appears once per harness carrying the same description; demote it so it stays
-# visible in the report without failing `validate --strict`. AR602 flags the repository's
-# development `.mcp.json` and the shipped plugin both registering "basemind" over different
-# launchers (node for a local checkout, ${PLUGIN_ROOT} once installed) — a harness reads one of
-# them, so the collision is intended.
-[lint.severity]
-AR701 = "info"
-AR602 = "info"
-
-[lock]
-include_outputs = false
+[[plugins]]
+marketplace = "basemind"
+name = "basemind"
+scope = "project"
+enabled = true

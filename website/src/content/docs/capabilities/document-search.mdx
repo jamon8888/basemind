@@ -1,63 +1,57 @@
 ---
 title: Document Search
-description: Semantic and full-text search over PDFs, Office files, HTML, email, and images — with OCR, reranking, and NER filtering.
+description: Semantic and full-text search over PDFs, Office files, HTML, email, images, and web pages — with OCR, reranking, and NER filtering.
 ---
 
 import { Aside, Badge, Card, CardGrid } from '@astrojs/starlight/components';
 
-basemind extracts PDFs, Office files, spreadsheets, email, HTML, XML, Markdown and Jupyter
-notebooks (and, with OCR, raster images and scanned PDFs) into a
+basemind extracts 90+ file formats (PDF, Office, HTML, email, images via OCR) into a
 LanceDB vector store and answers meaning-based queries with optional cross-encoder reranking.
+Web pages scraped or crawled into the same store are searchable the same way.
 
-<Badge text="--features documents" /> or `--features full`; OCR needs the `documents-ocr`
-feature and entity filtering needs `documents-ner` (both in `full`)
+<Badge text="--features documents" /> or `--features full`
 
 ## Requirements
 
-- `docs_search` needs a build with `--features documents` (or `full`). `memory_save` and
-  `memory_search` are gated on the separate `--features memory` (also in `full`). Without the
-  relevant feature the tool is advertised but returns an `isError` result naming the Cargo
-  feature.
-- OCR and named-entity recognition are separate Cargo features, `documents-ocr` and
-  `documents-ner`. The published binaries (Homebrew, npm, pip, GitHub releases) are built with
-  `full` and have both. A source build with `--features documents` alone has neither: raster
-  images are not indexed as documents, a PDF with no text layer is indexed with no text and logs a
-  warning naming the file and `documents-ocr`, `[documents.ner] enabled = true` logs a warning
-  and has no effect, and a `docs_search` call with `entity` returns an error naming `documents-ner`.
-- Archives (`.zip`, `.tar`, `.7z`, `.gz`) are never extracted.
+- The `memory` MCP tool's `documents` mode needs a build with `--features documents` (or
+  `full`). The other `memory` modes (`put`, `get`, `list`, `search`, `delete`, `audit`) are
+  gated on the separate `--features memory` (also in `full`). Without the relevant feature
+  the tool is advertised but the mode's body returns an error.
+- Web ingestion (`web` modes `scrape`, `crawl`, `map`) needs `--features crawl`. When that
+  feature is off the `web` tool is not registered at all.
 - Documents must be scanned first: `basemind scan` with the documents feature extracts
   and embeds them into the global cache.
 
 ## Core tool
 
-### `docs_search`
+### `memory` mode `documents`
 
-Semantic search across PDFs, Office, HTML, email, and images (OCR). Returns
+Semantic search across PDFs, Office, HTML, email, images (OCR), and web pages. Returns
 chunk-level hits with path, matched text, byte span, vector distance, and — when enabled
 at scan time — cross-encoder rerank score, named entities, and document summary. CLI:
 `basemind memory documents`.
 
 ```json
 {
-  "query": "how releases are versioned",
+  "mode": "documents",
+  "query": "how is the index schema versioned",
   "limit": 10,
-  "entity": "PERSON",
-  "keywords": "release"
+  "entity_category": "PERSON",
+  "keywords_contains": "release"
 }
 ```
 
 Filter results by:
 
-- **`entity`** — narrow to documents mentioning entities like `PERSON`, `LOCATION`,
-  `ORGANIZATION` (NER-extracted at scan time). Needs a build with `documents-ner`; without it
-  the call returns an error instead of an empty result.
-- **`keywords`** — narrow to documents with a matching keyword (extracted at scan
+- **`entity_category`** — narrow to documents mentioning entities like `PERSON`, `LOCATION`,
+  `ORGANIZATION` (NER-extracted at scan time).
+- **`keywords_contains`** — narrow to documents with a matching keyword (extracted at scan
   time).
 - **`mime_type`** — filter by file type, e.g. `"application/pdf"` or `"text/html"`.
 
 Each hit carries:
 
-- `path` — file path.
+- `path` — file path or web scope (`web:<host>/<path>`).
 - `chunk_idx` — which chunk within the document.
 - `text` — the matched passage.
 - `byte_span` — precise location in the source.
@@ -66,48 +60,97 @@ Each hit carries:
   is enabled).
 - `keywords` / `entities` / `summary` — document-level metadata (when enabled at scan).
 
-## Pages ingested by older versions
+## Web ingestion
 
-Web ingestion (the `web` tool and `basemind web`) was removed. Pages an older version scraped or
-crawled stay in the document store under the scope `web:<host>` and are no longer refreshed.
-`docs_search` searches this repository's scope by default, so pass `scope: "web:<host>"`
-(`--scope web:<host>` on the CLI) to search them.
+### `web` mode `scrape`
+
+Fetch and index a single page, adding it to the document store. CLI: `basemind web scrape`.
+
+```json
+{
+  "mode": "scrape",
+  "url": "https://docs.example.com/guide",
+  "scope": "docs"
+}
+```
+
+Results land tagged with a `scope` (default: `web:<host>`), making them queryable the same
+way as local documents.
+
+### `web` mode `crawl`
+
+Follow links from a seed URL up to a configurable depth, indexing all discovered pages.
+CLI: `basemind web crawl`.
+
+```json
+{
+  "mode": "crawl",
+  "url": "https://docs.example.com/",
+  "max_depth": 2,
+  "max_pages": 100
+}
+```
+
+<Aside type="note">
+The crawler honors `robots.txt` by default (disable with config). It SSRF-blocks private
+and loopback hosts unless `[crawl].allow_private_network = true` is set in
+`basemind.toml`.
+</Aside>
+
+### `web` mode `map`
+
+Discover a site's pages without fetching bodies — returns a sitemap. CLI: `basemind web
+map`.
+
+```json
+{
+  "mode": "map",
+  "url": "https://docs.example.com"
+}
+```
+
+Useful for "what pages exist on this site?" without the download cost.
 
 ## Shared memory
 
 Store key–value pairs that persist across sessions and are queryable by any agent on the
 same repo (determined by normalized git origin URL). Unrelated repos keep separate memory.
 
-### `memory_save`
+### `memory` mode `put`
 
-Store a note. Saving an existing `key` replaces it. CLI: `basemind memory put`.
-
-```json
-{
-  "key": "decision/auth-tokens",
-  "value": "Tokens rotate every 24h.",
-  "tags": ["auth"]
-}
-```
-
-### `memory_search`
-
-Recall notes. `query` searches by meaning, `key` reads one note, `prefix` lists by key prefix, and
-no arguments lists everything. CLI: `basemind memory search` / `get` / `list`.
+Store a value. CLI: `basemind memory put`.
 
 ```json
 {
-  "query": "token rotation"
+  "mode": "put",
+  "key": "architecture_notes",
+  "value": "The scanner uses rayon parallel iteration..."
 }
 ```
+
+### `memory` mode `get` / `list`
+
+Retrieve a value by exact key or list keys by prefix. CLI: `basemind memory get` /
+`basemind memory list`.
 
 ```json
 {
-  "key": "decision/auth-tokens"
+  "mode": "get",
+  "key": "architecture"
 }
 ```
 
-Deleting a note is CLI only: `basemind memory delete <key>`.
+### `memory` mode `search`
+
+Semantic search over stored values. CLI: `basemind memory search`.
+
+```json
+{
+  "mode": "search",
+  "query": "how is parallelism managed",
+  "limit": 5
+}
+```
 
 ## Configuration
 
@@ -116,23 +159,39 @@ In `basemind.toml`:
 ```toml
 [documents]
 enabled = true
-embed = true  # set to false to disable embeddings (keyword search only)
+embed = true  # set to false for a lexical-only store: no embeddings, keyword search instead
 include = []  # globs selecting which non-code files become documents (empty = all that pass [scan])
 exclude = []  # globs never indexed as documents (wins over include)
 max_file_bytes = 52428800  # per-document size cap (50 MiB), independent of [scan] max_file_bytes
 embed_include = []  # embed only matching documents (empty = all); embed_exclude always wins
-
 [documents.reranker]
 enabled = true  # cross-encoder reranking for document chunks
 ```
 
+With `embed = false` the store holds no vectors, so document search runs the **keyword lane**: a
+full-text index over each chunk's text and its Markdown heading breadcrumb, with a relaxation ladder
+that drops query terms when the strict conjunction matches nothing. Nothing is embedded and no
+embedding model is downloaded to answer a query that does not need one.
+
+The two lanes are **chosen by this setting, not combined**. A store is either lexical-only or
+vector-backed; there is no configuration that runs both and fuses their rankings. If you want
+semantic recall, leave `embed = true`.
+
+The heading breadcrumb is recognised from Markdown `#` headings (and setext underlines) only. A
+document whose sections are plain prose — a PDF whose divisions read `IV. TERMINATION` rather than
+`## Termination` — produces an empty breadcrumb for every chunk, and the keyword lane then matches on
+chunk text alone. There is also no statute-number or quoted-phrase lane: `§ 362(a)(1)` is tokenised
+like any other text, so it matches loosely rather than exactly.
+
 ## Discipline
 
-- **Use `docs_search` instead of opening PDFs/Office/HTML by hand.** Semantic
+- **Use `memory` mode `documents` instead of opening PDFs/Office/HTML by hand.** Semantic
   search finds passages about a topic without keyword matching.
-- **Use `memory_save` / `memory_search` for agent-generated insights.** Store findings that
+- **Use `web` modes `scrape` / `crawl` to pull docs into the RAG store.** Once indexed, they
+  are searchable alongside local documents.
+- **Use `memory` modes `put` / `search` for agent-generated insights.** Store findings that
   you want to recall in future sessions.
-- **Filter by `entity` or `mime_type` when the query is too broad.** Narrow results
+- **Filter by `entity_category` or `mime_type` when the query is too broad.** Narrow results
   to a document class.
 
 <Aside type="note">

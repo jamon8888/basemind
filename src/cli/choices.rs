@@ -24,26 +24,87 @@ macro_rules! choice_enum {
 }
 
 choice_enum! {
-    /// `code refs` name matching.
-    RefsMatch { Exact => "exact", Substring => "substring" }
+    /// `graph calls` walk direction.
+    CallDirection { Callers => "callers", Callees => "callees" }
 }
 
 choice_enum! {
-    /// `code search` retrieval lane.
+    /// `graph neighbors` edge direction.
+    NeighborDirection { Both => "both", Out => "out", In => "in" }
+}
+
+choice_enum! {
+    /// Edge lanes a graph is built over.
+    EdgeLane {
+        All => "all",
+        Calls => "calls",
+        Imports => "imports",
+        Inherits => "inherits",
+        Both => "both",
+        Contains => "contains",
+    }
+}
+
+choice_enum! {
+    /// Community-detection algorithm.
+    CommunityAlgorithm { LabelPropagation => "label_propagation", Louvain => "louvain" }
+}
+
+choice_enum! {
+    /// `graph map` rollup level.
+    Granularity { Module => "module", File => "file", Symbol => "symbol" }
+}
+
+choice_enum! {
+    /// `graph export` output format.
+    ExportFormat {
+        NodeLink => "node_link",
+        Dot => "dot",
+        Mermaid => "mermaid",
+        Graphml => "graphml",
+        Cypher => "cypher",
+        Html => "html",
+        Svg => "svg",
+    }
+}
+
+choice_enum! {
+    /// `graph display` / `graph open` output format (visual formats only).
+    VisualFormat { Html => "html", Svg => "svg" }
+}
+
+choice_enum! {
+    /// `code semantic` retrieval lane.
     SearchLane { Hybrid => "hybrid", Semantic => "semantic", Keyword => "keyword" }
 }
 
 choice_enum! {
-    /// `code refs` relation.
-    RefsRelation {
-        Callers => "callers",
-        Implementations => "implementations",
-        Importers => "importers",
-        Definition => "definition",
-    }
+    /// `git search` field.
+    CommitField { Author => "author", Message => "message", All => "all" }
+}
+
+choice_enum! {
+    /// `git symbol-history` fingerprint strategy.
+    HashMode { Normalized => "normalized", Structural => "structural", StructuralLoose => "structural_loose" }
 }
 
 choice_enum! {
     /// `admin telemetry` aggregation window.
     TelemetryWindow { Today => "today", Hour => "1h", Day => "24h", All => "all" }
+}
+
+choice_enum! {
+    /// `admin compress` reduction intensity.
+    CompressLevel {
+        Off => "off",
+        Light => "light",
+        Moderate => "moderate",
+        Aggressive => "aggressive",
+        Maximum => "maximum",
+    }
+}
+
+choice_enum! {
+    /// `memory proposals` kind filter.
+    ProposalKind { Skill => "skill", Memory => "memory" }
 }

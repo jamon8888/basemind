@@ -3,61 +3,6 @@
 
 use super::*;
 
-/// Why a [`CommsClient::wait_inbox_unseen`] call returned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitReason {
-    /// The page carries at least one unread message the caller had not seen.
-    Message,
-    /// The timeout elapsed with nothing new.
-    Timeout,
-    /// A thread became discoverable to this agent; the page is empty.
-    Discovery,
-    /// The daemon announced shutdown or the link closed; reconnect and retry.
-    Shutdown,
-}
-
-impl WaitReason {
-    /// The wire spelling reported to MCP and CLI callers.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Message => "message",
-            Self::Timeout => "timeout",
-            Self::Discovery => "discovery",
-            Self::Shutdown => "shutdown",
-        }
-    }
-}
-
-/// What a [`CommsClient::wait_inbox_unseen`] call returned.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WaitOutcome {
-    /// Why the wait ended.
-    pub reason: WaitReason,
-    /// The unseen rows; empty unless `reason` is [`WaitReason::Message`].
-    pub messages: Vec<SeqMeta>,
-    /// Unread messages remaining after the page.
-    pub unread: u32,
-    /// Resume token for the next page.
-    pub next_cursor: Option<Cursor>,
-}
-
-impl WaitOutcome {
-    /// The pre-`reason` flag, kept for callers that only retry on it: true for
-    /// [`WaitReason::Timeout`] and, as before, for [`WaitReason::Shutdown`].
-    pub fn timed_out(&self) -> bool {
-        matches!(self.reason, WaitReason::Timeout | WaitReason::Shutdown)
-    }
-
-    fn empty(reason: WaitReason, unread: u32) -> Self {
-        Self {
-            reason,
-            messages: Vec::new(),
-            unread,
-            next_cursor: None,
-        }
-    }
-}
-
 impl CommsClient {
     /// Register or update this agent's card.
     pub async fn register_agent(&mut self, card: AgentCard) -> Result<(), CommsClientError> {
@@ -266,22 +211,6 @@ impl CommsClient {
         mark_read: bool,
         since_micros: Option<i64>,
     ) -> Result<(Vec<SeqMeta>, u32, Option<Cursor>), CommsClientError> {
-        self.read_inbox_in(None, remote, cwd, cursor, limit, mark_read, since_micros)
-            .await
-    }
-
-    /// [`CommsClient::read_inbox`] restricted to one joined thread when `thread` is `Some`.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    pub async fn read_inbox_in(
-        &mut self,
-        thread: Option<ThreadId>,
-        remote: Option<String>,
-        cwd: Option<PathBuf>,
-        cursor: Option<Cursor>,
-        limit: u32,
-        mark_read: bool,
-        since_micros: Option<i64>,
-    ) -> Result<(Vec<SeqMeta>, u32, Option<Cursor>), CommsClientError> {
         match self
             .request(CommsRequest::Inbox {
                 remote,
@@ -290,7 +219,6 @@ impl CommsClient {
                 limit: Some(limit),
                 mark_read,
                 since_micros,
-                thread,
             })
             .await?
         {
@@ -343,9 +271,6 @@ impl CommsClient {
     ///   yields `timed_out = true` with an empty page — the caller reconnects and retries.
     /// * the `timeout` elapsing with nothing new yields `timed_out = true`, carrying the unread
     ///   count observed by the immediate read.
-    ///
-    /// The tuple cannot tell those endings apart; [`CommsClient::wait_inbox_unseen`] returns the
-    /// [`WaitOutcome`] that can.
     #[allow(clippy::too_many_arguments)]
     pub async fn wait_inbox(
         &mut self,
@@ -357,25 +282,18 @@ impl CommsClient {
         limit: u32,
         timeout: std::time::Duration,
     ) -> Result<(bool, Vec<SeqMeta>, u32, Option<Cursor>), CommsClientError> {
-        let outcome = self
-            .wait_inbox_unseen(
-                remote,
-                cwd,
-                thread,
-                since_micros,
-                cursor,
-                limit,
-                timeout,
-                &CancellationToken::new(),
-                |_| false,
-            )
-            .await?;
-        Ok((
-            outcome.timed_out(),
-            outcome.messages,
-            outcome.unread,
-            outcome.next_cursor,
-        ))
+        self.wait_inbox_unseen(
+            remote,
+            cwd,
+            thread,
+            since_micros,
+            cursor,
+            limit,
+            timeout,
+            &CancellationToken::new(),
+            |_| false,
+        )
+        .await
     }
 
     /// [`CommsClient::wait_inbox`] that skips rows the caller already `is_seen` and stops promptly
@@ -398,23 +316,13 @@ impl CommsClient {
         timeout: std::time::Duration,
         cancel: &CancellationToken,
         is_seen: impl Fn(&SeqMeta) -> bool,
-    ) -> Result<WaitOutcome, CommsClientError> {
+    ) -> Result<(bool, Vec<SeqMeta>, u32, Option<Cursor>), CommsClientError> {
         let sub = tokio::select! {
             () = cancel.cancelled() => return Err(CommsClientError::Cancelled),
-            sub = self.subscribe_inbox(thread.clone()) => sub?,
+            sub = self.subscribe_inbox(thread) => sub?,
         };
         let outcome = self
-            .wait_inbox_after_subscribe(
-                thread,
-                remote,
-                cwd,
-                since_micros,
-                cursor,
-                limit,
-                timeout,
-                cancel,
-                is_seen,
-            )
+            .wait_inbox_after_subscribe(remote, cwd, since_micros, cursor, limit, timeout, cancel, is_seen)
             .await;
         if !matches!(outcome, Err(CommsClientError::Cancelled)) {
             let _ = self.unsubscribe(sub).await;
@@ -427,7 +335,6 @@ impl CommsClient {
     #[allow(clippy::too_many_arguments)]
     async fn wait_inbox_after_subscribe(
         &mut self,
-        thread: Option<ThreadId>,
         remote: Option<String>,
         cwd: Option<PathBuf>,
         since_micros: Option<i64>,
@@ -436,38 +343,20 @@ impl CommsClient {
         timeout: std::time::Duration,
         cancel: &CancellationToken,
         is_seen: impl Fn(&SeqMeta) -> bool,
-    ) -> Result<WaitOutcome, CommsClientError> {
+    ) -> Result<(bool, Vec<SeqMeta>, u32, Option<Cursor>), CommsClientError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let (rows, unread, next) = tokio::select! {
                 () = cancel.cancelled() => return Err(CommsClientError::Cancelled),
-                read = self.read_inbox_in(
-                    thread.clone(),
-                    remote.clone(),
-                    cwd.clone(),
-                    cursor.clone(),
-                    limit,
-                    false,
-                    since_micros,
-                ) => read?,
+                read = self.read_inbox(remote.clone(), cwd.clone(), cursor.clone(), limit, false, since_micros) => read?,
             };
-            // A daemon that predates the `thread` field on `Inbox` ignores it and returns every
-            // joined thread, so the filter is re-applied here.
-            let fresh: Vec<SeqMeta> = rows
-                .into_iter()
-                .filter(|row| thread.as_ref().is_none_or(|only| &row.meta.thread == only) && !is_seen(row))
-                .collect();
+            let fresh: Vec<SeqMeta> = rows.into_iter().filter(|row| !is_seen(row)).collect();
             if !fresh.is_empty() {
-                return Ok(WaitOutcome {
-                    reason: WaitReason::Message,
-                    messages: fresh,
-                    unread,
-                    next_cursor: next,
-                });
+                return Ok((false, fresh, unread, next));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Ok(WaitOutcome::empty(WaitReason::Timeout, unread));
+                return Ok((true, Vec::new(), unread, None));
             }
             let note = tokio::select! {
                 () = cancel.cancelled() => return Err(CommsClientError::Cancelled),
@@ -478,14 +367,10 @@ impl CommsClient {
                 // Discovery metadata is consumed directly through `subscribe_inbox` plus
                 // `poll_notification`. Keep the legacy message-only wait shape exhaustive without
                 // misreporting a live wake as a timeout.
-                Ok(Ok(Some(CommsNotification::ThreadDiscovered(_)))) => {
-                    return Ok(WaitOutcome::empty(WaitReason::Discovery, unread));
-                }
-                Ok(Ok(Some(CommsNotification::Shutdown))) | Ok(Ok(None)) => {
-                    return Ok(WaitOutcome::empty(WaitReason::Shutdown, 0));
-                }
+                Ok(Ok(Some(CommsNotification::ThreadDiscovered(_)))) => return Ok((false, Vec::new(), unread, None)),
+                Ok(Ok(Some(CommsNotification::Shutdown))) | Ok(Ok(None)) => return Ok((true, Vec::new(), 0, None)),
                 Ok(Err(err)) => return Err(err),
-                Err(_elapsed) => return Ok(WaitOutcome::empty(WaitReason::Timeout, unread)),
+                Err(_elapsed) => return Ok((true, Vec::new(), unread, None)),
             }
         }
     }
@@ -559,6 +444,49 @@ impl CommsClient {
         match self.request(CommsRequest::BranchesList { repo_id }).await? {
             CommsResponse::Branches { branches } => Ok(branches),
             other => Err(self.shape_err(other, "list_branches")),
+        }
+    }
+
+    /// Advisory-claim a worktree for `claimant`. Returns `true` when the claim is now held by
+    /// `claimant` (freshly taken or already theirs), `false` when another claimant holds it or the
+    /// worktree is unknown.
+    pub async fn claim_worktree(
+        &mut self,
+        repo_id: String,
+        name: String,
+        claimant: String,
+    ) -> Result<bool, CommsClientError> {
+        match self
+            .request(CommsRequest::WorktreeClaim {
+                repo_id,
+                name,
+                claimant,
+            })
+            .await?
+        {
+            CommsResponse::ClaimOutcome { held } => Ok(held),
+            other => Err(self.shape_err(other, "claim_worktree")),
+        }
+    }
+
+    /// Release an advisory worktree claim held by `claimant`. Returns `true` when a claim by
+    /// `claimant` was cleared, `false` otherwise.
+    pub async fn release_worktree(
+        &mut self,
+        repo_id: String,
+        name: String,
+        claimant: String,
+    ) -> Result<bool, CommsClientError> {
+        match self
+            .request(CommsRequest::WorktreeRelease {
+                repo_id,
+                name,
+                claimant,
+            })
+            .await?
+        {
+            CommsResponse::ClaimOutcome { held } => Ok(held),
+            other => Err(self.shape_err(other, "release_worktree")),
         }
     }
 }

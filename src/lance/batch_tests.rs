@@ -7,9 +7,14 @@ fn doc_rows(scope: &str, path: &str, n: usize, tag: &str) -> Vec<DocumentRow> {
             path: path.into(),
             chunk_idx: c as u32,
             mime_type: "text/plain".into(),
+            facets: Default::default(),
             text: format!("{tag} {path} {c}"),
+            text_phrase: format!("{tag} {path} {c}"),
+            heading_path: String::new(),
+            cites: String::new(),
             byte_start: 0,
             byte_end: 1,
+            rehydration_ref: None,
             embedding: vec![0.0; 4],
         })
         .collect()

@@ -7,13 +7,14 @@ pub mod doc_fallback;
 #[cfg(feature = "documents")]
 pub mod doc_guard;
 #[cfg(feature = "documents")]
-pub mod doc_tiers;
+pub mod doc_metrics;
 pub mod l1;
 pub mod l2;
 pub mod l3;
 pub mod locals;
+#[cfg(feature = "documents")]
+mod ocr_assets;
 mod rationale;
-mod rust_macro_items;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,10 +54,9 @@ pub fn extract_l1_l2(
             return Err(ExtractError::ParseTimeout(crate::lang::DEFAULT_PARSE_TIMEOUT));
         }
     };
-    let bodies = rust_macro_items::MacroBodies::collect(lang, tree.root_node(), source)?;
-    let l1 = extract_l1_from_tree(lang, &tree, source, &bodies)?;
+    let l1 = extract_l1_from_tree(lang, &tree, source)?;
     let l2 = if eager_l2 {
-        extract_l2_from_tree(lang, &tree, source, &bodies).ok()
+        extract_l2_from_tree(lang, &tree, source).ok()
     } else {
         None
     };
@@ -87,8 +87,8 @@ pub const SCHEMA_VER: u16 = crate::version::RELEASE_MINOR;
 ///
 /// History:
 /// - 1: symbol `signature` stops at the grammar's body field (`extract::l1::header_text`).
-/// - 2: Rust outlines gain bodiless trait methods, nested `fn` items, items inside item-position
-///   macro bodies, and trait impls written with a path or generic trait.
+/// - 2: document extraction adds a plain-text OCR retry when the Tesseract dictionary filter
+///   removed all lines; forces one-time re-extraction of all previously extracted files.
 pub const EXTRACT_EPOCH: u16 = 2;
 
 #[derive(Debug, Error)]

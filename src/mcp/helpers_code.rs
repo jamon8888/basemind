@@ -1,257 +1,237 @@
-//! Bodies of the code verb tools: `code_outline`, `code_symbols`, `code_grep`, `code_search`,
-//! `code_refs` and `find_files`.
+//! The `code` domain dispatcher, plus the bodies of its `outline`, `symbols` and `dependents`
+//! modes.
 //!
-//! Each `pub(super) async fn` here is what both the `#[tool]` shim in `tools.rs` and the matching
-//! `basemind code …` command run. They translate the tool's wire arguments
-//! ([`super::types_tools`]) into the per-operation shapes the query bodies take; those bodies stay
-//! where they already lived: `helpers_files`, `helpers_grep`, `helpers_calls`, `helpers_impls`,
-//! `helpers_intel`, `helpers_code_search`. `code_read` is in `helpers_expand`.
+//! [`run_code`] is what the `#[tool]` shim and the CLI both call: it validates the flat
+//! [`CodeParams`] against the selected [`CodeMode`] and delegates to the per-mode body. The other
+//! bodies stay where they already lived — `helpers_files` (`files`/`find`), `helpers_grep`
+//! (`grep`), `helpers_calls` (`references`/`callers`), `helpers_impls` (`implementations`),
+//! `helpers_intel` (`definition`), `helpers_compress` (`expand`), `helpers_code_search`
+//! (`semantic`/`chunk`) — so consolidation moved the surface, not the queries.
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 
+use super::MapCache;
 use super::ServerState;
 use super::helpers::{
-    RefsSource, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, elapsed_us, json_result, kind_to_str, run_find_callers,
-    run_find_files, run_find_implementations, run_find_references, run_list_files, run_workspace_grep,
+    RefsSource, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, elapsed_us, json_result, kind_to_str, parse_kind,
+    run_find_callers, run_find_files, run_find_implementations, run_find_references, run_list_files,
+    run_workspace_grep,
 };
 use super::index_route::IndexRoute;
-use super::tool_contract::{budget, not_indexed_in};
+use super::mode::{CodeMode, reject_unsupported};
 use super::types::{
-    DependentsResponse, FindCallersParams, FindFilesParams, FindReferencesParams, GotoDefinitionParams,
-    ListFilesParams, OutlineResponse, OutlineSymbol, SearchSymbolsParams, WorkspaceGrepParams,
+    CallView, DependentsResponse, DocView, FindCallersParams, FindFilesParams, FindReferencesParams,
+    GotoDefinitionParams, ImportView, ListFilesParams, OutlineParams, OutlineResponse, SearchHitView, SearchResponse,
+    SearchSymbolsParams, SymbolView, WorkspaceGrepParams,
 };
+use super::types_code::{CodeParams, GetChunkParams, SearchCodeParams};
+use super::types_compress::ExpandParams;
 use super::types_impls::FindImplementationsParams;
-use super::types_tools::{
-    CodeGrepParams, CodeOutlineParams, CodeRefsParams, CodeSearchParams, CodeSymbolsParams, FindFilesToolParams,
-};
+use crate::query;
 
-/// Symbols returned by one `code_outline` page when the caller passes no `limit`.
-const OUTLINE_LIMIT_DEFAULT: u32 = 500;
-/// Imports listed on the first `code_outline` page.
-const OUTLINE_IMPORTS_MAX: usize = 200;
+/// `definition`'s column default: the start of the line.
+const DEFAULT_COLUMN: u32 = 0;
+/// `grep` ships one line of context on either side of a hit unless told otherwise.
+const DEFAULT_INCLUDE_CONTEXT: bool = true;
 
-/// `code_grep`: content search over every indexed code file.
-pub(super) async fn code_grep(state: &ServerState, p: CodeGrepParams) -> Result<CallToolResult, McpError> {
-    if p.pattern.is_empty() {
-        return Err(McpError::invalid_params(
-            "`code_grep`: `pattern` is empty; pass the text to find.".to_string(),
-            None,
-        ));
-    }
+/// Fail a mode that was given a field belonging to some other mode.
+///
+/// Inverted against `allowed` rather than listing every rejected field per mode: with thirteen
+/// modes and twenty-four sibling fields, an explicit per-mode reject list is where a newly added
+/// field silently becomes accept-everywhere.
+fn reject_foreign_fields(mode: CodeMode, present: &[(&str, bool)], allowed: &[&str]) -> Result<(), McpError> {
+    let foreign: Vec<(&str, bool)> = present
+        .iter()
+        .filter(|(field, _)| !allowed.contains(field))
+        .copied()
+        .collect();
+    reject_unsupported(CodeMode::DOMAIN, mode.as_str(), &foreign)
+}
+
+/// Unwrap a field this mode cannot run without, naming the exact `mode`/field pair.
+fn require_field<T>(mode: CodeMode, field: &str, value: Option<T>) -> Result<T, McpError> {
+    value.ok_or_else(|| McpError::invalid_params(format!("`code` mode=\"{}\" requires `{field}`", mode.as_str()), None))
+}
+
+/// Reported when a retrieval mode's feature is missing from this build.
+#[cfg(not(feature = "code-search"))]
+fn not_enabled(mode: CodeMode, feature: &'static str) -> Result<CallToolResult, McpError> {
+    Err(McpError::invalid_request(
+        format!(
+            "`code` mode=\"{}\" requires the `{feature}` feature, which is not compiled into this \
+             basemind binary. Rebuild with `--features {feature}` (the published release binary \
+             includes it).",
+            mode.as_str()
+        ),
+        None,
+    ))
+}
+
+/// Dispatch the single `code` tool onto the per-operation helper its `mode` selects.
+///
+/// Fields belonging to another mode are rejected rather than dropped: a silently ignored
+/// `path_contains` on a `symbols` call reads to an agent as a successful scoped search.
+pub(super) async fn run_code(state: &ServerState, params: CodeParams) -> Result<CallToolResult, McpError> {
+    let CodeParams {
+        mode,
+        path,
+        name,
+        query: text_query,
+        pattern,
+        trait_name,
+        module,
+        kind,
+        language,
+        path_contains,
+        path_prefix,
+        line,
+        column,
+        l2,
+        include_context,
+        limit,
+        max_tokens,
+        format,
+        cursor,
+        lane,
+        rerank,
+        rerank_preset,
+        rerank_top_k,
+        chunk_id,
+        byte_start,
+    } = params;
+    let present = [
+        ("path", path.is_some()),
+        ("name", name.is_some()),
+        ("query", text_query.is_some()),
+        ("pattern", pattern.is_some()),
+        ("trait_name", trait_name.is_some()),
+        ("module", module.is_some()),
+        ("kind", kind.is_some()),
+        ("language", language.is_some()),
+        ("path_contains", path_contains.is_some()),
+        ("path_prefix", path_prefix.is_some()),
+        ("line", line.is_some()),
+        ("column", column.is_some()),
+        ("l2", l2.is_some()),
+        ("include_context", include_context.is_some()),
+        ("limit", limit.is_some()),
+        ("max_tokens", max_tokens.is_some()),
+        ("format", format.is_some()),
+        ("cursor", cursor.is_some()),
+        ("lane", lane.is_some()),
+        ("rerank", rerank.is_some()),
+        ("rerank_preset", rerank_preset.is_some()),
+        ("rerank_top_k", rerank_top_k.is_some()),
+        ("chunk_id", chunk_id.is_some()),
+        ("byte_start", byte_start.is_some()),
+    ];
+    reject_foreign_fields(mode, &present, allowed_fields(mode))?;
+
+    // Timed from here, matching the pre-consolidation shims: the cache-ready wait a cold server
+    // pays is part of the reported `elapsed_us` (such responses also carry a lifecycle `notice`).
     let started = std::time::Instant::now();
-    state.await_cache_ready().await;
-    run_workspace_grep(
-        state,
-        WorkspaceGrepParams {
-            pattern: p.pattern,
-            language: p.language,
-            path_contains: p.path,
-            limit: p.limit,
-            max_tokens: budget(p.max_tokens),
-            format: None,
-            include_context: p.context.unwrap_or(false),
-            literal: !p.regex.unwrap_or(false),
-            cursor: p.cursor,
-        },
-        started,
-    )
-    .await
-}
 
-/// `code_symbols`: find definitions by name.
-pub(super) async fn code_symbols(state: &ServerState, p: CodeSymbolsParams) -> Result<CallToolResult, McpError> {
-    let started = std::time::Instant::now();
-    super::helpers_symbols::run_search_symbols(
-        state,
-        SearchSymbolsParams {
-            needle: p.name,
-            kind: p.kind,
-            fuzzy: p.fuzzy.unwrap_or(false),
-            limit: p.limit,
-            max_tokens: budget(p.max_tokens),
-            format: None,
-            cursor: p.cursor,
-        },
-        started,
-    )
-    .await
-}
-
-/// `code_search`: semantic / hybrid search returning pointers.
-pub(super) async fn code_search(state: &ServerState, p: CodeSearchParams) -> Result<CallToolResult, McpError> {
-    #[cfg(feature = "code-search")]
-    {
-        use super::helpers_page::{RANKED_FETCH, RANKED_LIMIT_DEFAULT, page_ranked, ranked_offset, ranked_retrieval};
-
-        let generation = state.shared.index_generation.load(std::sync::atomic::Ordering::Relaxed);
-        let offset = ranked_offset("code_search", p.cursor.as_ref(), generation)?;
-        let limit = p.limit.unwrap_or(RANKED_LIMIT_DEFAULT);
-        let ranking = serde_json::json!({ "query": &p.query, "lane": &p.lane });
-        let search = super::types_code::SearchCodeParams {
-            query: p.query,
-            limit: Some(RANKED_FETCH),
-            max_tokens: None,
-            // The page is cut out of the structured response, which only the JSON encoding has, so
-            // `[documents.output] format = "toon"` does not apply to this tool.
-            format: Some("json".to_string()),
-            mode: p.lane,
-            reranker_enabled: None,
-            reranker_preset: None,
-            reranker_top_k: None,
-        };
-        let cache = &state.shared.ranked;
-        let result = ranked_retrieval(cache, "code_search", &ranking, "hits", generation, || {
-            super::helpers_code_search::run_search_code(state, search)
-        })
-        .await?;
-        page_ranked(result, "hits", offset, limit, budget(p.max_tokens), generation)
-    }
-    #[cfg(not(feature = "code-search"))]
-    {
-        let _ = (state, p);
-        Err(super::tool_contract::feature_missing("code_search", "code-search"))
-    }
-}
-
-/// `find_files`: fuzzy file-name search, or a plain listing when `query` is omitted.
-pub(super) async fn find_files(state: &ServerState, p: FindFilesToolParams) -> Result<CallToolResult, McpError> {
-    match p.query.filter(|query| !query.trim().is_empty()) {
-        Some(query) => {
-            run_find_files(
+    match mode {
+        CodeMode::Outline => {
+            run_outline(
                 state,
-                FindFilesParams {
-                    query,
-                    path_prefix: p.path_prefix,
-                    language: p.language,
-                    limit: p.limit,
-                    max_tokens: budget(p.max_tokens),
-                    format: None,
-                    cursor: p.cursor,
+                OutlineParams {
+                    path: require_field(mode, "path", path)?,
+                    l2: l2.unwrap_or(false),
+                    max_tokens,
+                    format,
                 },
+                started,
             )
             .await
         }
-        None => {
+        CodeMode::Symbols => {
+            run_search_symbols(
+                state,
+                SearchSymbolsParams {
+                    needle: require_field(mode, "name", name)?,
+                    kind,
+                    limit,
+                    max_tokens,
+                    format,
+                    cursor,
+                },
+                started,
+            )
+            .await
+        }
+        CodeMode::Grep => {
+            state.await_cache_ready().await;
+            run_workspace_grep(
+                state,
+                WorkspaceGrepParams {
+                    pattern: require_field(mode, "pattern", pattern)?,
+                    language,
+                    path_contains,
+                    limit,
+                    max_tokens,
+                    format,
+                    include_context: include_context.unwrap_or(DEFAULT_INCLUDE_CONTEXT),
+                    cursor,
+                },
+                started,
+            )
+            .await
+        }
+        CodeMode::Files => {
             run_list_files(
                 state,
                 ListFilesParams {
-                    path_contains: None,
-                    path_prefix: p.path_prefix,
-                    language: p.language,
-                    limit: p.limit,
-                    max_tokens: budget(p.max_tokens),
-                    format: None,
-                    cursor: p.cursor,
+                    path_contains,
+                    language,
+                    limit,
+                    max_tokens,
+                    format,
+                    cursor,
                 },
             )
             .await
         }
-    }
-}
-
-/// What `code_refs` lists about a name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Relation {
-    Callers,
-    Implementations,
-    Importers,
-    Definition,
-}
-
-impl Relation {
-    fn parse(raw: Option<&str>) -> Result<Self, McpError> {
-        match raw.unwrap_or("callers") {
-            "callers" => Ok(Self::Callers),
-            "implementations" => Ok(Self::Implementations),
-            "importers" => Ok(Self::Importers),
-            "definition" => Ok(Self::Definition),
-            other => Err(McpError::invalid_params(
-                format!(
-                    "`code_refs`: unknown relation `{other}`; expected `callers`, `implementations`, \
-                     `importers` or `definition`"
-                ),
-                None,
-            )),
+        CodeMode::Find => {
+            run_find_files(
+                state,
+                FindFilesParams {
+                    query: require_field(mode, "query", text_query)?,
+                    path_prefix,
+                    language,
+                    limit,
+                    max_tokens,
+                    format,
+                    cursor,
+                },
+            )
+            .await
         }
-    }
-}
-
-/// The argument shapes `code_refs` accepts, quoted in every shape error.
-const REFS_SHAPES: &str = "accepted shapes: {name} (call sites of a name), {name, path} (callers of the definition in \
-     that file; add `line` when several there share the name), {name, relation:\"implementations\"}, \
-     {name, relation:\"importers\"}, {name, relation:\"definition\", path, line} (the definition a reference \
-     binds to)";
-
-/// `code_refs`: usages of a name: call sites, implementations, importers, or the definition a
-/// reference binds to.
-pub(super) async fn code_refs(state: &ServerState, p: CodeRefsParams) -> Result<CallToolResult, McpError> {
-    let relation = Relation::parse(p.relation.as_deref())?;
-    let substring = super::helpers_refs_match::Matching::parse(p.match_mode.as_deref())?
-        == super::helpers_refs_match::Matching::Substring;
-    let started = std::time::Instant::now();
-    let shape_error = |problem: &str| McpError::invalid_params(format!("`code_refs`: {problem}; {REFS_SHAPES}"), None);
-    if relation != Relation::Definition && p.column.is_some() {
-        return Err(shape_error("`column` applies only to relation `definition`"));
-    }
-    if p.line.is_some() && (matches!(relation, Relation::Implementations | Relation::Importers) || p.path.is_none()) {
-        return Err(shape_error(
-            "`line` needs `path`: it picks one of several same-named definitions, or locates the reference \
-             for relation `definition`",
-        ));
-    }
-    match relation {
-        Relation::Callers => match p.path {
-            Some(path) => {
-                let callers = FindCallersParams {
-                    path,
-                    name: p.name,
-                    substring,
-                    kind: None,
-                    line: p.line,
-                    limit: p.limit,
-                    max_tokens: budget(p.max_tokens),
-                    cursor: p.cursor,
-                };
-                run_callers(state, callers, started).await
-            }
-            None => {
-                state.await_cache_ready().await;
-                let route = IndexRoute::resolve(state).await;
-                let cache = state.shared.cache.load_full();
-                run_find_references(
-                    &route,
-                    FindReferencesParams {
-                        name: p.name,
-                        substring,
-                        limit: p.limit,
-                        max_tokens: budget(p.max_tokens),
-                        format: None,
-                        cursor: p.cursor,
-                    },
-                    &cache,
-                    || state.lifecycle_notice(),
-                    started,
-                )
-                .await
-            }
-        },
-        Relation::Implementations => {
-            if p.path.is_some() {
-                return Err(shape_error("`path` does not apply to relation `implementations`"));
-            }
+        CodeMode::Definition => {
+            super::helpers_intel::run_goto_definition(
+                state,
+                GotoDefinitionParams {
+                    path: require_field(mode, "path", path)?,
+                    line: require_field(mode, "line", line)?,
+                    column: column.unwrap_or(DEFAULT_COLUMN),
+                },
+            )
+            .await
+        }
+        CodeMode::References => {
+            let name = require_field(mode, "name", name)?;
             state.await_cache_ready().await;
             let route = IndexRoute::resolve(state).await;
             let cache = state.shared.cache.load_full();
-            run_find_implementations(
+            run_find_references(
                 &route,
-                FindImplementationsParams {
-                    trait_name: p.name,
-                    substring,
-                    language: None,
-                    limit: p.limit,
-                    max_tokens: budget(p.max_tokens),
-                    cursor: p.cursor,
+                FindReferencesParams {
+                    name,
+                    limit,
+                    max_tokens,
+                    format,
+                    cursor,
                 },
                 &cache,
                 || state.lifecycle_notice(),
@@ -259,40 +239,132 @@ pub(super) async fn code_refs(state: &ServerState, p: CodeRefsParams) -> Result<
             )
             .await
         }
-        Relation::Importers => {
-            if p.path.is_some() {
-                return Err(shape_error("`path` does not apply to relation `importers`"));
-            }
-            if p.match_mode.is_some() {
-                return Err(shape_error(
-                    "relation `importers` matches `name` against import paths and takes no `match`",
-                ));
-            }
-            run_dependents(state, p.name, p.limit, p.cursor, budget(p.max_tokens), started).await
+        CodeMode::Callers => {
+            let callers = FindCallersParams {
+                path: require_field(mode, "path", path)?,
+                name: require_field(mode, "name", name)?,
+                kind,
+                limit,
+                max_tokens,
+                cursor,
+            };
+            run_callers(state, callers, started).await
         }
-        Relation::Definition => {
-            let (Some(path), Some(line)) = (p.path, p.line) else {
-                return Err(shape_error("relation `definition` needs `path` and `line`"));
-            };
-            if p.limit.is_some() || p.cursor.is_some() || p.max_tokens.is_some() || p.match_mode.is_some() {
-                return Err(shape_error(
-                    "relation `definition` returns one location and takes no `match`, `limit`, `cursor` or \
-                     `max_tokens`",
-                ));
-            }
-            let column = match p.column {
-                Some(0) => return Err(shape_error("`column` is 1-based")),
-                Some(column) => Some(column - 1),
-                None => None,
-            };
-            let reference = GotoDefinitionParams {
-                path,
-                line,
-                column,
-                name: p.name,
-            };
-            super::helpers_intel::run_goto_definition(state, reference).await
+        CodeMode::Implementations => {
+            let trait_name = require_field(mode, "trait_name", trait_name)?;
+            state.await_cache_ready().await;
+            let route = IndexRoute::resolve(state).await;
+            let cache = state.shared.cache.load_full();
+            run_find_implementations(
+                &route,
+                FindImplementationsParams {
+                    trait_name,
+                    language,
+                    limit,
+                    max_tokens,
+                    cursor,
+                },
+                &cache,
+                || state.lifecycle_notice(),
+                started,
+            )
+            .await
         }
+        CodeMode::Dependents => run_dependents(state, require_field(mode, "module", module)?, started).await,
+        CodeMode::Expand => {
+            super::helpers_compress::run_expand(
+                state,
+                ExpandParams {
+                    path: require_field(mode, "path", path)?,
+                    name: require_field(mode, "name", name)?,
+                    kind,
+                },
+            )
+            .await
+        }
+        CodeMode::Semantic => {
+            let search = SearchCodeParams {
+                query: require_field(mode, "query", text_query)?,
+                limit,
+                max_tokens,
+                format,
+                mode: lane,
+                reranker_enabled: rerank,
+                reranker_preset: rerank_preset,
+                reranker_top_k: rerank_top_k,
+            };
+            #[cfg(feature = "code-search")]
+            {
+                super::helpers_code_search::run_search_code(state, search).await
+            }
+            #[cfg(not(feature = "code-search"))]
+            {
+                let _ = search;
+                not_enabled(mode, "code-search")
+            }
+        }
+        CodeMode::Chunk => {
+            let fetch = GetChunkParams {
+                path: require_field(mode, "path", path)?,
+                chunk_id,
+                byte_start,
+            };
+            #[cfg(feature = "code-search")]
+            {
+                super::helpers_code_search::run_get_chunk(state, fetch).await
+            }
+            #[cfg(not(feature = "code-search"))]
+            {
+                let _ = fetch;
+                not_enabled(mode, "code-search")
+            }
+        }
+    }
+}
+
+/// The sibling fields each mode accepts. Everything else present on the call is rejected by
+/// [`reject_foreign_fields`], so a parameter an agent believed took effect never silently doesn't.
+fn allowed_fields(mode: CodeMode) -> &'static [&'static str] {
+    match mode {
+        CodeMode::Outline => &["path", "l2", "max_tokens", "format"],
+        CodeMode::Symbols => &["name", "kind", "limit", "max_tokens", "format", "cursor"],
+        CodeMode::Grep => &[
+            "pattern",
+            "language",
+            "path_contains",
+            "limit",
+            "max_tokens",
+            "format",
+            "include_context",
+            "cursor",
+        ],
+        CodeMode::Files => &["path_contains", "language", "limit", "max_tokens", "format", "cursor"],
+        CodeMode::Find => &[
+            "query",
+            "path_prefix",
+            "language",
+            "limit",
+            "max_tokens",
+            "format",
+            "cursor",
+        ],
+        CodeMode::Definition => &["path", "line", "column"],
+        CodeMode::References => &["name", "limit", "max_tokens", "format", "cursor"],
+        CodeMode::Callers => &["path", "name", "kind", "limit", "max_tokens", "cursor"],
+        CodeMode::Implementations => &["trait_name", "language", "limit", "max_tokens", "cursor"],
+        CodeMode::Dependents => &["module"],
+        CodeMode::Expand => &["path", "name", "kind"],
+        CodeMode::Semantic => &[
+            "query",
+            "limit",
+            "max_tokens",
+            "format",
+            "lane",
+            "rerank",
+            "rerank_preset",
+            "rerank_top_k",
+        ],
+        CodeMode::Chunk => &["path", "chunk_id", "byte_start"],
     }
 }
 
@@ -332,7 +404,7 @@ async fn run_callers(
         &store,
         refs,
         &route,
-        super::tool_contract::IndexedFiles::of(state),
+        &state.shared.root,
         &cache,
         params,
         || state.lifecycle_notice(),
@@ -341,122 +413,269 @@ async fn run_callers(
     .await
 }
 
-/// 1-based line of the byte at `offset`, from the sorted offsets of every newline in the file.
-fn line_of(newlines: &[usize], offset: usize) -> u32 {
-    newlines.partition_point(|newline| *newline < offset) as u32 + 1
+/// Project an L1 filemap onto the outline response's symbol + import views.
+fn l1_views(l1: &crate::extract::FileMapL1) -> (Vec<SymbolView>, Vec<ImportView>) {
+    let symbols = l1
+        .symbols
+        .iter()
+        .map(|s| SymbolView {
+            name: s.name.clone(),
+            kind: kind_to_str(s.kind),
+            start_row: s.start_row,
+            start_col: s.start_col,
+            start_byte: s.start_byte,
+            end_byte: s.end_byte,
+            signature: s.signature.clone(),
+        })
+        .collect();
+    let imports = l1
+        .imports
+        .iter()
+        .map(|i| ImportView {
+            module: i.module.clone(),
+            raw: i.raw.clone(),
+            start_byte: i.start_byte,
+        })
+        .collect();
+    (symbols, imports)
 }
 
-/// `code_outline`: one file's symbols with their 1-based line spans, plus its imports.
-///
-/// `end_line` is not in the index (a symbol records its byte span and start row), so it is derived
-/// from the working-tree file. When that file no longer holds the indexed content the outline is
-/// extracted from the file as it is and flagged `stale`: the indexed spans laid over other bytes
-/// would end on the wrong lines.
-pub(super) async fn code_outline(state: &ServerState, p: CodeOutlineParams) -> Result<CallToolResult, McpError> {
+/// Assemble the L1 half of an outline response. `calls` / `docs` are filled in afterwards on the
+/// `l2` path.
+fn outline_response(path: &crate::path::RelPath, l1: &crate::extract::FileMapL1) -> OutlineResponse {
+    let (symbols, imports) = l1_views(l1);
+    OutlineResponse {
+        path: path.clone(),
+        language: l1.language.clone(),
+        size_bytes: l1.size_bytes,
+        had_errors: l1.had_errors,
+        error_count: l1.error_count,
+        budgeted: false,
+        symbols,
+        imports,
+        calls: None,
+        docs: None,
+        l2_status: None,
+        notice: None,
+        elapsed_us: 0,
+    }
+}
+
+/// Body of the `outline` mode: a file's structure from the in-RAM map when it is warm, else from
+/// the content-addressed blob, plus the L2 call/doc sidecar when `l2` was requested.
+async fn run_outline(
+    state: &ServerState,
+    params: OutlineParams,
+    started: std::time::Instant,
+) -> Result<CallToolResult, McpError> {
+    let mut response = if params.l2 {
+        let store = state.shared.store.read().await;
+        let l1 = query::file_outline(&store, &params.path)
+            .map_err(|e| McpError::invalid_params(format!("file_outline({}): {e}", params.path), None))?;
+        let mut r = outline_response(&params.path, &l1);
+        let entry = store
+            .lookup(&params.path)
+            .ok_or_else(|| McpError::internal_error("file not indexed after outline succeeded", None))?;
+        match store.read_l2_by_hex(&entry.hash_hex) {
+            Ok(Some(l2)) => {
+                r.calls = Some(
+                    l2.calls
+                        .iter()
+                        .map(|c| CallView {
+                            callee: c.callee.clone(),
+                            start_byte: c.start_byte,
+                        })
+                        .collect(),
+                );
+                r.docs = Some(
+                    l2.docs
+                        .iter()
+                        .map(|d| DocView {
+                            text: d.text.clone(),
+                            start_byte: d.start_byte,
+                        })
+                        .collect(),
+                );
+            }
+            Ok(None) => {
+                r.l2_status = Some("missing — run `basemind code outline <path> --l2` to materialize");
+            }
+            Err(e) => {
+                r.l2_status = Some("error");
+                return Err(McpError::internal_error(format!("read_l2: {e}"), None));
+            }
+        }
+        r
+    } else {
+        let cache = state.shared.cache.load();
+        if let Some(l1) = cache.get(&params.path) {
+            outline_response(&params.path, &l1)
+        } else {
+            let store = state.shared.store.read().await;
+            let l1 = query::file_outline(&store, &params.path)
+                .map_err(|e| McpError::invalid_params(format!("file_outline({}): {e}", params.path), None))?;
+            outline_response(&params.path, &l1)
+        }
+    };
+    response.notice = state.lifecycle_notice();
+
+    if params.max_tokens.is_some() {
+        let budgeted = super::budget::apply_budget(std::mem::take(&mut response.symbols), params.max_tokens);
+        response.symbols = budgeted.items;
+        response.budgeted = budgeted.budgeted;
+    }
+    response.elapsed_us = elapsed_us(started);
+    super::toon::format_result(&response, super::toon::ResponseFormat::parse(params.format.as_deref()))
+}
+
+fn search_hit(path: &crate::path::RelPath, sym: &crate::extract::Symbol) -> SearchHitView {
+    SearchHitView {
+        path: path.clone(),
+        name: sym.name.clone(),
+        kind: kind_to_str(sym.kind),
+        start_row: sym.start_row,
+        start_col: sym.start_col,
+        signature: sym.signature.clone(),
+    }
+}
+
+/// Decode `path`'s outline once and project the symbols at `page` into `results`.
+fn push_hits(cache: &MapCache, path: &crate::path::RelPath, page: &[usize], results: &mut Vec<SearchHitView>) {
+    if page.is_empty() {
+        return;
+    }
+    if let Some(l1) = cache.get(path) {
+        results.extend(
+            page.iter()
+                .filter_map(|&i| l1.symbols.get(i))
+                .map(|s| search_hit(path, s)),
+        );
+    }
+}
+
+/// Body of the `symbols` mode: a case-sensitive substring sweep of every indexed symbol name in the
+/// in-RAM map, bounded by [`search_max_total`](super::tools::search_max_total).
+async fn run_search_symbols(
+    state: &ServerState,
+    params: SearchSymbolsParams,
+    started: std::time::Instant,
+) -> Result<CallToolResult, McpError> {
     use std::sync::atomic::Ordering;
 
-    let started = std::time::Instant::now();
-    let generation = state.shared.index_generation.load(Ordering::Relaxed);
-    // Path-keyed: served from the in-RAM map when it is warm, else from the one blob. Waiting for
-    // the map here would make a one-shot CLI call decode the whole corpus to outline one file.
-    let cache = state.shared.cache.load_full();
-    let (file, entry, l1) = {
-        let store = state.shared.store.read().await;
-        let (entry, l1) = super::freshness::indexed_outline(&store, &cache, &p.path)
-            .ok_or_else(|| not_indexed_in(&store, &state.shared.root, "code_outline", &p.path))?;
-        (
-            super::tool_contract::indexed_file(state, &store, "code_outline", &p.path)?,
-            entry,
-            l1,
-        )
+    state.await_cache_ready().await;
+    let format = super::toon::ResponseFormat::parse(params.format.as_deref());
+    let kind = params.kind.as_deref().map(parse_kind).transpose()?;
+    let limit = params.limit.unwrap_or(SEARCH_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
+    let generation = state.shared.cache_generation.load(Ordering::Relaxed);
+
+    let empty = |cursor_invalidated: bool| SearchResponse {
+        total: 0,
+        total_is_partial: false,
+        truncated: false,
+        budgeted: false,
+        results: Vec::new(),
+        next_cursor: None,
+        cursor_invalidated,
+        notice: state.lifecycle_notice(),
+        elapsed_us: elapsed_us(started),
     };
 
-    let skip = match p.cursor.as_ref() {
-        Some(cursor) => {
-            let (offset, snapshot) = cursor.decode_in_memory()?;
-            if snapshot != generation {
-                return Err(McpError::invalid_params(
-                    "`code_outline`: the index changed since this cursor was issued. Call again without `cursor`."
-                        .to_string(),
-                    None,
-                ));
+    let skip = match params.cursor.as_ref() {
+        Some(c) => {
+            let (offset, snapshot_id) = c.decode_in_memory()?;
+            if snapshot_id != generation {
+                return super::toon::format_result(&empty(true), format);
             }
             offset as usize
         }
         None => 0,
     };
-    let limit = p.limit.unwrap_or(OUTLINE_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
 
-    let max_bytes = state.shared.config.scan.max_file_bytes;
-    let (l1, source, stale) = super::index_route::blocking(|| {
-        let live = super::freshness::load(&file, (&entry).into(), max_bytes)
-            .map_err(|reason| super::freshness::unloadable("code_outline", &p.path, reason, max_bytes))?;
-        let l1 = if live.fresh {
-            l1
-        } else {
-            super::freshness::reparse(state, "code_outline", &p.path, &live.bytes)?
-        };
-        Ok::<_, McpError>((l1, live.bytes, !live.fresh))
-    })?;
-    let newlines: Vec<usize> = memchr::memchr_iter(b'\n', &source).collect();
-
-    let total = l1.symbols.len();
-    let page: Vec<OutlineSymbol> = l1
-        .symbols
-        .iter()
-        .skip(skip)
-        .take(limit)
-        .map(|symbol| {
-            let line = symbol.start_row + 1;
-            let end_line = line_of(&newlines, (symbol.end_byte as usize).min(source.len())).max(line);
-            OutlineSymbol {
-                name: symbol.name.clone(),
-                kind: kind_to_str(symbol.kind),
-                line,
-                end_line,
-                signature: symbol.signature.clone(),
+    if params.needle.is_empty() {
+        return super::toon::format_result(&empty(false), format);
+    }
+    let finder = memchr::memmem::Finder::new(params.needle.as_bytes());
+    let max_total = super::tools::search_max_total(limit);
+    let mut results: Vec<SearchHitView> = Vec::with_capacity(limit);
+    let mut total: usize = 0;
+    let mut seen: usize = 0;
+    let mut total_is_partial = false;
+    let cache = state.shared.cache.load_full();
+    // Swept over the resident term index (names only); only the returned page is decoded, via the
+    // L1 cache. Needles holding the blob separator can't be answered from it and stream instead.
+    if finder.needle().contains(&0) {
+        cache.for_each_while(|path, l1| {
+            for sym in &l1.symbols {
+                if finder.find(sym.name.as_bytes()).is_none() || kind.is_some_and(|k| sym.kind != k) {
+                    continue;
+                }
+                if seen < skip {
+                    seen += 1;
+                    continue;
+                }
+                seen += 1;
+                total += 1;
+                if results.len() < limit {
+                    results.push(search_hit(path, sym));
+                }
+                if total >= max_total {
+                    total_is_partial = true;
+                    return false;
+                }
             }
-        })
-        .collect();
-    let budgeted = super::budget::apply_budget(page, budget(p.max_tokens));
-    let symbols = budgeted.items;
-    let next = skip + symbols.len();
-    let imports: Vec<String> = if skip == 0 {
-        l1.imports
-            .iter()
-            .take(OUTLINE_IMPORTS_MAX)
-            .map(|import| import.module.clone().unwrap_or_else(|| import.raw.clone()))
-            .collect()
+            true
+        });
     } else {
-        Vec::new()
-    };
-
-    let imports_omitted = if skip == 0 {
-        l1.imports.len().saturating_sub(OUTLINE_IMPORTS_MAX)
+        'sweep: for (path, terms) in cache.terms().iter() {
+            let mut page: Vec<usize> = Vec::new();
+            for idx in terms.matching_symbols(&finder, kind) {
+                if seen < skip {
+                    seen += 1;
+                    continue;
+                }
+                seen += 1;
+                total += 1;
+                if results.len() + page.len() < limit {
+                    page.push(idx);
+                }
+                if total >= max_total {
+                    total_is_partial = true;
+                    push_hits(&cache, path, &page, &mut results);
+                    break 'sweep;
+                }
+            }
+            push_hits(&cache, path, &page, &mut results);
+        }
+    }
+    let truncated = total > limit || total_is_partial;
+    let budget = super::budget::apply_budget(results, params.max_tokens);
+    let results = budget.items;
+    let budgeted = budget.budgeted;
+    let next_cursor = if total > results.len() {
+        Some(super::cursor::Cursor::encode_in_memory(
+            (skip + results.len()) as u64,
+            generation,
+        ))
     } else {
-        0
+        None
     };
-
-    json_result(&OutlineResponse {
-        path: p.path,
-        language: l1.language.clone(),
-        size_bytes: l1.size_bytes,
-        had_errors: l1.had_errors,
-        total,
-        budgeted: budgeted.budgeted,
-        stale,
-        symbols,
-        truncated: imports_omitted > 0,
-        truncated_reason: (imports_omitted > 0).then_some("imports"),
-        omitted: imports_omitted,
-        imports,
-        next_cursor: (next < total).then(|| super::cursor::Cursor::encode_in_memory(next as u64, generation)),
-        notice: state.lifecycle_notice(),
-        elapsed_us: elapsed_us(started),
-    })
+    super::toon::format_result(
+        &SearchResponse {
+            total,
+            total_is_partial,
+            truncated,
+            budgeted,
+            results,
+            next_cursor,
+            cursor_invalidated: false,
+            notice: state.lifecycle_notice(),
+            elapsed_us: elapsed_us(started),
+        },
+        format,
+    )
 }
 
-/// Body of `code_refs` relation `importers`: a heuristic reverse lookup over every file's imports.
+/// Body of the `dependents` mode: a heuristic reverse lookup over every file's imports.
 ///
 /// Streams the corpus instead of consulting a pre-flattened imports index. That index was a second
 /// full copy of every import held for the process lifetime, to save one pass over data this tool
@@ -464,36 +683,9 @@ pub(super) async fn code_outline(state: &ServerState, p: CodeOutlineParams) -> R
 async fn run_dependents(
     state: &ServerState,
     module: String,
-    limit: Option<u32>,
-    cursor: Option<super::cursor::Cursor>,
-    max_tokens: Option<u32>,
     started: std::time::Instant,
 ) -> Result<CallToolResult, McpError> {
-    use std::sync::atomic::Ordering;
-
     state.await_cache_ready().await;
-    let generation = state.shared.cache_generation.load(Ordering::Relaxed);
-    let skip = match cursor.as_ref() {
-        Some(cursor) => {
-            let (offset, snapshot) = cursor.decode_in_memory()?;
-            if snapshot != generation {
-                return Err(McpError::invalid_params(
-                    "`code_refs`: the index changed since this cursor was issued. Call again without `cursor`."
-                        .to_string(),
-                    None,
-                ));
-            }
-            offset as usize
-        }
-        None => 0,
-    };
-    let limit = limit.unwrap_or(SEARCH_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
-    if module.is_empty() {
-        return Err(McpError::invalid_params(
-            "`code_refs`: `name` is empty; pass the module or import path to look for.".to_string(),
-            None,
-        ));
-    }
     let finder = memchr::memmem::Finder::new(module.as_bytes());
     let mut paths: Vec<crate::path::RelPath> = Vec::new();
     let cache = state.shared.cache.load_full();
@@ -503,7 +695,6 @@ async fn run_dependents(
                 paths.push(path.clone());
             }
         });
-        paths.sort_unstable();
     } else {
         // Path order, so `paths` comes out sorted.
         paths.extend(
@@ -514,16 +705,9 @@ async fn run_dependents(
                 .map(|(p, _)| p.clone()),
         );
     }
-    let total = paths.len();
-    let page: Vec<crate::path::RelPath> = paths.into_iter().skip(skip).take(limit).collect();
-    let budgeted = super::budget::apply_budget(page, max_tokens);
-    let next = skip + budgeted.items.len();
     json_result(&DependentsResponse {
         module,
-        total,
-        budgeted: budgeted.budgeted,
-        paths: budgeted.items,
-        next_cursor: (next < total).then(|| super::cursor::Cursor::encode_in_memory(next as u64, generation)),
+        paths,
         notice: state.lifecycle_notice(),
         elapsed_us: elapsed_us(started),
     })

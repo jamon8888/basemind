@@ -36,7 +36,13 @@ use crate::store_gc_live::{SweepLock, collect_workspace_hashes_healing_stale_vie
 /// (code-search tier), and `.rref.msgpack` (code-intel resolved-references tier). All share the
 /// same source-hash stem as the `.fm` blob, so they are reclaimed together when the source file
 /// changes or is deleted (its stem drops out of the live set).
-const BLOB_SUFFIXES: [&str; 4] = [".fm.msgpack", ".doc.msgpack", ".chunk.msgpack", ".rref.msgpack"];
+const BLOB_SUFFIXES: [&str; 5] = [
+    ".fm.msgpack",
+    ".doc.msgpack",
+    ".chunk.msgpack",
+    ".rref.msgpack",
+    ".rehydration.blob",
+];
 
 /// Pre-0.9 split-tier blob suffixes (`<hash>.l1.msgpack` / `<hash>.l2.msgpack`), superseded by
 /// the combined `.fm.msgpack` frame. No current code writes or reads these, so any left on disk
@@ -52,10 +58,6 @@ const LEGACY_BLOB_SUFFIXES: [&str; 2] = [".l1.msgpack", ".l2.msgpack"];
 /// encounter; the grace costs only delayed reclamation.
 const BLOB_GC_GRACE: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Suffix of the temp files blob writers stage before an atomic rename
-/// (`<stem>.rref.msgpack.<pid>.ThreadId(N).tmp`). A writer that died leaves its file behind.
-const TMP_SUFFIX: &str = ".tmp";
-
 /// Env override for [`BLOB_GC_GRACE`], in whole seconds (`0` reclaims every unreferenced blob at
 /// once). Meant for operators clearing a known-dead cache and for the upgrade regression tests; the
 /// default protects entry-less blobs that a concurrent scan is about to reference.
@@ -63,7 +65,7 @@ pub const BLOB_GC_GRACE_ENV: &str = "BASEMIND_BLOB_GC_GRACE_SECS";
 
 /// The grace the destructive sweeps apply: [`BLOB_GC_GRACE_ENV`] when set to a number, else
 /// [`BLOB_GC_GRACE`].
-pub(crate) fn blob_gc_grace() -> Duration {
+fn blob_gc_grace() -> Duration {
     grace_from(std::env::var(BLOB_GC_GRACE_ENV).ok().as_deref())
 }
 
@@ -75,9 +77,7 @@ fn grace_from(raw: Option<&str>) -> Duration {
 /// The orphaned-workspace reaper — the other half of keeping the machine-global cache bounded.
 /// Lives in its own module (like `store_lock.rs`) to keep this file under the module size cap;
 /// re-exported here so callers see one GC surface.
-pub use crate::store_gc_workspace::{
-    MarkerlessCandidates, ReapReport, markerless_workspace_candidates, reap_orphaned_workspaces,
-};
+pub use crate::store_gc_workspace::{ReapReport, reap_orphaned_workspaces};
 
 /// Cache size-budget enforcement + persisted last-GC state — the third leg of keeping the
 /// machine-global cache bounded (and observable). Re-exported so callers see one GC surface.
@@ -89,9 +89,7 @@ pub use crate::store_gc_budget::{
 /// Lives in its own module to keep this file under the module size cap; re-exported here so
 /// callers keep importing the whole cache surface from `crate::store_gc`.
 pub(crate) use crate::store_cache_admin::dir_size;
-pub use crate::store_cache_admin::{
-    CacheComponent, CacheStats, ClearReport, cache_stats, clear_component, clear_single_view,
-};
+pub use crate::store_cache_admin::{CacheComponent, CacheStats, cache_stats, clear_component, clear_single_view};
 
 /// Errors raised by the cache GC + cleanup layer. Wraps [`StoreError`] for the shared
 /// blob/index machinery and adds a thin I/O variant for the directory walks this module
@@ -138,14 +136,6 @@ pub struct GcReport {
     /// [`Self::bytes_freed`], which counts only global-blob bytes.
     #[serde(default)]
     pub workspace_bytes_freed: u64,
-    /// Marker-less workspace dirs the next destructive sweep would reap (see
-    /// [`markerless_workspace_candidates`]). Set only by [`gc_report_only`]; a destructive sweep
-    /// counts the ones it removed in [`Self::workspaces_reaped`].
-    #[serde(default)]
-    pub markerless_workspaces_reapable: usize,
-    /// On-disk size of those dirs.
-    #[serde(default)]
-    pub markerless_workspace_bytes_reapable: u64,
     /// Cold workspace dirs evicted by cache-budget enforcement (see
     /// [`crate::store_gc_budget::enforce_cache_budget`]). `0` on every path that does not
     /// enforce the budget.
@@ -183,10 +173,7 @@ pub struct GcReport {
 /// A view directory that simply has no `index.msgpack` yet (`read_index` returns
 /// `Ok(None)`) contributes nothing and is skipped — it genuinely references no blobs.
 ///
-/// A view a newer basemind wrote is skipped too: blobs are namespaced by schema, so it cannot
-/// reference a blob of this binary's namespace.
-///
-/// Any *other* read failure (corrupt msgpack, an older schema, I/O error) is treated as a
+/// Any *other* read failure (corrupt msgpack, schema mismatch, I/O error) is treated as a
 /// hard error and propagated. Silently skipping such a view would drop its live hashes from
 /// the union and cause the subsequent sweep to delete blobs that are in fact still
 /// referenced — orphaning the entire store. Refusing to sweep when the live set might be
@@ -214,17 +201,16 @@ pub fn collect_referenced_hashes(basemind_dir: &Path) -> Result<LiveBlobs, GcErr
         let index = match read_index(&view_dir) {
             Ok(Some(idx)) => idx,
             Ok(None) => continue,
-            // A newer basemind's view names blobs of its own namespace only: it has no vote in
-            // this one, and must not stop the sweep of it.
-            Err(StoreError::NewerSchema { .. }) => continue,
             Err(e) => return Err(GcError::Store(e)),
         };
         for entry in index.files.values() {
             referenced.code.insert(entry.hash_hex.clone());
         }
-        referenced.code.extend(index.rebuild_pins);
         for entry in index.doc_files.values() {
             referenced.docs.insert(entry.hash_hex.clone());
+            if let Some(ref rref) = entry.rehydration_ref {
+                referenced.docs.insert(rref.clone());
+            }
         }
     }
     Ok(referenced)
@@ -267,11 +253,6 @@ fn gc_blobs_in(blobs_dir: &Path, referenced: &LiveBlobs, grace: Duration) -> Res
         let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if file_name.ends_with(TMP_SUFFIX) {
-            report.scanned += 1;
-            sweep_stray_tmp(&path, now, grace, &mut report)?;
-            continue;
-        }
         let is_legacy = LEGACY_BLOB_SUFFIXES.iter().any(|suffix| file_name.ends_with(suffix));
         let Some(_) = blob_stem(file_name) else {
             report.scanned += 1;
@@ -311,31 +292,6 @@ fn gc_blobs_in(blobs_dir: &Path, referenced: &LiveBlobs, grace: Duration) -> Res
         report.bytes_freed += size;
     }
     Ok(report)
-}
-
-/// Remove `path`, a stray `*.tmp`, when it is older than the grace window.
-///
-/// Age is the only test: a tmp file is never "referenced", and one a live writer is still filling
-/// has a fresh mtime. The window is never shorter than [`BLOB_GC_GRACE`] even when the caller
-/// passes a zero grace (the budget sweep does), because a zero window would reap an in-flight write.
-fn sweep_stray_tmp(path: &Path, now: SystemTime, grace: Duration, report: &mut GcReport) -> Result<(), GcError> {
-    let io = |source| GcError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let meta = std::fs::metadata(path).map_err(io)?;
-    let age = meta
-        .modified()
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .unwrap_or(Duration::ZERO);
-    if age < grace.max(BLOB_GC_GRACE) {
-        return Ok(());
-    }
-    std::fs::remove_file(path).map_err(io)?;
-    report.removed += 1;
-    report.bytes_freed += meta.len();
-    Ok(())
 }
 
 /// Union the referenced blob stems across EVERY workspace index under the machine-global cache.
@@ -385,41 +341,7 @@ pub fn gc_global_blobs() -> Result<GcReport, GcError> {
         tracing::debug!("global blob sweep already running in another process; skipping");
         return Ok(GcReport::default());
     };
-    gc_blob_store_in(
-        &cache.join(WORKSPACES_DIR),
-        &crate::store_layout::global_blobs_root(),
-        crate::extract::SCHEMA_VER,
-        blob_gc_grace(),
-    )
-}
-
-/// Sweep a whole blob store: the unreferenced blobs of the `schema` namespace under `blobs_root`,
-/// and everything older builds left there (see [`crate::store_gc_namespaces`]). The second sweep
-/// needs no live set, so it runs whatever became of the first: a workspace whose references cannot
-/// be read must not also keep the superseded namespaces on disk.
-pub(crate) fn gc_blob_store_in(
-    workspaces_dir: &Path,
-    blobs_root: &Path,
-    schema: u16,
-    grace: Duration,
-) -> Result<GcReport, GcError> {
-    let current = gc_global_blobs_in(workspaces_dir, &blobs_root.join(format!("v{schema}")), grace);
-    let superseded = crate::store_gc_namespaces::sweep_superseded_namespaces(blobs_root, schema, grace);
-    if let (Err(_), Ok(superseded)) = (&current, &superseded)
-        && superseded.removed > 0
-    {
-        tracing::info!(
-            removed = superseded.removed,
-            bytes_freed = superseded.bytes_freed,
-            "reaped superseded blob namespaces although the current one could not be swept"
-        );
-    }
-    let mut report = current?;
-    let superseded = superseded?;
-    report.scanned += superseded.scanned;
-    report.removed += superseded.removed;
-    report.bytes_freed += superseded.bytes_freed;
-    Ok(report)
+    gc_global_blobs_in(&cache.join(WORKSPACES_DIR), &global_blobs_dir(), blob_gc_grace())
 }
 
 /// The cleanup a scan runs for itself when it displaced artifacts (see
@@ -497,36 +419,25 @@ pub fn run_gc(basemind_dir: &Path) -> Result<GcReport, GcError> {
     Ok(report)
 }
 
-/// Non-destructive GC report over the GLOBAL blob store: counts every blob file (`scanned`), in
-/// every namespace and beside them, and the marker-less workspace dirs the daemon's sweep would
-/// reap, and removes nothing. This is the safe standalone behavior while the blob store is
-/// machine-global (see [`run_gc`]). `bytes_freed` / `removed` are always `0`.
+/// Non-destructive GC report over the GLOBAL blob store: counts every blob file (`scanned`) and
+/// removes nothing. This is the safe standalone behavior while the blob store is machine-global —
+/// see [`run_gc`]. `bytes_freed` / `removed` are always `0`.
 pub fn gc_report_only() -> Result<GcReport, GcError> {
-    let candidates = markerless_workspace_candidates()?;
-    Ok(GcReport {
-        markerless_workspaces_reapable: candidates.count,
-        markerless_workspace_bytes_reapable: candidates.bytes,
-        scanned: count_blob_files(&crate::store_layout::global_blobs_root())?,
-        ..GcReport::default()
-    })
-}
-
-/// How many files a blob store holds: those in its root (blobs from before the namespaces) and
-/// those of each namespace directory.
-pub(crate) fn count_blob_files(blobs_root: &Path) -> Result<usize, GcError> {
-    if !blobs_root.exists() {
-        return Ok(0);
+    let blobs_dir = global_blobs_dir();
+    let mut report = GcReport::default();
+    if !blobs_dir.exists() {
+        return Ok(report);
     }
-    let mut files = 0;
-    for entry in read_dir(blobs_root)?.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files += read_dir(&path)?.flatten().filter(|blob| blob.path().is_file()).count();
-        } else {
-            files += 1;
+    for entry in read_dir(&blobs_dir)? {
+        let entry = entry.map_err(|source| GcError::Io {
+            path: blobs_dir.clone(),
+            source,
+        })?;
+        if entry.path().is_file() {
+            report.scanned += 1;
         }
     }
-    Ok(files)
+    Ok(report)
 }
 
 /// Strip a known blob suffix off a filename, returning the hex stem. `None` if the filename
@@ -550,6 +461,7 @@ pub(crate) fn read_dir(dir: &Path) -> Result<std::fs::ReadDir, GcError> {
 #[path = "store_gc_tier_tests.rs"]
 mod tier_tests;
 
+/// The module's tests live in a subdirectory by the 1000-line module cap
+/// (`tests/max_lines.rs`), the same shape `tier_tests` above uses.
 #[cfg(test)]
-#[path = "store_gc_tests.rs"]
 mod tests;

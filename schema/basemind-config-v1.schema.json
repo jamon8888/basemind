@@ -73,19 +73,7 @@
         "enabled": true,
         "mime_allowlist": [],
         "include": [],
-        "exclude": [
-          "*.svg",
-          "pnpm-lock.yaml",
-          "package-lock.json",
-          "yarn.lock",
-          "Cargo.lock",
-          "poetry.lock",
-          "*.lock",
-          "**/test_data/**",
-          "**/testdata/**",
-          "**/fixtures/**",
-          "**/__snapshots__/**"
-        ],
+        "exclude": [],
         "max_file_bytes": 52428800,
         "extension_denylist": [],
         "max_chunks_per_document": 2000,
@@ -95,9 +83,9 @@
         "max_abandoned_extractions": 4,
         "markdown_chunk_max_bytes": 1048576,
         "plain_text_chunk_max_bytes": 4194304,
-        "max_characters": 1000,
-        "overlap": 200,
-        "embedding_preset": "balanced",
+        "max_characters": 800,
+        "overlap": 100,
+        "embedding_preset": "multilingual",
         "embed": true,
         "embed_include": [],
         "embed_exclude": [],
@@ -112,8 +100,8 @@
         },
         "reranker": {
           "enabled": false,
-          "preset": "bge-reranker-base",
-          "top_k": 10
+          "preset": "bge-reranker-v2-m3",
+          "top_k": 20
         },
         "keywords": {
           "enabled": false,
@@ -138,14 +126,66 @@
           "enabled": false,
           "strategy": "extractive"
         },
+        "redaction": {
+          "enabled": false,
+          "categories": [],
+          "strategy": "token-replace",
+          "ner": null,
+          "preserve_offsets": true,
+          "custom_terms": [],
+          "custom_patterns": []
+        },
         "ocr": {
           "backend": "tesseract",
           "languages": [
-            "eng"
+            "eng",
+            "deu",
+            "fra",
+            "spa",
+            "ita",
+            "nld",
+            "pol"
           ]
         },
         "output": {
           "format": "json"
+        },
+        "fusion": {
+          "max_relaxations": 3
+        },
+        "fts": {
+          "ngram_min_length": 3,
+          "ngram_max_length": 3,
+          "stem": true,
+          "remove_stop_words": true,
+          "ascii_folding": true,
+          "max_token_length": 64,
+          "stemmer_language": "English",
+          "custom_stop_words": [
+            "pursuant",
+            "herein",
+            "hereto",
+            "aforesaid",
+            "wherein",
+            "notwithstanding",
+            "provided that",
+            "hereinafter",
+            "thereunder"
+          ]
+        },
+        "graphrag": {
+          "enabled": false,
+          "labels": [
+            "person",
+            "organization",
+            "location"
+          ],
+          "max_rows": 200,
+          "hops": 2
+        },
+        "citations": {
+          "extract": true,
+          "max_per_chunk": 64
         },
         "embed_max_threads": 0
       }
@@ -154,18 +194,19 @@
       "description": "Resource-governance knobs: scanner / embedder thread caps, document\nconcurrency, embed batch size, footprint ceiling, and the document model\nprofile. Bounds basemind's footprint on constrained machines.",
       "$ref": "#/$defs/ResourcesConfig",
       "default": {
-        "scan_threads": 0,
-        "embed_threads": 0,
-        "max_concurrent_documents": 0,
-        "embed_batch_size": 32,
+        "scan_threads": 2,
+        "embed_threads": 2,
+        "max_concurrent_documents": 1,
+        "embed_batch_size": 16,
         "max_footprint_mb": 0,
-        "max_map_cache_mb": 256,
+        "max_map_cache_mb": 128,
         "document_models": "full",
+        "keep_models_warm": false,
         "onnx_provider": "cpu"
       }
     },
     "code_search": {
-      "description": "Semantic code-search tier: chunk + embed source for the `code_search` tool.\nInert unless the `code-search` cargo feature is compiled in.",
+      "description": "Semantic code-search tier: chunk + embed source for the `code` tool's `semantic` mode.\nInert unless the `code-search` cargo feature is compiled in.",
       "$ref": "#/$defs/CodeSearchConfig",
       "default": {
         "enabled": true,
@@ -177,8 +218,8 @@
         "embed_exclude": [],
         "reranker": {
           "enabled": false,
-          "preset": "bge-reranker-base",
-          "top_k": 10
+          "preset": "bge-reranker-v2-m3",
+          "top_k": 20
         }
       }
     },
@@ -203,15 +244,30 @@
       }
     },
     "crawl": {
-      "description": "Deprecated and ignored: web crawling was removed. Accepted so files that still carry a\n`[crawl]` table (`basemind init` used to write one) keep loading.",
-      "$ref": "#/$defs/DeprecatedSection"
+      "$ref": "#/$defs/CrawlConfig",
+      "default": {
+        "respect_robots_txt": true,
+        "max_pages": 32,
+        "max_depth": 2,
+        "max_body_size": 4194304,
+        "user_agent": "basemind/0.38.0 (+https://github.com/Goldziher/basemind)",
+        "allow_private_network": false
+      }
     },
     "shells": {
-      "description": "Deprecated and ignored: agent shells were removed. Accepted so files that still carry a\n`[shells]` table keep loading.",
-      "$ref": "#/$defs/DeprecatedSection"
+      "description": "Visual / headless agent-shell presentation config. Consumed by the `shells` feature's\nvisual launcher; the schema is stable regardless of feature gating.",
+      "$ref": "#/$defs/ShellsConfig",
+      "default": {
+        "enabled": true,
+        "visual": "headless",
+        "terminal": "auto",
+        "default_cols": 200,
+        "default_rows": 50,
+        "keep_on_exit": true
+      }
     },
     "llm": {
-      "description": "Deprecated and ignored: LLM summarization and LLM entity recognition were removed and\nnothing else read this table. Accepted so existing files keep loading; a table with content\nlogs a warning.",
+      "description": "Shared LLM configuration. Consumed by reranker-llm, ner-llm, summarization-llm,\nVLM OCR, and any future LLM-backed capability. Off by default — leaving\n`api_key` `Unset` short-circuits any LLM-backed feature.",
       "$ref": "#/$defs/LlmConfig",
       "default": {
         "model": "",
@@ -295,7 +351,7 @@
           "default": true
         },
         "eager_l2": {
-          "description": "When true (default), the scanner runs L2 extraction (calls + docs) inline with L1.\nL2 populates the `calls_by_callee` Fjall partition that drives `code_refs`. Flipping to\n`false` halves the scan budget on large repos at the cost of empty reference-search results\nuntil a foreground L2 pass is triggered (or the existing on-demand\n`query::file_outline_l2` lazy path runs).",
+          "description": "When true (default), the scanner runs L2 extraction (calls + docs) inline with L1.\nL2 populates the `calls_by_callee` Fjall partition that drives the `code` tool's\n`references` and `callers` modes. Flipping to `false` halves the scan budget on large\nrepos at the cost\nof empty reference-search results until a foreground L2 pass is triggered (or the\nexisting on-demand `query::file_outline_l2` lazy path runs).",
           "type": "boolean",
           "default": true
         },
@@ -321,7 +377,7 @@
       "type": "object",
       "properties": {
         "precise_resolution": {
-          "description": "Master switch for precise, scope- and import-aware name resolution. When `true` (default),\nlanguages with a precise engine resolve references to their true definitions — JS/TS via oxc\n(`code-intel-js`), Python/Java via the stack-graphs `.tsg` engine (`code-intel-stack`) — so\n`code_refs` (pinned callers and the `definition` relation) distinguishes a shadowed local\nfrom an import instead of matching by name. Set to `false` to fall back to fast tree-sitter `locals`\nscope binding for every language (the precise engines are skipped). Inert for languages with\nno precise engine regardless. Takes effect on files (re)analyzed after the change; run a full\n`basemind scan` to apply it to an already-indexed repo.",
+          "description": "Master switch for precise, scope- and import-aware name resolution. When `true` (default),\nlanguages with a precise engine resolve references to their true definitions — JS/TS via oxc\n(`code-intel-js`), Python/Java via the stack-graphs `.tsg` engine (`code-intel-stack`) — so\n`code` modes `references` / `callers` / `definition` distinguish a shadowed local from an\nimport instead of matching by name. Set to `false` to fall back to fast tree-sitter `locals`\nscope binding for every language (the precise engines are skipped). Inert for languages with\nno precise engine regardless. Takes effect on files (re)analyzed after the change; run a full\n`basemind scan` to apply it to an already-indexed repo.",
           "type": "boolean",
           "default": true
         }
@@ -439,25 +495,13 @@
           "default": []
         },
         "exclude": {
-          "description": "Deny-list of globs applied to document indexing itself (not just embedding): matching files\nare not extracted, chunked or searchable as documents. Same syntax as `include`. The default\ndrops low-value bulk: `*.svg`, lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`,\n`Cargo.lock`, `poetry.lock`, `*.lock`) and test-data directories (`test_data`, `testdata`,\n`fixtures`, `__snapshots__`). Setting the key replaces the default list; `exclude = []`\nindexes all of them, and a custom list must repeat any default entry it still wants.",
+          "description": "Deny-list of globs applied to document indexing itself (not just embedding): matching files\nare not extracted, chunked or searchable as documents. Same syntax as `include`.",
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1
           },
-          "default": [
-            "*.svg",
-            "pnpm-lock.yaml",
-            "package-lock.json",
-            "yarn.lock",
-            "Cargo.lock",
-            "poetry.lock",
-            "*.lock",
-            "**/test_data/**",
-            "**/testdata/**",
-            "**/fixtures/**",
-            "**/__snapshots__/**"
-          ]
+          "default": []
         },
         "max_file_bytes": {
           "description": "Per-document size cap in bytes, independent of `[scan] max_file_bytes` (which only bounds\nsource files). Default 50 MiB, so PDFs and Office files above the 2 MiB scan cap are still\nextracted. Larger files are skipped and counted in the scan summary as too large.",
@@ -530,19 +574,19 @@
           "type": "integer",
           "format": "uint",
           "minimum": 64,
-          "default": 1000
+          "default": 800
         },
         "overlap": {
           "description": "Overlap between chunks in characters.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 200
+          "default": 100
         },
         "embedding_preset": {
-          "description": "Xberg embedding preset name. Defaults to \"balanced\".",
+          "description": "Xberg embedding preset name. Defaults to \"multilingual\"\n(multilingual-e5-base, 768-dim, 100+ languages).\n\nThe preset feeds the LanceDB `(dim, embedding_model, schema_ver)` triple,\nso changing it wipes and re-embeds every existing workspace index — pick\ndeliberately before indexing. Set `embedding_preset = \"balanced\"` for an\nEnglish-focused 768-dim alternative.",
           "type": "string",
-          "default": "balanced"
+          "default": "multilingual"
         },
         "embed": {
           "description": "Generate embeddings (`true`) or skip vector storage entirely (`false`).",
@@ -568,19 +612,19 @@
           "default": []
         },
         "extract_archives": {
-          "description": "Deprecated and ignored: archive extraction was removed, so archives and compressed\ncontainers (`.zip/.tar/.jar/...`) are always skipped. Accepted so existing files keep\nloading; `true` logs a warning.",
+          "description": "Route archives (`.zip/.tar/.jar/...`) into xberg's recursive archive extractor. Default\n`false`: archives and compressed containers are rejected by the built-in floor before any\nextraction, so a single archive can't explode into thousands of embeds. Flip to `true` to opt\ninto extracting the files *inside* archives — at the cost of the extra recursion + embedding\nwork. True binaries (`.so/.wasm/.exe/...`) are always rejected regardless of this flag.",
           "type": "boolean",
           "default": false
         },
         "max_archive_bytes": {
-          "description": "Cap on the total *uncompressed* bytes xberg may unpack from the zip container of one Office\ndocument (`.docx/.pptx/.xlsx/.odt`). A document past the cap fails extraction (counted as an\nextract failure) instead of being unpacked into memory. Default 64 MiB; xberg's own default\nis 500 MB.",
+          "description": "Cap on the total *uncompressed* bytes xberg may unpack from one archive when\n`extract_archives = true`. An archive past the cap fails extraction (counted as an extract\nfailure) instead of being unpacked into memory. Default 64 MiB; xberg's own default is 500 MB.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1024,
           "default": 67108864
         },
         "max_archive_entries": {
-          "description": "Cap on the number of entries in the zip container of one Office document\n(`.docx/.pptx/.xlsx/.odt`). Default 1000; xberg's own default is 10,000.",
+          "description": "Cap on the number of entries in one archive when `extract_archives = true`. Default 1000;\nxberg's own default is 10,000.",
           "type": "integer",
           "format": "uint",
           "minimum": 1,
@@ -601,8 +645,8 @@
           "$ref": "#/$defs/RerankerConfig",
           "default": {
             "enabled": false,
-            "preset": "bge-reranker-base",
-            "top_k": 10
+            "preset": "bge-reranker-v2-m3",
+            "top_k": 20
           }
         },
         "keywords": {
@@ -640,13 +684,32 @@
             "strategy": "extractive"
           }
         },
+        "redaction": {
+          "description": "PII redaction / anonymisation at ingest time.",
+          "$ref": "#/$defs/RedactionConfig",
+          "default": {
+            "enabled": false,
+            "categories": [],
+            "strategy": "token-replace",
+            "ner": null,
+            "preserve_offsets": true,
+            "custom_terms": [],
+            "custom_patterns": []
+          }
+        },
         "ocr": {
           "description": "OCR backend selection for image / scanned-PDF inputs.",
           "$ref": "#/$defs/OcrConfig",
           "default": {
             "backend": "tesseract",
             "languages": [
-              "eng"
+              "eng",
+              "deu",
+              "fra",
+              "spa",
+              "ita",
+              "nld",
+              "pol"
             ]
           }
         },
@@ -655,6 +718,59 @@
           "$ref": "#/$defs/OutputConfig",
           "default": {
             "format": "json"
+          }
+        },
+        "fusion": {
+          "description": "Lexical retrieval controls (`[documents.fusion]`).",
+          "$ref": "#/$defs/FusionConfig",
+          "default": {
+            "max_relaxations": 3
+          }
+        },
+        "fts": {
+          "description": "Tokenizer settings for the lexical index (`[documents.fts]`).",
+          "$ref": "#/$defs/FtsConfig",
+          "default": {
+            "ngram_min_length": 3,
+            "ngram_max_length": 3,
+            "stem": true,
+            "remove_stop_words": true,
+            "ascii_folding": true,
+            "max_token_length": 64,
+            "stemmer_language": "English",
+            "custom_stop_words": [
+              "pursuant",
+              "herein",
+              "hereto",
+              "aforesaid",
+              "wherein",
+              "notwithstanding",
+              "provided that",
+              "hereinafter",
+              "thereunder"
+            ]
+          }
+        },
+        "graphrag": {
+          "description": "GraphRAG entity graph (`[graphrag]`).",
+          "$ref": "#/$defs/GraphragConfig",
+          "default": {
+            "enabled": false,
+            "labels": [
+              "person",
+              "organization",
+              "location"
+            ],
+            "max_rows": 200,
+            "hops": 2
+          }
+        },
+        "citations": {
+          "description": "Identifier extraction for the exact lane (`[documents.citations]`).",
+          "$ref": "#/$defs/CitationsConfig",
+          "default": {
+            "extract": true,
+            "max_per_chunk": 64
           }
         },
         "embed_max_threads": {
@@ -709,19 +825,51 @@
           "default": false
         },
         "preset": {
-          "description": "Xberg reranker preset name (`bge-reranker-base` is the small default;\n`bge-reranker-large` and `bge-reranker-v2-m3` are heavier alternatives).",
+          "description": "Xberg reranker preset name. Defaults to `bge-reranker-v2-m3` (multilingual,\n568M params, 100+ languages) per the GDPR PII spec: cross-encoder reranking\nmust cover all EU languages. Costs nothing while `enabled = false` (default).",
           "type": "string",
-          "default": "bge-reranker-base"
+          "default": "bge-reranker-v2-m3"
         },
         "top_k": {
-          "description": "How many hits to rerank. The vector search returns `top_k` candidates\nwhich the cross-encoder then reorders.",
+          "description": "How many hits to rerank. The vector search returns `top_k` candidates\nwhich the cross-encoder then reorders. Defaults to 20 per spec.",
           "type": "integer",
           "format": "uint",
-          "minimum": 1,
-          "default": 10
+          "minimum": 0,
+          "default": 20
+        },
+        "custom_model": {
+          "description": "Custom ONNX cross-encoder (Hugging Face repo) used when no per-call\npreset is given. Lets deployments run models xberg ships no preset\nfor (e.g. `onnx-community/gte-multilingual-reranker-base` int8).\nAn explicit per-call preset always wins over this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CustomRerankerModel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "CustomRerankerModel": {
+      "description": "Custom ONNX cross-encoder resolved from a Hugging Face repo by xberg's\nlazy downloader (same layout convention as its `Custom` embedding models).",
+      "type": "object",
+      "properties": {
+        "model_id": {
+          "description": "Hugging Face repo id, e.g. `\"onnx-community/gte-multilingual-reranker-base\"`.",
+          "type": "string"
+        },
+        "model_file": {
+          "description": "ONNX file within the repo. Defaults to `\"onnx/model.onnx\"`; int8\nvariants use e.g. `\"onnx/model_int8.onnx\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model_id"
+      ]
     },
     "KeywordsConfig": {
       "type": "object",
@@ -740,7 +888,7 @@
           "description": "Maximum keywords to extract per document. Matches xberg's\n`KeywordConfig.max_keywords` default of 10.",
           "type": "integer",
           "format": "uint",
-          "minimum": 1,
+          "minimum": 0,
           "default": 10
         },
         "min_score": {
@@ -787,12 +935,12 @@
       "type": "object",
       "properties": {
         "enabled": {
-          "description": "Master switch — off by default; the ONNX backend downloads gline-rs weights on first use.\nNeeds a build with the `documents-ner` Cargo feature (the published binaries have it);\nwithout it the switch has no effect and a warning is logged.",
+          "description": "Master switch — off by default; ONNX backend downloads gline-rs weights on\nfirst use, LLM backend costs API tokens. Maps to `Some(NerConfig)` /\n`None` on `ExtractionConfig.ner`.",
           "type": "boolean",
           "default": false
         },
         "backend": {
-          "description": "Backend selection. `onnx` uses gline-rs locally. `llm` is accepted but not supported: no\nentities are extracted and a warning is logged.",
+          "description": "Backend selection. `onnx` uses gline-rs locally; `llm` routes through the\nshared `[llm]` config.",
           "$ref": "#/$defs/NerBackend",
           "default": "onnx"
         },
@@ -813,7 +961,7 @@
           "default": []
         },
         "custom_labels": {
-          "description": "Arbitrary user-supplied entity labels for gline-rs zero-shot inference. Matches xberg's\n`NerConfig.custom_labels`. Useful for domain-specific types like\n`\"Treatment\"`, `\"Vessel\"` without forking GLiNER's taxonomy. Custom\nlabels surface as `EntityCategory::Custom(_)` in the entity stream.",
+          "description": "Arbitrary user-supplied entity labels for gline-rs zero-shot inference\n(and the LLM backend's structured-output schema). Matches xberg's\n`NerConfig.custom_labels`. Useful for domain-specific types like\n`\"Treatment\"`, `\"Vessel\"` without forking GLiNER's taxonomy. Custom\nlabels surface as `EntityCategory::Custom(_)` in the entity stream.",
           "type": "array",
           "items": {
             "type": "string"
@@ -839,7 +987,7 @@
           "default": false
         },
         "strategy": {
-          "description": "Strategy: `extractive` (TextRank). `abstractive` is deprecated: LLM summarization was\nremoved, so it logs a warning and produces extractive summaries.",
+          "description": "Strategy: `extractive` (TextRank, no LLM) or `abstractive` (routed via\nthe top-level `[llm]` config). When `abstractive` is set but `[llm].model`\nis empty, the boundary falls back to `extractive` with a warning so the\nscan still completes.",
           "$ref": "#/$defs/SummarizationStrategy",
           "default": "extractive"
         },
@@ -862,22 +1010,179 @@
         "abstractive"
       ]
     },
+    "RedactionConfig": {
+      "description": "PII redaction / anonymisation config.\n\nWhen `enabled = true`, xberg's redaction post-processor runs at the Late stage\nof document extraction and rewrites every textual field (content, tables, metadata,\nURIs, form fields, OCR, Djot, etc.) with `[TYPE_N]` tokens via `TokenReplace`.\nThe rehydration map is NOT stored by basemind — it is returned to the caller\nvia `ExtractedDocument.redaction_report`. Use `basemind vault-encrypt` to\nencrypt and persist the map separately.\n\nRequires `xberg/redaction` (enabled in the `documents` feature) and\n`xberg/redaction-rehydrate` (also enabled in the `documents` feature) for the\n`TokenReplace` strategy that enables later rehydration.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch — off by default.",
+          "type": "boolean",
+          "default": false
+        },
+        "categories": {
+          "description": "PII categories to redact. Empty = all categories supported by the engine.\nAccepted values: `email`, `phone`, `ssn`, `credit_card`, `iban`,\n`ip_address`, `swift_bic`, `postal_code`, `person`, `organization`,\n`location`, `date_of_birth`. Categories suffixed with `_strict` use\nchecksum validation where applicable (e.g. `iban_strict`).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "strategy": {
+          "description": "Redaction strategy. `token_replace` (default) assigns stable `[TYPE_N]`\ntokens per category and is reversible via the rehydration map. `mask`\nreplaces with `[REDACTED]` irreversibly. `hash` replaces with\n`[HASH:...` irreversibly. `drop` removes the span with no marker.",
+          "$ref": "#/$defs/RedactionStrategy",
+          "default": "token-replace"
+        },
+        "ner": {
+          "description": "NER backend config for PERSON / ORGANIZATION / LOCATION categories.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NerRedactionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "preserve_offsets": {
+          "description": "Preserve chunk byte ranges after redaction (default: `true`).",
+          "type": "boolean",
+          "default": true
+        },
+        "custom_terms": {
+          "description": "Custom literal terms to redact. Each hit surfaces as `Custom(<label>)`\nin the redaction report.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RedactionCustomTerm"
+          },
+          "default": []
+        },
+        "custom_patterns": {
+          "description": "Custom regex patterns to redact. Each hit surfaces as `Custom(<label>)`\nin the redaction report.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RedactionCustomPattern"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "RedactionStrategy": {
+      "type": "string",
+      "enum": [
+        "token-replace",
+        "mask",
+        "hash",
+        "drop"
+      ]
+    },
+    "NerRedactionConfig": {
+      "description": "NER backend config for redaction (separate from the extraction-tier NER config).",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "description": "NER backend: `onnx` (local GLiNER) or `llm` (provider API).",
+          "$ref": "#/$defs/NerBackend",
+          "default": "onnx"
+        },
+        "model": {
+          "description": "Override the ONNX model name.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "categories": {
+          "description": "Categories to detect via NER.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "custom_labels": {
+          "description": "Custom labels for zero-shot detection.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "RedactionCustomTerm": {
+      "description": "A literal string to redact, surfaced as `Custom(<label>)` in the report.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "Label shown in the redaction report for each hit.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Literal value to find and redact.",
+          "type": "string"
+        },
+        "case_sensitive": {
+          "description": "Case-sensitive match (default: false, i.e. case-insensitive).",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "value"
+      ]
+    },
+    "RedactionCustomPattern": {
+      "description": "A regex pattern to redact, surfaced as `Custom(<label>)` in the report.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "Label shown in the redaction report for each hit.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regex pattern (Rust dialect, no look-around).",
+          "type": "string"
+        },
+        "case_sensitive": {
+          "description": "Case-sensitive match (default: false, i.e. case-insensitive).",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "pattern"
+      ]
+    },
     "OcrConfig": {
       "type": "object",
       "properties": {
         "backend": {
-          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value); OCR runs with xberg's defaults.",
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value). Tesseract remains the document-tier OCR backend for now.",
           "$ref": "#/$defs/OcrBackend",
           "default": "tesseract"
         },
         "languages": {
-          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value).",
+          "description": "Tesseract / PaddleOCR language packs (ISO 639-3 codes like `\"eng\"`). These are passed to\nthe document OCR backend. The default document build bundles English plus the six EU\nnational-ID languages (DE, FR, ES, IT, NL, PL), so OCR is ready offline.",
           "type": "array",
           "items": {
             "type": "string"
           },
           "default": [
-            "eng"
+            "eng",
+            "deu",
+            "fra",
+            "spa",
+            "ita",
+            "nld",
+            "pol"
           ]
         }
       },
@@ -906,43 +1211,182 @@
       "type": "string",
       "enum": [
         "json",
-        "toon"
+        "toon",
+        "markdown"
       ]
+    },
+    "FusionConfig": {
+      "description": "`[documents.fusion]` — lexical retrieval controls.",
+      "type": "object",
+      "properties": {
+        "max_relaxations": {
+          "description": "How many times a multi-term query may drop its lowest-idf term before giving up.\n\nThis bounds latency on a query that matches nothing conjunctively. Each relaxation is a\nwhole re-run of the FTS query, so this is a latency knob as much as a recall one.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 3
+        }
+      },
+      "additionalProperties": false
+    },
+    "FtsConfig": {
+      "description": "`[documents.fts]` — tokenizer settings for the lexical index.\n\nEvery field maps to a real `InvertedIndexParams` field; nothing here is a basemind-level\nsetting masquerading as a tokenizer one. Deliberately absent:\n\n- **`enabled`.** `[documents].enabled` is already the tier's master switch; a nested one\n  would shadow it and make \"the tier is on but the index is off\" expressible.\n- **Cadence keys.** `optimize()` frequency and the unindexed-row warning threshold are build\n  settings, not tokenizer parameters. They do not belong in a table named `fts`.\n- **`language`.** `[documents].language` already exists and is a *detection* table\n  (`auto_detect`, `min_confidence`, `detect_multiple`, `preferred_languages`). Two different\n  `language` keys of different shapes at different depths is a trap, so the stemmer's language\n  is named for what it does.",
+      "type": "object",
+      "properties": {
+        "ngram_min_length": {
+          "description": "N-gram length for the citation (trigram) index. Both bounds are set because Lance's n-gram\ntokenizer takes a min and a max; 3/3 is what makes `362` reach `§ 362(a)(1)`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 3
+        },
+        "ngram_max_length": {
+          "description": "Upper n-gram length for the citation index. See `ngram_min_length`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 3
+        },
+        "stem": {
+          "description": "Stemming on the lexical index.",
+          "type": "boolean",
+          "default": true
+        },
+        "remove_stop_words": {
+          "description": "Stop-word removal on the lexical index. The citation index overrides this to `false` —\nremoving stop words from a statute reference changes what it means.",
+          "type": "boolean",
+          "default": true
+        },
+        "ascii_folding": {
+          "description": "ASCII folding, so `société` matches `societe`. Matters for the French and Spanish corpora\nthis tier exists for.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_token_length": {
+          "description": "Maximum token length. Lance's default of 40 truncates long French and Spanish tokens, and a\ntruncated token indexes as the wrong term.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 64
+        },
+        "stemmer_language": {
+          "description": "Language whose stemmer and stop-word list apply.",
+          "type": "string",
+          "default": "English"
+        },
+        "custom_stop_words": {
+          "description": "Legal boilerplate added to the stop-word list. These carry no retrieval signal and are\nfrequent enough to dominate a short query.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "pursuant",
+            "herein",
+            "hereto",
+            "aforesaid",
+            "wherein",
+            "notwithstanding",
+            "provided that",
+            "hereinafter",
+            "thereunder"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GraphragConfig": {
+      "description": "GraphRAG entity graph configuration (spec 0016).\n\nWhen `enabled = true` (and the `graphrag` feature is compiled), the scanner\nbuilds `graph_entities` and `graph_edges` Lance tables from the NER sidecar\nat scan time. The `graph entities` and `graph rag` tool modes become available.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch — off by default.",
+          "type": "boolean",
+          "default": false
+        },
+        "labels": {
+          "description": "Labels to project as graph nodes. Default: person, organization, location + custom_labels.\nNumeric/secret labels (email, phone, iban, swift_bic, ip_address, api_key, password,\nssn, credit_card, date_of_birth) are excluded by default.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "person",
+            "organization",
+            "location"
+          ]
+        },
+        "max_rows": {
+          "description": "Max rows returned by Cypher queries (server-side budget).",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 200
+        },
+        "hops": {
+          "description": "Hop depth for graph rag expansion (1 or 2).",
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0,
+          "maximum": 255,
+          "default": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "CitationsConfig": {
+      "description": "`[documents.citations]` — identifier extraction for the exact lane.",
+      "type": "object",
+      "properties": {
+        "extract": {
+          "description": "Extract normalized identifiers (statute cites, docket numbers, case short names) at ingest.\n\nThe escape hatch for store size: the trigram index over this column is the one most likely\nto dominate the store on a large corpus. Turning it off disables the `exact` lane, not the\nrest of retrieval.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_per_chunk": {
+          "description": "Cap on identifiers stored per chunk. A dense statute-heavy chunk can yield hundreds.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 64
+        }
+      },
+      "additionalProperties": false
     },
     "ResourcesConfig": {
       "description": "Top-level `[resources]` table. Every field has `#[serde(default)]` (directly\nor via a default fn) so adding a knob never breaks an older TOML file, and an\nomitted `[resources]` section deserialises to [`ResourcesConfig::default`].\n\n`0` is the \"auto\" sentinel for the thread / concurrency caps: it means \"let\nbasemind pick a bounded fraction of the machine\" rather than \"use zero\nthreads\". This keeps the default config safe on a laptop while letting an\noperator pin an explicit budget on a shared box.\n\n**In the shared daemon these are ceilings, not requests.** The effective value is the smaller of\nthe file's and the daemon's cap (`BASEMIND_DAEMON_MAX_SCAN_THREADS`, `..._MAX_EMBED_THREADS`,\n`..._MAX_EMBED_BATCH`, `..._MAX_CONCURRENT_DOCUMENTS`, `..._MAX_FOOTPRINT_MB`,\n`..._MAX_MAP_CACHE_MB`, and `..._MAX_CANDIDATES` for `[scan] max_candidates`), and a file value\nthat means \"no limit\" (`0`, `\"auto\"`, `\"off\"`) resolves to the cap. The operator raises a cap in\nthe daemon's environment; a repository cannot.",
       "type": "object",
       "properties": {
         "scan_threads": {
-          "description": "Cap on the code-map scanner's rayon pool. `0` (auto) keeps rayon's\ndefault (one worker per logical CPU); a non-zero value pins the pool so\nthe scan can't saturate every core on a shared machine. First scan wins\nfor the process — the pool is built once and its size is then fixed.",
+          "description": "Cap on the code-map scanner's rayon pool. `2` pins the pool to a\nconservative default that leaves headroom on 8 GiB machines; `0` (auto)\nwould use one worker per logical CPU. First scan wins for the process —\nthe pool is built once and its size is then fixed.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 2
         },
         "embed_threads": {
-          "description": "Cap on the ONNX embedding pool. `0` (auto) resolves to\n`max(2, logical_cpus / 4)` via `crate::embeddings::resolve_embed_threads`\n— a bounded fraction of cores so the embedder never pins the machine and\nORT arenas are not replicated across every core. This supersedes the\ndeprecated `[documents].embed_max_threads`; see\n[`ResourcesConfig::effective_embed_threads`] for the precedence.",
+          "description": "Cap on the ONNX embedding pool. `2` pins the pool to a conservative\ndefault that bounds ORT arena replication on 8 GiB machines; `0` (auto)\nwould resolve to `max(2, logical_cpus / 4)`. This supersedes the\ndeprecated `[documents].embed_max_threads`; see\n[`ResourcesConfig::effective_embed_threads`] for the precedence.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 2
         },
         "max_concurrent_documents": {
-          "description": "Upper bound on documents extracted concurrently. `0` (auto) leaves the\ndispatch unbounded. Enforced by a counting semaphore around document\nextraction (`backpressure::acquire_doc_slot`).\n\nComplementary to `max_footprint_mb` rather than redundant with it: a\ndocument extraction's spike (decoded page buffers, OCR bitmaps, an\nembedding batch) lands faster than the footprint sampler can observe it,\nso a memory ceiling alone reacts after the allocation. This bounds how\nmany such spikes can overlap in the first place.",
+          "description": "Upper bound on documents extracted concurrently. `1` ensures only one\nGLiNER/embedding spike can be in-flight at a time on 8 GiB machines; `0`\n(auto) leaves the dispatch unbounded. Enforced by a counting semaphore\naround document extraction (`backpressure::acquire_doc_slot`).\n\nComplementary to `max_footprint_mb` rather than redundant with it: a\ndocument extraction's spike (decoded page buffers, OCR bitmaps, an\nembedding batch) lands faster than the footprint sampler can observe it,\nso a memory ceiling alone reacts after the allocation. This bounds how\nmany such spikes can overlap in the first place.",
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 0
+          "default": 1
         },
         "embed_batch_size": {
-          "description": "Number of chunks the embedder submits to ONNX per batch. Larger batches\namortise per-call overhead at the cost of a higher transient memory\nspike; 32 is a safe default across the preset models. Threaded into both\n`SharedEmbedder` (code-search + query paths) and the document extractor's\n`EmbeddingConfig`.",
+          "description": "Number of chunks the embedder submits to ONNX per batch. `16` amortises\nper-call overhead while keeping the transient memory spike low enough\nfor 8 GiB machines; 32 is the previous default. Threaded into both\n`SharedEmbedder` (code-search + query paths) and the document extractor's\n`EmbeddingConfig`.",
           "type": "integer",
           "format": "uint",
           "minimum": 1,
-          "default": 32
+          "default": 16
         },
         "max_footprint_mb": {
-          "description": "Ceiling on process memory footprint, in mebibytes. Accepts a positive\ninteger (an explicit ceiling), `0` or `\"auto\"` (derive one from the\nenvironment — the default), or `\"off\"` (no ceiling at all).\n\nThe best-effort backpressure gate\n([`crate::backpressure::FootprintGate`]) samples\n[`crate::sysres::phys_footprint`] at each admit point and parks the\nworker while the process is over the ceiling, shaving the scan's peak.\nIt stays best-effort: an unreadable sample or a sustained overshoot\nadmits anyway to guarantee forward progress, so the ceiling shapes the\npeak rather than enforcing a hard invariant.\n\n**`0` used to mean \"disabled\" and now means \"auto\".** A config carrying\nthe old default therefore gains a ceiling on upgrade; `\"off\"` restores\nthe previous behaviour. See [`MaxFootprint::auto_ceiling_bytes`] for the\narithmetic.",
+          "description": "Ceiling on process memory footprint, in mebibytes. Accepts a positive\ninteger (an explicit ceiling), `0` or `\"auto\"` (derive one from the\nenvironment — the default), or `\"off\"` (no ceiling at all).\n\nThe best-effort backpressure gate\n([`crate::backpressure::FootprintGate`]) samples\n[`crate::sysres::process_rss`] at each admit point and parks the\nworker while the process is over the ceiling, shaving the scan's peak.\nIt stays best-effort: an unreadable sample or a sustained overshoot\nadmits anyway to guarantee forward progress, so the ceiling shapes the\npeak rather than enforcing a hard invariant.\n\n**`0` used to mean \"disabled\" and now means \"auto\".** A config carrying\nthe old default therefore gains a ceiling on upgrade; `\"off\"` restores\nthe previous behaviour. See [`MaxFootprint::auto_ceiling_bytes`] for the\narithmetic.",
           "$ref": "#/$defs/MaxFootprint",
           "default": 0
         },
@@ -951,12 +1395,17 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0,
-          "default": 256
+          "default": 128
         },
         "document_models": {
           "description": "Which model families run during document extraction. `Full` (default)\nruns every configured post-processor; the narrower profiles strip\nenrichment / embeddings to shrink the scan-time footprint on code-centric\nworkspaces. See [`DocumentModelProfile`].",
           "$ref": "#/$defs/DocumentModelProfile",
           "default": "full"
+        },
+        "keep_models_warm": {
+          "description": "Keep ONNX embedding and NER engines resident after an embedding pass.\nThis removes the cold-model reload on the next scan or query at the cost\nof retaining the model weights and runtime arenas in the daemon.",
+          "type": "boolean",
+          "default": false
         },
         "onnx_provider": {
           "description": "ONNX Runtime execution provider for every model basemind loads (embeddings, reranking, layout\ndetection, NER). Defaults to `cpu`: on macOS the `auto` provider routes models through CoreML,\nwhich compiles a fresh graph per input shape and measured 7.6 GB resident for one tiny document\nagainst 0.8 GB on the CPU provider (and 3x slower), so a scan over a document-heavy repository\ngrew without bound. `auto` restores the platform default (CoreML on macOS, CUDA on a Linux\nbuild with GPU support); `coreml`, `cuda` and `tensorrt` pin one.",
@@ -1047,7 +1496,7 @@
       ]
     },
     "CodeSearchConfig": {
-      "description": "`[code_search]` table. Chunk + embed source code for the `code_search` tool.",
+      "description": "`[code_search]` table. Chunk + embed source code for the `code` tool's `semantic` mode.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1104,8 +1553,8 @@
           "$ref": "#/$defs/RerankerConfig",
           "default": {
             "enabled": false,
-            "preset": "bge-reranker-base",
-            "top_k": 10
+            "preset": "bge-reranker-v2-m3",
+            "top_k": 20
           }
         }
       },
@@ -1206,14 +1655,174 @@
       },
       "additionalProperties": false
     },
-    "DeprecatedSection": {
-      "description": "A table that configured a removed feature. Any content is accepted and nothing is read from it,\nso a `basemind.toml` written for an older version keeps loading under the strict schema.",
+    "CrawlConfig": {
       "type": "object",
-      "additionalProperties": true,
-      "deprecated": true
+      "properties": {
+        "respect_robots_txt": {
+          "description": "Honour `robots.txt` when fetching pages. Default `true`. Override only\nfor hosts you control — flipping this off violates `robots.txt`\ndirectives for every domain the crawler touches.",
+          "type": "boolean",
+          "default": true
+        },
+        "max_pages": {
+          "description": "Hard cap on pages visited in a single `web_crawl` call.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "default": 32
+        },
+        "max_depth": {
+          "description": "Maximum link-following depth from the seed URL during `web_crawl`.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 2
+        },
+        "max_body_size": {
+          "description": "Truncate response bodies above this many bytes before parsing.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1024,
+          "default": 4194304
+        },
+        "user_agent": {
+          "description": "User-Agent header sent with every request. Override to identify your\ncrawler to operators; the default includes the basemind release\nversion + the upstream repo URL so site operators can trace traffic.",
+          "type": "string",
+          "minLength": 1,
+          "default": "basemind/0.38.0 (+https://github.com/Goldziher/basemind)"
+        },
+        "allow_private_network": {
+          "description": "Allow crawling URLs that resolve to private, loopback, or link-local\naddresses (`127.0.0.0/8`, `10.0.0.0/8`, `169.254.0.0/16`, …). Default\n`false`: the engine rejects them with an SSRF-policy violation. Flip this\non only to scrape an internal docs server you control. **`true` in the repository's own\n`basemind.toml` is ignored (with a warning) unless the operator sets\n`BASEMIND_ALLOW_PRIVATE_HOSTS=1` in the environment**, because a cloned repository could\notherwise aim the crawler at internal services. (The `CRAWLBERG_ALLOW_PRIVATE_NETWORK` env\nvar is honoured as a process-wide override regardless of this setting.)",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ShellsConfig": {
+      "description": "`[shells]` config sub-tree. See module docs for context.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Only meaningful when the `shells` cargo feature is compiled in; when\n`false` the shell MCP / CLI tools are wired but no session is ever spawned.",
+          "type": "boolean",
+          "default": true
+        },
+        "visual": {
+          "description": "How a visual session is surfaced. Defaults to [`VisualMode::Headless`] so background agent\nwork does not open terminal tabs; opt into `current` or `window` for a visible attachment.",
+          "$ref": "#/$defs/VisualMode",
+          "default": "headless"
+        },
+        "terminal": {
+          "description": "Which terminal emulator to drive. [`TerminalChoice::Auto`] (the default) detects the\nrunning terminal from the environment and falls back gracefully.",
+          "$ref": "#/$defs/TerminalChoice",
+          "default": "auto"
+        },
+        "default_cols": {
+          "description": "Initial column count for the session's pseudo-terminal.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 200
+        },
+        "default_rows": {
+          "description": "Initial row count for the session's pseudo-terminal.",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 50
+        },
+        "keep_on_exit": {
+          "description": "Reserved: parsed but currently has no effect (a load-time warning is logged when set to a\nnon-default value).",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "VisualMode": {
+      "description": "How a visual shell session is presented to the user.",
+      "oneOf": [
+        {
+          "description": "Open the session as a new tab in the terminal that is already open.",
+          "type": "string",
+          "const": "current"
+        },
+        {
+          "description": "Open the session in a brand-new terminal window.",
+          "type": "string",
+          "const": "window"
+        },
+        {
+          "description": "Surface the session over a web frontend. No terminal is launched (no command is built); the caller gets the attach command.",
+          "type": "string",
+          "const": "web"
+        },
+        {
+          "description": "Do not present the session at all; it runs headless. This is the default for agent work.",
+          "type": "string",
+          "const": "headless"
+        }
+      ]
+    },
+    "TerminalChoice": {
+      "description": "Which terminal emulator the visual launcher should drive.\n\n[`TerminalChoice::Auto`] inspects the environment (`TERM_PROGRAM`, `$TERMINAL`, and platform\ndefaults) to pick a concrete emulator. The explicit variants force a specific emulator\nregardless of detection.",
+      "oneOf": [
+        {
+          "description": "Detect the running terminal from the environment and fall back gracefully.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "iTerm2 (macOS).",
+          "type": "string",
+          "const": "iterm2"
+        },
+        {
+          "description": "Terminal.app (macOS).",
+          "type": "string",
+          "const": "terminal_app"
+        },
+        {
+          "description": "Windows Terminal (`wt.exe`).",
+          "type": "string",
+          "const": "windows_terminal"
+        },
+        {
+          "description": "GNOME Terminal (Linux).",
+          "type": "string",
+          "const": "gnome_terminal"
+        },
+        {
+          "description": "Konsole (Linux / KDE).",
+          "type": "string",
+          "const": "konsole"
+        },
+        {
+          "description": "WezTerm (cross-platform).",
+          "type": "string",
+          "const": "wezterm"
+        },
+        {
+          "description": "Alacritty (cross-platform).",
+          "type": "string",
+          "const": "alacritty"
+        },
+        {
+          "description": "kitty (cross-platform).",
+          "type": "string",
+          "const": "kitty"
+        },
+        {
+          "description": "xterm (Linux / X11 fallback).",
+          "type": "string",
+          "const": "xterm"
+        }
+      ]
     },
     "LlmConfig": {
-      "description": "Deprecated and ignored: LLM credentials + model selection for the removed LLM summarization\nand LLM entity recognition. Nothing reads it; it stays typed so existing files keep loading\nunder the strict schema and a literal `api_key` keeps serialising as `\"<redacted>\"`.",
+      "description": "Shared LLM credentials + model selection. Consumed by every LLM-backed\ncapability (ner-llm, summarization-llm, reranker-llm, VLM OCR).\n\nMirrors xberg's `LlmConfig` field-for-field with one safety upgrade:\n`api_key` is the [`ApiKey`] tri-state (literal / env-ref / unset) instead of\n`Option<String>`, so credentials are never stored as bare literals in TOML.\nAt the boundary the env-ref is resolved into a [`SecretString`] and then\nexposed via [`SecretString::expose`] when constructing xberg's struct.",
       "type": "object",
       "properties": {
         "model": {
@@ -1222,12 +1831,12 @@
           "default": ""
         },
         "api_key": {
-          "description": "API key — either a literal (discouraged; keeps secrets in version control)\nor an `{ env = \"OPENAI_API_KEY\" }` reference. `Unset` lets the underlying\nprovider SDK fall back to its standard environment variable lookup. Never resolved: nothing\nreads `[llm]` any more.",
+          "description": "API key — either a literal (discouraged; keeps secrets in version control)\nor an `{ env = \"OPENAI_API_KEY\" }` reference. `Unset` lets the underlying\nprovider SDK fall back to its standard environment variable lookup. In the repository's\nown `basemind.toml`, an env reference is honoured only for the chosen provider's standard\nvariable (`OPENAI_API_KEY` for `openai/...`, `ANTHROPIC_API_KEY` for `anthropic/...`, ...)\nor `BASEMIND_LLM_API_KEY`; any other name is ignored with a warning unless\n`BASEMIND_ALLOW_REPO_LLM=1` is set.",
           "$ref": "#/$defs/ApiKey",
           "default": null
         },
         "base_url": {
-          "description": "Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). Never contacted:\nnothing reads `[llm]` any more.",
+          "description": "Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). **Ignored (with a\nwarning) when it comes from the repository's own `basemind.toml`** unless the operator sets\n`BASEMIND_ALLOW_REPO_LLM=1` in the environment: a cloned repository could otherwise point\nthe summarizer and NER at a host that collects your API key and document text. A value\npassed by CLI flag or environment override is operator-supplied and always honoured.",
           "type": [
             "string",
             "null"
@@ -1274,8 +1883,7 @@
           "default": null
         }
       },
-      "additionalProperties": false,
-      "deprecated": true
+      "additionalProperties": false
     },
     "ApiKey": {
       "description": "Tri-state API key wrapper. Serde-deserialised as `null` (`Unset`), a plain\nstring (`Literal`), or a `{ env = \"NAME\" }` table (`Env`).\n\n`Serialize` is implemented manually — the `Literal` variant NEVER emits its\ncleartext secret. It serialises to the marker string `\"<redacted>\"` so any\ndownstream pipeline that round-trips this enum through JSON / TOML (e.g.\nthe config validator at `src/config/mod.rs`) cannot leak credentials into\nlogs, snapshot tests, or error messages. Deserialisation is unchanged:\nloading a TOML config with a literal `api_key = \"sk-...\"` still produces\n`ApiKey::Literal(...)`. The redaction is one-way by design.",

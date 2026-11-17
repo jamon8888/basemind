@@ -12,6 +12,7 @@ mkdir -p "${ROOT}"
 
 export BASEMIND_DATA_HOME="${BASEMIND_DATA_HOME:-${ROOT}/cache}"
 export BASEMIND_COMMS_DIR="${BASEMIND_COMMS_DIR:-${ROOT}/comms}"
+export BASEMIND_SHELLS_SOCKET="${BASEMIND_SHELLS_SOCKET:-${ROOT}/shells/rmux.sock}"
 if [ -z "${BASEMIND_HARDEN_KEEP:-}" ]; then
   echo "==> wiping prior global index cache at ${BASEMIND_DATA_HOME}"
   rm -rf "${BASEMIND_DATA_HOME}"
@@ -44,7 +45,7 @@ fi
 workspace_root="$(pwd -P)"
 target_dir="${CARGO_TARGET_DIR:-${workspace_root}/target}"
 if [[ "${target_dir}" != /* ]]; then target_dir="${workspace_root}/${target_dir}"; fi
-export BASEMIND_DAEMON_BINARY="${BASEMIND_DAEMON_BINARY:-${target_dir}/release/basemind}"
+export RMUX_SDK_DAEMON_BINARY="${RMUX_SDK_DAEMON_BINARY:-${target_dir}/release/basemind}"
 
 failed=()
 passed=()
@@ -67,26 +68,11 @@ for entry in "${REPOS[@]}"; do
     echo "==> reusing existing clone at ${dest}"
   fi
 
-  ok=1
-  if [ -z "${BASEMIND_HARDEN_SKIP_SUITE:-}" ]; then
-    BASEMIND_HARDEN_REPO="${dest}" \
-      BASEMIND_HARDEN_REPO_NAME="${name}" \
-      BASEMIND_HARDEN_RESULTS="${RESULTS}" \
-      cargo test --release ${feature_args[@]+"${feature_args[@]}"} --test harden -- \
-      --ignored --nocapture --test-threads=1 --exact harden_repo || ok=0
-  fi
-
-  # BASEMIND_HARDEN_WORKTREES=<K> adds K git worktrees at older commits and measures what each
-  # costs on disk and to first-scan. BASEMIND_HARDEN_SKIP_SUITE=1 runs that measurement alone.
-  if [ -n "${BASEMIND_HARDEN_WORKTREES:-}" ]; then
-    BASEMIND_HARDEN_REPO="${dest}" \
-      BASEMIND_HARDEN_REPO_NAME="${name}" \
-      BASEMIND_HARDEN_RESULTS="${RESULTS}" \
-      cargo test --release ${feature_args[@]+"${feature_args[@]}"} --test harden -- \
-      --ignored --nocapture --test-threads=1 --exact worktrees::harden_worktrees || ok=0
-  fi
-
-  if [ "${ok}" -eq 1 ]; then
+  if BASEMIND_HARDEN_REPO="${dest}" \
+    BASEMIND_HARDEN_REPO_NAME="${name}" \
+    BASEMIND_HARDEN_RESULTS="${RESULTS}" \
+    cargo test --release ${feature_args[@]+"${feature_args[@]}"} --test harden -- \
+    --ignored --nocapture --test-threads=1 --exact harden_repo; then
     passed+=("${name}")
   else
     failed+=("${name}")

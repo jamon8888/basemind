@@ -20,16 +20,10 @@ include = [
   "!/src/comms/workspace_pool_tests.rs",
   "!/src/comms/daemon_tests.rs",
   "!/src/comms/daemon_forward_tests.rs",
-  "!/src/comms/generation_cleanup_tests.rs",
-  "!/src/comms/singleton_tests.rs",
-  "!/src/comms/singleton_takeover_tests.rs",
-  "!/src/comms/singleton_takeover_decision_tests.rs",
-  "!/src/comms/singleton_endpoint_windows_tests.rs",
-  "!/src/daemon_lock_tests.rs",
-  "!/src/stdio_relay_tests.rs",
-  "!/src/stdio_relay_offline_tests.rs",
   "!/src/lance/tests.rs",
   "!/src/mcp/helpers_calls_scan_tests.rs",
+  "!/src/mcp/helpers_governance/tests.rs",
+  "!/src/mcp/codegraph_tests.rs",
   "!/src/mcp/index_route_tests.rs",
   "!/src/mcp/lazy_cache_tests.rs",
   "!/src/mcp/find_files_tests.rs",
@@ -39,10 +33,10 @@ include = [
   "!/src/index/writer_tests.rs",
 ]
 name = "basemind"
-version = "0.33.0"
+version = "0.38.0"
 authors = ["Na'aman Hirschfeld <nhirschfeld@gmail.com>"]
 edition = "2024"
-description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
+description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, on-demand web crawl, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/Goldziher/basemind"
@@ -52,21 +46,17 @@ keywords = ["mcp", "agent-context", "rag", "code-map", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.cargo-machete]
-ignored = ["serde_toon_format"]
+# `rustix` is not imported directly: it is pinned to hold rmux-client's Linux build (see the
+# dependency's comment), so machete's unused-dependency scan must skip it.
+ignored = ["serde_toon_format", "rustix"]
 [workspace]
-members = [
-  "crates/basemind-agents",
-  "crates/lsp-positions",
-  "crates/stack-graphs",
-  "crates/tree-sitter-graph",
-  "crates/tree-sitter-stack-graphs",
-]
-
-[workspace.dependencies]
-agent-client-protocol = "5.3.0"
+members = ["crates/lsp-positions", "crates/stack-graphs", "crates/tree-sitter-graph", "crates/tree-sitter-stack-graphs"]
 
 [workspace.lints.clippy]
 all = "warn"
+
+[lints]
+workspace = true
 
 [lib]
 name = "basemind"
@@ -76,10 +66,14 @@ path = "src/lib.rs"
 name = "basemind"
 path = "src/main.rs"
 
+[build-dependencies]
+sha2 = "0.11"
+ureq = { version = "3.4", default-features = false, features = ["rustls", "platform-verifier"] }
+
 [features]
 default = []
 
-intelligence = ["dep:xberg", "dep:lancedb", "dep:futures", "xberg/embeddings"]
+intelligence = ["dep:xberg", "dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
 
 # Just the real o200k tokenizer (`xberg::chunking::count_tokens`), used by `basemind admin tokens`
 # and `src/mcp/savings.rs`. `xberg/chunking-tokenizers` is a pure-Rust `tokenizers` crate underneath
@@ -87,44 +81,35 @@ intelligence = ["dep:xberg", "dep:lancedb", "dep:futures", "xberg/embeddings"]
 # `intelligence` — it stays cheap enough to build without also pulling in the vector-store deps.
 tokenizer = ["dep:xberg", "xberg/chunking-tokenizers"]
 
-# Document RAG on local files: PDF text layers, Office, spreadsheets, email, HTML, XML (SVG text
-# included), Markdown/MDX and notebooks (`xberg/office` carries `notebook`). xberg's `formats` and
-# `analysis` umbrellas are deliberately not used: they also pull in archives, sqlite, heic, svg
-# rasterisation, wordperfect, hwp, iwork and diff, none of which basemind reaches.
 documents = [
   "intelligence",
   "tokenizer",
-  "dep:serde_toon_format",
-  "xberg/pdf",
-  "xberg/office",
-  "xberg/excel",
-  "xberg/email",
-  "xberg/html",
-  "xberg/xml",
-  "xberg/mdx",
-  "xberg/language-detection",
-  "xberg/quality",
-  "xberg/markdown-footnotes",
+  "xberg/formats",
+  "xberg/analysis",
+  "xberg/embeddings",
+  "xberg/reranker",
+  "xberg/reranker-presets",
+  "xberg/ocr",
+  "xberg/paddle-ocr",
+  "xberg/layout-detection",
+  "xberg/auto-rotate",
+  "xberg/ner-onnx",
   "xberg/keywords-yake",
   "xberg/keywords-rake",
   "xberg/summarization",
-  "xberg/reranker",
-  "xberg/reranker-presets",
+  "xberg/summarization-llm",
+  "xberg/redaction",
+  "xberg/redaction-rehydrate",
+  "xberg/qr-codes",
+  "dep:serde_toon_format",
+  "dep:image",
 ]
 
-# Tesseract OCR for images and PDFs with no text layer. Its own tier because it compiles leptonica
-# and tesseract from source through cmake.
-documents-ocr = ["documents", "xberg/ocr"]
+code-search = ["intelligence", "xberg/embeddings", "xberg/reranker", "xberg/reranker-presets"]
 
-# PaddleOCR as an extra OCR stage. Opt-in for source builds, never part of `full`.
-documents-ocr-paddle = ["documents-ocr", "xberg/paddle-ocr"]
+memory = ["intelligence", "xberg/embeddings", "xberg/keywords", "xberg/ner-onnx"]
 
-# ONNX named-entity recognition: `[documents.ner]` and the `entity` filter of `docs_search`.
-documents-ner = ["documents", "xberg/ner-onnx"]
-
-code-search = ["intelligence", "xberg/reranker", "xberg/reranker-presets"]
-
-memory = ["intelligence"]
+crawl = ["documents", "dep:crawlberg", "dep:url"]
 
 comms = [
   "dep:hyper",
@@ -136,6 +121,8 @@ comms = [
   "dep:getrandom",
   "rmcp/transport-streamable-http-server",
 ]
+
+shells = ["dep:rmux-sdk", "dep:rmux-server", "dep:rmux-client"]
 
 code-intel-js = [
   "dep:oxc_allocator",
@@ -150,16 +137,70 @@ code-intel-stack = ["dep:stack-graphs", "dep:tree-sitter-graph", "dep:tree-sitte
 
 code-intel = ["code-intel-js", "code-intel-stack"]
 
-full = ["documents", "documents-ocr", "documents-ner", "memory", "comms", "code-intel", "code-search"]
+# GLiNER2 candle NER backend for redact_text person/organization/location (#37).
+# Degrades to pattern-only redaction when the model dir is missing or the tool
+# is called without `ner_model_dir`.
+# tokenizers: #71 windowing must count tokens exactly as the backend will, so
+# the planner loads the model's own `tokenizer.json` with the same crate.
+ner-candle = ["documents", "xberg/ner-candle-backend", "dep:tokenizers"]
 
-test-support = []
+full = ["documents", "memory", "crawl", "comms", "shells", "code-intel", "code-search", "ner-candle"]
+
+# Minimal feature set for hacienda integration:
+# - documents: xberg document extraction + redaction (required by ner-candle)
+# - memory: agent memory put/get/search (shared memory system)
+# - code-search: semantic code search (basemind code semantic/chunk)
+# - ner-candle: GLiNER2 NER for redact_text (requires documents)
+# - comms: the agent-comms broker. hacienda starts `basemind comms daemon`, and that subcommand
+#   only exists in a build with this feature.
+# Note: ner-candle transitively includes documents; memory + code-search share intelligence + xberg/embeddings
+hacienda = ["documents", "memory", "code-search", "ner-candle", "comms"]
+
+# Intel macOS has no static ONNX Runtime artifact in the current ort/xberg release. Keep this
+# convenience profile separate from `full`: ARM macOS and Linux should continue using their
+# normal bundled-runtime profile, while Intel builds load an x86_64 dylib at runtime.
+intel-macos = ["full", "ort-dynamic"]
+
+# Focus release for legal client-folder deployments ("hacienda-legal"), shipped as
+# `basemind-hacienda-legal-<triple>` release assets:
+# - documents: xberg ingestion (PDF/Office/HTML/email/images + OCR), chunking, the
+#   LanceDB store, `memory mode=documents` retrieval (exact/FTS/vector lanes +
+#   fusion + rerank), ingest-time NER/keywords/summaries, and redaction with
+#   caller-owned rehydration maps (`redact_text` + `vault`).
+# - memory: durable agent memory over the same Lance store.
+# - ner-candle: GLiNER2 Candle NER backend for redact_text person/org/location
+#   (transitively includes documents).
+# - graphrag: entity graph (`graph entities`) built from the NER sidecar at scan
+#   time. NOTE: the GraphRAG *query* surface is partially implemented — see
+#   docs/agents/features.md#incomplete-and-proposed-work.
+# Deliberately excluded: the comms broker/daemon and its agents/workspace domains; `serve` uses
+# rmcp's direct stdio transport in this profile. Also excluded are shells,
+# crawl, code-intel and code-search — a client folder is documents, not code.
+hacienda-legal = ["documents", "memory", "ner-candle", "graphrag"]
+graphrag = ["documents", "dep:lance-graph", "dep:arrow-select", "dep:arrow-ipc", "dep:arrow56"]
+test-support = ["dep:tempfile"]
+
+ort-dynamic = ["xberg?/ort-dynamic"]
 
 [dependencies]
 ahash = "0.8"
 anstream = "1.0"
 anstyle = "1"
 anyhow = "1"
-arc-swap = "1.9.5"
+arc-swap = "1.9.2"
+# ~keep Arrow major 58 matches LanceDB 0.40 so public schema and array types share one identity.
+# Bumping past 58 forks arrow into two versions and breaks Scannable/Schema type identity. ~keep
+arrow-array = { version = "=58", optional = true }
+arrow-schema = { version = "=58", optional = true }
+# graphrag: `concat_batches` over the graph table batches handed to lance-graph's Cypher
+# engine. Same `=58` pin as arrow-array/arrow-schema (see the fork note above).
+arrow-select = { version = "=58", optional = true }
+# graphrag: lance-graph 0.5.4 still builds against arrow 56 while lancedb 0.40 is on
+# arrow 58. The graph bridge crosses the boundary with an in-memory IPC roundtrip
+# (writer on 58, reader on 56) — see `batch_to_v56` in lance/graphrag.rs.
+arrow-ipc = { version = "=58", optional = true }
+arrow56 = { package = "arrow", version = "=56.2", default-features = false, features = ["ipc"], optional = true }
+base64 = "0.23"
 blake3 = "1"
 bstr = { version = "1", features = ["serde"] }
 # Streamable-HTTP MCP front-end (comms daemon only): response bodies + query parsing + hyper server. ~keep
@@ -167,15 +208,16 @@ bytes = { version = "1", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 clap_mangen = "0.3"
+crawlberg = { version = "1.10.3", default-features = false, features = ["native-runtime"], optional = true }
 directories = "6"
-fjall = "3.1.13"
+fjall = "3.1.12"
 form_urlencoded = { version = "1", optional = true }
 fs2 = "0.4"
 futures = { version = "0.3", optional = true }
 # OS CSPRNG for the comms daemon's HTTP bearer token. Already in the graph via ahash, so this adds ~keep
 # no build cost; a hand-rolled seed mix would be rolling our own crypto for a credential. ~keep
 getrandom = { version = "0.4", features = ["std"], optional = true }
-gix = { version = "0.90.0", features = ["status", "blob-diff", "revision", "max-performance"] }
+gix = { version = "0.89.0", features = ["status", "blob-diff", "revision", "max-performance-safe"] }
 globset = "0.4"
 hex = "0.4"
 # Loopback-TCP hyper server hosting the streamable-HTTP MCP transport (comms daemon only). ~keep
@@ -184,43 +226,53 @@ http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["server", "http1", "http2"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
 ignore = "0.4"
-# ~keep Every `$ref` in the bundled config schema is internal, so no HTTP or file resolver (and no
-# ~keep reqwest/rustls in the core's graph, ADR-0032); drafts are built in, and no `idn-*` format is used.
-jsonschema = { version = "0.61", default-features = false }
-# ~keep `remote` is enabled only because lancedb 0.38-0.41 do not compile without it: `error.rs`
+jsonschema = "0.58"
+# ~keep `remote` is enabled only because lancedb 0.38-0.40 do not compile without it: `error.rs`
 # ~keep gates `Error::Http` behind `#[cfg(feature = "remote")]` while `job.rs` uses it unconditionally.
 # ~keep It pulls tonic/arrow-flight/reqwest in but nothing is invoked; drop it once upstream fixes the gate.
-# ~keep Arrow is never a direct dependency: `src/lance` takes it from `lancedb::arrow`, so schema and array
-# types always share LanceDB's identity. A separate Arrow major forks them and breaks `Scannable`/`Schema`. ~keep
-lancedb = { version = "0.41.0", features = ["remote"], optional = true }
+lancedb = { version = "0.40.0", features = ["remote"], optional = true }
+lance-graph = { version = "0.5.4", optional = true }
 libc = "0.2"
 # ~keep `extended` exposes `mi_option_set`, used by `alloc_tag` to retag the heap off `VM_MEMORY_IOACCELERATOR`.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
-lru = "0.19.0"
+lru = "0.18.5"
 memchr = "2"
-memmap2 = "0.9"
 mimalloc = "0.1"
 notify = "8"
 notify-debouncer-full = "0.7"
 nucleo-matcher = "0.3.1"
-oxc_allocator = { version = "0.159.0", optional = true }
-oxc_parser = { version = "0.159.0", optional = true }
+oxc_allocator = { version = "0.154.0", optional = true }
+oxc_parser = { version = "0.154.0", optional = true }
 oxc_resolver = { version = "11.24.3", optional = true }
-oxc_semantic = { version = "0.159.0", optional = true }
-oxc_span = { version = "0.159.0", optional = true }
-oxc_syntax = { version = "0.159.0", optional = true }
+oxc_semantic = { version = "0.154.0", optional = true }
+oxc_span = { version = "0.154.0", optional = true }
+oxc_syntax = { version = "0.154.0", optional = true }
 rayon = "1"
 regex = "1.13.1"
 regex-syntax = "0.8"
-rmcp = { version = "3.10", default-features = false, features = ["server", "macros", "schemars", "transport-async-rw"] }
+rmcp = { version = "3.9", default-features = false, features = [
+  "server",
+  "macros",
+  "schemars",
+  "transport-async-rw",
+  "transport-io",
+] }
 rmp-serde = "1"
+rmux-client = { version = "0.10", default-features = false, optional = true }
+rmux-sdk = { version = "0.10", default-features = false, optional = true }
+rmux-server = { version = "0.10", default-features = false, optional = true }
+# rustix 1.1.5 renamed the `runtime` module rmux-client 0.10 imports to a ~keep
+# mangled private name (`runtime_448b8ad740e2a26f`) and made the old path ~keep
+# `pub(crate)`, so the Linux-only signal setup in its attach resize path stops ~keep
+# compiling. Hold rustix at 1.1.4, the last release whose `runtime` is public. ~keep
+rustix = "=1.1.4"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_toon_format = { version = "0.2", optional = true }
 stack-graphs = { package = "basemind-stack-graphs", version = "0.14.1", path = "crates/stack-graphs", optional = true }
 streaming-iterator = "0.1"
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = [
   "rt-multi-thread",
@@ -235,15 +287,30 @@ tokio = { version = "1", features = [
   "process",
 ] }
 tokio-util = { version = "0.7", features = ["codec"] }
-toml = "1.2"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.27"
 tree-sitter-graph = { package = "basemind-tree-sitter-graph", version = "0.12.1", path = "crates/tree-sitter-graph", optional = true }
-tree-sitter-language-pack = "1.25.2"
+tree-sitter-language-pack = "1.22.1"
 tree-sitter-stack-graphs = { package = "basemind-tree-sitter-stack-graphs", version = "0.10.1", path = "crates/tree-sitter-stack-graphs", optional = true }
-xberg = { version = "1.4.0", default-features = false, features = ["tokio-runtime", "simd-utf8"], optional = true }
-zstd = "0.14.4"
+url = { version = "2", features = ["serde"], optional = true }
+# Keep this repository's lockfile on 1.3.9: newer xberg releases fail the bundled ORT link step in CI.
+xberg = { version = "1.3.9", default-features = false, features = ["tokio-runtime", "simd-utf8"], optional = true }
+image = { version = "0.25.10", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+  "bmp",
+  "tiff",
+  "gif",
+  "pnm",
+], optional = true }
+# #71: same crate as `xberg-gliner`'s candle path, so the window planner's token
+# counts are the backend's counts, not an estimate. Same feature set to avoid a
+# divergent feature resolution.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
+zstd = "0.14.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.7"
@@ -251,14 +318,26 @@ mach2 = "0.7"
 [dev-dependencies]
 basemind = { path = ".", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
-proc-macro2 = "1"
+form_urlencoded = "1"
+insta = "1"
+# #71: the windowing unit tests build a tokenizer that costs one token per
+# word; `tokenizers` names its vocab map with `ahash`, so the tests can spell
+# the type the builder asks for.
+ahash = "0.8"
 proptest = "1"
-rmcp = { version = "3.10", features = ["client", "transport-async-rw", "transport-child-process"] }
-syn = { version = "3", features = ["full", "visit"] }
+rmcp = { version = "3.9", features = ["client", "transport-async-rw", "transport-child-process"] }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+wiremock = "0.6"
 
-[lints]
-workspace = true
+# Keep local debug and test artifacts small enough to link quickly. Most CI jobs use this setting
+# through CARGO_PROFILE_{DEV,TEST}_DEBUG; Linux full and hacienda-legal use 0 to limit disk use.
+# Local builds can use the same environment variables to override these defaults.
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
 
 # ~keep `version::build_id` streams the whole executable (~1.3 GB in a debug build) through blake3;
 # ~keep unoptimized that takes 10+ s and tripped the comms request timeouts in debug test runs.
@@ -315,17 +394,21 @@ opt-level = 3
 # ~keep config while tesseract still configures -DCMAKE_BUILD_TYPE=Release, its exported target
 # ~keep stops resolving, and the build script dies in check_leptonica_tiff_support with
 # ~keep "IMPORTED_LOCATION not set for imported target leptonica". Only the `full` Windows build
-# ~keep compiles tesseract, so CI's `comms` leg cannot catch this -- publish is where it lands.
+# ~keep compiles tesseract, so CI's `comms shells` leg cannot catch this -- publish is where it lands.
 [profile.release.package.xberg-tesseract]
 opt-level = 3
 
 [profile.release.package.aws-lc-sys]
 opt-level = 3
 
-# ~keep Also not perf tuning. xberg's own workspace pins `zip` because it miscompiles into a SIGBUS
-# ~keep on macOS ARM64 above opt-level 2. Cargo profiles only apply from the workspace ROOT, so
-# ~keep building xberg as a dependency here silently drops that pin; the `package."*"` size override
-# ~keep above would otherwise compile it past the safe level. Office and spreadsheet files are zips.
+# ~keep Also not perf tuning. xberg's own workspace pins these two because the archive crates
+# ~keep miscompile into a SIGBUS on macOS ARM64 at higher optimization -- sevenz-rust2 needs
+# ~keep opt-level 1 specifically (2 still faulted), zip needs at most 2. Cargo profiles only apply
+# ~keep from the workspace ROOT, so building xberg as a dependency here silently drops those pins;
+# ~keep the `package."*"` size override above would otherwise compile both well past the safe level.
+[profile.release.package.sevenz-rust2]
+opt-level = 1
+
 [profile.release.package.zip]
 opt-level = 2
 
@@ -334,12 +417,11 @@ name = "doc_measure"
 required-features = ["documents"]
 
 [[example]]
-name = "lance_bench"
+name = "document_benchmark"
 required-features = ["documents"]
 
 [[example]]
-name = "retrieval_bench"
-path = "examples/retrieval_bench/main.rs"
+name = "lance_bench"
 required-features = ["documents"]
 
 [[bench]]
@@ -356,8 +438,4 @@ harness = false
 
 [[bench]]
 name = "git_history"
-harness = false
-
-[[bench]]
-name = "index_read"
 harness = false

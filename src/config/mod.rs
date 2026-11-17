@@ -3,11 +3,13 @@ mod comms;
 pub mod daemon;
 mod documents;
 mod documents_validate;
+mod enrichment;
 pub(crate) mod layered;
-pub mod overrides;
+mod overrides;
 mod resources;
 pub mod root_guard;
 pub mod rules;
+mod shells;
 mod source;
 pub mod trust;
 mod v1;
@@ -20,14 +22,17 @@ use thiserror::Error;
 pub use code::CodeSearchConfig;
 pub use comms::CommsConfig;
 pub use documents::{
-    ApiKey, DocLanguageConfig, DocumentsConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig,
-    OcrBackend, OcrConfig, OutputConfig, OutputFormat, RerankerConfig, SecretString, SummarizationConfig,
-    SummarizationStrategy,
+    ApiKey, CitationsConfig, CustomRerankerModel, DocLanguageConfig, DocumentsConfig, FtsConfig, FusionConfig,
+    GraphragConfig, KeywordAlgorithm, KeywordsConfig, LlmConfig, NerBackend, NerConfig, NerRedactionConfig, OcrBackend,
+    OcrConfig, OutputConfig, OutputFormat, RedactionConfig, RedactionCustomPattern, RedactionCustomTerm,
+    RedactionStrategy, RerankerConfig, ResolvedRerankerModel, SecretString, SummarizationConfig, SummarizationStrategy,
 };
-pub use layered::{ConfigLayers, LoadedConfig, NoOverrides, OverrideLayer, defaults_only, merge_layers};
+pub use layered::{ConfigLayers, LoadedConfig, defaults_only, merge_layers};
+pub use overrides::DocumentsCliOverrides;
 pub use resources::{DocumentModelProfile, FootprintKeyword, MaxFootprint, OnnxProvider, ResourcesConfig};
+pub use shells::{ShellsConfig, TerminalChoice, VisualMode};
 pub use source::{ConfigSource, ProvenanceMap};
-pub use v1::{CodeIntelConfig, ConfigV1, DeprecatedSection, LanguageConfig, Visibility};
+pub use v1::{CodeIntelConfig, ConfigV1, CrawlConfig, LanguageConfig};
 
 pub type Config = ConfigV1;
 
@@ -67,7 +72,7 @@ pub enum ConfigError {
 }
 
 /// Load the TOML config (no overrides). Existing call sites use this — the
-/// layered merger is reached via [`overrides::load_with_overrides`] when CLI flags or
+/// layered merger is reached via [`load_with_overrides`] when CLI flags or
 /// env vars are involved.
 pub fn load(root: &Path) -> Result<Config, ConfigError> {
     let path = resolve_config_path(root);
@@ -92,17 +97,21 @@ pub fn load(root: &Path) -> Result<Config, ConfigError> {
     let mut config = parse_str(&raw).map_err(|e| annotate_path(e, &path))?;
     trust::sanitize_repo_config(&mut config, trust::Grants::from_env());
     trust::warn_inert_fields(&config);
-    trust::warn_deprecated_sections(&config);
     Ok(config)
 }
 
 /// Load the TOML config (if present) plus optional env / CLI override layers,
-/// produce a fully-resolved `LoadedConfig` with provenance. A caller with no
-/// override layer passes `None` for both, typed [`NoOverrides`].
-pub fn load_with_layers<O: OverrideLayer>(
+/// produce a fully-resolved `LoadedConfig` with provenance.
+///
+/// `env_overrides` and `cli_overrides` are accepted separately so future
+/// tooling can report "this came from `BASEMIND_*`" vs "this came from
+/// `--flag`" distinctly. Today clap collapses both into a single
+/// `DocumentsCliOverrides` per command — callers typically pass the parsed
+/// `args.documents` as `cli_overrides` and `None` as `env_overrides`.
+pub fn load_with_overrides(
     root: &Path,
-    env_overrides: Option<O>,
-    cli_overrides: Option<O>,
+    env_overrides: Option<DocumentsCliOverrides>,
+    cli_overrides: Option<DocumentsCliOverrides>,
 ) -> Result<LoadedConfig, ConfigError> {
     let toml_file = match load(root) {
         Ok(cfg) => Some(cfg),
@@ -118,8 +127,6 @@ pub fn load_with_layers<O: OverrideLayer>(
         },
     );
     validate_merged(&loaded.config)?;
-    // Again on the merged result: a `--llm-*` flag or `BASEMIND_LLM_*` variable sets `[llm]` too.
-    trust::warn_deprecated_sections(&loaded.config);
     Ok(loaded)
 }
 
@@ -299,7 +306,20 @@ fn parse_v1(raw: &str) -> Result<Config, ConfigError> {
     match schema_tag {
         "v1" | "https://basemind.dev/schema/v1.json" => {
             validate::validate_v1(&json_value)?;
-            let config = serde_json::from_value::<ConfigV1>(json_value).map_err(ConfigError::Deserialize)?;
+            let mut config = serde_json::from_value::<ConfigV1>(json_value).map_err(ConfigError::Deserialize)?;
+            // A file that only knows `[documents].embed_max_threads` never sets
+            // `resources.embed_threads`, so `#[serde(default)]` fills in the nonzero app default and
+            // the resolver below never reaches the alias. Carry it across here, where key presence
+            // is still visible. An explicit `embed_threads = 0` means auto and falls through to the
+            // alias in the resolver anyway, so only key absence is handled here.
+            if config.documents.embed_max_threads != 0
+                && toml_value
+                    .get("resources")
+                    .and_then(|table| table.get("embed_threads"))
+                    .is_none()
+            {
+                config.resources.embed_threads = config.documents.embed_max_threads;
+            }
             rules::validate(&config).map_err(ConfigError::SchemaValidation)?;
             Ok(config)
         }
@@ -373,10 +393,10 @@ mod tests {
     fn resources_section_parses_embed_batch_size_and_defaults_when_absent() {
         let default_cfg = parse_str("\"$schema\" = \"v1\"\n").unwrap();
         assert_eq!(
-            default_cfg.resources.embed_batch_size, 32,
-            "embed_batch_size defaults to 32 when [resources] is absent"
+            default_cfg.resources.embed_batch_size, 16,
+            "embed_batch_size defaults to 16 when [resources] is absent"
         );
-        assert_eq!(default_cfg.resources.scan_threads, 0);
+        assert_eq!(default_cfg.resources.scan_threads, 2);
         assert_eq!(
             default_cfg.resources.document_models,
             crate::config::DocumentModelProfile::Full
@@ -386,6 +406,53 @@ mod tests {
         assert_eq!(
             overridden.resources.embed_batch_size, 8,
             "an explicit embed_batch_size = 8 is honored"
+        );
+    }
+
+    /// `#[serde(default)]` fills a missing `resources.embed_threads` with the nonzero app default,
+    /// which would silently retire the deprecated alias. `parse_str` carries the alias across only
+    /// when the key itself is absent, so all three precedence cases below stay distinguishable.
+    #[test]
+    fn deprecated_embed_threads_alias_survives_unset_resources_key() {
+        let alias_only = parse_str("\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n")
+            .expect("a documents-only config is valid");
+        assert_eq!(
+            alias_only
+                .resources
+                .effective_embed_threads(alias_only.documents.embed_max_threads),
+            8,
+            "a file that only sets the deprecated alias keeps it"
+        );
+
+        let with_other_resources = parse_str(
+            "\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n[resources]\nmax_footprint_mb = 6144\n",
+        )
+        .expect("[resources] max_footprint_mb is a valid field");
+        assert_eq!(
+            with_other_resources
+                .resources
+                .effective_embed_threads(with_other_resources.documents.embed_max_threads),
+            8,
+            "unrelated [resources] keys must not retire the alias"
+        );
+
+        let explicit =
+            parse_str("\"$schema\" = \"v1\"\n[documents]\nembed_max_threads = 8\n[resources]\nembed_threads = 4\n")
+                .expect("[resources] embed_threads is a valid field");
+        assert_eq!(
+            explicit
+                .resources
+                .effective_embed_threads(explicit.documents.embed_max_threads),
+            4,
+            "an explicit nonzero [resources].embed_threads still wins"
+        );
+
+        let no_alias = parse_str("\"$schema\" = \"v1\"\n[resources]\nembed_batch_size = 8\n")
+            .expect("[resources] embed_batch_size is a valid field");
+        assert_eq!(
+            no_alias.resources.effective_embed_threads(0),
+            2,
+            "with the alias unset the 8 GiB default still applies"
         );
     }
 

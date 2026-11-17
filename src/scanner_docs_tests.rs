@@ -1,3 +1,4 @@
+use super::cache::{cached_doc_is_reusable, cached_embeddings_are_reusable};
 use super::*;
 
 #[test]
@@ -12,10 +13,14 @@ fn preset_dim_for_balanced_returns_768() {
 #[test]
 fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     use crate::extract::doc::{DocChunk, FileMapDoc};
-    let doc = FileMapDoc {
+    let mut doc = FileMapDoc {
         config_digest: String::new(),
         linear_chunked: false,
         text_fallback: false,
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
         schema_ver: 0,
         mime_type: "application/pdf".to_string(),
         content: "hello".to_string(),
@@ -26,6 +31,8 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
             byte_end: 5,
             text: "hello".to_string(),
             embedding: vec![0.0_f32; 768],
+            heading_path: String::new(),
+            cites: String::new(),
         }],
         embedding_model: "balanced".to_string(),
         embedding_dim: 768,
@@ -48,6 +55,7 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
         embedding_preset: "multilingual".to_string(),
         ..DocumentsConfig::default()
     };
+    doc.config_digest = "d".to_string();
     assert!(
         !cached_doc_is_reusable(&doc, &switched, true, "d"),
         "switching balanced -> multilingual (same dim, different model) must force recompute"
@@ -56,6 +64,18 @@ fn cached_doc_not_reusable_when_preset_model_differs_at_same_dim() {
     assert!(
         cached_doc_is_reusable(&doc, &switched, false, "d"),
         "embedding off: cached doc is always reusable"
+    );
+    assert!(
+        cached_doc_content_is_reusable(&doc, &switched, "d"),
+        "changing only the embedding preset must preserve extracted content and NER"
+    );
+    assert!(
+        !cached_embeddings_are_reusable(&doc, &switched),
+        "changing the embedding preset must invalidate only the vector stage"
+    );
+    assert!(
+        !cached_doc_content_is_reusable(&doc, &switched, "other"),
+        "a changed extraction digest must reject stale content"
     );
 }
 
@@ -71,13 +91,17 @@ fn pending_doc_batch_is_metadata_only() {
         blob_hash: "deadbeef".to_string(),
         doc_scope: "repo:origin".to_string(),
         chunk_count: 3,
+        token_count: 12,
+        content_bytes: 64,
         embedding_dim: 768,
         emit_rows: true,
         embedded: true,
         embed_attempted: true,
         reused: false,
+        reembedded: false,
         degraded: false,
         text_fallback: false,
+        rehydration_ref: None,
     };
     assert!(batch.emit_rows);
     assert_eq!(batch.chunk_count, 3);
@@ -93,12 +117,18 @@ fn doc_fixture(chunk_count: usize, embedding_dim: u16) -> crate::extract::doc::F
             byte_end: i as u32 + 1,
             text: format!("chunk {i}"),
             embedding: vec![0.0_f32; embedding_dim as usize],
+            heading_path: String::new(),
+            cites: String::new(),
         })
         .collect();
     FileMapDoc {
         config_digest: String::new(),
         linear_chunked: false,
         text_fallback: false,
+        redaction_findings: Vec::new(),
+        redaction_fingerprint: None,
+        rehydration_ref: None,
+        pending_rehydration: None,
         schema_ver: 0,
         mime_type: "application/pdf".to_string(),
         content: "body".to_string(),
@@ -127,7 +157,7 @@ fn pending_from_doc_marks_a_failed_embed_as_attempted_not_embedded() {
     let cfg = DocumentsConfig::default();
 
     let failed = doc_fixture(3, 0);
-    let batch = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, true, false);
+    let batch = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, true, false, false);
     assert!(!batch.embedded, "no vectors => not embedded");
     assert!(
         batch.embed_attempted,
@@ -136,17 +166,17 @@ fn pending_from_doc_marks_a_failed_embed_as_attempted_not_embedded() {
     assert!(!batch.emit_rows, "a vectorless doc emits no LanceDB rows");
 
     let ok = doc_fixture(3, 768);
-    let batch = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, false);
+    let batch = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, false, false);
     assert!(
         batch.embedded && batch.embed_attempted,
         "a successful embed sets both flags"
     );
 
-    let off = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, false, false);
+    let off = pending_from_doc(&failed, "docs/a.pdf", "hash", "repo:x", &cfg, false, false, false);
     assert!(off.embedded, "embed off leaves the requirement trivially satisfied");
     assert!(!off.embed_attempted, "embed off ran no attempt");
 
-    let reused = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, true);
+    let reused = pending_from_doc(&ok, "docs/a.pdf", "hash", "repo:x", &cfg, true, true, false);
     assert!(
         !reused.embed_attempted,
         "a reused blob ran no fresh attempt (already embedded)"
@@ -163,6 +193,7 @@ fn doc_entry_settled_backs_off_after_a_failed_embed_attempt() {
     let base = DocEntry {
         config_digest: String::new(),
         hash_hex: "h".to_string(),
+        rehydration_ref: None,
         embedding_preset: "balanced".to_string(),
         size_bytes: 10,
         mtime: 0,
@@ -195,6 +226,38 @@ fn doc_entry_settled_backs_off_after_a_failed_embed_attempt() {
     assert!(
         doc_entry_settled(&legacy, "h", "balanced", false, "", false),
         "no embed requested this pass: settled regardless of the attempt flag"
+    );
+}
+
+#[test]
+fn doc_entry_settled_does_not_settle_a_legacy_rehydration_ref() {
+    use crate::store::DocEntry;
+    let base = DocEntry {
+        config_digest: String::new(),
+        hash_hex: "h".to_string(),
+        rehydration_ref: None,
+        embedding_preset: "balanced".to_string(),
+        size_bytes: 10,
+        mtime: 0,
+        embedded: true,
+        embed_attempted: true,
+    };
+    assert!(doc_entry_settled(&base, "h", "balanced", true, "", false));
+
+    // A reference kept alive by a Literal pass must not let its doc settle forever: basemind
+    // keeps no key at rest, so the next pass re-processes the doc and the Inline pipeline
+    // clears the reference (an entry where GC would otherwise pin the blob indefinitely).
+    let referred = DocEntry {
+        rehydration_ref: Some("blob/deadbeef".to_string()),
+        ..base.clone()
+    };
+    assert!(
+        !doc_entry_settled(&referred, "h", "balanced", true, "", false),
+        "an entry carrying a rehydration_ref re-opens"
+    );
+    assert!(
+        doc_entry_settled(&base, "h", "balanced", false, "", false),
+        "sanity: the reference-free entry settles as before"
     );
 }
 
@@ -278,6 +341,7 @@ fn doc_entry_settled_requires_current_digest_and_honours_reflush() {
     let entry = DocEntry {
         config_digest: "d1".to_string(),
         hash_hex: "h".to_string(),
+        rehydration_ref: None,
         embedding_preset: "balanced".to_string(),
         size_bytes: 10,
         mtime: 0,
@@ -357,26 +421,31 @@ fn preset_dim_for_unknown_errors() {
 }
 
 #[test]
-fn archives_stay_denied_whatever_extract_archives_says() {
-    for extract_archives in [false, true] {
-        let cfg = DocumentsConfig {
-            extract_archives,
-            ..DocumentsConfig::default()
-        };
-        assert!(
-            is_denied_binary_or_archive(Path::new("bundle.zip"), "application/zip", &cfg),
-            "archive extraction is not compiled in (extract_archives = {extract_archives})"
-        );
-        assert!(
-            is_denied_binary_or_archive(Path::new("bundle.tgz"), "application/gzip", &cfg),
-            "archive extraction is not compiled in (extract_archives = {extract_archives})"
-        );
-        assert!(is_denied_binary_or_archive(
-            Path::new("libfoo.so"),
-            "application/x-sharedlib",
-            &cfg
-        ));
-    }
+fn extract_archives_toggle_gates_only_archives_not_binaries() {
+    let default_cfg = DocumentsConfig::default();
+    assert!(!default_cfg.extract_archives, "archives rejected by default");
+    assert!(is_denied_binary_or_archive(
+        Path::new("bundle.zip"),
+        "application/zip",
+        &default_cfg
+    ));
+
+    let extract_cfg = DocumentsConfig {
+        extract_archives: true,
+        ..DocumentsConfig::default()
+    };
+    assert!(
+        !is_denied_binary_or_archive(Path::new("bundle.zip"), "application/zip", &extract_cfg),
+        "extract_archives=true must route archives to the extractor"
+    );
+    assert!(
+        is_denied_binary_or_archive(Path::new("libfoo.so"), "application/x-sharedlib", &extract_cfg),
+        "binaries stay denied even with extract_archives=true"
+    );
+    assert!(
+        is_denied_binary_or_archive(Path::new("mod.wasm"), "application/wasm", &extract_cfg),
+        "wasm binary stays denied"
+    );
 }
 
 #[test]
@@ -401,7 +470,7 @@ fn doc_config_from_propagates_language_settings() {
         },
         ..Default::default()
     };
-    let doc_cfg = doc_config_from(&cfg, &ResourcesConfig::default(), cfg.embed);
+    let doc_cfg = doc_config_from(&cfg, &LlmConfig::default(), &ResourcesConfig::default(), cfg.embed);
     assert!(doc_cfg.language.auto_detect);
     assert_eq!(doc_cfg.language.min_confidence, 0.5);
     assert!(doc_cfg.language.detect_multiple);
@@ -414,13 +483,13 @@ fn doc_config_from_propagates_extraction_limits() {
         extraction_timeout_secs: 42,
         ..Default::default()
     };
-    let doc_cfg = doc_config_from(&cfg, &ResourcesConfig::default(), cfg.embed);
+    let doc_cfg = doc_config_from(&cfg, &LlmConfig::default(), &ResourcesConfig::default(), cfg.embed);
     assert_eq!(doc_cfg.max_pages, 37);
     assert_eq!(doc_cfg.extraction_timeout_secs, 42);
 }
 
 #[test]
-fn doc_config_from_propagates_summarization() {
+fn doc_config_from_propagates_summarization_and_llm() {
     use crate::config::{SummarizationConfig, SummarizationStrategy};
     let cfg = DocumentsConfig {
         summarization: SummarizationConfig {
@@ -430,9 +499,14 @@ fn doc_config_from_propagates_summarization() {
         },
         ..Default::default()
     };
-    let doc_cfg = doc_config_from(&cfg, &ResourcesConfig::default(), cfg.embed);
+    let llm = LlmConfig {
+        model: "openai/gpt-4o".to_string(),
+        ..Default::default()
+    };
+    let doc_cfg = doc_config_from(&cfg, &llm, &ResourcesConfig::default(), cfg.embed);
     assert!(doc_cfg.summarization.enabled);
     assert_eq!(doc_cfg.summarization.max_tokens, Some(150));
+    assert_eq!(doc_cfg.llm.model, "openai/gpt-4o");
 }
 
 #[test]
@@ -488,41 +562,11 @@ fn should_extract_document_honors_extension_denylist_override() {
 }
 
 #[test]
-fn audio_and_video_are_denied() {
-    let cfg = DocumentsConfig::default();
-    assert!(should_extract_document(Path::new("clips/audio.mp3"), &cfg).is_none());
-    assert!(should_extract_document(Path::new("clips/movie.mp4"), &cfg).is_none());
-}
-
-#[cfg(feature = "documents-ocr")]
-#[test]
-fn images_pass_with_the_ocr_tier() {
+fn images_pass_but_audio_video_denied() {
     let cfg = DocumentsConfig::default();
     assert!(should_extract_document(Path::new("assets/photo.png"), &cfg).is_some());
-}
-
-#[cfg(not(feature = "documents-ocr"))]
-#[test]
-fn images_are_denied_without_the_ocr_tier_but_svg_is_text() {
-    let cfg = DocumentsConfig::default();
-    for path in ["assets/photo.png", "assets/photo.jpg", "scans/page.tiff", "a/b.webp"] {
-        assert!(
-            should_extract_document(Path::new(path), &cfg).is_none(),
-            "an image has no text without OCR: {path}"
-        );
-    }
-    assert_eq!(
-        should_extract_document(Path::new("assets/diagram.svg"), &cfg).as_deref(),
-        Some("image/svg+xml")
-    );
-    let allowlisted = DocumentsConfig {
-        mime_allowlist: vec!["image/".to_string()],
-        ..DocumentsConfig::default()
-    };
-    assert!(
-        should_extract_document(Path::new("assets/photo.png"), &allowlisted).is_none(),
-        "the allowlist cannot route an image to an extractor that is not compiled in"
-    );
+    assert!(should_extract_document(Path::new("clips/audio.mp3"), &cfg).is_none());
+    assert!(should_extract_document(Path::new("clips/movie.mp4"), &cfg).is_none());
 }
 
 #[test]
@@ -577,9 +621,14 @@ fn seeded_doc_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceSto
             path: (*path).to_string(),
             chunk_idx: 0,
             mime_type: "text/plain".to_string(),
+            facets: Default::default(),
             text: "body".to_string(),
+            text_phrase: "body".to_string(),
+            heading_path: String::new(),
+            cites: String::new(),
             byte_start: 0,
             byte_end: 4,
+            rehydration_ref: None,
             embedding: vec![0.25; 768],
         };
         lance.replace_document("repo:s", path, vec![row]).expect("seed row");
@@ -588,6 +637,7 @@ fn seeded_doc_lance(store: &mut Store, paths: &[&str]) -> crate::lance::LanceSto
             crate::store::DocEntry {
                 config_digest: String::new(),
                 hash_hex: "h".to_string(),
+                rehydration_ref: None,
                 embedding_preset: "balanced".to_string(),
                 size_bytes: 1,
                 mtime: 0,
@@ -661,6 +711,7 @@ fn embed_policy_purge_never_creates_the_vector_store() {
         crate::store::DocEntry {
             config_digest: String::new(),
             hash_hex: "h".to_string(),
+            rehydration_ref: None,
             embedding_preset: "balanced".to_string(),
             size_bytes: 1,
             mtime: 0,

@@ -32,9 +32,6 @@ use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::{ServiceExt, service::RoleClient, service::RunningService};
 use serde_json::{Value, json};
 
-#[path = "harden/worktrees.rs"]
-mod worktrees;
-
 /// Per-tool wall-clock ceiling. Any call exceeding this fails the harness.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -53,7 +50,7 @@ fn scan_ceiling_secs(repo_name: &str) -> u64 {
 
 #[derive(Debug, serde::Serialize)]
 struct ToolCallRecord {
-    /// The tool name plus what selects the operation: see [`record_label`].
+    /// `domain:mode` for a mode-dispatched tool, else the bare tool name.
     tool: String,
     ok: bool,
     elapsed_ms: u128,
@@ -128,64 +125,40 @@ async fn connect(repo_root: &Path) -> ServiceHandle {
     ().serve(transport).await.expect("rmcp handshake with basemind serve")
 }
 
-/// Every tool the harness may call: the verb tools plus the mode-dispatched comms tool.
+/// Build a tool call, rejecting any name that is not one of the nine domain tools.
 ///
-/// A fixed list rather than the server's advertised one, because `agents` is cfg-gated: under a
-/// default-feature build it is absent, and the harness calls it deliberately so it can record it
-/// as skipped. ~keep
-const KNOWN_TOOLS: [&str; 16] = [
-    "code_outline",
-    "code_symbols",
-    "code_read",
-    "code_grep",
-    "code_search",
-    "code_refs",
-    "find_files",
-    "docs_search",
-    "git_log",
-    "git_blame",
-    "git_diff",
-    "memory_save",
-    "memory_search",
-    "index_status",
-    "index_rescan",
-    "agents",
-];
-
-/// Tools whose retrieval stack is feature-gated. Gated off, they answer with an `isError` result
-/// naming the Cargo feature, which the harness records as skipped rather than failed.
-const FEATURE_GATED_TOOLS: [&str; 4] = ["code_search", "docs_search", "memory_save", "memory_search"];
-
-/// Arguments that page or bound a response without selecting what the tool does.
-const PAGING_ARGS: [&str; 3] = ["limit", "cursor", "max_tokens"];
-
-/// Build a tool call, rejecting any name that is not in [`KNOWN_TOOLS`].
-///
-/// Every canary call site is wrapped in `if let Ok(out) = …`, so an unknown tool name does not fail
+/// Every call site here is wrapped in `if let Ok(out) = …`, so an unknown tool name does not fail
 /// the call — it skips the block, leaves the canary unset, and `unwrap_or(0)` then reports zero
-/// hits. That reads as a capability regression rather than a stale test: an earlier surface change
-/// left `find_implementations` and `find_callers` behind here, and the next harden run blamed the
-/// engine for returning no `Future` implementations in tokio. Panicking on an unknown name turns
-/// that silent misattribution into an immediate, obvious failure. ~keep
+/// hits. That reads as a capability regression rather than a stale test: the nine-domain
+/// consolidation left `find_implementations` and `find_callers` behind here, and the next harden
+/// run blamed the engine for returning no `Future` implementations in tokio. Panicking on an
+/// unknown name turns that silent misattribution into an immediate, obvious failure. ~keep
 fn call_params(name: &'static str, args: &Value) -> CallToolRequestParams {
+    // Checked against the fixed nine, not `mode::domain_modes()`, because that list is cfg-gated:
+    // under a default-feature build `shell` / `web` / `agents` / `workspace` are absent, and the
+    // harness calls them deliberately so it can record them as skipped. The invariant worth
+    // asserting is that the name is a domain at all, not that this build serves it. ~keep
+    const DOMAINS: [&str; 9] = [
+        "code",
+        "graph",
+        "git",
+        "memory",
+        "admin",
+        "web",
+        "agents",
+        "workspace",
+        "shell",
+    ];
     assert!(
-        KNOWN_TOOLS.contains(&name),
-        "harden calls `{name}`, which is not a basemind tool — a call site was missed when the \
-         surface changed; an unknown tool would silently read back as a zero canary"
+        DOMAINS.contains(&name),
+        "harden calls `{name}`, which is not one of the nine domain tools — a call site was missed \
+         when the surface consolidated; an unknown tool would silently read back as a zero canary"
     );
     let mut params = CallToolRequestParams::new(name);
     if let Some(obj) = args.as_object() {
         params = params.with_arguments(obj.clone());
     }
     params
-}
-
-/// Decode a canary response, or `None` when the tool reported a failure.
-///
-/// A verb tool reports a failure as an `isError` result, not a protocol error, so `if let Ok(..)`
-/// alone would read an error message as a body with zero hits.
-fn canary_body(result: &CallToolResult) -> Option<Value> {
-    (result.is_error != Some(true)).then(|| decode_text(result))
 }
 
 fn decode_text(result: &CallToolResult) -> Value {
@@ -204,36 +177,19 @@ fn decode_text(result: &CallToolResult) -> Value {
     serde_json::from_str(&raw).unwrap_or(Value::String(raw))
 }
 
-/// The label a call is recorded under: `tool:mode` for a mode-dispatched tool, `tool:relation` for
-/// `code_refs`, else the tool name plus the arguments that select its operation
-/// (`git_log:path+symbol`). Without this every `git_log` call would collapse into one row and the
-/// harness's per-operation latency table — the thing it exists to produce — would report a single
-/// blended number for five different queries.
+/// Call a tool and record the result. Returns the decoded JSON body if successful
+/// so per-tool drivers can chain assertions on it. Records the call either way.
+/// The label a call is recorded under: `domain:mode` for a mode-dispatched tool, else the bare
+/// name. Without this every `code` call would collapse into one `"code"` row and the harness's
+/// per-operation latency table — the thing it exists to produce — would report a single blended
+/// number for thirteen different queries.
 fn record_label(tool: &'static str, args: &Value) -> String {
-    for selector in ["mode", "relation"] {
-        if let Some(value) = args.get(selector).and_then(Value::as_str) {
-            return format!("{tool}:{value}");
-        }
-    }
-    let shape: Vec<&str> = args
-        .as_object()
-        .map(|object| {
-            object
-                .keys()
-                .map(String::as_str)
-                .filter(|key| !PAGING_ARGS.contains(key))
-                .collect()
-        })
-        .unwrap_or_default();
-    if shape.is_empty() {
-        tool.to_string()
-    } else {
-        format!("{tool}:{}", shape.join("+"))
+    match args.get("mode").and_then(Value::as_str) {
+        Some(mode) => format!("{tool}:{mode}"),
+        None => tool.to_string(),
     }
 }
 
-/// Call a tool and record the result. Returns the decoded JSON body if successful
-/// so per-tool drivers can chain assertions on it. Records the call either way.
 async fn call(
     svc: &ServiceHandle,
     records: &mut Vec<ToolCallRecord>,
@@ -274,10 +230,7 @@ async fn call(
                 elapsed_ms: elapsed.as_millis(),
                 elapsed_us: elapsed.as_micros(),
                 detail: if is_error {
-                    match &body {
-                        Value::String(message) => format!("is_error: {message}"),
-                        other => format!("is_error: {other}"),
-                    }
+                    "is_error=true".to_string()
                 } else {
                     "ok".to_string()
                 },
@@ -377,35 +330,46 @@ async fn drive_tools(svc: &ServiceHandle, sample: Option<&SampleFile>) -> Vec<To
 
     let _ = svc.list_tools(None).await;
 
-    call(svc, &mut records, "index_status", json!({})).await;
+    call(svc, &mut records, "admin", json!({ "mode": "status" })).await;
     call(svc, &mut records, "agents", json!({ "mode": "status" })).await;
     call(svc, &mut records, "agents", json!({ "mode": "cleanup" })).await;
-    call(svc, &mut records, "find_files", json!({ "limit": 50 })).await;
-    call(svc, &mut records, "find_files", json!({ "query": "src", "limit": 50 })).await;
+    call(svc, &mut records, "code", json!({ "mode": "files", "limit": 50 })).await;
     call(
         svc,
         &mut records,
-        "code_symbols",
-        json!({ "name": "test", "limit": 50 }),
+        "code",
+        json!({ "mode": "find", "query": "src", "limit": 50 }),
     )
     .await;
-    call(svc, &mut records, "code_grep", json!({ "pattern": "fn ", "limit": 50 })).await;
+    call(
+        svc,
+        &mut records,
+        "code",
+        json!({ "mode": "symbols", "needle": "test", "limit": 50 }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "code",
+        json!({ "mode": "grep", "pattern": "fn ", "limit": 50, "include_context": false }),
+    )
+    .await;
 
     if let Some(sample) = sample {
-        call(svc, &mut records, "code_outline", json!({ "path": &sample.path })).await;
-
-        // With an explicit `column` the server never looks `name` up on the line, so any name does.
         call(
             svc,
             &mut records,
-            "code_refs",
-            json!({
-                "name": sample.sample_symbol.as_deref().unwrap_or("_"),
-                "relation": "definition",
-                "path": &sample.path,
-                "line": 1,
-                "column": 1,
-            }),
+            "code",
+            json!({ "mode": "outline", "path": &sample.path, "l2": false }),
+        )
+        .await;
+
+        call(
+            svc,
+            &mut records,
+            "code",
+            json!({ "mode": "definition", "path": &sample.path, "line": 1, "column": 0 }),
         )
         .await;
 
@@ -413,117 +377,319 @@ async fn drive_tools(svc: &ServiceHandle, sample: Option<&SampleFile>) -> Vec<To
             call(
                 svc,
                 &mut records,
-                "code_refs",
-                json!({ "name": module, "relation": "importers" }),
+                "code",
+                json!({ "mode": "dependents", "module": module }),
             )
             .await;
         }
 
-        call(svc, &mut records, "git_diff", json!({})).await;
-        call(svc, &mut records, "git_log", json!({ "limit": 20 })).await;
+        call(svc, &mut records, "git", json!({ "mode": "status" })).await;
+        call(svc, &mut records, "admin", json!({ "mode": "repo" })).await;
         call(
             svc,
             &mut records,
-            "git_log",
-            json!({ "path": &sample.path, "limit": 10 }),
-        )
-        .await;
-        if let Some((directory, _)) = sample.path.to_str_lossy().rsplit_once('/') {
-            call(
-                svc,
-                &mut records,
-                "git_log",
-                json!({ "path": format!("{directory}/"), "limit": 20 }),
-            )
-            .await;
-        }
-        call(svc, &mut records, "git_log", json!({ "query": "fix", "limit": 20 })).await;
-        call(
-            svc,
-            &mut records,
-            "git_diff",
-            json!({ "path": &sample.path, "structural": true, "from": "HEAD" }),
+            "git",
+            json!({ "mode": "recent", "limit": 20, "include_files": true }),
         )
         .await;
         call(
             svc,
             &mut records,
-            "git_diff",
-            json!({ "path": &sample.path, "from": "HEAD~1", "to": "HEAD" }),
+            "git",
+            json!({ "mode": "touching", "path": &sample.path, "limit": 10 }),
         )
         .await;
-        call(svc, &mut records, "git_blame", json!({ "path": &sample.path })).await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "by_path", "pattern": "\\.md$", "window": 200, "limit": 20 }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "search", "pattern": "fix", "field": "message", "limit": 20 }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "churn", "window": 200, "top_k": 20 }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "diff_outline", "path": &sample.path, "rev": "HEAD" }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "diff", "path": &sample.path, "rev_old": "HEAD~1", "rev_new": "HEAD" }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "git",
+            json!({ "mode": "blame", "path": &sample.path }),
+        )
+        .await;
 
         if let Some(sym) = &sample.sample_symbol {
             call(
                 svc,
                 &mut records,
-                "git_blame",
-                json!({ "path": &sample.path, "symbol": sym }),
+                "git",
+                json!({ "mode": "blame_symbol", "path": &sample.path, "name": sym }),
             )
             .await;
             call(
                 svc,
                 &mut records,
-                "git_log",
-                json!({ "path": &sample.path, "symbol": sym, "limit": 20 }),
+                "git",
+                json!({ "mode": "symbol_history", "path": &sample.path, "name": sym, "limit": 20 }),
             )
             .await;
-            call(svc, &mut records, "code_refs", json!({ "name": sym, "limit": 100 })).await;
+            call(
+                svc,
+                &mut records,
+                "code",
+                json!({ "mode": "references", "name": sym, "limit": 100 }),
+            )
+            .await;
+            call(
+                svc,
+                &mut records,
+                "graph",
+                json!({ "mode": "calls", "name": sym, "direction": "callers", "max_depth": 2 }),
+            )
+            .await;
+            call(
+                svc,
+                &mut records,
+                "graph",
+                json!({ "mode": "neighbors", "name": sym, "direction": "both", "depth": 2, "max_nodes": 100 }),
+            )
+            .await;
+            call(
+                svc,
+                &mut records,
+                "graph",
+                json!({ "mode": "path", "from": sym, "to": sym }),
+            )
+            .await;
+            call(
+                svc,
+                &mut records,
+                "graph",
+                json!({ "mode": "subgraph", "name": sym, "depth": 2, "max_nodes": 30 }),
+            )
+            .await;
         }
     }
 
     call(
         svc,
         &mut records,
-        "code_refs",
-        json!({ "name": "Future", "relation": "implementations", "limit": 100 }),
+        "code",
+        json!({ "mode": "implementations", "trait_name": "Future", "limit": 100 }),
     )
     .await;
 
-    if let Some(sample) = sample
-        && let Some(sym) = &sample.sample_symbol
-    {
+    call(
+        svc,
+        &mut records,
+        "graph",
+        json!({ "mode": "communities", "algorithm": "label_propagation", "edges": "all", "max_communities": 50 }),
+    )
+    .await;
+
+    call(
+        svc,
+        &mut records,
+        "graph",
+        json!({ "mode": "export", "format": "dot", "edges": "all", "max_nodes": 200 }),
+    )
+    .await;
+
+    // open:false keeps the sweep headless — never launch a desktop viewer from the harness.
+    call(
+        svc,
+        &mut records,
+        "graph",
+        json!({ "mode": "display", "format": "html", "edges": "all", "max_nodes": 200, "open": false }),
+    )
+    .await;
+
+    call(
+        svc,
+        &mut records,
+        "graph",
+        json!({ "mode": "open", "format": "html", "edges": "all", "max_nodes": 200, "open": false }),
+    )
+    .await;
+
+    if let Some(sample) = sample {
         call(
             svc,
             &mut records,
-            "code_read",
-            json!({ "path": &sample.path, "symbol": sym }),
+            "admin",
+            json!({ "mode": "compress", "path": &sample.path }),
         )
         .await;
+
+        if let Some(sym) = &sample.sample_symbol {
+            call(
+                svc,
+                &mut records,
+                "code",
+                json!({ "mode": "expand", "path": &sample.path, "name": sym }),
+            )
+            .await;
+        }
     }
 
     call(
         svc,
         &mut records,
-        "memory_save",
-        json!({ "key": "harden_probe", "value": "basemind harden probe" }),
+        "admin",
+        json!({ "mode": "compress", "text": "It is worth noting that basemind provides code-aware compression. The index is fast." }),
     )
     .await;
-    call(svc, &mut records, "memory_search", json!({ "key": "harden_probe" })).await;
-    call(svc, &mut records, "memory_search", json!({})).await;
-    call(svc, &mut records, "docs_search", json!({ "query": "code map scanner" })).await;
+
     call(
         svc,
         &mut records,
-        "code_search",
-        json!({ "query": "parse the file and extract symbols" }),
-    )
-    .await;
-    call(
-        svc,
-        &mut records,
-        "code_search",
-        json!({ "query": "parse file extract symbols", "lane": "keyword" }),
+        "memory",
+        json!({ "mode": "put",  "key": "harden_probe", "value": "basemind harden probe", "embed": false }),
     )
     .await;
     call(
         svc,
         &mut records,
-        "code_search",
-        json!({ "query": "spawn", "lane": "hybrid" }),
+        "memory",
+        json!({ "mode": "get",  "key": "harden_probe" }),
     )
     .await;
+    call(svc, &mut records, "memory", json!({ "mode": "list"})).await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "delete",  "key": "harden_probe" }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "put",  "key": "harden_audit_probe", "value": "audit probe", "embed": false }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "audit",  "key": "harden_audit_probe", "dry_run": true }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "delete",  "key": "harden_audit_probe" }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "documents",  "query": "code map scanner" }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "code",
+        json!({ "mode": "semantic", "query": "parse the file and extract symbols" }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "code",
+        json!({ "mode": "semantic", "query": "parse file extract symbols", "lane": "keyword" }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "code",
+        json!({ "mode": "semantic", "query": "spawn", "lane": "hybrid" }),
+    )
+    .await;
+
+    let chunk_path_arg = if let Some(s) = sample {
+        json!({ "mode": "chunk", "path": &s.path })
+    } else {
+        json!({ "mode": "chunk", "path": "src/lib.rs" })
+    };
+    call(svc, &mut records, "code", chunk_path_arg).await;
+
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "mine",  "window": 100, "min_support": 5, "min_confidence": 0.6 }),
+    )
+    .await;
+    call(
+        svc,
+        &mut records,
+        "memory",
+        json!({ "mode": "proposals",  "kind": "skill", "limit": 20 }),
+    )
+    .await;
+
+    call(svc, &mut records, "admin", json!({ "mode": "cache_stats" })).await;
+    call(svc, &mut records, "admin", json!({ "mode": "gc" })).await;
+
+    if let Some(spawned) = call(
+        svc,
+        &mut records,
+        "shell",
+        json!({ "mode": "spawn", "command": "echo basemind-harden-shell" }),
+    )
+    .await
+        && let Some(session_id) = spawned.get("session_id").and_then(Value::as_str)
+    {
+        assert!(
+            session_id.starts_with("bmsh-"),
+            "shell mode=spawn session_id should be a minted bmsh- id, got {session_id:?}"
+        );
+        call(
+            svc,
+            &mut records,
+            "shell",
+            json!({ "mode": "capture", "session_id": session_id }),
+        )
+        .await;
+        call(
+            svc,
+            &mut records,
+            "shell",
+            json!({ "mode": "kill", "session_id": session_id }),
+        )
+        .await;
+    }
+    call(svc, &mut records, "shell", json!({ "mode": "list" })).await;
 
     records
 }
@@ -563,10 +729,11 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
     }
 
     for r in &repo_record.tools {
-        let tool_name = r.tool.split(':').next().unwrap_or(&r.tool);
-        let feature_gated = FEATURE_GATED_TOOLS.contains(&tool_name) && r.detail.contains("Cargo feature");
-        let tolerated =
-            !r.ok && (feature_gated || r.detail.contains("tool not found") || r.detail.contains("disambiguate"));
+        let tolerated = !r.ok
+            && (r.detail.contains("requires the")
+                || r.detail.contains("tool not found")
+                || r.detail.contains("disambiguate")
+                || (r.tool == "code:chunk" && r.detail == "is_error=true"));
         if !r.ok && !tolerated {
             failures.push(format!("{} failed: {}", r.tool, r.detail));
         }
@@ -626,7 +793,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             if hit_count == 0 {
-                failures.push("react canary: code_symbols(\"useState\") returned 0 hits".into());
+                failures.push("react canary: search_symbols(\"useState\") returned 0 hits".into());
             }
         }
         name if name.ends_with("-shallow") => {
@@ -647,7 +814,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if hits < 50 {
                 failures.push(format!(
-                    "tokio canary: code_refs(\"spawn\") returned {hits} hits (expected ≥ 50)"
+                    "tokio canary: find_references(\"spawn\") returned {hits} hits (expected ≥ 50)"
                 ));
             }
             let find_files_hits = repo_record
@@ -667,7 +834,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if grep_hits < 20 {
                 failures.push(format!(
-                    "tokio canary: code_grep(\"fn spawn\") returned {grep_hits} hits (expected ≥ 20)"
+                    "tokio canary: workspace_grep(\"fn spawn\") returned {grep_hits} hits (expected ≥ 20)"
                 ));
             }
             let future_hits = repo_record
@@ -677,7 +844,115 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if future_hits < 20 {
                 failures.push(format!(
-                    "tokio canary: code_refs(\"Future\", implementations) returned {future_hits} hits (expected ≥ 20)"
+                    "tokio canary: find_implementations(\"Future\") returned {future_hits} hits (expected ≥ 20)"
+                ));
+            }
+            let cg_nodes = repo_record
+                .canaries
+                .get("spawn_call_graph_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if cg_nodes < 5 {
+                failures.push(format!(
+                    "tokio canary: call_graph(\"spawn\", callers, depth=2) returned {cg_nodes} nodes (expected ≥ 5)"
+                ));
+            }
+            let archmap_nodes = repo_record
+                .canaries
+                .get("archmap_module_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if archmap_nodes < 5 {
+                failures.push(format!(
+                    "tokio canary: architecture_map(module) returned {archmap_nodes} nodes (expected ≥ 5)"
+                ));
+            }
+            let import_edges = repo_record
+                .canaries
+                .get("archmap_import_edges")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if import_edges < 1 {
+                failures.push(format!(
+                    "tokio canary: architecture_map(module, edges=all) returned {import_edges} import edges (expected ≥ 1)"
+                ));
+            }
+            let neighbor_nodes = repo_record
+                .canaries
+                .get("neighbors_spawn_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if neighbor_nodes < 2 {
+                failures.push(format!(
+                    "tokio canary: neighbors(\"spawn\", in, depth=2) returned {neighbor_nodes} nodes (expected ≥ 2)"
+                ));
+            }
+            let louvain_communities = repo_record
+                .canaries
+                .get("louvain_communities")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if louvain_communities < 2 {
+                failures.push(format!(
+                    "tokio canary: communities(louvain) returned {louvain_communities} communities (expected ≥ 2)"
+                ));
+            }
+            let graph_export_nodes = repo_record
+                .canaries
+                .get("graph_export_nodes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if graph_export_nodes < 2 {
+                failures.push(format!(
+                    "tokio canary: graph_export(node_link) rendered {graph_export_nodes} nodes (expected ≥ 2)"
+                ));
+            }
+            let archmap_us = repo_record
+                .canaries
+                .get("archmap_module_elapsed_us")
+                .and_then(Value::as_u64);
+            let neighbors_us = repo_record
+                .canaries
+                .get("neighbors_spawn_elapsed_us")
+                .and_then(Value::as_u64);
+            let cold_us = repo_record.canaries.get("graph_calls_cold_us").and_then(Value::as_u64);
+            // Both readings below are WARM. `drive_tools` sweeps every graph mode before the first
+            // canary runs, so the shared codegraph entries are already built by the time these two
+            // are timed. The ratio therefore bounds warm-against-warm — a blow-up in the neighbors
+            // projection itself, on top of a build both calls got for free — and stays machine-
+            // independent by comparing two measurements from the same run rather than an absolute
+            // millisecond threshold. It says nothing about the build, which is what the cold guard
+            // below exists for. The +50ms floor absorbs timer noise on sub-millisecond runs. ~keep
+            if let (Some(archmap_us), Some(neighbors_us)) = (archmap_us, neighbors_us) {
+                let ceiling = archmap_us.saturating_mul(8).saturating_add(50_000);
+                if neighbors_us > ceiling {
+                    failures.push(format!(
+                        "tokio canary: warm neighbors latency {neighbors_us}µs > 8× warm \
+                         architecture_map baseline {archmap_us}µs + 50ms ({ceiling}µs) — \
+                         projection regression?"
+                    ));
+                }
+            }
+            // Memo effectiveness — the guard the ratio above structurally cannot provide. The
+            // neighbors canary asks for the same edge-kind set as the run's one cold build, so a
+            // working memo hands it a ready graph and it lands far cheaper. When `run_call_graph`
+            // took no shared stack and never populated the memo (fixed in 6a9ff7c), every graph
+            // call paid its own full build: warm ≈ cold, and the warm-vs-warm ratio above stayed
+            // green throughout because BOTH of its inputs were equally cold. Skipped when the cold
+            // build is itself under 50ms — below that the gap is timer noise, not evidence. ~keep
+            //
+            // 4× is calibrated against both ends, on tokio: a working memo measures cold 453ms vs
+            // warm 20ms (22×, so 5× headroom), and ef2fde4 — the commit where the memo went
+            // unpopulated — measured warm 443ms against a comparable cold build, which this fails
+            // and the ratio above did not. ~keep
+            if let (Some(cold_us), Some(neighbors_us)) = (cold_us, neighbors_us)
+                && cold_us >= 50_000
+                && neighbors_us.saturating_mul(4) > cold_us
+            {
+                failures.push(format!(
+                    "tokio canary: warm neighbors {neighbors_us}µs is not materially cheaper than \
+                     the run's cold codegraph build {cold_us}µs (expected at least 4× cheaper) — \
+                     is the shared graph memo still being populated?"
                 ));
             }
             if cfg!(feature = "code-search")
@@ -688,7 +963,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 && hits < 1
             {
                 failures.push(format!(
-                    "tokio canary: code_search(\"spawn a task\") returned {hits} hits (expected ≥ 1)"
+                    "tokio canary: search_code(\"spawn a task\") returned {hits} hits (expected ≥ 1)"
                 ));
             }
         }
@@ -700,7 +975,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if hits < 50 {
                 failures.push(format!(
-                    "django canary: code_refs(\"get\") returned {hits} hits (expected ≥ 50)"
+                    "django canary: find_references(\"get\") returned {hits} hits (expected ≥ 50)"
                 ));
             }
             let search_fixed = repo_record
@@ -710,7 +985,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if search_fixed < 20 {
                 failures.push(format!(
-                    "django canary: git_log(query=\"fixed\") returned {search_fixed} commits (expected ≥ 20)"
+                    "django canary: search_git_history(\"fixed\", message) returned {search_fixed} commits (expected ≥ 20)"
                 ));
             }
             let query_commits = repo_record
@@ -720,7 +995,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                 .unwrap_or(0);
             if query_commits < 10 {
                 failures.push(format!(
-                    "django canary: git_log(path=\"django/db/models/query.py\") returned {query_commits} commits (expected ≥ 10)"
+                    "django canary: commits_touching(\"django/db/models/query.py\") returned {query_commits} commits (expected ≥ 10)"
                 ));
             }
             if let Some(author_hits) = repo_record.canaries.get("author_search_hits").and_then(Value::as_u64) {
@@ -731,7 +1006,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                         .and_then(Value::as_str)
                         .unwrap_or("?");
                     failures.push(format!(
-                        "django canary: git_log(author={token:?}) found 0 commits for a deep-history author — full-depth author search regressed"
+                        "django canary: search_git_history(author={token:?}) found 0 commits for a deep-history author — full-depth author search regressed"
                     ));
                 }
                 if repo_record
@@ -741,9 +1016,16 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                     == Some(false)
                 {
                     failures.push(
-                        "django canary: git_log(author) returned a commit whose author does not match the query — author scope leaked".into(),
+                        "django canary: search_git_history(field=author) returned a commit whose author does not match the query — author scope leaked".into(),
                     );
                 }
+            }
+            if let Some(mined) = repo_record.canaries.get("proposals_mined").and_then(Value::as_u64)
+                && mined < 1
+            {
+                failures.push(format!(
+                    "django canary: proposals_mine (default thresholds) returned {mined} candidates (expected ≥ 1)"
+                ));
             }
             if precise_resolution_expected() {
                 let resolved_total = repo_record
@@ -758,7 +1040,7 @@ fn assert_passing(repo_name: &str, scan: &ScanOutcome, repo_record: &mut RepoRec
                     .unwrap_or(0);
                 if resolved_total < 1 || cross_file < 1 {
                     failures.push(format!(
-                        "django canary: code_refs(force_str, path) precise resolution regressed — \
+                        "django canary: `code` mode=callers(force_str) precise resolution regressed — \
                          resolved_total={resolved_total}, resolved cross-file hits={cross_file} \
                          (expected ≥ 1 of each)"
                     ));
@@ -793,53 +1075,51 @@ fn git_first_line(repo: &Path, args: &[&str]) -> Option<String> {
 }
 
 async fn capture_canaries(svc: &ServiceHandle, repo_name: &str, repo_root: &Path, record: &mut RepoRecord) {
-    // Cache accounting has no MCP tool; this is the call `basemind cache stats` makes.
-    let cache_dir = basemind::store::workspace_cache_dir(repo_root);
-    if let Ok(Ok(stats)) = tokio::task::spawn_blocking(move || basemind::store_gc::cache_stats(&cache_dir)).await {
-        record
-            .canaries
-            .insert("stats_git_history_bytes".into(), json!(stats.git_history_bytes));
-        record
-            .canaries
-            .insert("stats_total_bytes".into(), json!(stats.total_bytes));
+    if let Ok(out) = svc
+        .call_tool(call_params("admin", &json!({ "mode": "cache_stats" })))
+        .await
+    {
+        let body = decode_text(&out);
+        if let Some(gh) = body.get("git_history_bytes").and_then(Value::as_u64) {
+            record.canaries.insert("stats_git_history_bytes".into(), json!(gh));
+        }
+        if let Some(total) = body.get("total_bytes").and_then(Value::as_u64) {
+            record.canaries.insert("stats_total_bytes".into(), json!(total));
+        }
     }
-
-    // Canaries count rows, so each asks for a budget far above its page instead of the default.
-    const WHOLE_PAGE: u32 = 1_000_000;
-    let count = |body: &Value, key: &str| {
-        body.get(key)
-            .and_then(Value::as_array)
-            .map_or(0, |rows| rows.len() as u64)
-    };
 
     match repo_name {
         "react" => {
             let res = svc
                 .call_tool(call_params(
-                    "code_symbols",
-                    &json!({ "name": "useState", "limit": 20, "max_tokens": WHOLE_PAGE }),
+                    "code",
+                    &json!({ "mode": "symbols", "needle": "useState", "limit": 20 }),
                 ))
                 .await;
-            if let Ok(out) = res
-                && let Some(body) = canary_body(&out)
-            {
-                record
-                    .canaries
-                    .insert("useState_hits".into(), json!(count(&body, "results")));
+            if let Ok(out) = res {
+                let body = decode_text(&out);
+                let hits = body
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("useState_hits".into(), json!(hits));
             }
         }
         name if name.ends_with("-shallow") => {
             let mut truncated = false;
-            for (tool, args) in [
-                ("git_log", json!({ "limit": 5 })),
-                ("git_blame", json!({ "path": "README.md" })),
-            ] {
-                if let Ok(out) = svc.call_tool(call_params(tool, &args)).await
-                    && let Some(body) = canary_body(&out)
-                    && body.get("truncated").and_then(Value::as_bool) == Some(true)
-                {
-                    truncated = true;
-                    break;
+            for mode in ["recent", "blame"] {
+                let args = if mode == "blame" {
+                    json!({ "mode": mode, "path": "README.md" })
+                } else {
+                    json!({ "mode": mode, "limit": 5, "include_files": false })
+                };
+                if let Ok(out) = svc.call_tool(call_params("git", &args)).await {
+                    let body = decode_text(&out);
+                    if body.get("truncated").and_then(Value::as_bool) == Some(true) {
+                        truncated = true;
+                        break;
+                    }
                 }
             }
             record.canaries.insert("any_truncated".into(), json!(truncated));
@@ -847,104 +1127,217 @@ async fn capture_canaries(svc: &ServiceHandle, repo_name: &str, repo_root: &Path
         "tokio" => {
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_refs",
-                    &json!({ "name": "spawn", "limit": 200, "max_tokens": WHOLE_PAGE }),
+                    "code",
+                    &json!({ "mode": "references", "name": "spawn", "limit": 200 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record.canaries.insert("spawn_hits".into(), json!(count(&body, "hits")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("spawn_hits".into(), json!(hits));
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "find_files",
-                    &json!({ "query": "src", "limit": 200, "max_tokens": WHOLE_PAGE }),
+                    "code",
+                    &json!({ "mode": "find", "query": "src", "limit": 200 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record
-                    .canaries
-                    .insert("find_files_src_hits".into(), json!(count(&body, "files")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("find_files_src_hits".into(), json!(hits));
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_refs",
-                    &json!({
-                        "name": "Future",
-                        "relation": "implementations",
-                        "limit": 200,
-                        "max_tokens": WHOLE_PAGE,
-                    }),
+                    "code",
+                    &json!({ "mode": "implementations", "trait_name": "Future", "limit": 200 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record
-                    .canaries
-                    .insert("future_impl_hits".into(), json!(count(&body, "hits")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("future_impl_hits".into(), json!(hits));
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_grep",
-                    &json!({ "pattern": "fn spawn", "limit": 200, "max_tokens": WHOLE_PAGE }),
+                    "graph",
+                    &json!({ "mode": "calls", "name": "spawn", "direction": "callers", "max_depth": 2, "max_nodes": 500 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
+                let body = decode_text(&out);
+                let nodes = body
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("spawn_call_graph_nodes".into(), json!(nodes));
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "graph",
+                    &json!({ "mode": "map", "granularity": "module", "depth": 2, "max_nodes": 100, "include_churn": false }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let nodes = body
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("archmap_module_nodes".into(), json!(nodes));
+                // Baseline for the shared codegraph-build cost: every graph tool pays this same
+                // full-repo build, so it anchors the machine-independent latency ratio below.
+                if let Some(us) = body.get("elapsed_us").and_then(Value::as_u64) {
+                    record.canaries.insert("archmap_module_elapsed_us".into(), json!(us));
+                }
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "graph",
+                    &json!({ "mode": "map", "granularity": "module", "depth": 2, "max_nodes": 100, "max_edges": 2000, "edges": "all", "include_churn": false }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let import_edges = body
+                    .get("edges")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter(|e| e.get("kind").and_then(Value::as_str) == Some("imports"))
+                            .count() as u64
+                    })
+                    .unwrap_or(0);
+                record.canaries.insert("archmap_import_edges".into(), json!(import_edges));
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "graph",
+                    &json!({ "mode": "neighbors", "name": "spawn", "direction": "in", "depth": 2, "edges": "calls", "max_nodes": 200 }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let nodes = body
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("neighbors_spawn_nodes".into(), json!(nodes));
+                if let Some(us) = body.get("elapsed_us").and_then(Value::as_u64) {
+                    record.canaries.insert("neighbors_spawn_elapsed_us".into(), json!(us));
+                }
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "graph",
+                    &json!({ "mode": "communities", "algorithm": "louvain", "edges": "all", "max_communities": 200 }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let num = body.get("num_communities").and_then(Value::as_u64).unwrap_or(0);
+                record.canaries.insert("louvain_communities".into(), json!(num));
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "graph",
+                    &json!({ "mode": "export", "format": "node_link", "edges": "all", "max_nodes": 500 }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
+                let nodes = body.get("node_count").and_then(Value::as_u64).unwrap_or(0);
+                record.canaries.insert("graph_export_nodes".into(), json!(nodes));
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "code",
+                    &json!({ "mode": "grep", "pattern": "fn spawn", "limit": 200, "include_context": false }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
                 let hits = body.get("total_matches").and_then(Value::as_u64).unwrap_or(0);
                 record.canaries.insert("grep_fn_spawn_hits".into(), json!(hits));
             }
             #[cfg(feature = "code-search")]
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_search",
-                    &json!({ "query": "spawn a task", "limit": 10, "max_tokens": WHOLE_PAGE }),
+                    "code",
+                    &json!({ "mode": "semantic", "query": "spawn a task", "limit": 10 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
-                && let Some(hits) = body.get("hits").and_then(Value::as_array)
-                && !hits.is_empty()
             {
-                record
-                    .canaries
-                    .insert("search_code_spawn_hits".into(), json!(hits.len() as u64));
+                let body = decode_text(&out);
+                if let Some(hits) = body.get("hits").and_then(Value::as_array)
+                    && !hits.is_empty()
+                {
+                    record
+                        .canaries
+                        .insert("search_code_spawn_hits".into(), json!(hits.len() as u64));
+                }
             }
         }
         "django" => {
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_refs",
-                    &json!({ "name": "get", "limit": 200, "max_tokens": WHOLE_PAGE }),
+                    "code",
+                    &json!({ "mode": "references", "name": "get", "limit": 200 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record.canaries.insert("get_hits".into(), json!(count(&body, "hits")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("hits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("get_hits".into(), json!(hits));
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "git_log",
-                    &json!({ "path": "django/db/models/query.py", "limit": 100, "max_tokens": WHOLE_PAGE }),
+                    "git",
+                    &json!({ "mode": "touching", "path": "django/db/models/query.py", "limit": 100 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record
-                    .canaries
-                    .insert("query_py_commits".into(), json!(count(&body, "commits")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("query_py_commits".into(), json!(hits));
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "git_log",
-                    &json!({ "query": "fixed", "limit": 100, "max_tokens": WHOLE_PAGE }),
+                    "git",
+                    &json!({ "mode": "search", "pattern": "fixed", "field": "message", "limit": 100 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
-                record
-                    .canaries
-                    .insert("search_fixed_commits".into(), json!(count(&body, "commits")));
+                let body = decode_text(&out);
+                let hits = body
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len() as u64)
+                    .unwrap_or(0);
+                record.canaries.insert("search_fixed_commits".into(), json!(hits));
             }
             if let Some(author) = git_first_line(repo_root, &["log", "--format=%an", "-1", "--skip=500"])
                 && let Some(token) = author
@@ -952,12 +1345,12 @@ async fn capture_canaries(svc: &ServiceHandle, repo_name: &str, repo_root: &Path
                     .find(|w| w.chars().all(char::is_alphabetic) && w.len() >= 3)
                 && let Ok(out) = svc
                     .call_tool(call_params(
-                        "git_log",
-                        &json!({ "author": token, "limit": 100, "max_tokens": WHOLE_PAGE }),
+                        "git",
+                        &json!({ "mode": "search", "pattern": token, "field": "author", "limit": 100 }),
                     ))
                     .await
-                && let Some(body) = canary_body(&out)
             {
+                let body = decode_text(&out);
                 let commits = body
                     .get("commits")
                     .and_then(Value::as_array)
@@ -983,17 +1376,24 @@ async fn capture_canaries(svc: &ServiceHandle, repo_name: &str, repo_root: &Path
             }
             if let Ok(out) = svc
                 .call_tool(call_params(
-                    "code_refs",
-                    &json!({
-                        "name": "force_str",
-                        "path": "django/utils/encoding.py",
-                        "limit": 200,
-                        "max_tokens": WHOLE_PAGE,
-                    }),
+                    "memory",
+                    &json!({ "mode": "mine",  "window": 100, "min_support": 5, "min_confidence": 0.6 }),
                 ))
                 .await
-                && let Some(body) = canary_body(&out)
             {
+                let body = decode_text(&out);
+                if let Some(mined) = body.get("mined").and_then(Value::as_u64) {
+                    record.canaries.insert("proposals_mined".into(), json!(mined));
+                }
+            }
+            if let Ok(out) = svc
+                .call_tool(call_params(
+                    "code",
+                    &json!({ "mode": "callers", "path": "django/utils/encoding.py", "name": "force_str", "limit": 200 }),
+                ))
+                .await
+            {
+                let body = decode_text(&out);
                 let resolved_total = body.get("resolved_total").and_then(Value::as_u64).unwrap_or(0);
                 // Cross-file AND proven: a hit is only evidence of precise resolution when the
                 // resolver bound it to this definition. `resolved: false` still names a real call
@@ -1329,6 +1729,22 @@ async fn harden_repo() {
         git_history,
         canaries: BTreeMap::new(),
     };
+
+    // `drive_tools` issues `graph calls` as the session's first graph call, so it pays a COLD build
+    // of the {calls} edge-kind set (no focus) — the very memo entry the `neighbors` canary asks for
+    // later. Recording it here is the only cold baseline available: by the time `capture_canaries`
+    // runs, the sweep has warmed an entry for every edge set it uses, so every graph timing taken
+    // there is a warm one, and a memo that silently stopped working reads as perfectly normal. ~keep
+    if let Some(cold_us) = record
+        .tools
+        .iter()
+        .find(|t| t.tool == "graph:calls" && t.ok)
+        .map(|t| t.elapsed_us)
+    {
+        record
+            .canaries
+            .insert("graph_calls_cold_us".to_string(), json!(cold_us as u64));
+    }
 
     if let Some(m) = &record.git_history {
         record.canaries.insert("gh_index_commits".to_string(), json!(m.commits));

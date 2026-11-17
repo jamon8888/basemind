@@ -17,7 +17,7 @@ use crate::path::RelPath;
 /// [`Ready`]: super::Lifecycle::Ready
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct LifecycleNotice {
-    /// Machine-readable state tag: `"warming_up"`, `"building_index"`, `"rescanning"`, or `"index_rebuilding"`.
+    /// Machine-readable state tag: `"warming_up"`, `"building_index"`, or `"rescanning"`.
     pub state: &'static str,
     /// Human/agent-readable explanation of what the server is doing and what it means for this result.
     pub message: &'static str,
@@ -41,8 +41,8 @@ impl LifecycleNotice {
             }),
             Lifecycle::BuildingIndex => Some(Self {
                 state: "building_index",
-                message: "Index is building for the first time. Results are incomplete — call \
-                          `index_status {}` until `indexing` is false, then retry.",
+                message: "Index is building for the first time. Results are incomplete — poll `status` \
+                          until `indexing` is false, then retry.",
                 retry: true,
             }),
             Lifecycle::Rescanning => Some(Self {
@@ -69,64 +69,54 @@ impl LifecycleNotice {
             retry: false,
         }
     }
+}
 
-    /// [`index_rebuilding`](Self::index_rebuilding) when `status` records a degraded scan, else `None`
-    /// (healthy, or no sidecar yet: the never-scanned case belongs to the building-index lifecycle).
-    pub(crate) fn for_scan_status(status: Option<&crate::store::StatusSidecar>) -> Option<Self> {
-        status
-            .is_some_and(crate::store::StatusSidecar::is_degraded)
-            .then(Self::index_rebuilding)
-    }
-
-    /// The notice attached when nothing has been scanned: every list is empty for that reason, not
-    /// because the query matched nothing.
-    pub(crate) fn empty_index() -> Self {
-        Self {
-            state: "empty_index",
-            message: "The index is empty: nothing has been scanned for this workspace, so this result \
-                      says nothing about the code. Run `index_rescan {}` (or `basemind scan` \
-                      in a shell) and retry.",
-            retry: true,
-        }
-    }
-
-    /// The notice for a workspace whose last scan is partial or whose resolve pass has not
-    /// committed, notably an index wiped by a schema revision bump and rebuilding. Reference-shaped
-    /// reads (`references` / `callers` / `implementations`) answer empty or short until it finishes.
-    pub(crate) fn index_rebuilding() -> Self {
-        Self {
-            state: "index_rebuilding",
-            message: "index rebuilding — results incomplete. A full scan is rebuilding the symbol / \
-                      reference index; an empty `references` / `callers` / `implementations` answer \
-                      does not mean there are none. Call `index_status {}` until `degraded` clears, then \
-                      retry.",
-            retry: true,
-        }
-    }
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct OutlineParams {
+    /// Repository-relative path (forward-slash). Must be a file basemind has scanned.
+    pub path: RelPath,
+    /// When true, also include calls + doc comments (L2). Falls back to empty
+    /// arrays if no L2 blob exists for the file's current content.
+    #[serde(default)]
+    pub l2: bool,
+    /// Optional token budget bounding the returned `symbols` list (not the whole envelope,
+    /// and not `imports` / `calls` / `docs`). Symbols are kept in file order until the
+    /// budget is hit; the rest are dropped and the response carries `budgeted: true`.
+    #[serde(default, alias = "token_budget", alias = "budget")]
+    pub max_tokens: Option<u32>,
+    /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
+    /// tabular encoding of the `symbols` list — far fewer tokens than JSON for large outlines.
+    #[serde(default, alias = "encoding")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchSymbolsParams {
     /// Substring matched against symbol name (case-sensitive).
+    #[serde(
+        alias = "query",
+        alias = "pattern",
+        alias = "name",
+        alias = "q",
+        alias = "term",
+        alias = "symbol"
+    )]
     pub needle: String,
     /// Optional kind filter: function, method, struct, enum, class, interface,
     /// trait, type, const, module, macro.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Also match names the needle is a fuzzy subsequence of, ranked below every literal match.
-    #[serde(default)]
-    pub fuzzy: bool,
     /// Cap the number of results returned. Default 100, max 1000.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Optional token budget bounding the returned result list (not the whole envelope).
     /// Items are kept best-first until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
     /// tabular encoding of the `results` list — far fewer tokens than JSON for large hit sets.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Resume token returned by the previous call's `next_cursor`. Cursors are scoped to
     /// the in-RAM index snapshot and invalidate on rescan.
@@ -139,9 +129,6 @@ pub struct ListFilesParams {
     /// Optional substring matched against the path. Cheaper than reading a glob crate.
     #[serde(default)]
     pub path_contains: Option<String>,
-    /// Optional prefix the path must start with.
-    #[serde(default)]
-    pub path_prefix: Option<String>,
     /// Filter by language (e.g. "rust", "python").
     #[serde(default)]
     pub language: Option<String>,
@@ -151,11 +138,11 @@ pub struct ListFilesParams {
     /// Optional token budget bounding the returned file list (not the whole envelope).
     /// Entries are kept in order until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
     /// tabular encoding of the `files` list — far fewer tokens than JSON for large listings.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Resume token returned by the previous call's `next_cursor`. Cursors are scoped to
     /// the in-RAM index snapshot and invalidate on rescan.
@@ -167,6 +154,7 @@ pub struct ListFilesParams {
 pub struct FindFilesParams {
     /// Fuzzy query matched as a subsequence against each indexed path (fzf/fd-style — letters
     /// of `query` must appear in order in the path, not necessarily contiguous). Case-insensitive.
+    #[serde(alias = "needle", alias = "pattern")]
     pub query: String,
     /// Optional prefix filter applied before scoring (e.g. "src/mcp/").
     #[serde(default)]
@@ -180,11 +168,11 @@ pub struct FindFilesParams {
     /// Optional token budget bounding the returned file list (not the whole envelope).
     /// Entries are kept in score order until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
     /// tabular encoding of the `files` list — far fewer tokens than JSON for large listings.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Resume token returned by the previous call's `next_cursor`. Cursors are scoped to
     /// the in-RAM index snapshot (and the score ordering computed for `query`); a rescan
@@ -194,25 +182,36 @@ pub struct FindFilesParams {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DependentsParams {
+    /// Module / import target (e.g. "tokio::sync" or "react").
+    #[serde(alias = "name", alias = "query", alias = "import")]
+    pub module: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StatusParams {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RepoInfoParams {}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FindReferencesParams {
     /// The callee identifier to look up. Substring match — case-sensitive, no scope
     /// resolution; both `Foo::bar()` and `bar()` register as callee `"bar"`. Use with
     /// caution on common names like `new` or `get`.
+    #[serde(alias = "needle", alias = "pattern", alias = "query", alias = "symbol", alias = "q")]
     pub name: String,
-    /// Match callee identifiers containing `name` instead of only those equal to it.
-    #[serde(default)]
-    pub substring: bool,
     /// Cap on results returned. Default 100, max 1000.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Optional token budget bounding the returned `hits` list (not the whole envelope).
     /// Hits are kept in scan order until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
     /// tabular encoding of the `hits` list — far fewer tokens than JSON for large hit sets.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Resume token returned by the previous call's `next_cursor`. Stable across rescans
     /// because the underlying Fjall keys are content-addressed.
@@ -225,23 +224,18 @@ pub struct FindCallersParams {
     /// Repository-relative path of the definition file.
     pub path: RelPath,
     /// Name of the definition.
+    #[serde(alias = "needle", alias = "query", alias = "symbol")]
     pub name: String,
-    /// Match callee identifiers containing `name` instead of only those equal to it.
-    #[serde(default)]
-    pub substring: bool,
     /// Optional kind filter for resolving the definition (function/method/class/...).
     #[serde(default)]
     pub kind: Option<String>,
-    /// 1-based line inside the definition meant, when several in the file share the name.
-    #[serde(default)]
-    pub line: Option<u32>,
     /// Cap on results returned. Default 100, max 1000.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Optional token budget bounding the returned `hits` list (not the whole envelope).
     /// Hits are kept in scan order until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Resume token returned by the previous call's `next_cursor`. Stable across rescans
     /// because the underlying Fjall keys are content-addressed.
@@ -254,70 +248,80 @@ pub struct GotoDefinitionParams {
     /// Repository-relative path of the file holding the reference.
     pub path: RelPath,
     /// 1-based line of the reference identifier.
+    #[serde(alias = "row")]
     pub line: u32,
     /// 0-based byte column of the reference within the line. Any byte inside the identifier
     /// resolves for span-aware engines (oxc JS/TS); the tree-sitter `locals` fallback matches
-    /// only the identifier's start byte. `None` takes the first whole-identifier occurrence of
-    /// `name` on the line.
-    #[serde(default)]
-    pub column: Option<u32>,
-    /// The referenced name, looked for on the line when `column` is absent.
-    #[serde(default)]
-    pub name: String,
+    /// only the identifier's start byte. Defaults to 0 (line start).
+    #[serde(default, alias = "col")]
+    pub column: u32,
 }
 
 pub(super) fn default_true() -> bool {
     true
 }
 
-/// Response of `code_outline`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct OutlineResponse {
     pub path: RelPath,
     pub language: String,
     pub size_bytes: u64,
-    /// The parser reported syntax errors; the outline may be missing symbols.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub had_errors: bool,
-    /// Symbols in the file, across every page.
-    pub total: usize,
-    /// True when the token budget dropped trailing symbols; page them with `next_cursor`.
+    pub error_count: u32,
+    /// True when a `max_tokens` budget dropped trailing `symbols`. Outline has no cursor;
+    /// raise `max_tokens` (or omit it) to retrieve the full symbol list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
-    /// The file changed since it was indexed, so this outline was extracted from the file as it is
-    /// now; the other tools describe the indexed content until `index_rescan`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stale: bool,
-    pub symbols: Vec<OutlineSymbol>,
-    /// Imported modules, on the first page only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub imports: Vec<String>,
-    /// True when `imports` was cut at its cap of 200: `truncated_reason` is `imports` and
-    /// `omitted` counts the imports left out. The symbol list is never cut this way; it pages.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub omitted: usize,
+    pub symbols: Vec<SymbolView>,
+    pub imports: Vec<ImportView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<Cursor>,
+    pub calls: Option<Vec<CallView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docs: Option<Vec<DocView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l2_status: Option<&'static str>,
+    /// Lifecycle notice when the server isn't fully ready (warming/building/rescanning); absent when
+    /// ready. Lets a caller tell "index still loading — retry" from a genuine empty result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<LifecycleNotice>,
+    /// Server-side handler latency in microseconds — the tool body's own execution (index / store
+    /// lookup + response construction), excluding MCP transport, argument deserialization, and
+    /// response serialization. A first call against a cold server also includes index warm-up;
+    /// such responses carry a `notice`. See [`crate::mcp::helpers::timing`] for the full contract.
     #[serde(default)]
     pub elapsed_us: u64,
 }
 
-/// One symbol of a `code_outline` page. `line` and `end_line` are 1-based and inclusive, the span
-/// `code_read` and `git_blame` take.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct OutlineSymbol {
+pub(super) struct SymbolView {
     pub name: String,
     pub kind: &'static str,
-    pub line: u32,
-    pub end_line: u32,
+    pub start_row: u32,
+    pub start_col: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub(super) struct ImportView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    pub raw: String,
+    pub start_byte: u32,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub(super) struct CallView {
+    pub callee: String,
+    pub start_byte: u32,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub(super) struct DocView {
+    pub text: String,
+    pub start_byte: u32,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -325,29 +329,22 @@ pub(super) struct SearchHitView {
     pub path: RelPath,
     pub name: String,
     pub kind: &'static str,
-    /// 1-based line of the definition.
-    pub line: u32,
-    /// 1-based column of the definition.
-    pub column: u32,
+    pub start_row: u32,
+    pub start_col: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// How the name matched: `exact`, `prefix`, `substring` or `fuzzy`. Rows are ranked in that
-    /// order.
-    #[serde(rename = "match")]
-    pub matched: &'static str,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct SearchResponse {
-    /// Matching symbols in the corpus, across every page.
+    /// Matches scanned up to the per-call cap (`limit * 64`, min 2000) — NOT the global
+    /// corpus total. When the cap is hit this is a lower bound; see `total_is_partial`.
     pub total: usize,
-    /// True when a fuzzy sweep stopped at its candidate cap, so `total` is a lower bound. Never
-    /// true because `limit` cut the page: that is paging, and `next_cursor` says it. Absent when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// True when the scan stopped at the cap, so `total` is a lower bound rather than the
+    /// exact number of matching symbols in the corpus (bug #16).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub total_is_partial: bool,
     pub truncated: bool,
-    /// `scan_cap` whenever `truncated` is true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
     /// True when a `max_tokens` budget dropped trailing results. The kept prefix is
     /// best-first; page the rest with `next_cursor`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -381,9 +378,9 @@ pub(super) struct ListFilesEntry {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct ListFilesResponse {
-    /// Files that pass the filters, across every page; `next_cursor` continues past this one.
     pub total: usize,
     pub returned: usize,
+    pub truncated: bool,
     /// True when the caller's requested `limit` exceeded the hard cap (`LIST_LIMIT_MAX`) and
     /// was clamped down to it. Surfaced so callers know the page size was reduced (bug #17).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -423,9 +420,9 @@ pub(super) struct FindFilesEntry {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct FindFilesResponse {
-    /// Files that match, across every page; `next_cursor` continues past this one.
     pub total: usize,
     pub returned: usize,
+    pub truncated: bool,
     /// True when the caller's requested `limit` exceeded the hard cap (`LIST_LIMIT_MAX`) and
     /// was clamped down to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -457,15 +454,15 @@ pub(super) struct FindFilesResponse {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct DependentsResponse {
     pub module: String,
-    /// Importing files, across every page.
-    pub total: usize,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub budgeted: bool,
     pub paths: Vec<RelPath>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<Cursor>,
+    /// Lifecycle notice when the server isn't fully ready (warming/building/rescanning); absent when
+    /// ready. Lets a caller tell "index still loading — retry" from a genuine empty result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<LifecycleNotice>,
+    /// Server-side handler latency in microseconds — the tool body's own execution (index / store
+    /// lookup + response construction), excluding MCP transport, argument deserialization, and
+    /// response serialization. A first call against a cold server also includes index warm-up;
+    /// such responses carry a `notice`. See [`crate::mcp::helpers::timing`] for the full contract.
     #[serde(default)]
     pub elapsed_us: u64,
 }
@@ -482,10 +479,6 @@ pub(super) struct StatusResponse {
     /// unscanned (no-blobs) view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// `true` when the code index cannot answer until a scan rebuilds it: an older basemind wrote
-    /// it, or a rebuild was interrupted. `note` says how to fix it. Absent (false) otherwise.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub rescan_needed: bool,
     /// `true` when a writer (a running `scan`/`rescan`/`watch`) currently holds the store
     /// lock, so this report was served *without* blocking on the in-progress rebuild. The
     /// index counts (`file_count`, `languages`) reflect the pre-rebuild state or are omitted;
@@ -493,16 +486,6 @@ pub(super) struct StatusResponse {
     /// path — status then reflects the fully-committed index.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rebuild_in_progress: bool,
-    /// `true` when the workspace's last full scan was cancelled or aborted before covering it (daemon
-    /// shutdown, idle reap, a full disk), so `file_count` and the queries reflect only the files
-    /// completed so far, not the repository. A full rescan clears it. Absent (false) otherwise.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub partial: bool,
-    /// One-line reason the index is degraded: a partial scan (with its reason and progress) or a
-    /// resolve pass that never completed, leaving resolved references and callers stale. Absent when
-    /// the last scan finished cleanly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub degraded: Option<String>,
     /// `true` while this serve's boot-time initial scan (auto-scan of an empty index) is still
     /// running. A client seeing this should treat empty query results as "index not ready yet"
     /// and poll again, rather than "no matches". Absent (false) once the index is built.
@@ -528,11 +511,7 @@ pub(super) struct StatusResponse {
     pub notice: Option<LifecycleNotice>,
     pub total_size_bytes: u64,
     pub languages: BTreeMap<String, usize>,
-    /// basemind's cache directory for this workspace: its index views, git cache and telemetry.
     pub cache_dir: String,
-    /// The tree-sitter grammar cache, which the language pack owns and other tools share.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grammar_dir: Option<String>,
     pub schema_version: u16,
     pub root: String,
     /// Forward-slash worktree roots of every submodule declared in `.gitmodules`. Always
@@ -549,69 +528,41 @@ pub(super) struct StatusResponse {
     /// lookup + response construction), excluding MCP transport, argument deserialization, and
     /// response serialization. Distinct from `index_build_ms` / `warm_ms`, which report the
     /// one-time boot-scan and preload costs. See [`crate::mcp::helpers::timing`] for the contract.
-    /// Current branch; absent outside a git repository or on a detached HEAD.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Full HEAD sha; absent outside a git repository.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_sha: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_short_sha: Option<String>,
     #[serde(default)]
     pub elapsed_us: u64,
 }
 
-#[derive(Debug, schemars::JsonSchema)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct ReferenceHit {
     pub path: RelPath,
-    /// 1-based line of the call site; `0` when the index holds no position for it.
+    /// 1-based.
     pub line: u32,
-    /// Byte column of the call site: 0-based here, written 1-based.
+    /// 0-based byte column from the start of the line.
     pub column: u32,
+    /// The exact callee identifier the index captured.
     pub callee: String,
-    /// With a pinned definition: `true` when scope / import resolution proved this site binds to
-    /// it, `false` when resolution checked the site and did not. Absent when nothing was checked:
-    /// no definition was pinned, resolution has no facts about the definition (`resolution` on the
-    /// response says why), or the site's file lies past the probe cap.
+    /// `find_callers` only. `true` when scope/import resolution PROVED this call site binds to the
+    /// definition being asked about; `false` when it could not.
+    ///
+    /// `false` is NOT evidence that the site isn't a caller. Resolution has blind spots it cannot
+    /// detect (a module-object import — `from pkg import mod` then `mod.f()` — binds a module, not
+    /// `f`, so the cross-file join has no export to bind; likewise unresolvable path aliases), and
+    /// every caller behind one lands here. It means exactly: "a call to this name that resolution
+    /// could not tie to this definition — it is either a real caller through an import form the
+    /// resolver does not model, or a call to a different, same-named symbol."
+    ///
+    /// Absent on `find_references`, which is name-only by contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<bool>,
-}
-
-/// Written by hand so a call site with no recorded position omits `line` and `column` together. A
-/// derived form would emit `"line": 0`, which is not a line, beside a `column` of 1.
-impl Serialize for ReferenceHit {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("path", &self.path)?;
-        if self.line != 0 {
-            map.serialize_entry("line", &self.line)?;
-            map.serialize_entry("column", &self.column.saturating_add(1))?;
-        }
-        map.serialize_entry("callee", &self.callee)?;
-        if let Some(resolved) = self.resolved {
-            map.serialize_entry("resolved", &resolved)?;
-        }
-        map.end()
-    }
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct FindReferencesResponse {
     pub name: String,
-    /// How `name` was matched against callee identifiers: `exact` or `substring`.
-    #[serde(rename = "match")]
-    pub matching: &'static str,
-    /// Matches across every page. A lower bound when `truncated`; an upper bound when a daemon that
-    /// predates exact matching answered, whose substring hits are dropped page by page.
     pub total: u32,
-    /// True when the scan stopped at its cap before the end of the matches: `total` is then a
-    /// lower bound, and `next_cursor` resumes the scan.
+    /// True when `total` was capped at `limit` and more matches exist on disk.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    /// `scan_cap` whenever `truncated` is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
+    pub total_is_partial: bool,
     /// True when a `max_tokens` budget dropped trailing `hits`. Page the rest with `next_cursor`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
@@ -634,34 +585,39 @@ pub(super) struct FindReferencesResponse {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct FindCallersResponse {
-    /// The definition the callers were pinned to.
-    pub definition: DefinitionView,
-    /// How `name` was matched against callee identifiers: `exact` or `substring`.
-    #[serde(rename = "match")]
-    pub matching: &'static str,
-    /// Why no hit carries `resolved`: `unsupported for <language>`, `no resolution facts for this
-    /// file`, `no resolution facts for this definition` (the file has facts and none names it), or
-    /// that the index's resolve pass has not finished.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-    /// Hits proven to bind to `definition`. Absent, not 0, when resolution did not run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_total: Option<u32>,
-    /// Matches across every page. A lower bound when `truncated`; an upper bound when a daemon that
-    /// predates exact matching answered, whose substring hits are dropped page by page.
+    /// Echo of the definition we resolved before scanning for callers.
+    pub definition: Option<DefinitionView>,
+    /// How many of the `total` reported call sites scope/import resolution PROVED bind to this
+    /// definition. A LOWER BOUND on the true caller count, never the answer to "what calls this?" —
+    /// `total` is. `resolved_total < total` is the normal case, not a warning sign: it means the
+    /// rest are call sites of this name that resolution could not bind (see `ReferenceHit::resolved`).
+    ///
+    /// Resolution cannot prove a negative, so it is never used to DROP a hit. A resolution-limited
+    /// subset is never reported as if it were the complete set — that made `find_callers` answer
+    /// "2 callers" for a symbol with 172, with no truncation flag, which is worse than an error.
+    pub resolved_total: u32,
+    /// Every call site whose callee identifier matches `name` — the same sound floor
+    /// `find_references` reports, so the two agree on an unambiguous name. Complete unless
+    /// `total_is_partial`.
     pub total: u32,
-    /// As on a `code_refs` name scan: the scan stopped at its cap, so `total` is a lower bound.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<&'static str>,
+    pub total_is_partial: bool,
+    /// True when a `max_tokens` budget dropped trailing `hits`. Page the rest with `next_cursor`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
     pub hits: Vec<ReferenceHit>,
+    /// Opaque cursor to pass back on the next call when more results are available.
+    /// Stable across rescans.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
+    /// Lifecycle notice when the server isn't fully ready (warming/building/rescanning); absent when
+    /// ready. Lets a caller tell "index still loading — retry" from a genuine empty result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<LifecycleNotice>,
+    /// Server-side handler latency in microseconds — the tool body's own execution (index / store
+    /// lookup + response construction), excluding MCP transport, argument deserialization, and
+    /// response serialization. A first call against a cold server also includes index warm-up;
+    /// such responses carry a `notice`. See [`crate::mcp::helpers::timing`] for the full contract.
     #[serde(default)]
     pub elapsed_us: u64,
 }
@@ -671,10 +627,8 @@ pub(super) struct DefinitionView {
     pub path: RelPath,
     pub name: String,
     pub kind: &'static str,
-    /// 1-based line of the definition.
-    pub line: u32,
-    /// 1-based column of the definition.
-    pub column: u32,
+    pub start_row: u32,
+    pub start_col: u32,
 }
 
 /// A resolved definition site returned by `goto_definition`.
@@ -705,10 +659,19 @@ pub(super) struct GotoDefinitionResponse {
     /// resolution + index lookup + response construction), excluding MCP transport, argument
     /// deserialization, and response serialization. A first call against a cold server also
     /// includes index warm-up. See [`crate::mcp::helpers::timing`] for the full contract.
-    /// Why there is no `definition`, when the file's language has no scope resolution:
-    /// `unsupported for <language>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
+    #[serde(default)]
+    pub elapsed_us: u64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub(super) struct RepoInfoResponse {
+    pub workdir: String,
+    pub head_sha: Option<String>,
+    pub head_short_sha: Option<String>,
+    pub branch: Option<String>,
+    /// Server-side handler latency in microseconds — the tool body's own execution (git HEAD
+    /// lookup + response construction), excluding MCP transport, argument deserialization, and
+    /// response serialization. See [`crate::mcp::helpers::timing`] for the full contract.
     #[serde(default)]
     pub elapsed_us: u64,
 }
@@ -716,6 +679,7 @@ pub(super) struct GotoDefinitionResponse {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WorkspaceGrepParams {
     /// Rust regex syntax (`regex` crate). Required.
+    #[serde(alias = "query", alias = "needle", alias = "regex", alias = "q", alias = "search")]
     pub pattern: String,
     /// Optional language filter (e.g. `"rust"`, `"typescript"`). Same ID convention as
     /// `list_files`.
@@ -732,72 +696,46 @@ pub struct WorkspaceGrepParams {
     /// Optional token budget bounding the returned `hits` list (not the whole envelope).
     /// Hits are kept in scan order until the budget is hit; the rest are dropped and the
     /// response carries `budgeted: true` plus a `next_cursor` to page them.
-    #[serde(default)]
+    #[serde(default, alias = "token_budget", alias = "budget")]
     pub max_tokens: Option<u32>,
     /// Wire format for the response: `"json"` (default) or `"toon"`. TOON is a compact
     /// tabular encoding of the `hits` list — far fewer tokens than JSON for large hit sets.
-    #[serde(default)]
+    #[serde(default, alias = "encoding")]
     pub format: Option<String>,
     /// Include 1 line of context before + after each hit. Default true.
     #[serde(default = "default_true")]
     pub include_context: bool,
-    /// Match `pattern` as literal text instead of compiling it as a regex.
-    #[serde(default)]
-    pub literal: bool,
     /// Resume token returned by the previous call's `next_cursor`. Cursors are scoped to
     /// the in-RAM index snapshot and invalidate on rescan.
     #[serde(default)]
     pub cursor: Option<Cursor>,
 }
 
-/// `skip_serializing_if` for a count that is reported only when something was left out.
-pub(super) fn is_zero(count: &usize) -> bool {
-    *count == 0
-}
-
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub(super) struct GrepHit {
     pub path: RelPath,
     /// 1-based line number of the match.
-    pub line: u32,
-    /// 1-based byte column of the match within the line.
+    pub line_num: u32,
+    /// 0-based byte column within the line.
     pub column: u32,
-    /// The matching line, so the hit can be read without opening the file. A line over 400 bytes is
-    /// cut to a window around the match, `…` marking each cut side.
-    pub text: String,
-    /// The innermost symbol whose span holds the match; absent outside every symbol.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<GrepSymbol>,
-    /// The line immediately before the match, when context was requested and line > 1.
+    /// The exact matched substring from the source.
+    pub matched_text: String,
+    /// The line immediately before the match, when `include_context` is true and line > 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_before: Option<String>,
-    /// The line immediately after the match, when context was requested and line < EOF.
+    /// The line immediately after the match, when `include_context` is true and line < EOF.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_after: Option<String>,
-    /// Byte offset of the match in the file; used to find `symbol`, not part of the response.
-    #[serde(skip)]
-    pub start_byte: u32,
-    /// The file changed since it was indexed. The hit is from the file as it is now, and `symbol`
-    /// is left out: the indexed outline describes other bytes until `index_rescan`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub stale: bool,
 }
-
-/// The symbol a grep hit sits in.
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-pub(super) struct GrepSymbol {
-    pub name: String,
-    pub kind: &'static str,
-}
-
-/// `truncated_reason` of a scan that stopped at its cap before the end of the matches.
-pub(super) const SCAN_CAP: &str = "scan_cap";
 
 /// Why a `workspace_grep` result was cut short. Present only when `truncated` is true — a grep that
 /// returned every match carries no reason, so an agent can tell a complete zero from a bounded one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum GrepTruncation {
+    /// More matches exist than `limit` allowed. Raise `limit` or page with `next_cursor`;
+    /// `total_matches` is the exact count that was available.
+    Limit,
     /// The corpus was larger than one call may read. Narrow with `path_contains` / `language`, or
     /// page with `next_cursor`. Only reachable on workspaces of multiple gigabytes of source.
     ByteBudget,
@@ -807,22 +745,17 @@ pub(super) enum GrepTruncation {
 pub(super) struct WorkspaceGrepResponse {
     /// Echoed pattern from the request.
     pub pattern: String,
-    /// Whether `pattern` was compiled as a regex; false means it was matched as literal text.
-    pub regex: bool,
     /// Number of files that had at least one match. Exact: every candidate file is scanned.
     pub total_files_matched: usize,
     /// Exact hit count across the whole scanned corpus — not just the returned page. Exceeds
-    /// `hits.len()` when `limit` or the token budget cut the page; `next_cursor` continues.
+    /// `hits.len()` when `limit` truncated the result, which is what makes `truncated` actionable.
     pub total_matches: u32,
-    /// True when files were left unread, so `total_matches` does not cover them. Never true
-    /// because `limit` cut the page or because the corpus is large: grep scans every candidate
-    /// file it may read. Absent when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// True when matches exist that this response does not carry. Never true merely because the
+    /// corpus is large: grep scans every candidate file.
     pub truncated: bool,
-    /// `byte_budget` whenever `truncated` is true. There is no `omitted`: the matches in the
-    /// unread files were never counted. `next_cursor` continues with those files.
+    /// Which bound cut the result, when `truncated` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub truncated_reason: Option<GrepTruncation>,
+    pub truncation_reason: Option<GrepTruncation>,
     /// True when a `max_tokens` budget dropped trailing `hits`. Page the rest with `next_cursor`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budgeted: bool,
@@ -830,9 +763,6 @@ pub(super) struct WorkspaceGrepResponse {
     /// Opaque cursor to pass back on the next call when more results are available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<Cursor>,
-    /// Files this call opened and could not search: unreadable, or not UTF-8 text.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub skipped_files: usize,
     /// True when the caller passed a `cursor` minted against a different in-RAM snapshot
     /// (a rescan happened between calls). The caller must restart pagination from the top.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -855,6 +785,11 @@ pub struct RescanParams {
     /// the full repo is walked. Paths are forward-slash with no leading `/`.
     #[serde(default)]
     pub paths: Option<Vec<String>>,
+    /// Force a complete working-tree re-index even when `paths` is supplied (full wins).
+    /// Use when the index is stale or reports "no indexed files" and a scoped rescan won't
+    /// rebuild it.
+    #[serde(default)]
+    pub full: bool,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -939,13 +874,22 @@ pub(super) struct RecentCallView {
     pub est_tokens_saved: u64,
 }
 
-#[cfg(feature = "documents")]
+#[cfg(feature = "crawl")]
+pub(super) use super::types_web::{
+    WebCrawlPageOutcome, WebCrawlResponse, WebMapEntry, WebMapResponse, WebScrapeResponse,
+};
+#[cfg(feature = "crawl")]
+pub use super::types_web::{WebCrawlParams, WebMapParams, WebScrapeParams};
+
+pub use super::types_admin::{CacheClearParams, CacheGcParams, CacheStatsParams};
+pub(super) use super::types_admin::{CacheClearResponse, CacheGcResponse, CacheStatsResponse};
 pub use super::types_documents::SearchDocumentsParams;
 #[cfg(feature = "documents")]
 pub(super) use super::types_documents::{DocumentSearchHit, SearchDocumentsResponse};
 pub use super::types_git::{
     BlameFileParams, BlameSymbolParams, CommitsTouchingParams, DiffFileParams, DiffOutlineParams,
     FindCommitsByPathParams, HotFilesParams, RecentChangesParams, SearchGitHistoryParams, SymbolHistoryParams,
+    WorkingTreeStatusParams,
 };
 pub(super) use super::types_git::{
     BlameHunkView, BlameResponse, BlameSymbolResponse, CommitFileView, CommitView, CommitsTouchingResponse,
@@ -953,3 +897,54 @@ pub(super) use super::types_git::{
     HotFileEntry, HotFilesResponse, HunkView, RecentChangesResponse, SearchGitHistoryResponse, SymbolHistoryEntry,
     SymbolHistoryResponse, WorkingTreeStatusView,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_grep_accepts_query_alias_for_pattern() {
+        let params: WorkspaceGrepParams = serde_json::from_value(serde_json::json!({ "query": "foo" })).unwrap();
+        assert_eq!(params.pattern, "foo");
+    }
+
+    #[test]
+    fn search_symbols_accepts_pattern_alias_for_needle() {
+        let params: SearchSymbolsParams = serde_json::from_value(serde_json::json!({ "pattern": "x" })).unwrap();
+        assert_eq!(params.needle, "x");
+    }
+
+    #[test]
+    fn search_symbols_accepts_symbol_alias_for_needle() {
+        let params: SearchSymbolsParams = serde_json::from_value(serde_json::json!({ "symbol": "Foo" })).unwrap();
+        assert_eq!(params.needle, "Foo");
+    }
+
+    #[test]
+    fn workspace_grep_accepts_regex_and_needle_aliases() {
+        let by_regex: WorkspaceGrepParams = serde_json::from_value(serde_json::json!({ "regex": "a.*b" })).unwrap();
+        assert_eq!(by_regex.pattern, "a.*b");
+        let by_needle: WorkspaceGrepParams = serde_json::from_value(serde_json::json!({ "needle": "lit" })).unwrap();
+        assert_eq!(by_needle.pattern, "lit");
+    }
+
+    #[test]
+    fn find_references_accepts_symbol_alias_for_name() {
+        let params: FindReferencesParams = serde_json::from_value(serde_json::json!({ "symbol": "spawn" })).unwrap();
+        assert_eq!(params.name, "spawn");
+    }
+
+    #[test]
+    fn call_graph_accepts_query_alias_for_name() {
+        let params: super::super::types_graph::CallGraphParams =
+            serde_json::from_value(serde_json::json!({ "query": "main" })).unwrap();
+        assert_eq!(params.name, "main");
+    }
+
+    #[test]
+    fn find_implementations_accepts_trait_alias_for_trait_name() {
+        let params: super::super::types_impls::FindImplementationsParams =
+            serde_json::from_value(serde_json::json!({ "trait": "Iterator" })).unwrap();
+        assert_eq!(params.trait_name, "Iterator");
+    }
+}

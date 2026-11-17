@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use basemind::comms::singleton::{comms_socket_path, generation_dir, probe_alive};
-use basemind::store::{CACHE_DIR, WORKSPACES_DIR, WriterProbe, probe_writer_lock, workspace_key};
+use basemind::comms::singleton::{comms_socket_path, probe_alive};
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_basemind");
@@ -106,7 +105,7 @@ impl Daemon {
             .spawn()
             .expect("spawn daemon");
         let daemon = Self { child, comms_dir };
-        let socket = comms_socket_path(&generation_dir(&daemon.comms_dir));
+        let socket = comms_socket_path(&daemon.comms_dir);
         let deadline = Instant::now() + Duration::from_secs(180);
         while Instant::now() < deadline {
             if probe_alive(&socket) {
@@ -176,30 +175,21 @@ fn writer_lock_collision_exits_busy_for_scan_rescan_and_cache_clear() {
         .stderr(Stdio::null())
         .spawn()
         .expect("watch");
-    // Wait until the watcher owns the lock, by probing it rather than by scanning: each probing scan
-    // held the lock itself, and `watch` gives up after half a second of contention, so on a loaded
-    // machine it exited busy and the loop waited out its deadline.
-    let workspace = env
-        .home
-        .path()
-        .join(CACHE_DIR)
-        .join(WORKSPACES_DIR)
-        .join(workspace_key(env.root()));
+    // Wait until the watcher owns the lock: from then on `scan` reports busy (3).
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !matches!(probe_writer_lock(&workspace), WriterProbe::Held { .. }) {
-        if let Some(status) = holder.try_wait().expect("poll watch") {
-            panic!("watch exited ({status}) before it took the lock");
+    loop {
+        let out = env.run(&["scan", "--quiet"]);
+        if code(&out) == 3 {
+            assert!(
+                text(&out).contains("already running") || text(&out).contains("locked"),
+                "{}",
+                text(&out)
+            );
+            break;
         }
-        assert!(Instant::now() < deadline, "watch never took the lock");
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(Instant::now() < deadline, "watch never took the lock: {}", text(&out));
+        std::thread::sleep(Duration::from_millis(250));
     }
-    let scan = env.run(&["scan", "--quiet"]);
-    assert_eq!(code(&scan), 3, "scan must not run next to a writer: {}", text(&scan));
-    assert!(
-        text(&scan).contains("already running") || text(&scan).contains("locked"),
-        "{}",
-        text(&scan)
-    );
     let rescan = env.run(&["rescan", "--quiet"]);
     assert_eq!(
         code(&rescan),
@@ -227,14 +217,11 @@ fn live_daemon_serves_rescan_memory_and_blocks_destructive_commands() {
     assert_eq!(code(&rescan), 0, "{}", text(&rescan));
     assert!(text(&rescan).contains("via daemon"), "{}", text(&rescan));
 
-    // Memory commands work only in a binary built with the `memory` feature.
-    if cfg!(feature = "memory") {
-        let put = env.run(&["memory", "put", "k1", "forwarded value"]);
-        assert_eq!(code(&put), 0, "memory put must forward, not fail: {}", text(&put));
-        let get = env.run(&["memory", "get", "k1"]);
-        assert_eq!(code(&get), 0, "{}", text(&get));
-        assert!(text(&get).contains("forwarded value"), "{}", text(&get));
-    }
+    let put = env.run(&["memory", "put", "k1", "forwarded value"]);
+    assert_eq!(code(&put), 0, "memory put must forward, not fail: {}", text(&put));
+    let get = env.run(&["memory", "get", "k1"]);
+    assert_eq!(code(&get), 0, "{}", text(&get));
+    assert!(text(&get).contains("forwarded value"), "{}", text(&get));
 
     let callers = env.run(&["--json", "code", "callers", "a.rs", "alpha"]);
     assert_eq!(code(&callers), 0, "{}", text(&callers));

@@ -18,9 +18,7 @@ use std::cmp::Ordering;
 
 use ahash::{AHashMap, AHashSet};
 
-use crate::chunk::CodeChunk;
-use crate::index::keys;
-use crate::index::view::{IndexView, Part};
+use crate::index::{IndexDb, keys};
 
 /// Upper bound on a single token's byte length. Tokens longer than this (minified blobs, base64
 /// spilled into a comment) are dropped — they are never real query terms and would bloat the index.
@@ -74,7 +72,8 @@ fn for_each_token(text: &str, mut f: impl FnMut(&str)) {
 /// Allocates a `String` key only on a token's first occurrence (via `get_mut`-then-`insert`), not on
 /// every repeat — repeats are the common case in code (keywords, an identifier used many times), and
 /// this runs in the scanner's per-file hot loop.
-fn tokenize_counts(text: &str) -> AHashMap<String, u32> {
+#[allow(dead_code)]
+pub(crate) fn tokenize_counts(text: &str) -> AHashMap<String, u32> {
     let mut counts: AHashMap<String, u32> = AHashMap::new();
     for_each_token(text, |tok| {
         if let Some(count) = counts.get_mut(tok) {
@@ -93,24 +92,6 @@ fn tokenize_query(query: &str) -> Vec<String> {
         seen.insert(tok.to_string());
     });
     seen.into_iter().collect()
-}
-
-/// Build the BM25 postings for a file's chunks. `doclen` is the total token count (with repetition);
-/// `terms` are the distinct `(term, tf)` pairs. Called from the scanner's parallel per-file worker.
-pub fn build_chunk_postings(chunks: &[CodeChunk]) -> Vec<ChunkPosting> {
-    chunks
-        .iter()
-        .map(|c| {
-            let counts = tokenize_counts(&c.searchable_text);
-            let doclen: u32 = counts.values().copied().sum();
-            let terms: Vec<(String, u32)> = counts.into_iter().collect();
-            ChunkPosting {
-                chunk_id: c.chunk_id.clone(),
-                doclen,
-                terms,
-            }
-        })
-        .collect()
 }
 
 /// BM25 inverse document frequency for a term appearing in `df` of `n` documents. Uses the
@@ -135,7 +116,7 @@ pub fn bm25_term_score(tf: u32, doclen: u32, avgdl: f32, idf: f32) -> f32 {
 /// Score `query` against the BM25 keyword index in `db` and return the top `limit` chunk hits,
 /// highest score first (ties broken by `chunk_id` for a stable order). Returns empty when the index
 /// is empty, the query has no tokens, or no chunk matches.
-pub fn bm25_search(db: &dyn IndexView, query: &str, limit: usize) -> Vec<Bm25Hit> {
+pub fn bm25_search(db: &IndexDb, query: &str, limit: usize) -> Vec<Bm25Hit> {
     let terms = tokenize_query(query);
     if terms.is_empty() || limit == 0 {
         return Vec::new();
@@ -151,8 +132,8 @@ pub fn bm25_search(db: &dyn IndexView, query: &str, limit: usize) -> Vec<Bm25Hit
     let mut scores: AHashMap<String, f32> = AHashMap::new();
     for term in &terms {
         let mut postings: Vec<(String, u32, u32)> = Vec::new();
-        for guard in db.prefix(Part::CodeBm25Postings, &keys::code_bm25_postings_prefix(term)) {
-            let (k, v) = match guard {
+        for guard in db.code_bm25_postings.prefix(keys::code_bm25_postings_prefix(term)) {
+            let (k, v) = match guard.into_inner() {
                 Ok(kv) => kv,
                 Err(error) => {
                     tracing::warn!(%term, ?error, "bm25: posting read failed; skipping entry");
@@ -192,24 +173,9 @@ pub fn bm25_search(db: &dyn IndexView, query: &str, limit: usize) -> Vec<Bm25Hit
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn chunk(chunk_id: &str, searchable_text: &str) -> CodeChunk {
-        CodeChunk {
-            chunk_id: chunk_id.to_string(),
-            path: "src/lib.rs".to_string(),
-            lang: "rust".to_string(),
-            kind: None,
-            symbol: None,
-            signature: None,
-            doc: None,
-            byte_start: 0,
-            byte_end: 0,
-            line_start: 1,
-            line_end: 1,
-            text: searchable_text.to_string(),
-            searchable_text: searchable_text.to_string(),
-        }
-    }
+    // No `CodeChunk` here any more: posting construction and the fixture that exercised it moved to
+    // `bm25_postings`, which is what stays behind `code-search`. This module is the scoring half,
+    // and what is left here is tokenization and scoring — neither of which takes a chunk.
 
     #[test]
     fn tokenizer_splits_snake_case_and_lowercases() {
@@ -228,15 +194,9 @@ mod tests {
         assert!(counts.get(huge.as_str()).is_none(), "oversized token must be dropped");
     }
 
-    #[test]
-    fn build_postings_reports_doclen_as_total_token_count() {
-        let postings = build_chunk_postings(&[chunk("h:0", "alpha beta alpha")]);
-        assert_eq!(postings.len(), 1);
-        assert_eq!(postings[0].chunk_id, "h:0");
-        assert_eq!(postings[0].doclen, 3, "three tokens total incl. the repeat");
-        let alpha = postings[0].terms.iter().find(|(t, _)| t == "alpha").unwrap();
-        assert_eq!(alpha.1, 2, "alpha appears twice");
-    }
+    // `build_postings_reports_doclen_as_total_token_count` moved to `bm25_postings` with the
+    // function it covers: it tests posting construction, which #67 moved behind `code-search`,
+    // and left here it tested a name this module no longer has.
 
     #[test]
     fn idf_is_non_negative_even_for_ubiquitous_terms() {

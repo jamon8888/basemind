@@ -9,16 +9,18 @@ const AdmZip = require("adm-zip");
 
 const { version } = require("./package.json");
 
+/// One `sysctl` inquiry; `-n` prints the value of `name`, or "" when it is absent.
+function sysctl(name) {
+  try {
+    return execFileSync("sysctl", ["-n", name], { encoding: "utf8" }).trim();
+  } catch {
+    return "";
+  }
+}
+
 function isAppleSilicon() {
   if (os.type() !== "Darwin") return false;
   if (os.arch() === "arm64") return true;
-  const sysctl = (name) => {
-    try {
-      return execFileSync("sysctl", ["-n", name], { encoding: "utf8" }).trim();
-    } catch {
-      return "";
-    }
-  };
   return sysctl("sysctl.proc_translated") === "1" || sysctl("hw.optional.arm64") === "1";
 }
 
@@ -38,8 +40,7 @@ function getPlatformTriple() {
   }
 
   if (type === "Darwin") {
-    if (isAppleSilicon()) return "aarch64-apple-darwin";
-    throw new Error("macOS on Intel (x86_64) is not supported; basemind publishes Apple Silicon (arm64) binaries only");
+    return isAppleSilicon() ? "aarch64-apple-darwin" : "x86_64-apple-darwin";
   }
 
   throw new Error(`Unsupported platform: ${type} ${arch}`);
@@ -47,7 +48,7 @@ function getPlatformTriple() {
 
 function getReleaseAssets() {
   const platform = getPlatformTriple();
-  const baseUrl = `https://github.com/Goldziher/basemind/releases/download/v${version}`;
+  const baseUrl = `https://github.com/jamon8888/basemind/releases/download/v${version}`;
   const ext = platform.includes("windows") ? "zip" : "tar.gz";
   const assetName = `basemind-${platform}.${ext}`;
   return {

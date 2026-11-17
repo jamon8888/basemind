@@ -17,8 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::config::overrides::DocumentsCliOverrides;
-use crate::config::{self, Config};
+use crate::config::{self, Config, DocumentsCliOverrides};
 use crate::git::Repo;
 use crate::git_cache::GitCache;
 use crate::mcp::BasemindServer;
@@ -58,7 +57,7 @@ pub fn build_server_for(
     intent: Intent,
 ) -> Result<BasemindServer> {
     let daemon = super::rescan::daemon_is_up();
-    let mut store = if daemon {
+    let store = if daemon {
         Store::open_read_only_no_index(root, view).context("open store (blobs only; the daemon holds the index)")?
     } else if intent == Intent::Rescan {
         Store::open_with_holder(root, view, LockHolder::Rescan).map_err(|err| {
@@ -71,18 +70,8 @@ pub fn build_server_for(
     } else {
         Store::open_read_only(root, view).context("open store (read-only)")?
     };
-    // A query or a hook would otherwise answer empty with nothing to say why.
-    if intent != Intent::Rescan && store.rescan_owed() {
-        eprintln!("basemind: {}", crate::store::RESCAN_OWED);
-    }
     let basemind_dir = store.basemind_dir.clone();
     let cfg = Arc::new(load_config(root, documents)?);
-    if intent != Intent::Rescan
-        && std::env::var_os("BASEMIND_INDEX_LAYERED").is_some_and(|value| value == "1")
-        && let Err(error) = crate::store_base::hydrate_cold_store(&mut store, &cfg)
-    {
-        tracing::debug!(%error, "shared worktree manifest unavailable");
-    }
     let repo = Repo::discover(root).ok().map(Arc::new);
     let git_cache = Arc::new(GitCache::open(&basemind_dir, CLI_GIT_CACHE_MEM, false).context("open git cache")?);
     #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -114,7 +103,7 @@ pub fn build_server_for(
 /// Load the resolved config, applying the document CLI override layer. Falls back
 /// to defaults when no `basemind.toml` exists.
 fn load_config(root: &Path, documents: DocumentsCliOverrides) -> Result<Config> {
-    match config::overrides::load_with_overrides(root, None, Some(documents)) {
+    match config::load_with_overrides(root, None, Some(documents)) {
         Ok(loaded) => Ok(loaded.config),
         Err(config::ConfigError::NotFound(_)) => Ok(config::default_for_root(root)),
         Err(e) => Err(anyhow::anyhow!(e)),

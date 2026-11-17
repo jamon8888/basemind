@@ -1,18 +1,17 @@
-//! In-process CLI over the same tool bodies the MCP server runs.
+//! In-process CLI that gives `basemind` 1:1 parity with the MCP tool surface.
 //!
-//! Every MCP tool has a subcommand that builds the tool's `*Params` struct, constructs a one-shot
-//! [`crate::mcp::BasemindServer`] (no background facilities), and calls the `*_call` method the
-//! `#[tool]` shim calls, then renders the returned [`rmcp::model::CallToolResult`]. Parity is by
-//! construction: the CLI runs the same tool code, not a re-implementation. The CLI additionally
-//! has shorthands and administrative commands with no MCP tool (ADR-0018).
+//! Every tool subcommand builds the matching `*Params` struct, constructs a
+//! one-shot [`crate::mcp::BasemindServer`] (no background facilities), and calls
+//! the identical `#[tool]` method an MCP client would dispatch — then renders the
+//! returned [`rmcp::model::CallToolResult`]. Parity is by construction: the CLI
+//! runs the same tool code, not a re-implementation.
 //!
 //! Layout:
 //! - `context.rs` — one-shot server construction.
 //! - `render.rs` — JSON extraction + generic human renderer.
-//! - `code.rs` / `git.rs` / `memory.rs` / `admin.rs` — subcommand groups.
+//! - `code.rs` / `git.rs` / `graph.rs` / `memory.rs` / `web.rs` / `admin.rs` — subcommand groups.
 
 pub mod admin;
-pub mod agent;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod agents;
 pub mod choices;
@@ -20,20 +19,28 @@ pub mod code;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod comms_daemon;
 pub mod context;
+pub mod cpu_features;
 pub mod exit;
 pub mod git;
+pub mod graph;
 pub mod hook;
 pub mod init;
 pub mod init_gitignore;
 pub mod init_rules;
 pub mod init_settings;
-pub mod init_verb;
 pub mod interrupt;
 pub mod memory;
+#[cfg(feature = "documents")]
+pub mod redact;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod registry;
 pub mod render;
 pub mod rescan;
+#[cfg(all(feature = "shells", any(unix, windows)))]
+pub mod shell;
+#[cfg(feature = "documents")]
+pub mod vault;
+pub mod web;
 
 use std::io::Write;
 use std::path::Path;
@@ -45,25 +52,46 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 
 use crate::cli::render::Emit;
-use crate::config::overrides::DocumentsCliOverrides;
+use crate::config::DocumentsCliOverrides;
 
 /// Tool subcommand groups dispatched through the in-process server.
 #[derive(Subcommand, Debug)]
 pub enum ToolCmd {
-    /// Code lookups: outline, symbols, read, grep, search, refs, find (plus shorthands).
+    /// Code-map lookups: outline, symbols, grep, files, find, definition, references, callers,
+    /// implementations, dependents, expand, semantic, chunk.
     #[command(subcommand)]
     Code(code::CodeCmd),
     /// Git history / blame / diff queries.
     #[command(subcommand)]
     Git(git::GitCmd),
-    /// Shared agent memory and document search (needs `--features memory,documents`).
+    /// Code-graph navigation: calls, neighbors, path, subgraph, communities, map, export, display,
+    /// open.
+    #[command(subcommand)]
+    Graph(graph::GraphCmd),
+    /// Shared agent memory, document search, and the co-change proposal queue
+    /// (needs `--features memory,documents`).
     #[command(subcommand)]
     Memory(memory::MemoryCmd),
-    /// Administration: telemetry, tokens, eval.
+    /// On-demand web ingestion (needs `--features crawl`).
+    #[command(subcommand)]
+    Web(web::WebCmd),
+    /// Server administration: repo identity, telemetry, compression, tokens, eval.
     #[command(subcommand)]
     Admin(admin::AdminCmd),
     /// Index health for this workspace: file counts, languages, scan age.
     Status,
+    /// Headless agent shell sessions: spawn / send / capture / kill / list / broadcast
+    /// (needs `--features shells`).
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    #[command(subcommand)]
+    Shell(shell::ShellCmd),
+    /// Encrypted PII rehydration map operations: encrypt, decrypt, find, forget, inspect.
+    #[cfg(feature = "documents")]
+    #[command(subcommand)]
+    Vault(vault::VaultCmd),
+    /// PII detection and redaction for arbitrary text (needs `--features documents`).
+    #[cfg(feature = "documents")]
+    Redact(redact::RedactArgs),
 }
 
 /// Resolve a user-supplied CLI path into the repo-relative `RelPath` key the index is keyed by
@@ -142,9 +170,17 @@ pub fn run(
         match cmd {
             ToolCmd::Code(c) => code::run(&server, c, &opts, &mut out).await?,
             ToolCmd::Git(g) => git::run(&server, g, &opts, &mut out).await?,
+            ToolCmd::Graph(g) => graph::run(&server, g, &opts, &mut out).await?,
             ToolCmd::Memory(m) => memory::run(&server, m, &opts, &mut out).await?,
+            ToolCmd::Web(w) => web::run(&server, w, &opts, &mut out).await?,
             ToolCmd::Admin(a) => admin::run(&server, a, &opts, &mut out).await?,
             ToolCmd::Status => admin::run_status(&server, &opts, &mut out).await?,
+            #[cfg(all(feature = "shells", any(unix, windows)))]
+            ToolCmd::Shell(s) => shell::run(&server, s, &opts, &mut out).await?,
+            #[cfg(feature = "documents")]
+            ToolCmd::Vault(v) => vault::run(&server, v, &opts, &mut out).await?,
+            #[cfg(feature = "documents")]
+            ToolCmd::Redact(r) => redact::run(&server, &r, &opts, &mut out).await?,
         }
         out.flush().context("flush stdout")?;
         Ok(())

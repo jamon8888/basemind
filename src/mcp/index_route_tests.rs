@@ -18,8 +18,6 @@ use super::types_impls::FindImplementationsParams;
 use super::{HostBackend, MapCache};
 use crate::comms::index_read_proto::{IndexReadQuery, IndexReadResult};
 use crate::config::ConfigV1;
-use crate::index::grep_bloom::GrepEntry;
-use crate::index::view::StandaloneView;
 use crate::path::RelPath;
 use crate::scanner::{EmbedMode, ScanSource, scan};
 use crate::store::{Store, VIEW_WORKING};
@@ -43,9 +41,7 @@ fn write_corpus(root: &Path) {
             h = k % 5,
             o = k % 7,
         );
-        let file = dir.join(format!("m{k}.rs"));
-        std::fs::write(&file, source).expect("rust file");
-        age(&file);
+        std::fs::write(dir.join(format!("m{k}.rs")), source).expect("rust file");
     }
     std::fs::create_dir_all(root.join("py")).expect("py dir");
     std::fs::write(
@@ -53,16 +49,6 @@ fn write_corpus(root: &Path) {
         b"class Base:\n    pass\n\n\nclass Child(Tr1):\n    def go(self):\n        get_arg()\n",
     )
     .expect("python file");
-    age(&root.join("py/a.py"));
-}
-
-/// Move a file's mtime an hour back: a stamp too close to the clock is not trusted for skipping.
-fn age(path: &Path) {
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)))
-        .expect("age file");
 }
 
 /// Stands in for the daemon's workspace pool: answers `host_index_read` from a writer store, after
@@ -71,8 +57,6 @@ struct StoreHost {
     store: Mutex<Store>,
     /// When set, every read fails, as a daemon that is restarting would.
     broken: bool,
-    /// When set, every read is answered with this instead, as a daemon on another build might.
-    forced_reply: Option<IndexReadResult>,
 }
 
 impl HostBackend for StoreHost {
@@ -86,21 +70,9 @@ impl HostBackend for StoreHost {
         Err("unused".into())
     }
 
-    fn host_rescan_named(
-        &self,
-        _root: &Path,
-        _paths: Vec<std::path::PathBuf>,
-        _embed: bool,
-    ) -> Result<crate::scanner::ScanStats, String> {
-        Err("unused".into())
-    }
-
     fn host_index_read(&self, _root: &Path, query: IndexReadQuery) -> Result<IndexReadResult, String> {
         if self.broken {
             return Err("daemon unavailable".into());
-        }
-        if let Some(reply) = &self.forced_reply {
-            return Ok(reply.clone());
         }
         let query: IndexReadQuery = round_trip(&query);
         let store = self.store.lock().expect("store lock");
@@ -132,6 +104,16 @@ impl HostBackend for StoreHost {
         _scope: &str,
         _op: crate::comms::memory_proto::MemoryOp,
     ) -> Result<crate::comms::memory_proto::MemoryOutcome, String> {
+        Err("unused".into())
+    }
+
+    #[cfg(feature = "memory")]
+    fn host_governance(
+        &self,
+        _root: &Path,
+        _scope: &str,
+        _op: crate::comms::proposals_proto::GovernanceOp,
+    ) -> Result<crate::comms::proposals_proto::GovernanceOutcome, String> {
         Err("unused".into())
     }
 }
@@ -174,16 +156,14 @@ fn fixture() -> Fixture {
     let host: Arc<StoreHost> = Arc::new(StoreHost {
         store: Mutex::new(store),
         broken: false,
-        forced_reply: None,
     });
     // A second store handle is not needed for the broken host: it never reads.
     let broken: Arc<dyn HostBackend> = Arc::new(StoreHost {
         store: Mutex::new(Store::open_read_only_no_index(&root, VIEW_WORKING).expect("store")),
         broken: true,
-        forced_reply: None,
     });
     Fixture {
-        local: IndexRoute::Local(Box::new(StandaloneView(idx))),
+        local: IndexRoute::Local(idx),
         host: IndexRoute::Host {
             host: Arc::clone(&host) as Arc<dyn HostBackend>,
             root: root.clone(),
@@ -236,7 +216,6 @@ fn references_page(
         &block_on(super::helpers::run_find_references(
             route,
             FindReferencesParams {
-                substring: true,
                 name: name.to_string(),
                 limit: Some(limit),
                 max_tokens,
@@ -296,7 +275,7 @@ fn references_are_identical_on_every_route_including_cursors() {
     let fx = fixture();
     let capped = references_page(&fx.local, &fx.cache, "get_arg", 250, None, None);
     assert_eq!(
-        capped["truncated_reason"], "scan_cap",
+        capped["total_is_partial"], true,
         "the corpus must really cross the scan cap, or the partial path goes untested: {capped}"
     );
     // Common name past the scan cap, rare names, a substring name, and an absent one.
@@ -319,7 +298,7 @@ fn a_forwarded_total_is_the_complete_count_not_a_capped_lower_bound() {
         page["total"], FILES as u64,
         "the total counts every file's call: {page}"
     );
-    assert!(page.get("truncated").is_none(), "{page}");
+    assert!(!page["total_is_partial"].as_bool().unwrap_or(false), "{page}");
     assert!(
         page["next_cursor"].is_string(),
         "more pages remain past the first five: {page}"
@@ -334,7 +313,6 @@ fn forwarded_routes_never_build_the_in_ram_projection() {
         &block_on(super::helpers::run_find_implementations(
             &fx.host,
             FindImplementationsParams {
-                substring: true,
                 trait_name: "Tr".to_string(),
                 language: None,
                 limit: Some(100),
@@ -371,7 +349,6 @@ fn implementations_are_identical_on_every_route_including_language_filter_and_cu
                     &block_on(super::helpers::run_find_implementations(
                         route,
                         FindImplementationsParams {
-                            substring: true,
                             trait_name: trait_name.to_string(),
                             language: language.map(str::to_string),
                             limit: Some(limit),
@@ -404,7 +381,6 @@ fn implementations_are_identical_on_every_route_including_language_filter_and_cu
             &block_on(super::helpers::run_find_implementations(
                 &fx.host,
                 FindImplementationsParams {
-                    substring: true,
                     trait_name: "Tr".to_string(),
                     language: None,
                     limit: Some(500),
@@ -424,7 +400,7 @@ fn implementations_are_identical_on_every_route_including_language_filter_and_cu
         hit_count(&all)
     );
     assert!(
-        all[0]["hits"][0]["line"].as_u64().unwrap_or(0) > 0,
+        all[0]["hits"][0]["start_row"].as_u64().unwrap_or(0) > 0,
         "the forwarded page carries the impl's position: {}",
         all[0]["hits"][0]
     );
@@ -441,14 +417,12 @@ fn callers_scan_and_file_batches_are_identical_on_every_route() {
                     &fx.session,
                     RefsSource::Local(&fx.session),
                     route,
-                    super::tool_contract::IndexedFiles::contained(&fx.root),
+                    &fx.root,
                     &fx.cache,
                     FindCallersParams {
-                        substring: true,
                         path: def.clone(),
                         name: "driver_0".to_string(),
                         kind: None,
-                        line: None,
                         limit: Some(1),
                         max_tokens: None,
                         cursor: cursor.map(|c| super::cursor::Cursor(c.to_string())),
@@ -528,27 +502,11 @@ fn corpus_paths() -> Vec<RelPath> {
     paths
 }
 
-fn corpus_entries(fx: &Fixture) -> Vec<GrepEntry> {
-    let store = fx.store.store.lock().expect("store");
-    corpus_paths()
-        .into_iter()
-        .map(|rel| {
-            let entry = store.lookup(&rel).expect("indexed corpus file");
-            GrepEntry {
-                rel,
-                hash_hex: entry.hash_hex.clone(),
-                size_bytes: entry.size_bytes,
-                mtime_ns: entry.mtime,
-            }
-        })
-        .collect()
-}
-
 #[test]
 fn grep_bloom_verdicts_are_identical_on_the_local_and_forwarded_routes() {
     let fx = fixture();
     let paths = corpus_paths();
-    let entries = corpus_entries(&fx);
+    let refs: Vec<&RelPath> = paths.iter().collect();
     for pattern in [
         "driver_7\\(",
         "shared_helper_3",
@@ -556,8 +514,8 @@ fn grep_bloom_verdicts_are_identical_on_the_local_and_forwarded_routes() {
         "Child\\(Tr1\\)",
         "zzz_not_in_corpus",
     ] {
-        let local = block_on(fx.local.grep_skip(&fx.root, pattern, &entries)).expect("local verdicts");
-        let host = block_on(fx.host.grep_skip(&fx.root, pattern, &entries)).expect("forwarded verdicts");
+        let local = block_on(fx.local.grep_skip(&fx.root, pattern, &refs)).expect("local verdicts");
+        let host = block_on(fx.host.grep_skip(&fx.root, pattern, &refs)).expect("forwarded verdicts");
         assert_eq!(local, host, "{pattern}: routes must agree");
         assert_eq!(local.len(), paths.len());
         let re = regex::Regex::new(pattern).expect("regex");
@@ -575,65 +533,25 @@ fn grep_bloom_verdicts_are_identical_on_the_local_and_forwarded_routes() {
 #[test]
 fn a_pattern_without_a_required_literal_or_a_failed_forward_means_no_prefilter() {
     let fx = fixture();
-    let entries = corpus_entries(&fx);
-    assert!(block_on(fx.local.grep_skip(&fx.root, r"\w+", &entries)).is_none());
-    assert!(block_on(fx.host.grep_skip(&fx.root, ".*", &entries)).is_none());
-    assert!(block_on(fx.broken_host.grep_skip(&fx.root, "driver_7", &entries)).is_none());
-}
-
-/// A route whose daemon answers every read with `reply`.
-fn host_replying(fx: &Fixture, reply: IndexReadResult) -> IndexRoute {
-    let host: Arc<dyn HostBackend> = Arc::new(StoreHost {
-        store: Mutex::new(Store::open_read_only_no_index(&fx.root, VIEW_WORKING).expect("store")),
-        broken: false,
-        forced_reply: Some(reply),
-    });
-    IndexRoute::Host {
-        host,
-        root: fx.root.clone(),
-    }
-}
-
-#[test]
-fn a_mismatched_grep_bloom_reply_degrades_to_a_full_sweep() {
-    let fx = fixture();
-    let entries = corpus_entries(&fx);
-    let replies = [
-        ("wrong length", IndexReadResult::GrepSkip(vec![true; entries.len() - 1])),
-        ("wrong variant", IndexReadResult::CallsInFiles(Vec::new())),
-    ];
-    for (what, reply) in replies {
-        let route = host_replying(&fx, reply);
-        assert!(
-            block_on(route.grep_skip(&fx.root, "driver_7", &entries)).is_none(),
-            "{what}: no verdicts, so every file is searched"
-        );
-    }
-    let agreeing = host_replying(&fx, IndexReadResult::GrepSkip(vec![false; entries.len()]));
-    assert_eq!(
-        block_on(agreeing.grep_skip(&fx.root, "driver_7", &entries)),
-        Some(vec![false; entries.len()]),
-        "a well-formed reply is still used"
-    );
+    let paths = corpus_paths();
+    let refs: Vec<&RelPath> = paths.iter().collect();
+    assert!(block_on(fx.local.grep_skip(&fx.root, r"\w+", &refs)).is_none());
+    assert!(block_on(fx.host.grep_skip(&fx.root, ".*", &refs)).is_none());
+    assert!(block_on(fx.broken_host.grep_skip(&fx.root, "driver_7", &refs)).is_none());
 }
 
 #[test]
 fn an_oversized_grep_bloom_batch_is_refused() {
     let fx = fixture();
-    let entries: Vec<GrepEntry> = (0..=crate::comms::index_read_proto::MAX_GREP_BLOOM_PATHS)
-        .map(|i| GrepEntry {
-            rel: RelPath::from(format!("pkg0/m{i}.rs").as_bytes()),
-            hash_hex: String::new(),
-            size_bytes: 0,
-            mtime_ns: 0,
-        })
+    let paths: Vec<RelPath> = (0..=crate::comms::index_read_proto::MAX_GREP_BLOOM_PATHS)
+        .map(|i| RelPath::from(format!("pkg0/m{i}.rs").as_bytes()))
         .collect();
     let store = fx.store.store.lock().expect("store");
     let error = super::index_read::index_read_against(
         &store,
         &IndexReadQuery::GrepBloom {
             pattern: "driver".into(),
-            entries,
+            paths,
         },
     )
     .expect_err("an unbounded wire batch must be rejected");

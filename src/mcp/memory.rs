@@ -18,15 +18,53 @@ use super::types::{DocumentSearchHit, SearchDocumentsParams, SearchDocumentsResp
 #[cfg(feature = "memory")]
 use super::types_memory::{
     MemoryDeleteParams, MemoryDeleteResponse, MemoryEntry, MemoryGetParams, MemoryListParams, MemoryListResponse,
-    MemoryPutParams, MemoryPutResponse, MemorySearchParams, Visibility,
+    MemoryPutParams, MemoryPutResponse, MemorySearchHit, MemorySearchParams, MemorySearchResponse, Visibility,
 };
 #[cfg(feature = "documents")]
-use crate::extract::doc::{DocBlobs, DocEntity, DocKeyword, DocSummary};
+use crate::extract::doc::{DocEntity, DocKeyword, DocSummary};
 
-/// The shared embedding engine, loaded on first use. Loading reads the model from disk (or
-/// downloads it), so it runs on a blocking thread and never stalls the async runtime.
 #[cfg(feature = "intelligence")]
-pub(super) async fn shared_embedder(state: &ServerState) -> Result<Arc<crate::embeddings::SharedEmbedder>, String> {
+pub(super) async fn embed_query(state: &ServerState, text: &str) -> Result<Vec<f32>, McpError> {
+    embed_query_shared(&state.shared, text).await
+}
+
+/// Embed one query text through the workspace's shared embedder (lazy-loaded once).
+#[cfg(feature = "intelligence")]
+pub(super) async fn embed_query_shared(
+    shared: &crate::mcp::shared_state::SharedReadStack,
+    text: &str,
+) -> Result<Vec<f32>, McpError> {
+    let preset = shared.config.documents.embedding_preset.clone();
+    let max_embed_threads = shared
+        .config
+        .resources
+        .effective_embed_threads(shared.config.documents.embed_max_threads);
+    let embed_batch_size = shared.config.resources.embed_batch_size;
+    let provider = shared.config.resources.onnx_provider;
+    let embedder = shared
+        .embedder
+        .get_or_try_init(|| async {
+            crate::embeddings::SharedEmbedder::load_with_provider(
+                &preset,
+                max_embed_threads,
+                embed_batch_size,
+                provider,
+            )
+            .map(Arc::new)
+            .map_err(|e| format!("load embedder: {e}"))
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.clone(), None))?;
+    let embedder = Arc::clone(embedder);
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || embedder.embed(&text))
+        .await
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("embed: {e}"), None))
+}
+
+#[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
+pub(super) async fn lance_store(state: &ServerState) -> Result<Arc<crate::lance::LanceStore>, McpError> {
     let preset = state.shared.config.documents.embedding_preset.clone();
     let max_embed_threads = state
         .shared
@@ -37,62 +75,25 @@ pub(super) async fn shared_embedder(state: &ServerState) -> Result<Arc<crate::em
     let provider = state.shared.config.resources.onnx_provider;
     state
         .shared
-        .embedder
-        .get_or_try_init(|| async {
-            tokio::task::spawn_blocking(move || {
-                crate::embeddings::SharedEmbedder::load_with_provider(
-                    &preset,
-                    max_embed_threads,
-                    embed_batch_size,
-                    provider,
-                )
-            })
-            .await
-            .map_err(|e| format!("load embedder join: {e}"))?
-            .map(Arc::new)
-            .map_err(|e| format!("load embedder: {e}"))
-        })
-        .await
-        .cloned()
-}
-
-#[cfg(feature = "intelligence")]
-pub(super) async fn embed_query(state: &ServerState, text: &str) -> Result<Vec<f32>, McpError> {
-    let embedder = shared_embedder(state)
-        .await
-        .map_err(|e| McpError::internal_error(e, None))?;
-    let text = text.to_string();
-    tokio::task::spawn_blocking(move || embedder.embed(&text))
-        .await
-        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
-        .map_err(|e| McpError::internal_error(format!("embed: {e}"), None))
-}
-
-/// Open the vector store at `dir` for `embedder`'s dimension and model, off the async runtime.
-#[cfg(feature = "intelligence")]
-async fn open_lance(
-    dir: std::path::PathBuf,
-    embedder: &crate::embeddings::SharedEmbedder,
-) -> Result<Arc<crate::lance::LanceStore>, String> {
-    let (dim, model) = (embedder.dim(), embedder.model().to_string());
-    tokio::task::spawn_blocking(move || crate::lance::LanceStore::open(&dir, dim, &model))
-        .await
-        .map_err(|e| format!("lance open join: {e}"))?
-        .map(Arc::new)
-        .map_err(|e| format!("open LanceStore: {e}"))
-}
-
-#[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
-pub(super) async fn lance_store(
-    state: &ServerState,
-) -> Result<Arc<crate::lance::LanceStore>, super::lance_cell::Unavailable> {
-    state
-        .shared
         .lance
-        .get_or_open(|| async {
-            let embedder = shared_embedder(state)
+        .get_or_try_init(|| async {
+            let embedder = state
+                .shared
+                .embedder
+                .get_or_try_init(|| async {
+                    crate::embeddings::SharedEmbedder::load_with_provider(
+                        &preset,
+                        max_embed_threads,
+                        embed_batch_size,
+                        provider,
+                    )
+                    .map(Arc::new)
+                    .map_err(|e| format!("load embedder: {e}"))
+                })
                 .await
                 .map_err(|e| format!("embedder init: {e}"))?;
+            let dim = embedder.dim();
+            let model = embedder.model().to_string();
             let lance_dir = state
                 .shared
                 .store
@@ -100,13 +101,156 @@ pub(super) async fn lance_store(
                 .await
                 .basemind_dir
                 .join(crate::store::LANCE_DIR);
-            open_lance(lance_dir, &embedder).await
+            let model_for_open = model.clone();
+            tokio::task::spawn_blocking(move || crate::lance::LanceStore::open(&lance_dir, dim, &model_for_open))
+                .await
+                .map_err(|e| format!("lance open join: {e}"))?
+                .map(Arc::new)
+                .map_err(|e| format!("open LanceStore: {e}"))
         })
         .await
+        .cloned()
+        .map_err(|e| McpError::internal_error(e.clone(), None))
 }
 
-/// Per-`(scope, key)` write serialization for `memory_put`.
+/// The Lance store opened **without** constructing an embedder.
 ///
+/// [`lance_store`] eagerly loads the ONNX embedder (`SharedEmbedder::load`) and derives the store's
+/// dimension from it, so every caller pays for a model download even when it only wants to read
+/// rows. For the lexical lane that is the whole cost of the query and none of the benefit: the
+/// answer does not depend on a vector.
+///
+/// The dimension is resolved from the configured preset by name instead
+/// ([`crate::scanner_docs::preset_dim`]), which is the same lookup the scanner uses. It refuses to
+/// guess for an unknown preset, so an unresolvable preset errors here exactly as it would during a
+/// scan — rather than opening a store at a wrong dimension and triggering a wipe.
+///
+/// Shares the same `state.shared.lance` cache as [`lance_store`], so the two paths cannot open the
+/// directory at different dimensions: whichever runs first wins, and a mismatch is caught by
+/// `LanceStore::open`'s `wipe_on_mismatch` rather than producing two stores.
+#[cfg(feature = "documents")]
+pub(super) async fn lance_store_lexical(state: &ServerState) -> Result<Arc<crate::lance::LanceStore>, McpError> {
+    let preset = state.shared.config.documents.embedding_preset.clone();
+    let dim = crate::scanner_docs::preset_dim(&preset)
+        .map_err(|e| McpError::internal_error(format!("resolve embedding preset '{preset}': {e}"), None))?;
+    state
+        .shared
+        .lance
+        .get_or_try_init(|| async {
+            let lance_dir = state
+                .shared
+                .store
+                .read()
+                .await
+                .basemind_dir
+                .join(crate::store::LANCE_DIR);
+            let model_for_open = preset.clone();
+            tokio::task::spawn_blocking(move || crate::lance::LanceStore::open(&lance_dir, dim, &model_for_open))
+                .await
+                .map_err(|e| format!("lance open join: {e}"))?
+                .map(Arc::new)
+                .map_err(|e| format!("open LanceStore: {e}"))
+        })
+        .await
+        .cloned()
+        .map_err(|e| McpError::internal_error(e.clone(), None))
+}
+
+/// Run the lexical lane on the `spawn_blocking` thread.
+///
+/// Named rather than inlined because that closure must be `'static`; building the term list and
+/// the scope predicate inside it keeps the borrowed config out of the captured environment.
+#[cfg(feature = "documents")]
+fn basemind_lexical(
+    lance: &crate::lance::LanceStore,
+    terms: &[String],
+    predicate: &str,
+    limit: usize,
+    max_relaxations: u32,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_relaxed_on(lance, terms, predicate, limit, max_relaxations)
+}
+
+#[cfg(feature = "documents")]
+fn basemind_phrase(
+    lance: &crate::lance::LanceStore,
+    phrase: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_phrase_on(lance, phrase, predicate, limit)
+}
+
+#[cfg(feature = "documents")]
+fn basemind_exact(
+    lance: &crate::lance::LanceStore,
+    term: &str,
+    predicate: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<crate::lance::fts::LexicalHit>> {
+    crate::lance::fts::search_exact_on(lance, term, predicate, limit)
+}
+
+#[cfg(feature = "documents")]
+fn facets_to_wire(facets: crate::lance::DocumentFacets) -> (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>) {
+    let keywords = facets
+        .keywords
+        .unwrap_or_default()
+        .into_iter()
+        .map(|text| DocKeyword {
+            text,
+            score: 0.0,
+            algorithm: "stored".to_string(),
+        })
+        .collect();
+    let entities = facets
+        .entities
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entity| {
+            let (category, text) = entity.split_once(':')?;
+            Some(DocEntity {
+                category: category.to_string(),
+                text: text.to_string(),
+                start: 0,
+                end: text.len() as u32,
+                confidence: None,
+            })
+        })
+        .collect();
+    let summary = facets.summary.map(|text| DocSummary {
+        text,
+        // Lance stores the normalized summary text; the current document
+        // pipeline only persists extractive summaries, so preserve the wire
+        // contract expected by existing clients.
+        strategy: "extractive".to_string(),
+        token_count: None,
+    });
+    (keywords, entities, summary)
+}
+
+#[cfg(feature = "documents")]
+fn lexical_hit_to_document_hit(hit: crate::lance::fts::LexicalHit, distance: f32) -> DocumentSearchHit {
+    let (keywords, entities, summary) = facets_to_wire(hit.facets);
+    DocumentSearchHit {
+        path: hit.path,
+        chunk_idx: hit.chunk_idx,
+        text: hit.text,
+        mime_type: hit.mime_type,
+        byte_start: hit.byte_start,
+        byte_end: hit.byte_end,
+        distance,
+        matched_lanes: vec!["lexical".to_string()],
+        retrieval_mode: "lexical".to_string(),
+        citation: hit.cites.lines().next().map(str::to_string),
+        rerank_score: None,
+        keywords,
+        entities,
+        summary,
+    }
+}
+
+/// Push `memory_put` concurrency docs anchor.
 /// `memory_put` is a read-modify-write across two stores (Fjall + LanceDB).
 /// Without serialization, two concurrent puts for the same key both read "no
 /// existing record" and stamp different `created_at` values, and their two-phase
@@ -149,7 +293,7 @@ fn memory_put_lock(scope: &str, vis_byte: u8, owner: &str, key: &str) -> Arc<tok
 /// String form of a [`Visibility`] for the LanceDB `visibility` column. Matches the serde
 /// `rename_all = "lowercase"` discriminants so the column reads back as the same enum.
 #[cfg(feature = "memory")]
-pub(super) fn lance_visibility(visibility: Visibility) -> &'static str {
+fn lance_visibility(visibility: Visibility) -> &'static str {
     match visibility {
         Visibility::Group => "group",
         Visibility::Individual => "individual",
@@ -162,7 +306,7 @@ pub(super) fn lance_visibility(visibility: Visibility) -> &'static str {
 /// server's resolved `agent_id`, which was validated through `AgentId` at boot and is
 /// therefore NUL-free — safe to embed in the length-prefixed Fjall key segment.
 #[cfg(feature = "memory")]
-pub(super) fn memory_namespace(state: &ServerState, visibility: Visibility) -> (u8, &str) {
+fn namespace(state: &ServerState, visibility: Visibility) -> (u8, &str) {
     let owner: &str = match visibility {
         Visibility::Individual => &state.agent_id,
         Visibility::Group => "",
@@ -172,56 +316,36 @@ pub(super) fn memory_namespace(state: &ServerState, visibility: Visibility) -> (
 
 #[cfg(feature = "memory")]
 pub(super) async fn run_memory_put(state: &ServerState, params: MemoryPutParams) -> Result<CallToolResult, McpError> {
-    let (vis_byte, owner) = memory_namespace(state, params.visibility);
+    let (vis_byte, owner) = namespace(state, params.visibility);
     let tags = params.tags.clone().unwrap_or_default();
-    super::memory_ops::check_note(&params.key, &params.value, &tags)?;
 
     let (created_at, updated_at) = memory_put_fjall(state, vis_byte, owner, &params.key, &params.value, &tags).await?;
 
-    // The note is durable from here on. A failure to embed it is reported on a successful result,
-    // never as an error: an error would read as "not saved" and invite a retry of a write that
-    // already happened.
-    let embedded = if params.embed && !params.value.is_empty() {
-        Some(super::memory_vectors::embed_note(state, &params, owner, tags, created_at, updated_at).await)
-    } else {
-        None
-    };
-    if matches!(embedded, Some(Ok(()))) {
-        super::memory_vectors::owe_rows_elsewhere(state).await;
-    } else {
-        // The note has no row of this write. One of an earlier write still holds the OLD text's
-        // vector; the join refuses it, and removing it keeps it from taking a slot in every later
-        // search. The namespace is no longer level: the next search by meaning embeds the note.
-        super::memory_vectors::delete_vector_row(state, params.visibility, owner, &params.key).await;
-        super::memory_vectors::not_level(state, vis_byte, owner);
-        let root = state.shared.root.clone();
-        let _ = tokio::task::spawn_blocking(move || super::memory_vectors::owe_rows(&root)).await;
+    if params.embed {
+        let embedding = embed_query(state, &params.value).await?;
+        let lance = lance_store(state).await?;
+        let row = crate::lance::MemoryRow {
+            scope: state.shared.scope.clone(),
+            key: params.key.clone(),
+            value: params.value.clone(),
+            tags,
+            visibility: lance_visibility(params.visibility).to_string(),
+            agent_id: owner.to_string(),
+            embedding,
+            created_at,
+            updated_at,
+        };
+        let lance_clone = Arc::clone(&lance);
+        tokio::task::spawn_blocking(move || lance_clone.upsert_memory(row))
+            .await
+            .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+            .map_err(|e| McpError::internal_error(format!("upsert_memory: {e}"), None))?;
     }
-    let (embedded, notice) = embed_report(embedded);
     json_result(&MemoryPutResponse {
         key: params.key,
         created_at,
         updated_at,
-        embedded,
-        notice,
     })
-}
-
-/// What `memory_save` says about the vector row of a note that is already saved:
-/// `(embedded, notice)`. `None` means embedding was not asked for.
-#[cfg(feature = "memory")]
-fn embed_report(outcome: Option<Result<(), String>>) -> (bool, Option<String>) {
-    match outcome {
-        Some(Ok(())) => (true, None),
-        Some(Err(error)) => (
-            false,
-            Some(format!(
-                "the note is saved and can be read by `key` or listed by `prefix`, but it could not be embedded \
-                 ({error}); `memory_search` with `query` will not find it until a later search embeds it"
-            )),
-        ),
-        None => (false, None),
-    }
 }
 
 /// Run the fjall half of `memory_put`, returning the resolved `(created_at, updated_at)`.
@@ -266,28 +390,21 @@ async fn memory_put_fjall(
         .index_db
         .as_ref()
         .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-    // The put ends in an fsync: off the reactor, like every other blocking store call.
-    Ok(super::index_route::blocking(|| {
-        super::memory_ops::put_core(idx, &state.shared.scope, vis_byte, owner, key, value, tags)
-    })?)
+    Ok(super::memory_ops::put_core(
+        idx,
+        &state.shared.scope,
+        vis_byte,
+        owner,
+        key,
+        value,
+        tags,
+    )?)
 }
 
 #[cfg(feature = "memory")]
 pub(super) async fn run_memory_get(state: &ServerState, params: MemoryGetParams) -> Result<CallToolResult, McpError> {
-    let (vis_byte, owner) = memory_namespace(state, params.visibility);
+    let (vis_byte, owner) = namespace(state, params.visibility);
 
-    let entry = memory_get_wire(state, vis_byte, owner, &params.key).await?;
-    json_result(&entry.map(wire_to_entry))
-}
-
-/// Read one note from the Fjall truth, through the daemon when it owns the store.
-#[cfg(feature = "memory")]
-pub(super) async fn memory_get_wire(
-    state: &ServerState,
-    vis_byte: u8,
-    owner: &str,
-    key: &str,
-) -> Result<Option<super::memory_ops::WireMemoryEntry>, McpError> {
     #[cfg(all(feature = "comms", any(unix, windows)))]
     if state.shared.daemon_writer {
         use crate::comms::memory_proto::{MemoryOp, MemoryOutcome};
@@ -295,142 +412,29 @@ pub(super) async fn memory_get_wire(
         let op = MemoryOp::Get {
             vis_byte,
             owner: owner.to_string(),
-            key: key.to_string(),
+            key: params.key.clone(),
         };
-        return match super::helpers_comms::dispatch_memory_op(state, op).await? {
-            MemoryOutcome::Got(entry) => Ok(entry),
-            other => Err(McpError::internal_error(
-                format!("memory_get: unexpected daemon outcome {other:?}"),
-                None,
-            )),
-        };
-    }
-
-    let store = state.shared.store.read().await;
-    let idx = store
-        .index_db
-        .as_ref()
-        .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-    Ok(super::memory_ops::get_core(
-        idx,
-        &state.shared.scope,
-        vis_byte,
-        owner,
-        key,
-    )?)
-}
-
-/// Read several notes of one namespace from the Fjall truth, one slot per key in order. However
-/// many keys, a request carries at most [`GET_MANY_MAX_KEYS`](super::memory_ops::GET_MANY_MAX_KEYS)
-/// of them, and a reply answers those whose notes fit in
-/// [`GET_MANY_MAX_BYTES`](super::memory_ops::GET_MANY_MAX_BYTES): the next request starts at the
-/// first key left unanswered.
-#[cfg(feature = "memory")]
-pub(super) async fn memory_get_many_wire(
-    state: &ServerState,
-    vis_byte: u8,
-    owner: &str,
-    keys: Vec<String>,
-) -> Result<Vec<Option<super::memory_ops::WireMemoryEntry>>, McpError> {
-    let framed = state.shared.memory_is_framed();
-    let mut entries = Vec::with_capacity(keys.len());
-    while entries.len() < keys.len() {
-        let rest = &keys[entries.len()..];
-        let chunk = super::memory_ops::request_chunk(rest, super::memory_ops::GET_MANY_MAX_KEYS, framed)?;
-        entries.extend(memory_get_chunk_wire(state, vis_byte, owner, chunk).await?);
-    }
-    Ok(entries)
-}
-
-/// One request of [`memory_get_many_wire`]: a slot for each of the leading keys, at least one.
-#[cfg(feature = "memory")]
-async fn memory_get_chunk_wire(
-    state: &ServerState,
-    vis_byte: u8,
-    owner: &str,
-    keys: &[String],
-) -> Result<Vec<Option<super::memory_ops::WireMemoryEntry>>, McpError> {
-    #[cfg(all(feature = "comms", any(unix, windows)))]
-    if state.shared.daemon_writer {
-        use crate::comms::memory_proto::{MemoryOp, MemoryOutcome};
-
-        let wanted = keys.len();
-        let op = MemoryOp::GetMany {
-            vis_byte,
-            owner: owner.to_string(),
-            keys: keys.to_vec(),
-        };
-        return match super::helpers_comms::dispatch_memory_op(state, op).await? {
-            MemoryOutcome::GotMany(entries) if (1..=wanted).contains(&entries.len()) => Ok(entries),
-            other => Err(McpError::internal_error(
-                format!("memory_get_many: unexpected daemon outcome {other:?}"),
-                None,
-            )),
-        };
-    }
-
-    let store = state.shared.store.read().await;
-    let idx = store
-        .index_db
-        .as_ref()
-        .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-    Ok(super::memory_ops::get_many_core(
-        idx,
-        &state.shared.scope,
-        vis_byte,
-        owner,
-        keys,
-    )?)
-}
-
-/// The `updated_at` of each key's note, in order, `None` where no note exists, without the notes'
-/// text: one request per [`STAMPS_MAX_KEYS`](super::memory_ops::STAMPS_MAX_KEYS) keys.
-#[cfg(feature = "memory")]
-pub(super) async fn memory_stamps_wire(
-    state: &ServerState,
-    vis_byte: u8,
-    owner: &str,
-    keys: &[String],
-) -> Result<Vec<Option<i64>>, McpError> {
-    let framed = state.shared.memory_is_framed();
-    let mut stamps = Vec::with_capacity(keys.len());
-    while stamps.len() < keys.len() {
-        let rest = &keys[stamps.len()..];
-        let chunk = super::memory_ops::request_chunk(rest, super::memory_ops::STAMPS_MAX_KEYS, framed)?;
-        #[cfg(all(feature = "comms", any(unix, windows)))]
-        if state.shared.daemon_writer {
-            use crate::comms::memory_proto::{MemoryOp, MemoryOutcome};
-
-            let op = MemoryOp::Stamps {
-                vis_byte,
-                owner: owner.to_string(),
-                keys: chunk.to_vec(),
-            };
-            match super::helpers_comms::dispatch_memory_op(state, op).await? {
-                MemoryOutcome::Stamps(read) if read.len() == chunk.len() => stamps.extend(read),
-                other => {
-                    return Err(McpError::internal_error(
-                        format!("memory_stamps: unexpected daemon outcome {other:?}"),
-                        None,
-                    ));
-                }
+        let outcome = super::helpers_comms::dispatch_memory_op(state, op).await?;
+        let entry = match outcome {
+            MemoryOutcome::Got(entry) => entry.map(wire_to_entry),
+            other => {
+                return Err(McpError::internal_error(
+                    format!("memory_get: unexpected daemon outcome {other:?}"),
+                    None,
+                ));
             }
-            continue;
-        }
-        let store = state.shared.store.read().await;
-        let idx = store
-            .index_db
-            .as_ref()
-            .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-        stamps.extend(super::memory_ops::stamps_core(
-            idx,
-            &state.shared.scope,
-            vis_byte,
-            owner,
-            chunk,
-        )?);
+        };
+        return json_result(&entry);
     }
-    Ok(stamps)
+
+    let store = state.shared.store.read().await;
+    let idx = store
+        .index_db
+        .as_ref()
+        .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
+    let entry: Option<MemoryEntry> =
+        super::memory_ops::get_core(idx, &state.shared.scope, vis_byte, owner, &params.key)?.map(wire_to_entry);
+    json_result(&entry)
 }
 
 /// Map a wire memory entry onto the MCP [`MemoryEntry`] response shape.
@@ -454,41 +458,10 @@ pub(super) async fn run_memory_list(state: &ServerState, params: MemoryListParam
         .limit
         .unwrap_or(super::helpers::SEARCH_LIMIT_DEFAULT)
         .min(super::helpers::SEARCH_LIMIT_MAX) as usize;
-    let (vis_byte, owner) = memory_namespace(state, params.visibility);
+    let (vis_byte, owner) = namespace(state, params.visibility);
     let key_prefix_filter = params.prefix.clone().unwrap_or_default();
     let cursor_bytes = params.cursor.as_ref().map(|c| c.decode_fjall()).transpose()?;
 
-    let page = memory_list_page(
-        state,
-        vis_byte,
-        owner,
-        &key_prefix_filter,
-        params.tag.as_deref(),
-        limit,
-        cursor_bytes,
-    )
-    .await?;
-    json_result(&MemoryListResponse {
-        total: page.total as usize,
-        truncated: page.truncated,
-        entries: page.entries.into_iter().map(wire_to_entry).collect(),
-        next_cursor: page.next_cursor.as_deref().map(Cursor::encode_fjall),
-        elapsed_us: elapsed_us(__body),
-    })
-}
-
-/// One page of a namespace's notes from the Fjall truth, through the daemon when it owns the
-/// store. Values are preview-truncated, as `memory_list` returns them.
-#[cfg(feature = "memory")]
-pub(super) async fn memory_list_page(
-    state: &ServerState,
-    vis_byte: u8,
-    owner: &str,
-    prefix: &str,
-    tag: Option<&str>,
-    limit: usize,
-    cursor: Option<Vec<u8>>,
-) -> Result<super::memory_ops::ListResult, McpError> {
     #[cfg(all(feature = "comms", any(unix, windows)))]
     if state.shared.daemon_writer {
         use crate::comms::memory_proto::{MemoryOp, MemoryOutcome};
@@ -496,22 +469,24 @@ pub(super) async fn memory_list_page(
         let op = MemoryOp::List {
             vis_byte,
             owner: owner.to_string(),
-            prefix: prefix.to_string(),
-            tag: tag.map(str::to_string),
+            prefix: key_prefix_filter,
+            tag: params.tag.clone(),
             limit: limit as u32,
-            cursor,
+            cursor: cursor_bytes,
         };
-        return match super::helpers_comms::dispatch_memory_op(state, op).await? {
+        let outcome = super::helpers_comms::dispatch_memory_op(state, op).await?;
+        return match outcome {
             MemoryOutcome::Listed {
                 entries,
                 total,
                 truncated,
                 next_cursor,
-            } => Ok(super::memory_ops::ListResult {
-                entries,
-                total,
+            } => json_result(&MemoryListResponse {
+                total: total as usize,
                 truncated,
-                next_cursor,
+                entries: entries.into_iter().map(wire_to_entry).collect(),
+                next_cursor: next_cursor.as_deref().map(Cursor::encode_fjall),
+                elapsed_us: elapsed_us(__body),
             }),
             other => Err(McpError::internal_error(
                 format!("memory_list: unexpected daemon outcome {other:?}"),
@@ -525,18 +500,25 @@ pub(super) async fn memory_list_page(
         .index_db
         .as_ref()
         .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-    Ok(super::memory_ops::list_core(
+    let result = super::memory_ops::list_core(
         idx,
         &state.shared.scope,
         &super::memory_ops::ListQuery {
             vis_byte,
             owner,
-            key_prefix: prefix,
-            tag,
+            key_prefix: &key_prefix_filter,
+            tag: params.tag.as_deref(),
             limit,
-            cursor: cursor.as_deref(),
+            cursor: cursor_bytes.as_deref(),
         },
-    )?)
+    )?;
+    json_result(&MemoryListResponse {
+        total: result.total as usize,
+        truncated: result.truncated,
+        entries: result.entries.into_iter().map(wire_to_entry).collect(),
+        next_cursor: result.next_cursor.as_deref().map(Cursor::encode_fjall),
+        elapsed_us: elapsed_us(__body),
+    })
 }
 
 #[cfg(feature = "memory")]
@@ -544,7 +526,41 @@ pub(super) async fn run_memory_search(
     state: &ServerState,
     params: MemorySearchParams,
 ) -> Result<CallToolResult, McpError> {
-    super::memory_vectors::search(state, params).await
+    let __body = std::time::Instant::now();
+    let limit = params.limit.unwrap_or(10).min(100) as usize;
+    if limit == 0 {
+        return Err(McpError::invalid_params(
+            "document search limit must be greater than zero",
+            None,
+        ));
+    }
+    let (_, owner) = namespace(state, params.visibility);
+    let visibility = lance_visibility(params.visibility).to_string();
+    let agent_id = owner.to_string();
+    let embedding = embed_query(state, &params.query).await?;
+    let lance = lance_store(state).await?;
+    let scope = state.shared.scope.clone();
+    let tag = params.tag.clone();
+    let hits_raw = tokio::task::spawn_blocking(move || {
+        lance.search_memory(&scope, &visibility, &agent_id, embedding, limit, tag.as_deref())
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+    .map_err(|e| McpError::internal_error(format!("search_memory: {e}"), None))?;
+    let hits = hits_raw
+        .into_iter()
+        .map(|h| MemorySearchHit {
+            key: h.key,
+            value: h.value,
+            tags: h.tags,
+            distance: h.distance,
+        })
+        .collect();
+    json_result(&MemorySearchResponse {
+        query: params.query,
+        hits,
+        elapsed_us: elapsed_us(__body),
+    })
 }
 
 #[cfg(feature = "memory")]
@@ -552,9 +568,32 @@ pub(super) async fn run_memory_delete(
     state: &ServerState,
     params: MemoryDeleteParams,
 ) -> Result<CallToolResult, McpError> {
-    let (vis_byte, owner) = memory_namespace(state, params.visibility);
+    let (vis_byte, owner) = namespace(state, params.visibility);
     let deleted_fjall = memory_delete_fjall(state, vis_byte, owner, &params.key).await?;
-    super::memory_vectors::delete_vector_row(state, params.visibility, owner, &params.key).await;
+    if let Some(lance) = state.shared.lance.get() {
+        let lance = Arc::clone(lance);
+        let scope = state.shared.scope.clone();
+        let key = params.key.clone();
+        let visibility = lance_visibility(params.visibility).to_string();
+        let agent_id = owner.to_string();
+        match tokio::task::spawn_blocking(move || lance.delete_memory(&scope, &visibility, &agent_id, &key)).await {
+            Ok(Ok(_rows_deleted)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    key = %params.key,
+                    ?error,
+                    "lance delete_memory failed; embedding may be stale relative to Fjall"
+                );
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    key = %params.key,
+                    ?join_error,
+                    "lance delete_memory task panicked; embedding may be stale relative to Fjall"
+                );
+            }
+        }
+    }
     json_result(&MemoryDeleteResponse { deleted: deleted_fjall })
 }
 
@@ -588,53 +627,25 @@ async fn memory_delete_fjall(state: &ServerState, vis_byte: u8, owner: &str, key
         .index_db
         .as_ref()
         .ok_or_else(|| McpError::internal_error("memory_by_key index not available", None))?;
-    Ok(super::index_route::blocking(|| {
-        super::memory_ops::delete_core(idx, &state.shared.scope, vis_byte, owner, key)
-    })?)
+    Ok(super::memory_ops::delete_core(
+        idx,
+        &state.shared.scope,
+        vis_byte,
+        owner,
+        key,
+    )?)
 }
 
 /// Pick the ingestion scope to search: the caller's if they named one, else this repo's.
 ///
-/// Documents are partitioned by ingestion scope. The scanner writes under the repo scope; rows an
-/// older version ingested from the web sit under `web:<host>` and are no longer refreshed, so
-/// naming that scope is the only way to reach them.
+/// Documents are partitioned by ingestion scope, and the lanes do not agree on one: the scanner
+/// writes under the repo scope while `web_scrape` / `web_crawl` write under `web:<host>`. Reading
+/// only `state.shared.scope`, with no way to ask for another, made every scraped page permanently
+/// invisible — the write landed, LanceDB grew on disk, and the query filtered it out and returned
+/// an empty, error-free, 14 ms answer.
 #[cfg(feature = "documents")]
 fn resolve_doc_scope(requested: Option<&str>, repo_scope: &str) -> String {
     requested.unwrap_or(repo_scope).to_string()
-}
-
-#[cfg(any(feature = "documents", feature = "code-search"))]
-pub(super) async fn shared_lance_route(
-    state: &ServerState,
-    lane: crate::lance::shared_store::SharedLane,
-) -> Option<(std::path::PathBuf, String)> {
-    if !crate::lance::shared_snapshot::enabled() {
-        return None;
-    }
-    let store = state.shared.store.read().await;
-    let generation = crate::lance::shared_snapshot::generation(&store.index, &state.shared.config, lane).ok()?;
-    Some((crate::store::repo_group_dir(&store.root), generation))
-}
-
-#[cfg(any(feature = "documents", feature = "code-search"))]
-pub(super) fn observe_semantic_route<T>(
-    tier: &str,
-    requested_shared: bool,
-    shared: Option<T>,
-    fallback: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    if let Some(hits) = shared {
-        tracing::debug!(tier, route = "layered", degraded = false, "semantic search route");
-        return Ok(hits);
-    }
-    let hits = fallback()?;
-    tracing::debug!(
-        tier,
-        route = "standalone",
-        degraded = requested_shared,
-        "semantic search route"
-    );
-    Ok(hits)
 }
 
 #[cfg(feature = "documents")]
@@ -643,12 +654,20 @@ pub(super) async fn run_search_documents(
     params: SearchDocumentsParams,
 ) -> Result<CallToolResult, McpError> {
     let __body = std::time::Instant::now();
-    if params.entity_category.is_some()
-        && let Some(reason) = crate::extract::doc_tiers::entity_filter_unavailable()
-    {
-        return Err(McpError::invalid_request(reason, None));
-    }
-    let (output_format, reranker_enabled, reranker_preset, reranker_top_k) = {
+    // An explicit Mcp preset override always means a compiled-in preset;
+    // otherwise the workspace `custom_model` (if any) wins over the default.
+    let explicit_preset = params.overrides.reranker_preset.clone();
+    let (output_format, reranker_enabled, _reranker_preset, reranker_top_k) = if params.overrides.any() {
+        let mut effective = (*state.shared.config).clone();
+        crate::config::layered::apply_documents_overrides(
+            &mut effective,
+            &params.overrides,
+            crate::config::ConfigSource::Mcp,
+            None,
+        );
+        let r = &effective.documents.reranker;
+        (effective.documents.output.format, r.enabled, r.preset.clone(), r.top_k)
+    } else {
         let r = &state.shared.config.documents.reranker;
         (
             state.shared.config.documents.output.format,
@@ -658,56 +677,287 @@ pub(super) async fn run_search_documents(
         )
     };
 
-    let limit = params.limit.unwrap_or(10).min(super::helpers_page::RANKED_FETCH) as usize;
-    // The keyword / entity filters run on the retrieved hits, so retrieval goes deeper than the
-    // page: a matching document ranked past `limit` would otherwise never be seen.
-    let filtered = params.entity_category.is_some() || params.keywords_contains.is_some();
-    let fetch = if filtered {
-        super::helpers_page::filtered_fetch(limit)
+    let limit = params.limit.unwrap_or(10).min(100) as usize;
+    let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
+    let facet_filter = crate::lance::DocumentFacetFilter {
+        doc_type: crate::extract::doc::facets::doc_type(params.doc_type.as_deref()),
+        section: crate::extract::doc::facets::section(params.section.as_deref()),
+        jurisdiction: crate::extract::doc::facets::jurisdiction(params.jurisdiction.as_deref()),
+        doc_date: crate::extract::doc::facets::doc_date(params.doc_date.as_deref()),
+    };
+    let facet_sql = {
+        let mut clauses = Vec::new();
+        for (column, value) in [
+            ("doc_type", facet_filter.doc_type.as_deref()),
+            ("section", facet_filter.section.as_deref()),
+            ("jurisdiction", facet_filter.jurisdiction.as_deref()),
+            ("doc_date", facet_filter.doc_date.as_deref()),
+        ] {
+            if let Some(value) = value {
+                clauses.push(format!(
+                    "({column} IS NULL OR {column} = '{}')",
+                    crate::lance::escape_sql_literal(value)
+                ));
+            }
+        }
+        clauses.join(" AND ")
+    };
+
+    // With `embed = false` there are no vectors, so the vector lane cannot run at all — and
+    // reaching for it would embed the query and download a model to answer a question that does
+    // not need one. The lexical lane is not a fallback here; on a lexical-only store it is the only
+    // lane, and it answers through a store opened without an embedder.
+    let lexical_only = !state.shared.config.documents.embed;
+    let has_metadata_filters = params.entity_category.is_some() || params.keywords_contains.is_some();
+    let candidate_limit = if has_metadata_filters {
+        limit.saturating_mul(8).clamp(limit, 1_000)
     } else {
         limit
     };
-    let embedding = embed_query(state, &params.query).await?;
-    let lance = lance_store(state)
+    let reranker_model = if reranker_enabled {
+        match state
+            .shared
+            .config
+            .documents
+            .reranker
+            .resolve_model(explicit_preset.as_deref())
+        {
+            crate::config::ResolvedRerankerModel::Preset { name } => Some(format!("preset:{name}")),
+            crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+                Some(format!("custom:{model_id}:{model_file}"))
+            }
+        }
+    } else {
+        None
+    };
+    let query_fingerprint = document_query_fingerprint(
+        &params,
+        &scope,
+        lexical_only,
+        state.shared.config.documents.fusion.max_relaxations,
+        reranker_enabled,
+        reranker_top_k,
+        reranker_model.as_deref(),
+    );
+
+    let (mut hits, cursor_generation, cursor_offset, raw_page_len, has_more, cursor_invalidated) = if lexical_only {
+        let max_relaxations = state.shared.config.documents.fusion.max_relaxations;
+        let lance = lance_store_lexical(state).await?;
+        let query = params.query.clone();
+        let scope_for_lane = scope.clone();
+        let facet_sql_for_lane = facet_sql.clone();
+        let mime_for_lane = params.mime_type.clone();
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(candidate_limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
+        let hits_raw = tokio::task::spawn_blocking(move || {
+            if invalidated {
+                return Ok(Vec::new());
+            }
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime_for_lane.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            if !facet_sql_for_lane.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql_for_lane);
+            }
+            let phrases = crate::lance::fts::quoted_phrases(&query);
+            let terms: Vec<String> = query.replace('"', " ").split_whitespace().map(str::to_string).collect();
+            let mut merged = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
+                }
+            }
+            for phrase in phrases {
+                if merged.len() >= fetch_limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(hit);
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
+                }
+            }
+            if !terms.is_empty() && merged.len() < fetch_limit {
+                for hit in basemind_lexical(&lance, &terms, &predicate, fetch_limit, max_relaxations)? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        merged.push(hit);
+                    }
+                }
+            }
+            merged.truncate(fetch_limit);
+            Ok::<Vec<crate::lance::fts::LexicalHit>, anyhow::Error>(merged)
+        })
         .await
-        .map_err(|unavailable| unavailable.refusal("docs_search", None))?;
-    let scope = resolve_doc_scope(params.scope.as_deref(), &state.shared.scope);
-    let mime = params.mime_type.clone();
-    let lane = crate::lance::shared_store::SharedLane::Documents;
-    let routing = shared_lance_route(state, lane).await;
-    let mut hits_raw = tokio::task::spawn_blocking(move || {
-        let requested_shared = crate::lance::shared_snapshot::enabled();
-        let shared = routing.and_then(|(group, generation)| {
-            crate::lance::shared_snapshot::read(&lance, &group, lane, &scope, &generation, |shared, paths| {
-                shared.search_documents(&scope, embedding.clone(), mime.as_deref(), paths, fetch)
-            })
-        });
-        observe_semantic_route("documents", requested_shared, shared, || {
-            lance.search_documents(&scope, embedding, fetch, mime.as_deref())
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("lexical search: {e}"), None))?;
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
+        let hits: Vec<DocumentSearchHit> = hits_raw
+            .into_iter()
+            .skip(offset)
+            .take(candidate_limit)
+            // No meaning for a lexical hit: FTS returns a relevance score, not a distance.
+            .map(|h| lexical_hit_to_document_hit(h, 0.0))
+            .collect();
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
+    } else {
+        let embedding = embed_query(state, &params.query).await?;
+        let lance = lance_store(state).await?;
+        let mime = params.mime_type.clone();
+        let scope_for_lane = scope.clone();
+        let query = params.query.clone();
+        let facet_filter_for_lane = facet_filter.clone();
+        let generation = lance.document_generation();
+        let (offset, invalidated) = document_cursor_offset(params.cursor.as_ref(), generation, query_fingerprint)?;
+        let fetch_limit = offset
+            .checked_add(candidate_limit)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| McpError::invalid_params("document cursor offset is too large", None))?;
+        let hits_raw = tokio::task::spawn_blocking(move || {
+            if invalidated {
+                return Ok(Vec::new());
+            }
+            let mut predicate = format!("scope = '{}'", crate::lance::escape_sql_literal(&scope_for_lane));
+            if let Some(mime) = mime.as_deref() {
+                predicate.push_str(" AND mime_type = '");
+                predicate.push_str(&crate::lance::escape_sql_literal(mime));
+                predicate.push('\'');
+            }
+            if !facet_sql.is_empty() {
+                predicate.push_str(" AND ");
+                predicate.push_str(&facet_sql);
+            }
+            let mut merged = Vec::with_capacity(fetch_limit);
+            let mut seen = std::collections::HashSet::new();
+            if let Some(candidate) = crate::lance::fts::exact_candidate(&query) {
+                match basemind_exact(&lance, &candidate, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if !crate::extract::doc::citations::extract_citations(&hit.cites, 64)
+                                .iter()
+                                .any(|cite| cite.eq_ignore_ascii_case(&candidate))
+                            {
+                                continue;
+                            }
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "exact citation lane failed; continuing"),
+                }
+            }
+            for phrase in crate::lance::fts::quoted_phrases(&query) {
+                if merged.len() >= fetch_limit {
+                    break;
+                }
+                match basemind_phrase(&lance, &phrase, &predicate, fetch_limit) {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                                merged.push(lexical_hit_to_document_hit(hit, 0.0));
+                            }
+                            if merged.len() >= fetch_limit {
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(?error, "phrase lane failed; continuing"),
+                }
+            }
+            if merged.len() < fetch_limit {
+                for hit in lance.search_documents_filtered(
+                    &scope_for_lane,
+                    embedding,
+                    fetch_limit,
+                    mime.as_deref(),
+                    Some(&facet_filter_for_lane),
+                )? {
+                    if seen.insert((hit.path.clone(), hit.chunk_idx)) {
+                        let (keywords, entities, summary) = facets_to_wire(hit.facets.clone());
+                        merged.push(DocumentSearchHit {
+                            path: hit.path,
+                            chunk_idx: hit.chunk_idx,
+                            text: hit.text,
+                            mime_type: hit.mime_type,
+                            byte_start: hit.byte_start,
+                            byte_end: hit.byte_end,
+                            distance: hit.distance,
+                            matched_lanes: vec!["vector".to_string()],
+                            retrieval_mode: "vector".to_string(),
+                            citation: None,
+                            rerank_score: None,
+                            keywords,
+                            entities,
+                            summary,
+                        });
+                    }
+                    if merged.len() >= fetch_limit {
+                        break;
+                    }
+                }
+            }
+            merged.truncate(fetch_limit);
+            Ok::<Vec<DocumentSearchHit>, anyhow::Error>(merged)
         })
-    })
-    .await
-    .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
-    .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
-    // A filter whose ranking goes on past the depth it was handed has not seen all of it: a
-    // matching document below that depth was never looked at, so the result is not "no match".
-    let filter_depth_used = filtered && super::helpers_page::cut_at_filter_depth(&mut hits_raw, fetch);
-    let mut hits: Vec<DocumentSearchHit> = hits_raw
-        .into_iter()
-        .map(|h| DocumentSearchHit {
-            path: h.path,
-            chunk_idx: h.chunk_idx,
-            text: h.text,
-            mime_type: h.mime_type,
-            byte_start: h.byte_start,
-            byte_end: h.byte_end,
-            distance: h.distance,
-            rerank_score: None,
-            keywords: Vec::new(),
-            entities: Vec::new(),
-            summary: None,
-        })
-        .collect();
+        .await
+        .map_err(|e| McpError::internal_error(format!("spawn_blocking: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("search_documents: {e}"), None))?;
+        let has_more = hits_raw.len() > offset.saturating_add(candidate_limit);
+        let hits: Vec<DocumentSearchHit> = hits_raw.into_iter().skip(offset).take(candidate_limit).collect();
+        let raw_page_len = hits.len();
+        (
+            hits,
+            generation,
+            offset as u64 + raw_page_len as u64,
+            raw_page_len,
+            has_more,
+            invalidated,
+        )
+    };
 
     attach_doc_metadata(
         state,
@@ -716,20 +966,32 @@ pub(super) async fn run_search_documents(
         params.keywords_contains.as_deref(),
     )
     .await?;
-    hits.truncate(limit);
 
-    let candidates = hits.len();
     if reranker_enabled && !hits.is_empty() {
-        if xberg::get_reranker_preset(&reranker_preset).is_none() {
-            return Err(McpError::invalid_params(
-                format!("unknown reranker preset: {reranker_preset:?}"),
-                None,
-            ));
-        }
+        let cfg = &state.shared.config.documents.reranker;
+        let krz_model = match cfg.resolve_model(explicit_preset.as_deref()) {
+            crate::config::ResolvedRerankerModel::Preset { name } => {
+                if xberg::get_reranker_preset(&name).is_none() {
+                    return Err(McpError::invalid_params(
+                        format!("unknown reranker preset: {name:?}"),
+                        None,
+                    ));
+                }
+                xberg::core::config::RerankerModelType::Preset { name }
+            }
+            crate::config::ResolvedRerankerModel::Custom { model_id, model_file } => {
+                xberg::core::config::RerankerModelType::Custom {
+                    model_id,
+                    model_file: Some(model_file),
+                    additional_files: Vec::new(),
+                    max_length: None,
+                    head: xberg::core::config::RerankerHead::CrossEncoder,
+                }
+            }
+        };
         let krz_config = xberg::core::config::RerankerConfig {
-            model: xberg::core::config::RerankerModelType::Preset { name: reranker_preset },
+            model: krz_model,
             top_k: Some(reranker_top_k),
-            acceleration: crate::embeddings::acceleration(state.shared.config.resources.onnx_provider),
             ..Default::default()
         };
         let documents: Vec<String> = hits.iter().map(|h| h.text.clone()).collect();
@@ -769,163 +1031,56 @@ pub(super) async fn run_search_documents(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
+    hits.truncate(limit);
+
     let output_format = match params.format.as_deref().map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case("toon") => crate::config::OutputFormat::Toon,
         Some(f) if f.eq_ignore_ascii_case("json") => crate::config::OutputFormat::Json,
         _ => output_format,
     };
 
-    let truncated_reason = super::helpers_page::retrieval_cut(filter_depth_used, hits.len() < candidates);
     let budget = super::budget::apply_budget(hits, params.max_tokens);
+    let budgeted = budget.budgeted;
+    let budget_kept_len = budget.items.len();
+    let page_start = cursor_offset.saturating_sub(raw_page_len as u64);
+    let next_offset = if budgeted {
+        page_start.saturating_add(budget_kept_len as u64)
+    } else {
+        cursor_offset
+    };
+    let next_cursor = if !cursor_invalidated && (has_more || budgeted) && next_offset <= MAX_DOCUMENT_CURSOR_OFFSET {
+        Some(crate::mcp::cursor::Cursor::encode_documents(
+            next_offset,
+            cursor_generation,
+            query_fingerprint,
+        ))
+    } else {
+        None
+    };
     format_response(
         &SearchDocumentsResponse {
             query: params.query,
-            budgeted: budget.budgeted,
-            truncated: truncated_reason.is_some(),
-            truncated_reason: truncated_reason.map(str::to_string),
+            budgeted,
             hits: budget.items,
+            next_cursor,
+            cursor_invalidated,
             elapsed_us: elapsed_us(__body),
         },
         output_format,
     )
 }
 
-/// Keywords, entities and summary of one document.
+#[path = "memory_documents.rs"]
 #[cfg(feature = "documents")]
-type DocMeta = (Vec<DocKeyword>, Vec<DocEntity>, Option<DocSummary>);
-
-/// Documents whose blobs are read under one hold of the store lock. A filtered search attaches
-/// metadata to up to [`FILTER_DEPTH`](super::helpers_page::FILTER_DEPTH) hits; read in one go that
-/// is hundreds of blob reads with every writer queued behind them and no point at which a cancelled
-/// call stops.
+mod document_helpers;
 #[cfg(feature = "documents")]
-const DOC_METADATA_BATCH: usize = 16;
-
-/// Attach each hit's document metadata (keywords, entities, summary), looked up through the
-/// document map (a document is not in the code file map), and drop the hits whose document fails
-/// the `entity_category` / `keywords_contains` filter.
-///
-/// Runs BEFORE the reranker so the cross-encoder only rescores survivors. One blob is read per
-/// distinct path, [`DOC_METADATA_BATCH`] at a time: the store lock is taken for each batch and
-/// released after it, and every re-acquisition is a point where a cancelled call ends. A path no
-/// longer in the document index (deleted between scan and query) has no metadata, which is not an
-/// error.
-#[cfg(feature = "documents")]
-async fn attach_doc_metadata(
-    state: &ServerState,
-    hits: &mut Vec<DocumentSearchHit>,
-    entity_category: Option<&str>,
-    keywords_contains: Option<&str>,
-) -> Result<(), McpError> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut unique_paths: Vec<&str> = Vec::with_capacity(hits.len());
-    {
-        let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
-        for hit in hits.iter() {
-            if seen.insert(hit.path.as_str()) {
-                unique_paths.push(hit.path.as_str());
-            }
-        }
-    }
-
-    let mut meta: ahash::AHashMap<String, Arc<DocMeta>> = ahash::AHashMap::with_capacity(unique_paths.len());
-    for batch in unique_paths.chunks(DOC_METADATA_BATCH) {
-        let store = state.shared.store.read().await;
-        meta.extend(super::index_route::blocking(|| read_doc_metadata(&store, batch)));
-    }
-
-    apply_doc_metadata(hits, &meta, entity_category, keywords_contains);
-    Ok(())
-}
-
-/// The metadata of each of `paths` that the document map still holds. Blocking: one blob read per
-/// path.
-#[cfg(feature = "documents")]
-fn read_doc_metadata(store: &crate::store::Store, paths: &[&str]) -> Vec<(String, Arc<DocMeta>)> {
-    paths
-        .iter()
-        .filter_map(|path| {
-            let entry = store.lookup_doc(path)?;
-            match store.read_doc_by_hex(&entry.hash_hex) {
-                Ok(doc) => doc.map(|doc| ((*path).to_string(), Arc::new((doc.keywords, doc.entities, doc.summary)))),
-                Err(error) => {
-                    tracing::warn!(path = %path, %error, "read doc blob for metadata attach failed");
-                    None
-                }
-            }
-        })
-        .collect()
-}
-
-/// Copy each hit's document metadata onto it, and keep only the hits whose document names an
-/// entity of a category containing `entity_category` and a keyword containing `keywords_contains`
-/// (each case-insensitive, each applied only when given). A document with no metadata fails every
-/// filter that is set.
-#[cfg(feature = "documents")]
-fn apply_doc_metadata(
-    hits: &mut Vec<DocumentSearchHit>,
-    meta: &ahash::AHashMap<String, Arc<DocMeta>>,
-    entity_category: Option<&str>,
-    keywords_contains: Option<&str>,
-) {
-    let cat_needle = entity_category.map(str::to_lowercase);
-    let kw_needle = keywords_contains.map(str::to_lowercase);
-
-    hits.retain_mut(|hit| {
-        let document = meta.get(&hit.path);
-
-        if let Some(needle) = cat_needle.as_deref() {
-            let entities = document.map(|m| m.1.as_slice()).unwrap_or(&[]);
-            if !entities.iter().any(|e| e.category.to_lowercase().contains(needle)) {
-                return false;
-            }
-        }
-        if let Some(needle) = kw_needle.as_deref() {
-            let keywords = document.map(|m| m.0.as_slice()).unwrap_or(&[]);
-            if !keywords.iter().any(|k| k.text.to_lowercase().contains(needle)) {
-                return false;
-            }
-        }
-
-        if let Some(m) = document {
-            hit.keywords = m.0.clone();
-            hit.entities = m.1.clone();
-            hit.summary = m.2.clone();
-        }
-        true
-    });
-}
-
-#[cfg(all(test, feature = "documents"))]
-#[path = "memory_docs_tests.rs"]
-mod docs_tests;
-
-#[cfg(all(test, feature = "memory"))]
-mod embed_report_tests {
-    use super::embed_report;
-
-    #[test]
-    fn an_embedded_note_carries_no_notice() {
-        assert_eq!(embed_report(Some(Ok(()))), (true, None));
-        assert_eq!(embed_report(None), (false, None));
-    }
-
-    #[test]
-    fn a_failed_embedding_is_a_notice_on_a_saved_note() {
-        let (embedded, notice) = embed_report(Some(Err("load embedder: offline".to_string())));
-        assert!(!embedded);
-        let notice = notice.expect("notice");
-        assert!(notice.contains("the note is saved"), "{notice}");
-        assert!(notice.contains("load embedder: offline"), "{notice}");
-        assert!(notice.contains("`query`"), "{notice}");
-    }
-}
-
-#[cfg(all(test, feature = "documents"))]
+use document_helpers::{
+    MAX_DOCUMENT_CURSOR_OFFSET, attach_doc_metadata, document_cursor_offset, document_query_fingerprint,
+};
+#[cfg(all(test, feature = "crawl"))]
 mod scope_tests {
     use super::resolve_doc_scope;
+    use crate::web::ingest::default_scope;
 
     #[test]
     fn defaults_to_the_repo_scope_when_the_caller_names_none() {
@@ -933,60 +1088,14 @@ mod scope_tests {
     }
 
     #[test]
-    fn a_legacy_web_scope_is_reachable_only_by_naming_it() {
-        let legacy_scope = "web:example.com";
+    fn a_scraped_page_is_reachable_only_by_naming_its_web_scope() {
+        let url = crate::url::Url::parse("https://example.com/page").unwrap();
+        let write_scope = default_scope(&url);
+        assert_eq!(write_scope, "web:example.com");
+
         let repo_scope = "repo-abc123";
-        assert_ne!(resolve_doc_scope(None, repo_scope), legacy_scope);
+        assert_ne!(resolve_doc_scope(None, repo_scope), write_scope);
 
-        assert_eq!(resolve_doc_scope(Some(legacy_scope), repo_scope), legacy_scope);
-    }
-}
-
-#[cfg(all(test, any(feature = "documents", feature = "code-search")))]
-#[test]
-fn successful_semantic_routes_emit_observed_provenance() {
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let output = Capture::default();
-    let writer = output.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .without_time()
-        .with_writer(move || writer.clone())
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        assert_eq!(
-            observe_semantic_route("code", true, Some(7), || panic!("fallback ran")).unwrap(),
-            7
-        );
-        assert_eq!(observe_semantic_route("documents", true, None, || Ok(8)).unwrap(), 8);
-        assert_eq!(observe_semantic_route("code", false, None, || Ok(9)).unwrap(), 9);
-        assert!(observe_semantic_route::<u8>("documents", true, None, || anyhow::bail!("failed")).is_err());
-    });
-    let bytes = output.0.lock().unwrap();
-    let events = std::str::from_utf8(&bytes).unwrap().lines().collect::<Vec<_>>();
-    assert_eq!(events.len(), 3);
-    for (event, expected) in events.iter().zip([
-        "tier=\"code\" route=\"layered\" degraded=false",
-        "tier=\"documents\" route=\"standalone\" degraded=true",
-        "tier=\"code\" route=\"standalone\" degraded=false",
-    ]) {
-        assert!(event.contains(expected), "{event}");
+        assert_eq!(resolve_doc_scope(Some(&write_scope), repo_scope), write_scope);
     }
 }

@@ -1,7 +1,6 @@
 """Gold for `dependents`: an imported module -> every file importing it.
 
-basemind's `code_refs` with `relation: "importers"` (CLI `code dependents MODULE`) is a
-substring match over the raw text of each import
+basemind's `code dependents MODULE` is a substring match over the raw text of each import
 statement (`from collections import (\\n OrderedDict,\\n ...)` matches `collections` and
 `OrderedDict`). The gold is every Python file with an `import` / `from ... import` whose
 statement source contains MODULE.
@@ -13,7 +12,7 @@ import ast
 import _common as c
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901 - the gold grammar is a flat chain of filters, split for the linter it hides
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     c.add_common_args(p)
     p.add_argument("--max-gold", type=int, default=60)
@@ -22,7 +21,7 @@ def main() -> None:
     a = p.parse_args()
 
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
-    stmts: dict[str, list[str]] = {}
+    stmts: dict[str, list[str]] = {}  # keyed by path: the import statement texts
     modules: set[str] = set()
     for path, src in repo.blobs(repo.files()):
         tree = c.parse_python(src)
@@ -56,7 +55,7 @@ def main() -> None:
             {
                 "id": f"dependents-{len(tasks):04d}",
                 "mode": "dependents",
-                "args": {"name": module, "relation": "importers"},
+                "args": {"module": module},
                 "gold": gold,
                 "scoring": "set",
                 "baseline": {

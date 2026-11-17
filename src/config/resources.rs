@@ -36,34 +36,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResourcesConfig {
-    /// Cap on the code-map scanner's rayon pool. `0` (auto) keeps rayon's
-    /// default (one worker per logical CPU); a non-zero value pins the pool so
-    /// the scan can't saturate every core on a shared machine. First scan wins
-    /// for the process — the pool is built once and its size is then fixed.
-    #[serde(default)]
+    /// Cap on the code-map scanner's rayon pool. `2` pins the pool to a
+    /// conservative default that leaves headroom on 8 GiB machines; `0` (auto)
+    /// would use one worker per logical CPU. First scan wins for the process —
+    /// the pool is built once and its size is then fixed.
+    #[serde(default = "ResourcesConfig::default_scan_threads")]
     pub scan_threads: usize,
-    /// Cap on the ONNX embedding pool. `0` (auto) resolves to
-    /// `max(2, logical_cpus / 4)` via `crate::embeddings::resolve_embed_threads`
-    /// — a bounded fraction of cores so the embedder never pins the machine and
-    /// ORT arenas are not replicated across every core. This supersedes the
+    /// Cap on the ONNX embedding pool. `2` pins the pool to a conservative
+    /// default that bounds ORT arena replication on 8 GiB machines; `0` (auto)
+    /// would resolve to `max(2, logical_cpus / 4)`. This supersedes the
     /// deprecated `[documents].embed_max_threads`; see
     /// [`ResourcesConfig::effective_embed_threads`] for the precedence.
-    #[serde(default)]
+    #[serde(default = "ResourcesConfig::default_embed_threads")]
     pub embed_threads: usize,
-    /// Upper bound on documents extracted concurrently. `0` (auto) leaves the
-    /// dispatch unbounded. Enforced by a counting semaphore around document
-    /// extraction (`backpressure::acquire_doc_slot`).
+    /// Upper bound on documents extracted concurrently. `1` ensures only one
+    /// GLiNER/embedding spike can be in-flight at a time on 8 GiB machines; `0`
+    /// (auto) leaves the dispatch unbounded. Enforced by a counting semaphore
+    /// around document extraction (`backpressure::acquire_doc_slot`).
     ///
     /// Complementary to `max_footprint_mb` rather than redundant with it: a
     /// document extraction's spike (decoded page buffers, OCR bitmaps, an
     /// embedding batch) lands faster than the footprint sampler can observe it,
     /// so a memory ceiling alone reacts after the allocation. This bounds how
     /// many such spikes can overlap in the first place.
-    #[serde(default)]
+    #[serde(default = "ResourcesConfig::default_max_concurrent_documents")]
     pub max_concurrent_documents: usize,
-    /// Number of chunks the embedder submits to ONNX per batch. Larger batches
-    /// amortise per-call overhead at the cost of a higher transient memory
-    /// spike; 32 is a safe default across the preset models. Threaded into both
+    /// Number of chunks the embedder submits to ONNX per batch. `16` amortises
+    /// per-call overhead while keeping the transient memory spike low enough
+    /// for 8 GiB machines; 32 is the previous default. Threaded into both
     /// `SharedEmbedder` (code-search + query paths) and the document extractor's
     /// `EmbeddingConfig`.
     #[serde(default = "ResourcesConfig::default_embed_batch_size")]
@@ -75,7 +75,7 @@ pub struct ResourcesConfig {
     ///
     /// The best-effort backpressure gate
     /// ([`crate::backpressure::FootprintGate`]) samples
-    /// [`crate::sysres::phys_footprint`] at each admit point and parks the
+    /// [`crate::sysres::process_rss`] at each admit point and parks the
     /// worker while the process is over the ceiling, shaving the scan's peak.
     /// It stays best-effort: an unreadable sample or a sustained overshoot
     /// admits anyway to guarantee forward progress, so the ceiling shapes the
@@ -109,6 +109,11 @@ pub struct ResourcesConfig {
     /// workspaces. See [`DocumentModelProfile`].
     #[serde(default)]
     pub document_models: DocumentModelProfile,
+    /// Keep ONNX embedding and NER engines resident after an embedding pass.
+    /// This removes the cold-model reload on the next scan or query at the cost
+    /// of retaining the model weights and runtime arenas in the daemon.
+    #[serde(default)]
+    pub keep_models_warm: bool,
     /// ONNX Runtime execution provider for every model basemind loads (embeddings, reranking, layout
     /// detection, NER). Defaults to `cpu`: on macOS the `auto` provider routes models through CoreML,
     /// which compiles a fresh graph per input shape and measured 7.6 GB resident for one tiny document
@@ -120,17 +125,34 @@ pub struct ResourcesConfig {
 }
 
 impl ResourcesConfig {
-    /// Default embedding batch size. 32 balances ONNX per-call amortisation
-    /// against the transient memory spike of a larger batch.
-    fn default_embed_batch_size() -> usize {
-        32
+    /// Default scanner thread count. `2` leaves headroom on 8 GiB machines
+    /// while still providing parallelism for tree-sitter parsing.
+    fn default_scan_threads() -> usize {
+        2
     }
 
-    /// Default read-stack outline-cache budget. 256 MiB holds roughly 180k
-    /// files at the measured median, so every repo that fits keeps today's
-    /// pure-RAM read stack while a monorepo that does not is bounded.
+    /// Default ONNX embedder thread count. `2` bounds ORT arena replication
+    /// on 8 GiB machines; `0` (auto) would resolve to `max(2, logical_cpus / 4)`.
+    fn default_embed_threads() -> usize {
+        2
+    }
+
+    /// Default concurrent document limit. `1` ensures only one GLiNER/embedding
+    /// spike is in-flight at a time on 8 GiB machines.
+    fn default_max_concurrent_documents() -> usize {
+        1
+    }
+
+    /// Default embedding batch size. `16` amortises per-call overhead while
+    /// keeping the transient memory spike low enough for 8 GiB machines.
+    fn default_embed_batch_size() -> usize {
+        16
+    }
+
+    /// Default read-stack outline-cache budget. 128 MiB holds roughly 90k
+    /// files at the measured median, halving the default to fit 8 GiB machines.
     fn default_max_map_cache_mb() -> usize {
-        256
+        128
     }
 
     /// Resolve the effective ONNX embed-thread cap, honouring the deprecated
@@ -141,6 +163,10 @@ impl ResourcesConfig {
     /// (resolved downstream by `crate::embeddings::resolve_embed_threads`). This
     /// lets existing configs that still set `[documents].embed_max_threads` keep
     /// working while new configs use the `[resources]` home for the knob.
+    ///
+    /// Table presence is handled one layer up: [`crate::config::parse_str`] copies
+    /// the alias into `embed_threads` when the file never sets that key, because
+    /// the app default is nonzero and would otherwise shadow the alias.
     pub fn effective_embed_threads(&self, deprecated_alias: usize) -> usize {
         if self.embed_threads != 0 {
             self.embed_threads
@@ -153,13 +179,14 @@ impl ResourcesConfig {
 impl Default for ResourcesConfig {
     fn default() -> Self {
         Self {
-            scan_threads: 0,
-            embed_threads: 0,
-            max_concurrent_documents: 0,
+            scan_threads: Self::default_scan_threads(),
+            embed_threads: Self::default_embed_threads(),
+            max_concurrent_documents: Self::default_max_concurrent_documents(),
             embed_batch_size: Self::default_embed_batch_size(),
             max_footprint_mb: MaxFootprint::default(),
             max_map_cache_mb: Self::default_max_map_cache_mb(),
             document_models: DocumentModelProfile::default(),
+            keep_models_warm: false,
             onnx_provider: OnnxProvider::default(),
         }
     }
@@ -176,20 +203,19 @@ const AUTO_ENFORCED_NUMERATOR: u64 = 3;
 const AUTO_ENFORCED_DENOMINATOR: u64 = 4;
 
 /// Fraction of a merely *advisory* limit — the machine's total RAM — that
-/// auto-mode budgets. A quarter: that memory is shared with the editor, the
-/// language servers and everything else the developer is running, none of which
-/// basemind can see, and half of a 96 GiB workstation (48 GiB) never engaged
-/// the gate on a scan that peaked at 6-8 GiB.
-const AUTO_ADVISORY_DENOMINATOR: u64 = 4;
+/// auto-mode budgets. Half, not three quarters: that memory is shared with the
+/// editor, the language servers and everything else the developer is running,
+/// none of which basemind can see.
+const AUTO_ADVISORY_DENOMINATOR: u64 = 2;
 
 /// Floor for an auto-derived ceiling. A 256 MiB container would otherwise
-/// compute a 192 MiB budget, and a 4 GiB machine a 1 GiB one, which the ONNX runtime and a single large
+/// compute a 192 MiB budget, which the ONNX runtime and a single large
 /// tree-sitter parse can exceed on their own, turning the gate into a permanent
 /// stall that never admits and never finishes. The floor deliberately allows
 /// the ceiling to sit *above* a very small cgroup limit: in that regime the
 /// process is going to be killed whatever it does, and a scan that runs and
 /// dies is more diagnosable than one that hangs.
-const AUTO_FLOOR_BYTES: u64 = 2048 * BYTES_PER_MB;
+const AUTO_FLOOR_BYTES: u64 = 512 * BYTES_PER_MB;
 
 /// The literal spellings `max_footprint_mb` accepts besides a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -351,13 +377,14 @@ mod tests {
     #[test]
     fn default_resources_config_has_expected_field_values() {
         let cfg = ResourcesConfig::default();
-        assert_eq!(cfg.scan_threads, 0);
-        assert_eq!(cfg.embed_threads, 0);
-        assert_eq!(cfg.max_concurrent_documents, 0);
-        assert_eq!(cfg.embed_batch_size, 32);
+        assert_eq!(cfg.scan_threads, 2);
+        assert_eq!(cfg.embed_threads, 2);
+        assert_eq!(cfg.max_concurrent_documents, 1);
+        assert_eq!(cfg.embed_batch_size, 16);
         assert_eq!(cfg.max_footprint_mb, MaxFootprint::Mebibytes(0));
-        assert_eq!(cfg.max_map_cache_mb, 256);
+        assert_eq!(cfg.max_map_cache_mb, 128);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
+        assert!(!cfg.keep_models_warm);
     }
 
     #[test]
@@ -366,22 +393,24 @@ mod tests {
     }
 
     #[test]
-    fn resources_toml_roundtrips_embed_batch_size_override() {
-        let cfg: ResourcesConfig = toml::from_str("embed_batch_size = 8\n").expect("parse [resources] body");
+    fn resources_toml_roundtrips_overrides() {
+        let cfg: ResourcesConfig =
+            toml::from_str("embed_batch_size = 8\nkeep_models_warm = true\n").expect("parse [resources] body");
         assert_eq!(cfg.embed_batch_size, 8);
-        assert_eq!(cfg.scan_threads, 0);
+        assert!(cfg.keep_models_warm);
+        assert_eq!(cfg.scan_threads, 2);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }
 
     #[test]
     fn resources_empty_toml_falls_back_to_all_defaults() {
         let cfg: ResourcesConfig = toml::from_str("").expect("empty [resources] body");
-        assert_eq!(cfg.embed_batch_size, 32);
-        assert_eq!(cfg.scan_threads, 0);
-        assert_eq!(cfg.embed_threads, 0);
-        assert_eq!(cfg.max_concurrent_documents, 0);
+        assert_eq!(cfg.embed_batch_size, 16);
+        assert_eq!(cfg.scan_threads, 2);
+        assert_eq!(cfg.embed_threads, 2);
+        assert_eq!(cfg.max_concurrent_documents, 1);
         assert_eq!(cfg.max_footprint_mb, MaxFootprint::Mebibytes(0));
-        assert_eq!(cfg.max_map_cache_mb, 256);
+        assert_eq!(cfg.max_map_cache_mb, 128);
         assert_eq!(cfg.document_models, DocumentModelProfile::Full);
     }
 
@@ -462,37 +491,27 @@ mod tests {
 
     #[test]
     fn auto_ceiling_takes_three_quarters_of_an_enforced_cgroup_limit() {
-        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(4096 * MB), true), Some(3072 * MB));
+        // The reporter's environment: a 2 GiB `MemoryMax`.
+        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(2048 * MB), true), Some(1536 * MB));
         assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(8192 * MB), true), Some(6144 * MB));
     }
 
     #[test]
-    fn auto_ceiling_takes_a_quarter_of_injected_machine_ram() {
+    fn auto_ceiling_takes_half_of_a_machine_wide_limit() {
         assert_eq!(
-            MaxFootprint::auto_ceiling_bytes(Some(32 * 1024 * MB), false),
+            MaxFootprint::auto_ceiling_bytes(Some(16 * 1024 * MB), false),
             Some(8 * 1024 * MB)
-        );
-        // The reporting machine: 96 GiB of RAM no longer resolves to a 48 GiB ceiling.
-        assert_eq!(
-            MaxFootprint::auto_ceiling_bytes(Some(96 * 1024 * MB), false),
-            Some(24 * 1024 * MB)
         );
     }
 
     #[test]
     fn auto_ceiling_floor_applies_to_a_small_container() {
-        // 256 MiB cgroup: three quarters is 192 MiB, which the floor lifts to 2 GiB.
-        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(256 * MB), true), Some(2048 * MB));
-        // 8 GiB of machine RAM: a quarter is exactly the floor.
-        assert_eq!(
-            MaxFootprint::auto_ceiling_bytes(Some(8192 * MB), false),
-            Some(2048 * MB)
-        );
-        // 4 GiB of machine RAM: a quarter is 1 GiB, lifted to the floor.
-        assert_eq!(
-            MaxFootprint::auto_ceiling_bytes(Some(4096 * MB), false),
-            Some(2048 * MB)
-        );
+        // 256 MiB cgroup: three quarters is 192 MiB, which the floor lifts to 512 MiB.
+        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(256 * MB), true), Some(512 * MB));
+        // 1 GiB of machine RAM: half is 512 MiB, exactly the floor.
+        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(1024 * MB), false), Some(512 * MB));
+        // 800 MiB of machine RAM: half is 400 MiB, lifted to the floor.
+        assert_eq!(MaxFootprint::auto_ceiling_bytes(Some(800 * MB), false), Some(512 * MB));
     }
 
     #[test]
@@ -504,7 +523,7 @@ mod tests {
     #[test]
     fn auto_ceiling_never_overflows_on_a_sentinel_sized_limit() {
         let ceiling = MaxFootprint::auto_ceiling_bytes(Some(u64::MAX), true).expect("a ceiling");
-        assert!((2048 * MB..u64::MAX).contains(&ceiling));
+        assert!((512 * MB..u64::MAX).contains(&ceiling));
     }
 
     #[test]
@@ -522,8 +541,8 @@ mod tests {
         let resolved = MaxFootprint::default().resolve_mb();
         if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             assert!(
-                resolved >= 2048,
-                "auto must clear the 2 GiB floor on a supported platform, got {resolved}"
+                resolved >= 512,
+                "auto must clear the 512 MiB floor on a supported platform, got {resolved}"
             );
         } else {
             assert_eq!(resolved, 0, "an unsupported platform reports no ceiling");
@@ -557,7 +576,16 @@ mod tests {
             ..ResourcesConfig::default()
         };
         assert_eq!(cfg.effective_embed_threads(8), 4);
+        // The standalone default pins embed_threads=2 (8 GiB default); it only reaches this
+        // resolver with an alias still set when the caller built the struct by hand —
+        // `parse_str` carries the alias across first when the file never sets the key.
         let cfg = ResourcesConfig::default();
+        assert_eq!(cfg.effective_embed_threads(8), 2);
+        // Explicit auto (0) falls through to the deprecated alias.
+        let cfg = ResourcesConfig {
+            embed_threads: 0,
+            ..ResourcesConfig::default()
+        };
         assert_eq!(cfg.effective_embed_threads(8), 8);
         assert_eq!(cfg.effective_embed_threads(0), 0);
     }

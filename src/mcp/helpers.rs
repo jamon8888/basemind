@@ -35,8 +35,6 @@ pub(super) const LOG_WALK_MAX: usize = 10_000;
 /// keeping the response under ~32 KiB. Opt-in: blame tools only paginate when `limit` is
 /// explicitly set.
 pub(super) const BLAME_LIMIT_MAX: u32 = 1000;
-/// Blame hunks per page when the caller passes no `limit`.
-pub(super) const BLAME_LIMIT_DEFAULT: u32 = 100;
 
 /// Wrap a tool-shim body with telemetry instrumentation.
 ///
@@ -122,8 +120,8 @@ pub(super) fn parse_kind(s: &str) -> Result<SymbolKind, McpError> {
 /// Every tool routes its response through here, so populating `structured_content` in one place
 /// gives the whole MCP surface typed output: `CallToolResult::structured` sets the parsed JSON on
 /// `structured_content` (for clients that consume typed results) and keeps a `to_string()` text
-/// block in `content` (for clients that only read text). No tool advertises an `output_schema`:
-/// one tool answers in several shapes, and `tests/mcp_smoke.rs` holds every verb tool to that.
+/// block in `content` (for clients that only read text). The tool's `output_schema` is advertised
+/// separately on each `#[tool]` definition.
 pub(super) fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let value =
         serde_json::to_value(value).map_err(|e| McpError::internal_error(format!("serialize response: {e}"), None))?;
@@ -146,7 +144,8 @@ pub(super) use timing::elapsed_us;
 ///
 /// "Tool body" means the `async` block inside the `#[tool]` shim when there is one, and otherwise the
 /// first statement of the `run_*` helper it delegates to. The distinction matters: several shims
-/// (`find_references`, `find_callers`, `workspace_grep`, `find_implementations`) await the in-RAM map and acquire the store lock *in the shim* before calling
+/// (`find_references`, `find_callers`, `workspace_grep`, `find_implementations`, `call_graph`,
+/// `architecture_map`) await the in-RAM map and acquire the store lock *in the shim* before calling
 /// their helper. Those shims start the timer themselves and pass the [`Instant`] down, so the wait and
 /// the lock acquisition are inside the measured region rather than silently omitted from it.
 ///
@@ -358,7 +357,7 @@ pub(super) fn blame_hunk_view(h: &crate::git::BlameHunk) -> BlameHunkView {
         commit_sha: h.commit_sha.clone(),
         short_sha: h.short_sha.clone(),
         start_line: h.start_line,
-        end_line: h.start_line + h.len.saturating_sub(1),
+        len: h.len,
         source_start_line: h.source_start_line,
         author: h.author.clone(),
         author_time_unix: h.author_time_unix,
@@ -367,64 +366,75 @@ pub(super) fn blame_hunk_view(h: &crate::git::BlameHunk) -> BlameHunkView {
     }
 }
 
-/// One page of blame hunks.
-pub(super) struct BlamePage {
-    pub hunks: Vec<BlameHunkView>,
-    pub next_cursor: Option<super::cursor::Cursor>,
-    /// The token budget, not `limit`, ended the page.
-    pub budgeted: bool,
-}
-
-/// Page a run of blame hunks. Skips any hunk whose `start_line <= resume_after` (the cursor encodes
-/// the *last returned* `start_line`, so the next page picks up strictly after it), keeps at most
-/// `limit` hunks (default [`BLAME_LIMIT_DEFAULT`], max [`BLAME_LIMIT_MAX`]) and trims them to
-/// `max_tokens`. `snapshot` is stamped into the cursor so a page of another revision refuses it.
+/// Page a slice of blame hunks. Skips any hunk whose `start_line <= resume_after` (so the
+/// cursor encodes the *last returned* `start_line` — the next page picks up strictly
+/// after it). When `limit` is `None` returns every remaining hunk with no cursor (the
+/// legacy un-paginated shape). When the page fills exactly at the limit and more hunks
+/// follow, returns a cursor with `snapshot_id = 0`.
 pub(super) fn paginate_blame_hunks<'a, I>(
     iter: I,
     resume_after: u32,
     limit: Option<u32>,
-    max_tokens: Option<u32>,
-    snapshot: u32,
-) -> BlamePage
+) -> (Vec<BlameHunkView>, Option<super::cursor::Cursor>)
 where
     I: IntoIterator<Item = &'a crate::git::BlameHunk>,
 {
-    let cap = limit.unwrap_or(BLAME_LIMIT_DEFAULT).min(BLAME_LIMIT_MAX) as usize;
+    let cap = limit.map(|n| n.min(BLAME_LIMIT_MAX) as usize);
     let mut out: Vec<BlameHunkView> = Vec::new();
+    let mut last_line: u32 = 0;
     let mut has_more = false;
     for h in iter {
         if h.start_line <= resume_after {
             continue;
         }
-        if out.len() >= cap {
+        if let Some(c) = cap
+            && out.len() >= c
+        {
             has_more = true;
             break;
         }
+        last_line = h.start_line;
         out.push(blame_hunk_view(h));
     }
-    let budget = super::budget::apply_budget(out, max_tokens);
-    let next_cursor = (has_more || budget.budgeted)
-        .then(|| budget.items.last().map(|hunk| hunk.start_line))
-        .flatten()
-        .map(|last_line| super::cursor::Cursor::encode_in_memory(u64::from(last_line), snapshot));
-    BlamePage {
-        hunks: budget.items,
-        next_cursor,
-        budgeted: budget.budgeted,
-    }
+    let next_cursor = if has_more {
+        Some(super::cursor::Cursor::encode_in_memory(last_line as u64, 0))
+    } else {
+        None
+    };
+    (out, next_cursor)
 }
 
-/// Where a blame page resumes: the `start_line` its cursor carries, or an error when the cursor was
-/// issued for another revision of the file.
-pub(super) fn blame_resume_after(cursor: Option<&super::cursor::Cursor>, snapshot: u32) -> Result<u32, McpError> {
-    let Some(cursor) = cursor else {
-        return Ok(0);
-    };
-    let (offset, issued_for) = cursor.decode_in_memory()?;
-    if issued_for != snapshot {
-        return Err(super::cursor_bind::stale_cursor("git_blame"));
-    }
-    Ok(offset.min(u64::from(u32::MAX)) as u32)
+/// Translate a tree-sitter symbol's byte range into a 1-based inclusive
+/// `(start_line, end_line)` pair against a specific source blob. We start from L1's
+/// `start_row` (0-based row) and add the count of newlines in `(start_byte..end_byte)`
+/// for the end. Pure + cheap: one memchr-count, no tree-sitter re-parse.
+fn line_range_in_blob(sym: &crate::extract::Symbol, bytes: &[u8]) -> (u32, u32) {
+    let start_line = sym.start_row + 1;
+    let s = sym.start_byte as usize;
+    let e = (sym.end_byte as usize).min(bytes.len());
+    let slice = if s < e { &bytes[s..e] } else { &[][..] };
+    let newlines = memchr::memchr_iter(b'\n', slice).count() as u32;
+    (start_line, start_line + newlines)
+}
+
+/// Symbol's 1-based inclusive `(start_line, end_line)` against the *committed HEAD blob* —
+/// the blob `blame_file` reads by default, so the range must be derived from the same blob to
+/// attribute lines correctly. On a clean tree HEAD equals the working copy and the result is
+/// exact; on a dirty tree, reading the HEAD blob (and clamping the end byte to its length)
+/// keeps the range bounded to the blamed blob instead of over-attributing on-disk-only lines.
+/// Fallbacks for an unborn HEAD: staged blob, then the working-tree file.
+pub(super) fn symbol_line_range(
+    repo: &crate::git::Repo,
+    path: &crate::path::RelPath,
+    sym: &crate::extract::Symbol,
+) -> (u32, u32) {
+    let bytes = path
+        .as_str()
+        .and_then(|s| repo.read_blob_at_rev("HEAD", s).ok().flatten())
+        .or_else(|| path.as_str().and_then(|s| repo.read_blob_staged(s).ok().flatten()))
+        .or_else(|| std::fs::read(repo.workdir().join(path.to_path_buf())).ok())
+        .unwrap_or_default();
+    line_range_in_blob(sym, &bytes)
 }
 
 /// If `err` is a wrapped `GitError::BlameTooLarge`, return a graceful empty response
@@ -444,7 +454,6 @@ pub(super) fn blame_too_large_response(
             path: path.clone(),
             suspect_sha: suspect_sha.to_string(),
             hunks: Vec::new(),
-            budgeted: false,
             truncated: true,
             truncated_reason: Some("too_large"),
             next_cursor: None,
@@ -477,7 +486,6 @@ pub(super) fn blame_symbol_too_large_response(
             line_start,
             line_end,
             hunks: Vec::new(),
-            budgeted: false,
             truncated: true,
             truncated_reason: Some("too_large"),
             next_cursor: None,
@@ -532,13 +540,25 @@ impl crate::scanner::ScanObserver for RescanPaths {
 /// Holds the `state.shared.store` write lock for the duration of the scan; MCP query tools block
 /// while it runs (acceptable for small/medium repos — rescan is agent-triggered, not
 /// per-request). `scoped_paths` limits the scan to those repo-relative paths; `None` runs a
-/// full working-tree scan. `named` says the paths came from a person or an agent, not from the
-/// watcher: a named file that reads as unchanged has its blob validated.
+/// full working-tree scan.
 pub(super) async fn scan_and_refresh(
     state: Arc<ServerState>,
     scoped_paths: Option<Vec<std::path::PathBuf>>,
     embed: crate::scanner::EmbedMode,
-    named: bool,
+) -> Result<crate::scanner::ScanReport, McpError> {
+    scan_and_refresh_with(state, scoped_paths, embed, false).await
+}
+
+/// [`scan_and_refresh`] that, with `keep_map_if_unchanged`, leaves the published map and its
+/// generation alone when a whole-tree pass changed nothing. A full pass otherwise always rebuilds and
+/// republishes the map, which invalidates every paging cursor handed out against the previous
+/// generation: right for an explicit rescan, wrong for the startup catch-up, which runs on every boot
+/// and usually finds nothing to do.
+pub(super) async fn scan_and_refresh_with(
+    state: Arc<ServerState>,
+    scoped_paths: Option<Vec<std::path::PathBuf>>,
+    embed: crate::scanner::EmbedMode,
+    keep_map_if_unchanged: bool,
 ) -> Result<crate::scanner::ScanReport, McpError> {
     if state.shared.read_only {
         return Err(McpError::invalid_request(
@@ -549,8 +569,8 @@ pub(super) async fn scan_and_refresh(
         ));
     }
     // The last in-process full-tree walk that the CLI's own guard does not cover (issue #62). The
-    // tool-subcommand dispatcher never calls `guard_workspace_root`, so `basemind rescan`
-    // reaches `crate::scanner::scan` here — and so does the `index_rescan` MCP tool, plus
+    // tool-subcommand dispatcher never calls `guard_workspace_root`, so `basemind admin rescan`
+    // reaches `crate::scanner::scan` here — and so does the `admin` MCP tool in `rescan` mode, plus
     // the boot/watcher scans in `mcp::background`. Guarding at this single funnel covers all of
     // them; it does NOT cover the read-only store open that `cli::context::build_server` already
     // performed, so a refused root can still have had its cache directory created by that point.
@@ -579,18 +599,14 @@ pub(super) async fn scan_and_refresh(
         store.ensure_dirs()?;
         let mut observer = RescanPaths::default();
         let cancel = crate::scanner::ScanCancel::new();
-        // A full Inline pass loads the embedding engine; release it once the pass is over (incremental
-        // watcher batches keep it warm for the searches that follow an edit).
+        // An Inline pass loads the embedding engine. Scoped/incremental batches retain it for the
+        // next edit; full passes release it unless the operator opts into warm models.
         #[cfg(feature = "intelligence")]
-        let _embed_pass = (matches!(embed, crate::scanner::EmbedMode::Inline) && scoped_paths.is_none())
-            .then(crate::embeddings::begin_embed_pass);
+        let _embed_pass = matches!(embed, crate::scanner::EmbedMode::Inline).then(|| {
+            crate::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm || scoped_paths.is_some())
+        });
         let report = if let Some(paths) = scoped_paths {
-            let scan = if named {
-                crate::scanner::scan_named_paths_with_observer
-            } else {
-                crate::scanner::scan_paths_with_observer
-            };
-            scan(&root, &mut store, &config, &paths, embed, &cancel, &mut observer)
+            crate::scanner::scan_paths_with_observer(&root, &mut store, &config, &paths, embed, &cancel, &mut observer)
         } else {
             crate::scanner::scan_with_observer(
                 &root,
@@ -611,6 +627,10 @@ pub(super) async fn scan_and_refresh(
     if was_scoped && report.stats.updated == 0 && report.stats.removed == 0 {
         return Ok(report);
     }
+    let stats = &report.stats;
+    if keep_map_if_unchanged && stats.updated == 0 && stats.docs_indexed == 0 && stats.removed == 0 {
+        return Ok(report);
+    }
 
     let RescanPaths { updated, removed } = paths;
 
@@ -621,7 +641,7 @@ pub(super) async fn scan_and_refresh(
             .shared
             .corpus_bytes
             .store(corpus_bytes, std::sync::atomic::Ordering::Relaxed);
-        let cache = if was_scoped {
+        let mut cache = if was_scoped {
             state.shared.cache.load().with_delta(&store, &updated, &removed)
         } else {
             super::MapCache::build(
@@ -629,10 +649,21 @@ pub(super) async fn scan_and_refresh(
                 super::l1_cache::budget_bytes_from(&state.shared.config.resources),
             )
         };
+        // A scoped rescan carries doc↔code links (ADR-0008) forward via `with_delta`; a full rebuild
+        // starts empty, so reattach them (off-reactor) before publish or the `documents` lane goes stale.
+        if !was_scoped {
+            super::doc_links_cache::attach_async(&mut cache, &store, &state.shared.config, &state.shared.scope).await;
+        }
         std::sync::Arc::new(cache)
     };
     state.shared.cache.store(new_cache);
-    state.shared.note_index_changed();
+    state
+        .shared
+        .cache_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    #[cfg(feature = "memory")]
+    super::helpers_governance::audit_scope_on_rescan(&state).await;
 
     Ok(report)
 }
@@ -707,10 +738,11 @@ mod tests {
 
     use super::{HashMode, outline_entry_for_blob, symbol_fingerprint};
     use crate::mcp::OutlineCache;
-    use std::sync::Arc;
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
 
     fn fresh_cache() -> OutlineCache {
-        OutlineCache::with_bounds(8, u64::MAX)
+        Mutex::new(lru::LruCache::new(NonZeroUsize::new(8).unwrap()))
     }
 
     fn fingerprint_for(source: &[u8], lang: LangId, mode: HashMode) -> Vec<u8> {
@@ -719,7 +751,7 @@ mod tests {
             .parse()
             .expect("synthetic oid");
         let entry = outline_entry_for_blob(&cache, oid, lang, source.to_vec()).expect("outline entry");
-        symbol_fingerprint(&entry, "alpha", None, 0, lang, mode).expect("fingerprint")
+        symbol_fingerprint(&entry, "alpha", None, lang, mode).expect("fingerprint")
     }
 
     #[test]
@@ -764,6 +796,27 @@ mod tests {
             fingerprint_for(b, RUST, HashMode::StructuralLoose),
             "StructuralLoose must still catch identifier renames"
         );
+    }
+
+    #[test]
+    fn line_range_counts_newlines_against_the_given_blob() {
+        use super::line_range_in_blob;
+        use crate::extract::{Symbol, SymbolKind};
+        let blob = b"// hdr\n\nfn alpha() {\n    body;\n}\nfn beta() {}\n";
+        let start = blob.windows(8).position(|w| w == b"fn alpha").unwrap();
+        let end = blob.iter().position(|&b| b == b'}').unwrap() + 1;
+        let sym = Symbol {
+            name: "alpha".into(),
+            kind: SymbolKind::Function,
+            start_byte: start as u32,
+            end_byte: end as u32,
+            start_row: 2,
+            start_col: 0,
+            signature: None,
+            decorators: Vec::new(),
+        };
+        assert_eq!(line_range_in_blob(&sym, blob), (3, 5));
+        assert_eq!(line_range_in_blob(&sym, &blob[..start + 4]), (3, 3));
     }
 
     #[test]

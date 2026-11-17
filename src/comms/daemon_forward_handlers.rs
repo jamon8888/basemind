@@ -1,5 +1,5 @@
 //! Forwarded-op handlers for the [`Broker`](super::daemon::Broker): the resolved-refs read plus the
-//! CORE memory operations a `daemon_writer` serve ships to the daemon (the
+//! CORE memory and PROPOSAL governance operations a `daemon_writer` serve ships to the daemon (the
 //! machine's sole fjall writer). Split out of `daemon.rs` to keep it under the 1000-line
 //! `rust-max-lines` cap; this is a second `impl Broker` block. The request dispatch stays in
 //! `daemon.rs` and calls these methods on the same type.
@@ -140,13 +140,7 @@ impl Broker {
         })
         .await;
         match outcome {
-            Ok(Ok(Ok(outcome))) => match crate::mcp::memory_ops::fit_for_a_frame(outcome) {
-                Ok(outcome) => CommsResponse::Memory(outcome),
-                Err(message) => CommsResponse::Error {
-                    code: "memory_op_failed".to_string(),
-                    message,
-                },
-            },
+            Ok(Ok(Ok(outcome))) => CommsResponse::Memory(outcome),
             Ok(Ok(Err(error))) => CommsResponse::Error {
                 code: "memory_op_failed".to_string(),
                 message: error.to_string(),
@@ -157,6 +151,47 @@ impl Broker {
             },
             Err(join) => CommsResponse::Error {
                 code: "memory_panicked".to_string(),
+                message: join.to_string(),
+            },
+        }
+    }
+
+    /// Run a forwarded PROPOSAL governance operation against the workspace's read-write index. Same
+    /// contract as [`on_memory`](Self::on_memory): the daemon is the sole fjall writer, the pool's
+    /// per-workspace store lock serializes same-workspace ops (so the mine-apply tombstone-check +
+    /// insert see one consistent view), the fjall work runs on a blocking thread, and any error
+    /// becomes a `CommsResponse::Error` (never a torn link).
+    #[cfg(feature = "memory")]
+    pub(super) async fn on_governance(
+        &self,
+        root: std::path::PathBuf,
+        scope: String,
+        op: super::proposals_proto::GovernanceOp,
+    ) -> CommsResponse {
+        self.mark_active().await;
+        let pool = Arc::clone(&self.workspaces);
+        let outcome = tokio::task::spawn_blocking(move || {
+            pool.with_workspace_mut(&root, |store| {
+                let idx = store
+                    .index_db
+                    .as_ref()
+                    .ok_or(crate::mcp::memory_ops::MemoryOpError::IndexUnavailable)?;
+                crate::mcp::proposals_ops::run_governance_op(idx, &scope, &op)
+            })
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Ok(outcome))) => CommsResponse::Governance(outcome),
+            Ok(Ok(Err(error))) => CommsResponse::Error {
+                code: "governance_op_failed".to_string(),
+                message: error.to_string(),
+            },
+            Ok(Err(error)) => CommsResponse::Error {
+                code: "governance_workspace_failed".to_string(),
+                message: error.to_string(),
+            },
+            Err(join) => CommsResponse::Error {
+                code: "governance_panicked".to_string(),
                 message: join.to_string(),
             },
         }
@@ -178,26 +213,19 @@ pub(crate) fn index_read_via_pool(
     query: &crate::comms::index_read_proto::IndexReadQuery,
 ) -> Result<crate::comms::index_read_proto::IndexReadResult, String> {
     use crate::comms::index_read_proto::IndexReadQuery;
-    if let IndexReadQuery::CallScan {
-        name,
-        exact,
-        limit,
-        cursor,
-    } = query
-    {
+    if let IndexReadQuery::CallScan { name, limit, cursor } = query {
         let idx = pool
-            .with_workspace(root, |store| store.read_index_view())
+            .with_workspace(root, |store| store.index_db.clone())
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "the daemon holds this workspace without a fjall index".to_string())?;
-        let matching = crate::mcp::index_read::Matching::from_substring(!exact);
-        return crate::mcp::index_read::call_scan(&*idx, name, matching, *limit, cursor.as_deref());
+        return crate::mcp::index_read::call_scan(&idx, name, *limit, cursor.as_deref());
     }
-    if let IndexReadQuery::GrepBloom { pattern, entries } = query {
+    if let IndexReadQuery::GrepBloom { pattern, paths } = query {
         let (idx, store_root) = pool
-            .with_workspace(root, |store| (store.read_index_view(), store.root.clone()))
+            .with_workspace(root, |store| (store.index_db.clone(), store.root.clone()))
             .map_err(|error| error.to_string())?;
         let idx = idx.ok_or_else(|| "the daemon holds this workspace without a fjall index".to_string())?;
-        return crate::mcp::index_read::grep_skip(&*idx, &store_root, pattern, entries);
+        return crate::mcp::index_read::grep_skip(&idx, &store_root, pattern, paths);
     }
     pool.with_workspace(root, |store| crate::mcp::index_read::index_read_against(store, query))
         .map_err(|error| error.to_string())?
@@ -242,19 +270,19 @@ pub(crate) fn code_search_lanes_against(
     use crate::comms::code_search_proto::CodeSearchLaneResult;
 
     let limit = (query.limit as usize).min(MAX_FORWARDED_LANE_LIMIT);
-    let Some(db) = store.read_index_view() else {
+    let Some(db) = store.index_db.as_ref() else {
         return Err(
             "the daemon holds this workspace without a fjall index, so neither the keyword nor the \
              exact lane can be read"
                 .to_string(),
         );
     };
-    let keyword = crate::search::bm25::bm25_search(&*db, &query.query, limit)
+    let keyword = crate::search::bm25::bm25_search(db, &query.query, limit)
         .into_iter()
         .map(|hit| (hit.chunk_id, hit.score))
         .collect();
     let exact = if query.want_exact {
-        crate::search::exact::exact_lane_chunk_ids(store, &*db, &query.query, limit)
+        crate::search::exact::exact_lane_chunk_ids(store, db, &query.query, limit)
     } else {
         Vec::new()
     };

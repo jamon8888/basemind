@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use ahash::AHashMap;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -45,10 +46,10 @@ pub const MAX_LIMIT: u32 = 1000;
 
 /// Idle window after which a daemon with no connected links and no work in flight self-terminates.
 ///
-/// A `basemind serve` session holds one relay link for as long as it lasts, so the window starts
-/// when the last session closes. The other callers (the CLI verbs, the MCP comms helpers) connect,
-/// do their RPC and drop the client; with only those, `link_count == 0` between requests and the
-/// window is "N minutes since anyone last called us". Reaping early is cheap (a respawn re-OPENS the on-disk
+/// Note what "idle" costs here: nothing holds a link between requests — every caller (`serve`, the
+/// CLI verbs, the MCP comms helpers) connects, does its RPC, and drops the client — so
+/// `link_count == 0` is the steady state even DURING an active session, and this window is really
+/// "N minutes since anyone last called us". Reaping early is cheap (a respawn re-OPENS the on-disk
 /// fjall indexes rather than rebuilding them), so this is deliberately short: ten minutes keeps an
 /// interactive session's daemon warm across normal pauses while shrinking the standing population a
 /// machine running the suite carries. The complementary [`BOOTSTRAP_TIMEOUT`] handles the other leak
@@ -205,6 +206,13 @@ pub struct Broker {
     /// Test hook: milliseconds the NEXT store call sleeps for on its blocking thread, then resets.
     #[cfg(test)]
     pub(super) store_delay_ms: Arc<AtomicU64>,
+    /// Serializes destructive global blob GC against in-flight rescans. Rescans take the READ side
+    /// (many workspaces rescan concurrently); the GC sweep takes the WRITE side. A rescan writes new
+    /// content-addressed blobs BEFORE its `index.msgpack` (which `collect_referenced_hashes` reads)
+    /// is rewritten, so a GC that reference-counts mid-rescan would see those fresh blobs as orphans
+    /// and reap them — a first-ever scan (no prior index) could lose ALL its blobs. This lock keeps
+    /// the two mutually exclusive without blocking concurrent rescans of different workspaces.
+    blob_gc_lock: RwLock<()>,
     /// The accept-loop shutdown signal, installed by the daemon entry point after it builds the
     /// `watch` channel. `begin_drain` fires it so a `Stop` RPC (or any drain) actually breaks the
     /// front-end accept loop — not just notifies connected sinks. Absent in tests that drive the
@@ -226,9 +234,6 @@ pub struct Broker {
     pub(super) subscriber_count: AtomicUsize,
     link_count: AtomicUsize,
     pub(super) relay_count: AtomicUsize,
-    /// Relay links whose handshake has begun and not yet ended in a registered session or a
-    /// refusal. A `Stop` is refused while any is open; see [`Broker::begin_relay_handshake`].
-    pub(super) relay_handshakes: AtomicUsize,
     /// Latches true the first time any link connects. Drives the bootstrap reaper: a daemon that
     /// stays `false` past [`BOOTSTRAP_TIMEOUT`] was spawned and abandoned (nobody ever dialed it) and
     /// self-terminates. Never reset — once a session has used the daemon, the idle window governs.
@@ -293,6 +298,7 @@ impl Broker {
             store_write_gate: Arc::new(std::sync::Mutex::new(())),
             #[cfg(test)]
             store_delay_ms: Arc::new(AtomicU64::new(0)),
+            blob_gc_lock: RwLock::new(()),
             shutdown: std::sync::OnceLock::new(),
             comms_dir: std::sync::OnceLock::new(),
             fatal_store: AtomicBool::new(false),
@@ -300,7 +306,6 @@ impl Broker {
             subscriber_count: AtomicUsize::new(0),
             link_count: AtomicUsize::new(0),
             relay_count: AtomicUsize::new(0),
-            relay_handshakes: AtomicUsize::new(0),
             ever_linked: AtomicBool::new(false),
             work_inflight: AtomicUsize::new(0),
             last_activity_ms: AtomicU64::new(0),
@@ -386,48 +391,55 @@ impl Broker {
     /// [`SharedReadStack`](crate::mcp::SharedReadStack) across every connection.
     ///
     /// The accept loop routes a connection here after peeking [`relay::RELAY_MAGIC`](super::relay::RELAY_MAGIC);
-    /// this consumes the magic, reads the [`RelayHello`](super::relay::RelayHello) within
-    /// [`HELLO_TIMEOUT`](super::relay::HELLO_TIMEOUT), and validates it.
+    /// this consumes the magic, reads the [`RelayHello`](super::relay::RelayHello), and validates it.
     /// A proto/view mismatch, or a failure to build the workspace's shared stack, is answered with a
-    /// non-accepting [`RelayWelcome`](super::relay::RelayWelcome) whose token tells the client
-    /// whether to retry. `link` is the accept-loop link guard, held for the whole session so the
-    /// idle reaper counts this rmcp client as live.
+    /// non-accepting [`RelayWelcome`](super::relay::RelayWelcome) so the client falls back to an
+    /// in-process serve — the daemon never bricks a client. `link` is the accept-loop link guard,
+    /// held for the whole session so the idle reaper counts this rmcp client as live.
     pub async fn serve_relay_connection<S>(self: Arc<Self>, mut stream: S, link: LinkGuard)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         use super::relay;
+        use tokio::io::AsyncReadExt as _;
 
-        let handshake = self.begin_relay_handshake();
         self.mark_active().await;
-        let hello = match relay::accept_hello(&mut stream).await {
+        let mut magic = [0u8; relay::RELAY_MAGIC.len()];
+        if let Err(error) = stream.read_exact(&mut magic).await {
+            tracing::warn!(%error, "relay: reading preamble failed");
+            return;
+        }
+        if magic != relay::RELAY_MAGIC {
+            tracing::warn!("relay: preamble mismatch after peek; dropping");
+            return;
+        }
+        let hello = match relay::read_hello(&mut stream).await {
             Ok(hello) => hello,
             Err(error) => {
-                tracing::warn!(%error, "relay: reading the preamble and hello failed; dropping the link");
+                tracing::warn!(%error, "relay: reading hello failed");
                 return;
             }
         };
 
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        let decline = |code: &str, detail: Option<String>| relay::RelayWelcome {
+        let decline = |code: &str| relay::RelayWelcome {
             relay_proto_ver: relay::RELAY_PROTO_VER,
             daemon_version: daemon_version.clone(),
             accepted: false,
             code: Some(code.to_string()),
-            detail,
         };
 
         if hello.relay_proto_ver != relay::RELAY_PROTO_VER {
-            let _ = relay::write_welcome(&mut stream, &decline(relay::decline::PROTO_SKEW, None)).await;
+            let _ = relay::write_welcome(&mut stream, &decline("relay_proto_skew")).await;
             return;
         }
         if hello.view != crate::store::VIEW_WORKING {
-            let _ = relay::write_welcome(&mut stream, &decline(relay::decline::VIEW_UNSUPPORTED, None)).await;
+            let _ = relay::write_welcome(&mut stream, &decline("view_unsupported")).await;
             return;
         }
 
-        // ~keep Build/fetch the shared stack BEFORE accepting, so a build failure reaches the client
-        // ~keep as a decline it can act on rather than "accepted" against a stack we cannot serve.
+        // ~keep Build/fetch the shared stack BEFORE accepting, so a build failure still lets the client
+        // ~keep fall back rather than being told "accepted" against a stack we cannot serve.
         let host = Arc::clone(&self.workspaces) as Arc<dyn crate::mcp::HostBackend>;
         let git_history_host = Arc::clone(&self) as Arc<dyn crate::git_history::remote::HistoryHost>;
         let shared = match self
@@ -438,8 +450,7 @@ impl Broker {
             Ok(shared) => shared,
             Err(error) => {
                 tracing::warn!(%error, root = %hello.root.display(), "relay: hosting read stack failed");
-                let (code, detail) = super::relay_decline::of_build_failure(&error);
-                let _ = relay::write_welcome(&mut stream, &decline(code, detail)).await;
+                let _ = relay::write_welcome(&mut stream, &decline("host_build_failed")).await;
                 return;
             }
         };
@@ -447,23 +458,20 @@ impl Broker {
             Ok(guard) => guard,
             Err(error) => {
                 tracing::warn!(%error, "relay: connection accounting failed");
-                let (code, detail) = super::relay_decline::of_build_failure(&anyhow::Error::new(error));
-                let _ = relay::write_welcome(&mut stream, &decline(code, detail)).await;
+                let _ = relay::write_welcome(&mut stream, &decline("host_build_failed")).await;
                 return;
             }
         };
         let Some(_relay) = self.try_register_relay().await else {
-            let _ = relay::write_welcome(&mut stream, &decline(relay::decline::DAEMON_DRAINING, None)).await;
+            let _ = relay::write_welcome(&mut stream, &decline("daemon_draining")).await;
             return;
         };
-        drop(handshake);
 
         let welcome = relay::RelayWelcome {
             relay_proto_ver: relay::RELAY_PROTO_VER,
             daemon_version,
             accepted: true,
             code: None,
-            detail: None,
         };
         if let Err(error) = relay::write_welcome(&mut stream, &welcome).await {
             tracing::warn!(%error, "relay: sending welcome failed");
@@ -663,9 +671,8 @@ impl Broker {
     }
 
     /// Reap orphaned workspace cache dirs, then reference-count the machine-global blob store across
-    /// every *surviving* workspace and reap orphan blobs — both holding the workspace pool's blob-GC
-    /// gate exclusively (see [`super::blob_gc_gate`]), so no scan the daemon runs is writing blobs
-    /// mid-sweep. Only the daemon calls this:
+    /// every *surviving* workspace and reap orphan blobs — both under the WRITE side of
+    /// [`Broker::blob_gc_lock`], so no rescan is writing blobs mid-sweep. Only the daemon calls this:
     /// it alone sees every workspace, the precondition for a safe cross-workspace sweep.
     ///
     /// The workspace reap runs FIRST and inside the same guard on purpose. A workspace whose worktree
@@ -681,7 +688,7 @@ impl Broker {
     }
 
     /// [`Broker::run_blob_gc`] with an explicit bound on how long the sweep waits for the
-    /// blob-GC gate. The wait must be bounded: a runaway rescan holds the shared side for
+    /// blob-GC write lock. The wait must be bounded: a runaway rescan holds the read side for
     /// its whole (potentially unbounded) duration, and an unbounded `write().await` here is how
     /// the maintenance loop silently parked forever while the cache grew to 116 GB. On timeout
     /// the cycle returns [`GcError::Starved`](crate::store_gc::GcError::Starved) — skipped and
@@ -691,14 +698,12 @@ impl Broker {
         lock_timeout: std::time::Duration,
     ) -> Result<crate::store_gc::GcReport, crate::store_gc::GcError> {
         let _working = self.begin_work();
-        let gate = self.workspaces.blob_gc_gate();
-        let swept = tokio::task::spawn_blocking(move || {
-            let Some(_sweeping) = gate.try_sweep(lock_timeout) else {
-                return Err(crate::store_gc::GcError::Starved(lock_timeout));
-            };
-            crate::store_gc::reap_gc_and_enforce_budget()
-        });
-        let result = match swept.await {
+        let Ok(_sweep_guard) = tokio::time::timeout(lock_timeout, self.blob_gc_lock.write()).await else {
+            let error = crate::store_gc::GcError::Starved(lock_timeout);
+            crate::store_gc::persist_gc_error(&error);
+            return Err(error);
+        };
+        let result = match tokio::task::spawn_blocking(crate::store_gc::reap_gc_and_enforce_budget).await {
             Ok(result) => result,
             Err(join) => Err(crate::store_gc::GcError::Join(join.to_string())),
         };
@@ -842,12 +847,8 @@ impl Broker {
                 limit,
                 mark_read,
                 since_micros,
-                thread,
                 ..
-            } => {
-                self.on_inbox(session, cursor, limit, mark_read, since_micros, thread)
-                    .await
-            }
+            } => self.on_inbox(session, cursor, limit, mark_read, since_micros).await,
             CommsRequest::AckInbox {
                 message_ids,
                 thread,
@@ -861,18 +862,29 @@ impl Broker {
                 paths,
                 full,
                 embed,
-                verify,
-            } => Ok(self.on_rescan(root, paths, full, embed, verify).await),
+            } => Ok(self.on_rescan(root, paths, full, embed).await),
             CommsRequest::ResolvedRefs { root, query } => Ok(self.on_resolved_refs(root, query).await),
             CommsRequest::IndexRead { root, query } => Ok(self.on_index_read(root, query).await),
             CommsRequest::CodeSearchLanes { root, query } => Ok(self.on_code_search_lanes(root, query).await),
             CommsRequest::GitHistory { root, op } => Ok(self.on_git_history(root, op).await),
             #[cfg(feature = "memory")]
             CommsRequest::Memory { root, scope, op } => Ok(self.on_memory(root, scope, op).await),
+            #[cfg(feature = "memory")]
+            CommsRequest::Governance { root, scope, op } => Ok(self.on_governance(root, scope, op).await),
             CommsRequest::AccessedPaths => Ok(self.on_accessed_paths()),
             CommsRequest::WorkspacesList => Ok(self.on_workspaces_list().await),
             CommsRequest::WorktreesList { repo_id } => Ok(self.on_worktrees_list(repo_id).await),
             CommsRequest::BranchesList { repo_id } => Ok(self.on_branches_list(repo_id).await),
+            CommsRequest::WorktreeClaim {
+                repo_id,
+                name,
+                claimant,
+            } => Ok(self.on_worktree_claim(repo_id, name, claimant).await),
+            CommsRequest::WorktreeRelease {
+                repo_id,
+                name,
+                claimant,
+            } => Ok(self.on_worktree_release(repo_id, name, claimant).await),
             CommsRequest::Ping => Ok(CommsResponse::Pong),
             CommsRequest::Status => self.on_status().await,
             CommsRequest::Stop => Ok(self.on_stop().await),
@@ -900,6 +912,10 @@ mod workspace_handlers;
 
 #[path = "daemon_store_blocking.rs"]
 mod store_blocking;
+
+#[path = "daemon_response.rs"]
+mod response;
+use response::registry_error;
 
 #[path = "daemon_threads.rs"]
 pub(super) mod threads;

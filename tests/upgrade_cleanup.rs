@@ -4,7 +4,7 @@
 //! Plain `#[test]` only — `scanner::scan` is synchronous and opening LanceDB inside a tokio runtime
 //! panics. Each test runs against the process-isolated cache, never the developer's.
 
-#![cfg(feature = "documents")]
+#![cfg(all(feature = "documents", feature = "code-search"))]
 
 use std::fs;
 use std::path::Path;
@@ -185,8 +185,6 @@ fn a_tier_migration_orphans_the_code_lane_blobs_and_the_cleanup_reclaims_only_th
         extract_epoch: 0,
     };
     store.write_filemap_hex(&hash_hex, &l1, None).unwrap();
-    // The chunk sidecar is a `code-search` artifact; other builds only have the outline blob.
-    #[cfg(feature = "code-search")]
     fs::write(store.blob_path_chunk_hex(&hash_hex), b"legacy chunk sidecar").unwrap();
     store.upsert(
         "README.md",
@@ -223,12 +221,10 @@ fn a_tier_migration_orphans_the_code_lane_blobs_and_the_cleanup_reclaims_only_th
     assert!(blob_exists(&store, &hash_hex, "fm"));
 
     age_past_grace(&store.blob_path_fm_hex(&hash_hex));
-    #[cfg(feature = "code-search")]
     age_past_grace(&store.blob_path_chunk_hex(&hash_hex));
     let report = basemind::store_gc::reclaim_displaced_blobs().expect("sweep");
 
-    let planted = if cfg!(feature = "code-search") { 2 } else { 1 };
-    assert!(report.removed >= planted, "fm (+ chunk) reclaimed: {report:?}");
+    assert!(report.removed >= 2, "fm + chunk reclaimed: {report:?}");
     assert!(!blob_exists(&store, &hash_hex, "fm"), "stale code-lane blob reclaimed");
     assert!(
         !blob_exists(&store, &hash_hex, "chunk"),

@@ -1,97 +1,11 @@
 use super::*;
 use crate::extract::{Call, FileMapL2, Import, SymbolKind};
-use crate::index::view::IndexView;
 use tempfile::TempDir;
 
 fn fresh_db() -> (TempDir, IndexDb) {
     let dir = tempfile::tempdir().unwrap();
     let db = IndexDb::open(dir.path()).unwrap();
     (dir, db)
-}
-
-#[test]
-fn open_reports_a_wipe_only_when_the_stamped_schema_version_differs() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let memory = dir.path().join("memory.fjall");
-    let fresh = IndexDb::open_with_memory(dir.path(), &memory).expect("fresh open");
-    assert!(!fresh.wiped_on_open(), "a first open wipes nothing");
-    fresh
-        .meta
-        .insert(
-            crate::index::META_SCHEMA_VER,
-            (crate::index::INDEX_SCHEMA_VER - 1).to_be_bytes(),
-        )
-        .expect("stamp an older schema version");
-    drop(fresh);
-
-    let wiped = IndexDb::open_with_memory(dir.path(), &memory).expect("reopen");
-    assert!(wiped.wiped_on_open(), "an older revision wipes the index");
-    assert!(wiped.view().symbols_index_is_empty());
-    drop(wiped);
-
-    let again = IndexDb::open_with_memory(dir.path(), &memory).expect("third open");
-    assert!(!again.wiped_on_open(), "the rewritten stamp matches, so no second wipe");
-}
-
-/// Stamp a schema version one past this binary's and return the directory holding the index.
-fn index_stamped_by_a_newer_basemind() -> (TempDir, std::path::PathBuf, u32) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let memory = dir.path().join("memory.fjall");
-    let newer = crate::index::INDEX_SCHEMA_VER + 1;
-    let fresh = IndexDb::open_with_memory(dir.path(), &memory).expect("fresh open");
-    fresh
-        .meta
-        .insert(crate::index::META_SCHEMA_VER, newer.to_be_bytes())
-        .expect("stamp a newer schema version");
-    drop(fresh);
-    (dir, memory, newer)
-}
-
-#[test]
-fn writer_open_refuses_an_index_stamped_by_a_newer_basemind_and_leaves_it_intact() {
-    let (dir, memory, newer) = index_stamped_by_a_newer_basemind();
-
-    let Err(error) = IndexDb::open_with_memory(dir.path(), &memory) else {
-        panic!("a newer index must not open for writing");
-    };
-
-    assert!(
-        matches!(
-            error,
-            IndexError::NewerSchema { stored, current }
-                if stored == newer && current == crate::index::INDEX_SCHEMA_VER
-        ),
-        "expected NewerSchema, got: {error}"
-    );
-    let message = error.to_string();
-    assert!(
-        message.contains("newer basemind") && message.contains("upgrade basemind"),
-        "the error must tell the user to upgrade, got: {message}"
-    );
-    assert_eq!(
-        crate::index::peek_index_schema_ver(dir.path()).expect("peek"),
-        Some(newer),
-        "the newer index keeps its stamp: it was neither wiped nor restamped"
-    );
-}
-
-#[test]
-fn read_only_open_refuses_an_index_stamped_by_a_newer_basemind_and_leaves_it_intact() {
-    let (dir, memory, newer) = index_stamped_by_a_newer_basemind();
-
-    let Err(error) = IndexDb::open_tolerating_held_memory(dir.path(), &memory) else {
-        panic!("a newer index must not open read-only");
-    };
-
-    assert!(
-        matches!(error, IndexError::NewerSchema { stored, .. } if stored == newer),
-        "expected NewerSchema, got: {error}"
-    );
-    assert_eq!(
-        crate::index::peek_index_schema_ver(dir.path()).expect("peek"),
-        Some(newer),
-        "a read-only open must not wipe or restamp a newer index"
-    );
 }
 
 fn synthetic_l1(syms: &[(&str, SymbolKind, u32)]) -> FileMapL1 {
@@ -490,7 +404,7 @@ fn definition_of_prefers_cross_file_target_over_import_binding() {
     writer.upsert_cross_file_edge(&target, 8, &importer, 100).unwrap();
     writer.commit().unwrap();
 
-    assert_eq!(db.view().definition_of(&importer, 100), Some((target, 8)));
+    assert_eq!(db.definition_of(&importer, 100), Some((target, 8)));
 }
 
 #[cfg(feature = "code-search")]
@@ -532,125 +446,26 @@ fn bm25_dual_partition_consistency() {
     spawn_docs.sort();
     assert_eq!(spawn_docs, vec![("h:0".to_string(), 2, 3), ("h:1".to_string(), 1, 1)]);
 
-    let sibling = RelPath::from("src/sibling.rs");
     let mut w = db.writer();
-    w.upsert_bm25_file(&sibling, &postings).unwrap();
+    w.upsert_bm25_file(
+        &rel,
+        &[ChunkPosting {
+            chunk_id: "h:0".to_string(),
+            doclen: 1,
+            terms: vec![("spawn".to_string(), 1)],
+        }],
+    )
+    .unwrap();
     w.commit().unwrap();
-    db.recompute_bm25_stats().unwrap();
-    assert_eq!(db.view().bm25_stats(), Some((4, 8)));
-    assert_eq!(db.code_bm25_postings.iter().count(), 3);
+    assert_eq!(db.code_bm25_postings.iter().count(), 1);
+    assert_eq!(db.code_bm25_by_path.iter().count(), 1);
 
-    let candidates = db.bm25_posting_candidates(&["src/foo.rs".to_string()]).unwrap();
-    assert_eq!(candidates.len(), 3);
+    db.recompute_bm25_stats().unwrap();
+    assert_eq!(db.bm25_stats(), Some((1, 1)));
+
     let mut w = db.writer();
     w.remove_bm25_file(&rel).unwrap();
     w.commit().unwrap();
-    db.retire_bm25_postings(candidates, |hash| hash == "h").unwrap();
-    db.recompute_bm25_stats().unwrap();
-    assert_eq!(db.view().bm25_stats(), Some((2, 4)));
-    assert_eq!(db.code_bm25_postings.iter().count(), 3);
-    assert_eq!(db.code_bm25_by_path.iter().count(), 2);
-
-    let candidates = db.bm25_posting_candidates(&["src/sibling.rs".to_string()]).unwrap();
-    assert_eq!(candidates.len(), 3);
-    let mut w = db.writer();
-    w.remove_bm25_file(&sibling).unwrap();
-    w.commit().unwrap();
-    db.retire_bm25_postings(candidates, |_| false).unwrap();
     assert!(db.code_bm25_postings.iter().next().is_none());
     assert!(db.code_bm25_by_path.iter().next().is_none());
-}
-
-/// The probe rows are written per importer, found by the probed path or by one of its ancestor
-/// directories, and removed together with the importer's resolved edges (the call a re-resolve or a
-/// removal makes) -- with no row left in either keyspace and none touched for a sibling importer.
-#[cfg(any(feature = "code-intel-js", feature = "code-intel-stack"))]
-#[test]
-fn import_probe_rows_roundtrip_and_leave_with_the_importer() {
-    let (_d, db) = fresh_db();
-    let app = RelPath::from("src/app.ts");
-    let other = RelPath::from("src/other.ts");
-    let (impl_ts, util_ts) = (RelPath::from("src/impl.ts"), RelPath::from("src/util.ts"));
-    let probes_app = [keys::probe_hash("src/impl.ts"), keys::probe_hash("src/util")];
-    let probes_other = [keys::probe_hash("src/impl.ts")];
-
-    let mut w = db.writer();
-    w.upsert_import_probes(&app, &[(7, impl_ts.clone(), 40), (31, util_ts, 2)], &probes_app);
-    w.upsert_import_probes(&other, &[(3, impl_ts.clone(), 40)], &probes_other);
-    w.commit().unwrap();
-
-    let mut targets = db.view().import_targets_of(&app);
-    targets.sort();
-    assert_eq!(
-        targets.len(),
-        2,
-        "the manifest row must not read as a binding: {targets:?}"
-    );
-    assert_eq!(targets[0], (7, impl_ts, 40));
-
-    let mut probing = db.view().importers_probing("src/impl.ts");
-    probing.sort();
-    assert_eq!(probing, vec![app.clone(), other.clone()]);
-    assert_eq!(
-        db.view().importers_probing("src/util/index.ts"),
-        vec![app.clone()],
-        "adding a file under a directory the importer saw missing must reach it through the directory"
-    );
-    assert!(db.view().is_probed("src/util/index.ts"));
-    assert!(!db.view().is_probed("docs/readme.md"));
-
-    let mut w = db.writer();
-    w.remove_resolved_file(&app).unwrap();
-    w.commit().unwrap();
-
-    assert!(db.view().import_targets_of(&app).is_empty());
-    assert_eq!(db.view().importers_probing("src/impl.ts"), vec![other.clone()]);
-    assert!(!db.view().is_probed("src/util"));
-    assert_eq!(
-        db.view().import_targets_of(&other).len(),
-        1,
-        "a sibling importer's rows must survive"
-    );
-    assert_eq!(db.importers_by_probe.iter().count(), 1);
-}
-
-#[test]
-fn import_probes_are_incomplete_until_stamped() {
-    let (_d, db) = fresh_db();
-    assert!(
-        !db.view().import_probes_complete(),
-        "a fresh index has no probe rows to trust"
-    );
-    db.set_import_probes_complete(true).unwrap();
-    assert!(db.view().import_probes_complete());
-    db.set_import_probes_complete(false).unwrap();
-    assert!(!db.view().import_probes_complete());
-}
-
-#[cfg(feature = "code-search")]
-#[test]
-fn full_scan_restores_missing_legacy_bm25_postings() {
-    use crate::scanner::{EmbedMode, ScanSource, scan};
-    use crate::store::{Store, VIEW_WORKING};
-
-    crate::store::init_isolated_cache();
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    std::fs::write(root.join("lib.rs"), "pub fn legacy_recovery() {}\n").unwrap();
-    let mut config = crate::config::default_for_root(root);
-    config.code_search.enabled = true;
-    config.code_search.embed = false;
-    config.documents.enabled = false;
-    let mut store = Store::open(root, VIEW_WORKING).unwrap();
-    scan(root, &mut store, &config, ScanSource::WorkingTree, EmbedMode::Inline).unwrap();
-
-    let db = store.index_db.as_ref().unwrap();
-    let (key, value) = db.code_bm25_postings.iter().next().unwrap().into_inner().unwrap();
-    db.code_bm25_postings.remove(&*key).unwrap();
-    assert!(db.code_bm25_postings.get(&key).unwrap().is_none());
-    store.index.embed_policy = "legacy-embed-policy".into();
-
-    scan(root, &mut store, &config, ScanSource::WorkingTree, EmbedMode::Inline).unwrap();
-    let db = store.index_db.as_ref().unwrap();
-    assert_eq!(db.code_bm25_postings.get(&key).unwrap(), Some(value));
 }

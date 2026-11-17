@@ -5,8 +5,6 @@ on:
     branches: [main]
     paths:
       - "website/**"
-      - "mise.toml"
-      - "mise.lock"
       - ".github/workflows/docs.yaml"
   workflow_dispatch: {}
 
@@ -26,15 +24,21 @@ jobs:
       run:
         working-directory: website
     steps:
-      - uses: actions/checkout@v7
-      - uses: xberg-io/actions/setup-mise@v1
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
         with:
-          install-args: node pnpm
+          version: 12.11.2
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Build site
         run: pnpm run build
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: website/dist
 
@@ -46,4 +50,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@v4

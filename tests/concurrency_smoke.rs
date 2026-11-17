@@ -103,13 +103,6 @@ fn call_params(name: &'static str, args: Value) -> CallToolRequestParams {
     params
 }
 
-/// Panic when a verb tool reported a failure: those arrive as `isError` results, not protocol errors.
-#[cfg(feature = "memory")]
-fn expect_success(result: CallToolResult, what: &str) -> CallToolResult {
-    assert_ne!(result.is_error, Some(true), "{what} failed: {result:?}");
-    result
-}
-
 /// Spawn a basemind serve process (plain, ALWAYS-WRITABLE local topology) and complete the rmcp
 /// handshake.
 ///
@@ -128,7 +121,7 @@ async fn spawn_server(root: &Path) -> rmcp::service::RunningService<rmcp::RoleCl
     ().serve(transport).await.expect("rmcp handshake")
 }
 
-/// Eight concurrent `git_log {path, symbol}` calls for the same symbol hit the shared
+/// Eight concurrent `symbol_history` calls for the same symbol hit the shared
 /// `Mutex<LruCache>` in `ServerState::outline_cache` at the same time.
 ///
 /// Asserts: all 8 calls complete within 60 s, each returns a `history` array,
@@ -143,15 +136,22 @@ async fn parallel_symbol_history_same_symbol() {
     let peer = Arc::new(service.peer().clone());
 
     let mut set: JoinSet<CallToolResult> = JoinSet::new();
-    for _ in 0_u8..8 {
+    for i in 0_u8..8 {
         let p = Arc::clone(&peer);
+        let hash_mode = if i < 4 { "normalized" } else { "structural" };
         set.spawn(async move {
             p.call_tool(call_params(
-                "git_log",
-                json!({ "path": "a.rs", "symbol": "alpha", "limit": 10 }),
+                "git",
+                json!({
+                    "mode": "symbol_history",
+                    "path": "a.rs",
+                    "name": "alpha",
+                    "limit": 10,
+                    "hash_mode": hash_mode
+                }),
             ))
             .await
-            .expect("git_log symbol history call")
+            .expect("symbol_history call")
         });
     }
 
@@ -175,7 +175,7 @@ async fn parallel_symbol_history_same_symbol() {
     let _ = service.cancel().await;
 }
 
-/// A reader loop (10x `code_symbols`) racing an `index_rescan` write exercises the
+/// A reader loop (10x `search_symbols`) racing a `rescan` write exercises the
 /// `RwLock<Store>` write-fairness path.
 ///
 /// Asserts: all 10 reader calls complete without error; the single rescan also
@@ -193,9 +193,12 @@ async fn concurrent_search_and_rescan() {
     let task_a = tokio::spawn(async move {
         for iteration in 0_u32..10 {
             let result = peer_a
-                .call_tool(call_params("code_symbols", json!({ "name": "alp", "limit": 50 })))
+                .call_tool(call_params(
+                    "code",
+                    json!({ "mode": "symbols", "name": "alp", "limit": 50 }),
+                ))
                 .await
-                .unwrap_or_else(|error| panic!("code_symbols iteration {iteration} failed: {error}"));
+                .unwrap_or_else(|error| panic!("search_symbols iteration {iteration} failed: {error}"));
             let body = decode_text(&result);
             assert!(
                 body.get("results").and_then(Value::as_array).is_some(),
@@ -207,7 +210,7 @@ async fn concurrent_search_and_rescan() {
     let task_b = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let result = peer_b
-            .call_tool(call_params("index_rescan", json!({})))
+            .call_tool(call_params("admin", json!({ "mode": "rescan" })))
             .await
             .expect("rescan call");
         let body = decode_text(&result);
@@ -229,10 +232,10 @@ async fn concurrent_search_and_rescan() {
     let _ = service.cancel().await;
 }
 
-/// Four concurrent `memory_save` writers and four concurrent `memory_search`
+/// Four concurrent `memory_put` writers and four concurrent `memory_search`
 /// readers exercise the `LanceStore` / `OnceCell` init path under contention.
 ///
-/// Gated on `--features memory` because `memory_save` is a feature-missing error without it
+/// Gated on `--features memory` because `memory_put` is a no-op error without it
 /// and the `LanceStore` won't be initialised.
 #[cfg(feature = "memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -248,30 +251,27 @@ async fn parallel_memory_put_and_search() {
     for n in 0_u32..4 {
         let p = Arc::clone(&peer);
         set.spawn(async move {
-            let result = p
-                .call_tool(call_params(
-                    "memory_save",
-                    json!({
-                        "key": format!("concurrency_test_k_{n}"),
-                        "value": format!("concurrency_test_v_{n}"),
-                    }),
-                ))
-                .await
-                .unwrap_or_else(|e| panic!("memory_save {n} failed: {e}"));
-            expect_success(result, &format!("memory_save {n}"));
+            p.call_tool(call_params(
+                "memory",
+                json!({ "mode": "put",
+                    "key": format!("concurrency_test_k_{n}"),
+                    "value": format!("concurrency_test_v_{n}"),
+                    "embed": false
+                }),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("memory_put {n} failed: {e}"));
         });
     }
     for n in 0_u32..4 {
         let p = Arc::clone(&peer);
         set.spawn(async move {
-            let result = p
-                .call_tool(call_params(
-                    "memory_search",
-                    json!({ "query": "concurrency_test", "limit": 10 }),
-                ))
-                .await
-                .unwrap_or_else(|e| panic!("memory_search {n} failed: {e}"));
-            expect_success(result, &format!("memory_search {n}"));
+            p.call_tool(call_params(
+                "memory",
+                json!({ "mode": "search",  "query": "concurrency_test", "limit": 10 }),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("memory_search {n} failed: {e}"));
         });
     }
 
@@ -284,14 +284,17 @@ async fn parallel_memory_put_and_search() {
     .expect("parallel_memory_put_and_search timed out");
 
     let list_result = peer
-        .call_tool(call_params("memory_search", json!({ "prefix": "concurrency_test_k_" })))
+        .call_tool(call_params(
+            "memory",
+            json!({ "mode": "list",  "prefix": "concurrency_test_k_" }),
+        ))
         .await
-        .expect("memory_search listing");
+        .expect("memory_list");
     let body = decode_text(&list_result);
     let entries = body
         .get("entries")
         .and_then(Value::as_array)
-        .expect("memory_search listing missing 'entries' field");
+        .expect("memory_list response missing 'entries' field");
     assert_eq!(
         entries.len(),
         4,
@@ -301,7 +304,7 @@ async fn parallel_memory_put_and_search() {
     let _ = service.cancel().await;
 }
 
-/// Four concurrent `git_blame` calls for the same file exercise the shared
+/// Four concurrent `blame_file` calls for the same file exercise the shared
 /// `GitCache` under parallel load.
 ///
 /// Asserts: all 4 calls return a non-empty `hunks` array; no panics or deadlocks
@@ -319,9 +322,9 @@ async fn parallel_blame_same_file() {
     for i in 0_u8..4 {
         let p = Arc::clone(&peer);
         set.spawn(async move {
-            p.call_tool(call_params("git_blame", json!({ "path": "a.rs" })))
+            p.call_tool(call_params("git", json!({ "mode": "blame", "path": "a.rs" })))
                 .await
-                .unwrap_or_else(|error| panic!("git_blame task {i} failed: {error}"))
+                .unwrap_or_else(|error| panic!("blame_file task {i} failed: {error}"))
         });
     }
 
@@ -336,20 +339,20 @@ async fn parallel_blame_same_file() {
                 .unwrap_or_else(|| panic!("task {completed}: expected hunks array, got: {body}"));
             assert!(
                 !hunks.is_empty(),
-                "task {completed}: git_blame should return at least one hunk for a.rs"
+                "task {completed}: blame_file should return at least one hunk for a.rs"
             );
             completed += 1;
         }
     })
     .await
-    .expect("parallel git_blame timed out after 60 s");
+    .expect("parallel blame_file timed out after 60 s");
 
-    assert_eq!(completed, 4, "all 4 concurrent git_blame calls should have completed");
+    assert_eq!(completed, 4, "all 4 concurrent blame_file calls should have completed");
 
     let _ = service.cancel().await;
 }
 
-/// Concurrent `memory_save` calls for the SAME key must serialize so the
+/// Concurrent `memory_put` calls for the SAME key must serialize so the
 /// read-modify-write of `created_at` is atomic. Without the per-key lock, two
 /// puts both observe "no existing record" and stamp different `created_at`
 /// values; whichever Fjall write lands last wins, so the surviving record's
@@ -357,7 +360,7 @@ async fn parallel_blame_same_file() {
 ///
 /// Here we seed the key once (establishing `created_at = C0`), then fire 8
 /// concurrent puts of new values. Every put must preserve `C0`, and a final
-/// `memory_search {key}` must report `created_at == C0` with `updated_at >= C0`.
+/// `memory_get` must report `created_at == C0` with `updated_at >= C0`.
 #[cfg(feature = "memory")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_key_put_preserves_created_at() {
@@ -371,9 +374,12 @@ async fn concurrent_same_key_put_preserves_created_at() {
     const KEY: &str = "same_key_race";
 
     let seed = peer
-        .call_tool(call_params("memory_save", json!({ "key": KEY, "value": "seed" })))
+        .call_tool(call_params(
+            "memory",
+            json!({ "mode": "put",  "key": KEY, "value": "seed", "embed": false }),
+        ))
         .await
-        .expect("seed memory_save");
+        .expect("seed memory_put");
     let seed_body = decode_text(&seed);
     let created0 = seed_body
         .get("created_at")
@@ -388,11 +394,11 @@ async fn concurrent_same_key_put_preserves_created_at() {
         set.spawn(async move {
             let result = p
                 .call_tool(call_params(
-                    "memory_save",
-                    json!({ "key": KEY, "value": format!("v{n}") }),
+                    "memory",
+                    json!({ "mode": "put",  "key": KEY, "value": format!("v{n}"), "embed": false }),
                 ))
                 .await
-                .unwrap_or_else(|e| panic!("memory_save {n} failed: {e}"));
+                .unwrap_or_else(|e| panic!("memory_put {n} failed: {e}"));
             decode_text(&result)
                 .get("created_at")
                 .and_then(Value::as_i64)
@@ -413,18 +419,18 @@ async fn concurrent_same_key_put_preserves_created_at() {
     .expect("concurrent_same_key_put timed out after 60 s");
 
     let get_result = peer
-        .call_tool(call_params("memory_search", json!({ "key": KEY })))
+        .call_tool(call_params("memory", json!({ "mode": "get",  "key": KEY })))
         .await
-        .expect("memory_search by key");
+        .expect("memory_get");
     let body = decode_text(&get_result);
     let created_final = body
         .get("created_at")
         .and_then(Value::as_i64)
-        .expect("memory_search by key missing created_at");
+        .expect("memory_get missing created_at");
     let updated_final = body
         .get("updated_at")
         .and_then(Value::as_i64)
-        .expect("memory_search by key missing updated_at");
+        .expect("memory_get missing updated_at");
     assert_eq!(
         created_final, created0,
         "final record must keep the original created_at after the put storm"
@@ -439,7 +445,7 @@ async fn concurrent_same_key_put_preserves_created_at() {
 
 /// Multi-SESSION repro: two `serve` processes against the SAME repo. fjall is
 /// single-holder, so the second process can't open the index and falls back to
-/// read-only (`index_db = None`). It must STILL answer `code_refs` — from
+/// read-only (`index_db = None`). It must STILL answer `find_references` — from
 /// the in-RAM call index built off the shared, concurrently-readable blobs.
 ///
 /// Before the fix this returned a `read_only_index_unavailable` error (the
@@ -455,14 +461,17 @@ async fn second_session_resolves_find_references_from_blobs() {
     let peer2 = serve2.peer().clone();
 
     let result = peer2
-        .call_tool(call_params("code_refs", json!({ "name": "alpha" })))
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "references", "name": "alpha", "format": "json" }),
+        ))
         .await
-        .expect("code_refs must succeed on the read-only 2nd session");
+        .expect("find_references must succeed on the read-only 2nd session");
     let body = decode_text(&result);
     let total = body
         .get("total")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("code_refs response missing 'total': {body}"));
+        .unwrap_or_else(|| panic!("find_references response missing 'total': {body}"));
     assert!(
         total >= 3,
         "2nd (read-only) session must resolve alpha()'s 3 call sites from blobs, got: {body}"
@@ -472,10 +481,11 @@ async fn second_session_resolves_find_references_from_blobs() {
     let _ = serve2.cancel().await;
 }
 
-/// The other Fjall-backed lookup, `code_refs` relation `implementations`, must also work on the read-only 2nd
-/// session, via the same in-RAM index built from the shared blobs.
+/// The other two Fjall-backed tools — `call_graph` and `find_implementations` —
+/// must also work on the read-only 2nd session, via the same in-RAM indexes built
+/// from the shared blobs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn second_session_resolves_impls_from_blobs() {
+async fn second_session_resolves_call_graph_and_impls_from_blobs() {
     let dir = build_repo();
     let root = dir.path();
     run_scan(root);
@@ -484,18 +494,40 @@ async fn second_session_resolves_impls_from_blobs() {
     let serve2 = spawn_server(root).await;
     let peer2 = serve2.peer().clone();
 
-    let fi = peer2
+    let cg = peer2
         .call_tool(call_params(
-            "code_refs",
-            json!({ "name": "Drawable", "relation": "implementations" }),
+            "graph",
+            json!({ "mode": "calls", "name": "alpha", "direction": "callers" }),
         ))
         .await
-        .expect("code_refs implementations on 2nd session");
+        .expect("call_graph on 2nd session");
+    let cg_body = decode_text(&cg);
+    let names: Vec<&str> = cg_body
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(|ns| {
+            ns.iter()
+                .filter_map(|n| n.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"caller"),
+        "call_graph must find caller() among alpha()'s callers, got: {cg_body}"
+    );
+
+    let fi = peer2
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "implementations", "trait_name": "Drawable" }),
+        ))
+        .await
+        .expect("find_implementations on 2nd session");
     let fi_body = decode_text(&fi);
     let fi_total = fi_body
         .get("total")
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("code_refs implementations missing total: {fi_body}"));
+        .unwrap_or_else(|| panic!("find_implementations missing total: {fi_body}"));
     assert!(
         fi_total >= 1,
         "2nd session must resolve the Drawable impl from blobs, got: {fi_body}"
@@ -505,7 +537,7 @@ async fn second_session_resolves_impls_from_blobs() {
     let _ = serve2.cancel().await;
 }
 
-/// Extract symbol names from a `code_symbols` response body.
+/// Extract symbol names from a `search_symbols` response body.
 #[cfg(all(feature = "comms", any(unix, windows)))]
 fn symbol_names(body: &Value) -> Vec<String> {
     body.get("results")
@@ -523,7 +555,11 @@ fn symbol_names(body: &Value) -> Vec<String> {
 /// `tests/git_history_daemon.rs`.
 #[cfg(all(feature = "comms", any(unix, windows)))]
 fn comms_paths() -> basemind::comms::singleton::CommsPaths {
-    basemind::comms::singleton::resolve_paths().expect("resolve the isolated comms paths")
+    let comms_dir = std::path::PathBuf::from(std::env::var("BASEMIND_COMMS_DIR").expect("isolated comms dir"));
+    basemind::comms::singleton::CommsPaths {
+        socket_path: basemind::comms::singleton::comms_socket_path(&comms_dir),
+        comms_dir,
+    }
 }
 
 /// Bring up a REAL `basemind comms daemon` and wait for it to answer.
@@ -587,7 +623,7 @@ async fn daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols() {
     let peer_a = serve_a.peer().clone();
 
     let rescan = peer_a
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan" })))
         .await
         .expect("rescan A forwarded to daemon");
     let scanned = decode_text(&rescan)
@@ -600,7 +636,10 @@ async fn daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols() {
     );
 
     let search_a = peer_a
-        .call_tool(call_params("code_symbols", json!({ "name": "alpha", "limit": 10 })))
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "symbols", "name": "alpha", "limit": 10 }),
+        ))
         .await
         .expect("search A");
     let names_a = symbol_names(&decode_text(&search_a));
@@ -612,7 +651,10 @@ async fn daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols() {
     let serve_b = spawn_daemon_writer_server(root).await;
     let peer_b = serve_b.peer().clone();
     let search_b = peer_b
-        .call_tool(call_params("code_symbols", json!({ "name": "Beta", "limit": 10 })))
+        .call_tool(call_params(
+            "code",
+            json!({ "mode": "symbols", "name": "Beta", "limit": 10 }),
+        ))
         .await
         .expect("search B");
     let names_b = symbol_names(&decode_text(&search_b));
@@ -621,7 +663,7 @@ async fn daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols() {
         "serve B reads 'Beta' from the shared index: {names_b:?}"
     );
     let rescan_b = peer_b
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan" })))
         .await
         .expect("rescan B also forwards + succeeds");
     let scanned_b = decode_text(&rescan_b)
@@ -671,7 +713,7 @@ async fn daemon_writer_serve_resolves_cross_file_callers_through_the_daemon() {
     let peer = serve.peer().clone();
 
     let rescan = peer
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan" })))
         .await
         .expect("rescan forwarded to daemon");
     let scanned = decode_text(&rescan).get("scanned").and_then(Value::as_u64).unwrap_or(0);
@@ -680,8 +722,8 @@ async fn daemon_writer_serve_resolves_cross_file_callers_through_the_daemon() {
     let body = decode_text(
         &peer
             .call_tool(call_params(
-                "code_refs",
-                json!({ "name": "target", "path": "lib.ts", "limit": 50 }),
+                "code",
+                json!({ "mode": "callers", "path": "lib.ts", "name": "target", "limit": 50 }),
             ))
             .await
             .expect("find_callers on the cross-file definition"),
@@ -730,7 +772,7 @@ async fn daemon_writer_serve_resolves_cross_file_python_callers_through_the_daem
     let peer = serve.peer().clone();
 
     let rescan = peer
-        .call_tool(call_params("index_rescan", json!({})))
+        .call_tool(call_params("admin", json!({ "mode": "rescan" })))
         .await
         .expect("rescan forwarded to daemon");
     let scanned = decode_text(&rescan).get("scanned").and_then(Value::as_u64).unwrap_or(0);
@@ -739,8 +781,8 @@ async fn daemon_writer_serve_resolves_cross_file_python_callers_through_the_daem
     let body = decode_text(
         &peer
             .call_tool(call_params(
-                "code_refs",
-                json!({ "name": "target", "path": "lib.py", "limit": 50 }),
+                "code",
+                json!({ "mode": "callers", "path": "lib.py", "name": "target", "limit": 50 }),
             ))
             .await
             .expect("find_callers on the cross-file Python definition"),

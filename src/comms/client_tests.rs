@@ -140,15 +140,10 @@ fn scripted_broker(delays: Vec<std::time::Duration>) -> (CommsPaths, tokio::task
 }
 
 fn rand_suffix() -> u128 {
-    // ~keep The clock alone collides when two tests start in the same tick, and the second bind
-    // then fails with AlreadyExists; the counter makes the suffix unique within the process.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000);
-    let micros = std::time::SystemTime::now()
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0);
-    micros * 1000 + seq
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// The reported failure: a request abandoned after its frame was written (the delivery-notice
@@ -242,7 +237,6 @@ fn test_message_meta() -> crate::comms::model::MessageMeta {
         id: "m1".to_string(),
         thread: ThreadId::parse("t1".to_string()).expect("valid thread id"),
         from: AgentId::parse("agent-1".to_string()).expect("valid agent id"),
-        from_name: None,
         ts_micros: 0,
         subject: "s".to_string(),
         tags: Vec::new(),

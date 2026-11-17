@@ -38,25 +38,27 @@ guessing. Once it knows what changed yesterday, it stops reading git logs.
 |---|---|
 | **Code intelligence** | Find where things are defined, what calls what, who implements what, and how calls chain — across 300+ languages. |
 | **Git intelligence** | Ask what changed recently, who last touched a function, where the churn is, how a file's structure differs across commits, and search commit authors + messages. |
-| **Document search** | Search PDFs, Office files, HTML, email, and images by meaning — with built-in text extraction and OCR, no extra setup (a source build needs the `documents-ocr` Cargo feature for OCR). |
+| **Document search** | Search PDFs, Office files, HTML, email, and images by meaning — with built-in text extraction and OCR, no extra setup. |
 | **Code search** | Find source code by meaning, term, or symbol — vector KNN, native BM25, or exact-symbol lanes, with optional reranking. Returns pointers; fetch bodies on demand. |
 | **Shared memory** | Per-repo memory agents can write to and search; clones of the same repo share it, unrelated repos stay separate. |
+| **Web crawl** | Fetch a page or follow links from a starting URL; results join the document search. |
 | **Agent comms** | A shared chat for agents on the same repo: rooms they auto-join, direct messages, and orchestration of many named subagents. |
-| **Token saving** | Hand an agent a file's outline instead of its full text, and pull back only the one function it needs. |
+| **Agent shells** | Let agents open, type into, and watch terminal sessions in the background. |
+| **Token saving** | Hand an agent a file's outline instead of its full text, pull back only the one function it needs, diff a re-read instead of resending it whole. |
 
 ## The operating rule: basemind first, shell/grep/git fallback
 
 basemind is built on one discipline: **prefer structure over content**.
 
-- **`code_outline` a file before you open it.** Then `code_read` only the symbol or span
-  you need, not the whole file.
-- **`code_symbols` instead of grep.** It matches on indexed symbol names
+- **`code` (`mode: outline`) a file before you open it.** Read only the exact span
+  you need from the outline, not the whole file.
+- **`code` (`mode: symbols`) instead of grep.** It matches on indexed symbol names
   and returns `path:line`, skipping comment and test noise.
-- **`code_refs` instead of grepping call sites.**
+- **`code` (`mode: references` / `mode: callers`) instead of grepping call sites.**
   Indexed call edges, not text matches.
-- **`git_log`, `git_blame` and `git_diff` instead of
-  `git log` / `git blame` / `git diff`.** History at symbol resolution, in tens of microseconds.
-- **`index_rescan` after you edit code**, not a server reconnect.
+- **`git` (`mode: recent` / `mode: blame_symbol` / `mode: diff_outline`) instead of
+  `git log` / `git blame`.** History at symbol resolution, in tens of microseconds.
+- **`admin` (`mode: rescan`) after you edit code**, not a server reconnect.
   Optionally limit it to the files you touched.
 - **Do not re-read a file basemind already mapped.** If the outline answered the
   question, stop.

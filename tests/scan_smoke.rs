@@ -47,46 +47,6 @@ fn scan_extracts_rust_symbols() {
     assert_eq!(hits.len(), 1);
 }
 
-#[cfg(feature = "documents")]
-#[test]
-fn scan_preserves_notebook_code_cell_text_in_document_index() {
-    let (dir, mut cfg) = fresh_repo();
-    let root = dir.path();
-    cfg.documents.embed = false;
-    let path = "analysis.ipynb";
-    fs::write(
-        root.join(path),
-        r#"{
-            "cells": [{"cell_type": "code", "execution_count": null, "metadata": {},
-                       "outputs": [], "source": ["host = 'service-dev.example'"]}],
-            "metadata": {"language_info": {"name": "python"}},
-            "nbformat": 4, "nbformat_minor": 4
-        }"#,
-    )
-    .unwrap();
-
-    let mut store = Store::open(root, basemind::store::VIEW_WORKING).unwrap();
-    scan(
-        root,
-        &mut store,
-        &cfg,
-        basemind::scanner::ScanSource::WorkingTree,
-        basemind::scanner::EmbedMode::Inline,
-    )
-    .unwrap();
-
-    use basemind::extract::doc::DocBlobs;
-    let entry = store.lookup_doc(path).expect("notebook indexed as a document");
-    let doc = store.read_doc_by_hex(&entry.hash_hex).unwrap().expect("notebook blob");
-    assert_eq!(doc.mime_type, "application/x-ipynb+json");
-    assert!(doc.content.contains("host = 'service-dev.example'"));
-    assert!(
-        doc.chunks
-            .iter()
-            .any(|chunk| chunk.text.contains("service-dev.example"))
-    );
-}
-
 #[test]
 fn scan_reuses_extraction_across_views_sharing_blobs() {
     let (dir, cfg) = fresh_repo();
@@ -855,8 +815,8 @@ fn extract_doc_surfaces_keywords_when_enabled() {
 
 /// End-to-end keywords + NER assertion. NER (gline-rs ONNX) downloads ~250 MB
 /// of weights on first run, so the test is `#[ignore]`-gated. Pre-warm with:
-/// `cargo test --features documents-ner scan_extracts_keywords_and_entities -- --ignored`.
-#[cfg(feature = "documents-ner")]
+/// `cargo test --features documents scan_extracts_keywords_and_entities -- --ignored`.
+#[cfg(feature = "documents")]
 #[test]
 #[ignore = "downloads gline-rs ONNX weights (~250MB) on first run; pre-warm explicitly"]
 fn scan_extracts_keywords_and_entities() {
@@ -1083,8 +1043,6 @@ fn markdown_headings_and_obsidian_references_are_indexed() {
 fn documents_are_cached_unchanged_and_pruned() {
     let (dir, mut cfg) = fresh_repo();
     cfg.documents.embed = false;
-    // `*.svg` is a default `[documents] exclude`; clearing the list opts the fixture back in.
-    cfg.documents.exclude = Vec::new();
     let root = dir.path();
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>the quick brown fox jumps</text></svg>"#;
 
@@ -1143,8 +1101,6 @@ fn documents_are_cached_unchanged_and_pruned() {
 fn identical_documents_share_the_content_addressed_cache() {
     let (dir, mut cfg) = fresh_repo();
     cfg.documents.embed = false;
-    // `*.svg` is a default `[documents] exclude`; clearing the list opts the fixture back in.
-    cfg.documents.exclude = Vec::new();
     let root = dir.path();
     let body = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>identical dedup content</text></svg>"#;
 
@@ -1250,7 +1206,7 @@ fn deferred_embed_mode_indexes_symbols_and_keyword_lane_but_writes_no_vectors() 
     assert_eq!(hits.len(), 1, "deferred scan must still index symbols");
 
     let db = store.index_db.as_ref().expect("index db present");
-    let keyword = basemind::search::bm25::bm25_search(&db.view(), "parse", 10);
+    let keyword = basemind::search::bm25::bm25_search(db, "parse", 10);
     assert!(!keyword.is_empty(), "deferred scan must populate the BM25 keyword lane");
 
     assert!(

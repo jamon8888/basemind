@@ -80,27 +80,7 @@ pub async fn serve_in_memory_lean(root: &Path, view: &str, lean: bool) -> Result
     serve_in_memory_inner(root, view, Some(lean)).await
 }
 
-/// Like [`serve_in_memory`], but an offload-eligible call becomes a SEP-2663 task after
-/// `threshold` instead of the production [`TASK_THRESHOLD`](super::tasks::TASK_THRESHOLD), so a
-/// test can exercise the task path (a zero threshold) without a genuinely slow call.
-pub async fn serve_in_memory_with_task_threshold(
-    root: &Path,
-    view: &str,
-    threshold: std::time::Duration,
-) -> Result<tokio::io::DuplexStream> {
-    serve_in_memory_configured(root, view, None, Some(threshold)).await
-}
-
 async fn serve_in_memory_inner(root: &Path, view: &str, lean: Option<bool>) -> Result<tokio::io::DuplexStream> {
-    serve_in_memory_configured(root, view, lean, None).await
-}
-
-async fn serve_in_memory_configured(
-    root: &Path,
-    view: &str,
-    lean: Option<bool>,
-    task_threshold: Option<std::time::Duration>,
-) -> Result<tokio::io::DuplexStream> {
     // Mirror the old in-process `serve` fallback: hold the write lock when free, else open read-only
     // so a SECOND in-memory server on the same repo (e.g. a lean vs full comparison in one test
     // process) still reads the shared index instead of hard-failing on lock contention.
@@ -120,13 +100,25 @@ async fn serve_in_memory_configured(
         // ~keep owns its own `ServerState.lean`, so this never races a sibling in-memory server.
         server.state.lean.store(lean, std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(threshold) = task_threshold {
-        server.state.task_threshold_ms.store(
-            u64::try_from(threshold.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
+    wait_for_startup_catch_up(&server).await;
     Ok(spawn_over_duplex(server))
+}
+
+/// Let the startup catch-up scan of a populated index finish before the test talks to the server.
+/// Tests assert on a settled index (counts, paging cursors, notice-free bodies); a catch-up still
+/// running would hold the store's write lock and flag the lifecycle as rescanning under them. Capped
+/// so a stuck scan fails the test on its own assertion instead of hanging it.
+async fn wait_for_startup_catch_up(server: &BasemindServer) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while server
+        .state
+        .shared
+        .catch_up_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Serve in-memory as a `daemon_writer` server — the exact shape a `comms`-build `basemind serve`
@@ -144,5 +136,6 @@ pub async fn serve_in_memory_daemon_writer(root: &Path, view: &str) -> Result<to
         ..ServerOptions::default()
     };
     let server = BasemindServer::new_with_options(store, root.to_path_buf(), config, repo, git_cache, options);
+    wait_for_startup_catch_up(&server).await;
     Ok(spawn_over_duplex(server))
 }

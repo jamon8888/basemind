@@ -1,15 +1,22 @@
 # Architecture
 
 basemind is a single Rust crate that builds one binary (`basemind`) and exposes
-its internals as a library. The binary serves three roles: `basemind scan` indexes
-a workspace, the daemon (`basemind comms daemon`, auto-spawned; singleton per user) is the sole
-writer managing a machine-global cache and hosts the MCP router over one shared read stack per
-workspace, and `basemind serve` is a thin stdio relay that ensures the daemon and pumps bytes to it
-(HTTP-native clients dial the daemon directly). `serve` needs the `comms` feature; the one-shot CLI
-(`basemind code …`, `git …`) opens the store itself and does not.
+its internals as a library. `basemind scan` indexes a workspace under an exclusive
+writer lock. The daemon (`basemind comms daemon`, auto-spawned; singleton per user)
+owns its active workspace writers and hosts the MCP router over shared read
+stacks. In `comms` builds, `basemind serve` is a thin stdio relay to the daemon;
+non-comms builds serve directly over stdio without the broker. HTTP-native
+clients can dial the daemon's opt-in HTTP frontend directly. One-shot query commands use the same helpers through
+`cli/context.rs`: local reads when possible, or index/memory forwarding when the
+daemon owns the store. `rescan` forwards to a running daemon; `scan` reports a
+writer collision rather than silently opening a second writer.
+
+For task-oriented navigation, see the [agent guide](agents/README.md),
+[complete source ownership map](agents/codebase-map.md), and
+[feature/build catalog](agents/features.md).
 
 The Cargo workspace also vendors four crates under `crates/` — `stack-graphs`,
-`tree-sitter-graph`, `tree-sitter-stack-graphs`, `lsp-positions` — a tree-sitter-0.26 fork of
+`tree-sitter-graph`, `tree-sitter-stack-graphs`, `lsp-positions` — compatibility forks of
 the upstream stack-graphs project, maintained in-tree because upstream targets an older
 tree-sitter. The fork root-caused and fixed two upstream panics and drops the C-FFI, serde,
 sqlite, and visualization modules basemind doesn't use. It backs the Python/Java half of the
@@ -18,40 +25,27 @@ code-intelligence tier (see [Code intelligence](#code-intelligence-precise-resol
 > This document describes the system as-built. For *why* a given decision was made and which
 > alternatives were rejected, see the Architecture Decision Records in [`adr/`](adr/README.md).
 
-```text
-                    ┌─────────────┐
-                    │ basemind    │
-                    │ scan        │
-                    └─────┬───────┘
-                          │ extraction results over IPC (UDS)
-                          ▼
-        ┌──────────────────────────────────────┐
-        │  basemind daemon (singleton)         │
-        │                                      │
-        │  ┌─────────┐ ┌─────────────┐         │
-        │  │ Fjall   │ │ LanceDB     │         │
-        │  │ writer  │ │ writer      │         │
-        │  └─────────┘ └─────────────┘         │
-        │  sole writer per machine; hosts the  │
-        │  MCP router + one shared read stack  │
-        │  per workspace                       │
-        └────┬─────────────────────────┬───────┘
-             │ <cache>/cache/          │ streamable HTTP (opt-in)
-             │ workspaces/<key>/       │ and the stdio relay
-   ┌─────────▼──────┐                  │
-   │ Content-addr   │                  │
-   │ msgpack blobs  │       ┌──────────┴───────────────┐
-   │ (cache/blobs,  │       │ basemind serve           │
-   │ machine-wide,  │       │ (stdio relay, one per    │
-   │ deduped)       │       │ client session)          │
-   └────────────────┘       └──────────┬───────────────┘
-                                       │ MCP stdio
-                                       ▼
-                            ┌──────────────────────┐
-                            │ AI coding agents     │
-                            │ (Claude Code, etc.)  │
-                            └──────────────────────┘
+```mermaid
+flowchart TD
+  Agent["Agent MCP client"] --> Relay["basemind serve: stdio relay"]
+  Relay --> Daemon["Daemon: MCP router and workspace pool"]
+  Agent --> HTTP["Opt-in authenticated HTTP frontend"]
+  HTTP --> Daemon
+  CLI["One-shot CLI"] --> Helpers["Shared query helpers"]
+  Helpers -->|daemon owns index| Daemon
+  Helpers -->|local read| Cache["Workspace views and indexes"]
+  Rescan["rescan"] -->|daemon running| Daemon
+  Rescan -->|no daemon| Cache
+  Scan["Local scan/watch: exclusive writer lock"] --> Cache
+  Daemon --> Cache
+  Cache --> Blobs["Machine-global content-addressed blobs"]
+  Cache --> Fjall["Fjall secondary indexes and metadata"]
+  Cache --> Lance["Optional LanceDB tables"]
 ```
+
+The local writer and daemon writer are alternative ownership paths, not two
+concurrent writers to the same workspace. See `main.rs`, `cli/context.rs`,
+`store_lock.rs`, and `comms/workspace_pool.rs` for admission and forwarding.
 
 ## Source layout
 
@@ -71,6 +65,7 @@ src/
 ├── scanner_code.rs         — code-search branch: L1/L2 → code chunks (feature code-search)
 ├── scanner_docs.rs         — document-tier scan (PDF/Office/HTML → LanceDB, feature documents); also takes
 │                             prose/data/config (md/json/yaml/toml, `lang::is_non_code`): the code map is code-only
+├── scanner_doc_links.rs    — document→code link production (ADR-0008) for the document tier
 ├── scanner_policy.rs       — embed-policy reconciliation: vector rows follow `embed*` config changes
 ├── scanner_candidates.rs   — candidate enumeration + the [scan] max_candidates ceilings and
 │                             the BASEMIND_ALLOW_EXTRA_ROOTS grant for extra_roots
@@ -93,6 +88,7 @@ src/
 │                             against gold task files (see benchmarks/eval/README.md)
 ├── chunk.rs                — code-chunk model + chunker (feature code-search)
 ├── embeddings.rs           — shared ONNX embedding engine (feature intelligence)
+├── url.rs                  — boundary-validated Url newtype (feature crawl)
 ├── store.rs                — content-addressed msgpack blob store; Store facade; holds IndexDb
 ├── store_blob.rs           — blob (de)framing + atomic write
 ├── store_layout.rs         — cache root / workspace-dir mapping; workspace.json marker
@@ -108,8 +104,8 @@ src/
 │   ├── mod.rs              — Fjall-backed secondary index; INDEX_SCHEMA_VER; refs_by_def /
 │   │                         refs_by_path (code-intelligence reverse index)
 │   ├── keys.rs             — length-prefixed composite key encodings
-│   ├── grep_bloom.rs       — per-file trigram bloom rows: the `code_grep` candidate prefilter
-│   │                         (ADR-0012)
+│   ├── grep_bloom.rs       — per-file trigram bloom rows: the `code grep` candidate prefilter
+│   │                         ([ADR-0012: Grep content prefilter](adr/0012-grep-content-prefilter.md))
 │   ├── name_dict.rs        — resident dictionary of distinct callee / trait names behind
 │   │                         `references` / `callers` / `implementations`
 │   └── writer.rs           — atomic read-before-write upsert; per-file commit;
@@ -122,8 +118,6 @@ src/
 │   │                         (the grammar-native fallback for the code-intel tier)
 │   ├── doc.rs              — xberg integration; FileMapDoc (+ keywords,
 │   │                         entities, summary on the documents path)
-│   ├── doc_tiers.rs        — the optional document tiers (documents-ocr, documents-ner) and what a
-│   │                         build without them reports
 │   └── doc_cost.rs         — header-derived peak-memory estimate of one document (skip if it
 │                             alone exceeds the footprint ceiling)
 ├── intel/                  — code-intelligence tier: scope/import-resolved navigation
@@ -156,56 +150,42 @@ src/
 │   │                         verdict, BASEMIND_ALLOW_ANY_ROOT, root-admission.json
 │   ├── documents.rs        — DocumentsConfig + sub-configs, ApiKey, SecretString
 │   ├── code.rs             — [code_search] config table
+│   ├── shells.rs           — [shells] config table
 │   ├── comms.rs            — [comms] config table (broker daemon + identity)
 │   ├── overrides.rs        — DocumentsCliOverrides — backs the clap flags
 │   ├── layered.rs          — merge_layers (Mcp > Cli > Env > File > Default)
 │   └── source.rs           — ConfigSource + ProvenanceMap ledger
-├── mcp/                    — MCP server: 15 tools, one per job, each with its own exact
-│                             schema (ADR-0018), plus the mode-dispatched `agents` tool
-│                             in `comms` builds — see "MCP surface" below
+├── mcp/                    — MCP server: domain tools plus feature-gated privacy tools;
+│                             see "MCP surface" below for registration and restrictions
 │   ├── mod.rs, state.rs    — server bootstrap; shared ServerState
-│   ├── types_tools.rs      — wire arguments: one deny_unknown_fields struct per tool, and
-│   │                         VERB_TOOLS, the tool names in declaration order
-│   ├── strict.rs           — Strict<T>: exact argument validation; an unknown or malformed
-│   │                         argument becomes an isError result naming the closest accepted
-│   │                         field and the accepted set
-│   ├── tool_contract.rs    — the contract every tool shares: answer(), isError results that
-│   │                         name the fix (not indexed, empty index, feature compiled out),
-│   │                         the default max_tokens budget, the alwaysLoad meta and schema
-│   │                         compaction applied to every advertised definition
-│   ├── mode.rs             — define_mode!: the `mode` vocabulary and per-mode field
-│   │                         validator of `agents` only
-│   ├── tools.rs            — #[tool] shims of code_outline, code_symbols, code_read,
-│   │                         code_grep, code_search, code_refs, find_files (thin wrappers;
-│   │                         1000-line cap)
-│   ├── tools_<area>.rs     — the remaining shims: git (git_log, git_blame, git_diff),
-│   │                         memory (docs_search, memory_save, memory_search), admin
-│   │                         (index_status, index_rescan), comms (→ `agents`)
-│   ├── tasks.rs            — Tasks extension: results are inline; index_rescan, code_search
-│   │                         and docs_search become a task only if still running after 3 s
-│   ├── term_index.rs       — resident term index (symbol names + import strings) behind
-│   │                         `code_symbols` and the `code_refs` importer lookup
-│   ├── index_route.rs      — where a `code_refs` call-site/caller/implementation read runs: local index,
+│   ├── mode.rs             — define_mode!: the mode enums, wire spellings, telemetry_key(),
+│   │                         and domain_modes() (what tests/cli_parity/ walks)
+│   ├── tools.rs            — the `code` tool shim (#[tool], thin wrapper; 1000-line cap)
+│   ├── tools_<area>.rs     — one shim per remaining domain: admin, comms (→ `agents`),
+│   │                         git, graph, memory, registry (→ `workspace`), shells
+│   │                         (→ `shell`), web — filenames predate the tool/CLI rename
+│   ├── term_index.rs       — resident term index (symbol names + import strings) behind the
+│   │                         `symbols` / `dependents` substring sweeps
+│   ├── index_route.rs      — where a references/callers/implementations read runs: local index,
 │   │                         daemon-hosted (in-process), forwarded to the daemon, or in-RAM fallback
 │   ├── index_read.rs       — daemon-side executor for the forwarded index reads (`IndexRead`)
 │   ├── l1_cache.rs         — byte-budgeted read-through cache of decoded outlines (max_map_cache_mb)
 │   ├── helpers.rs          — tool bodies; shared scan / decode helpers
-│   ├── helpers_<area>.rs   — the tool bodies, area-sliced: admin (index_status,
-│   │                         index_rescan), calls, calls_scan, code, code_search (feature
-│   │                         code-search), comms, documents, expand (code_read), files,
-│   │                         fingerprint, git, git_file, git_show, grep, impls, intel (the
-│   │                         code_refs definition body), memory, page (offset paging for
-│   │                         the ranked code_search / docs_search), registry, telemetry
-│   ├── memory.rs           — search_documents + memory_* bodies behind docs_search,
-│   │                         memory_save and memory_search
-│   ├── types.rs, types_<area>.rs — internal request shapes and response structs of the
-│   │                         bodies (code, documents, git, impls, memory, comms, registry);
-│   │                         the wire arguments are in types_tools.rs
+│   ├── helpers_<area>.rs   — the run_<mode> dispatch bodies, area-sliced: admin, archmap,
+│   │                         calls, calls_scan, code, code_search (feature code-search),
+│   │                         comms, community, compress, documents, files, fingerprint,
+│   │                         git, git_file, governance (feature memory), graph, graphview,
+│   │                         grep, impls, intel (definition mode body), memory, proposals
+│   │                         (feature memory), registry, shells, telemetry, traverse, web
+│   ├── memory.rs           — search_documents + memory_* bodies behind the `memory` domain
+│   ├── types.rs, types_<area>.rs — one flat <Domain>Params per domain (optional sibling
+│   │                         fields per mode) + response structs, mirroring the
+│   │                         tools_/helpers_ area split
 │   ├── cursor.rs           — cursor encoding for paginated tools
-│   ├── savings.rs          — token-savings heuristics, keyed by tool name (rows recorded
-│   │                         under the old domain:mode keys are mapped to it)
-│   ├── telemetry.rs        — per-call telemetry.jsonl writer; the key is the tool name
-│   └── budget.rs, toon.rs, lean.rs, lenient.rs, notifications.rs,
+│   ├── savings.rs          — token-savings heuristics, keyed by the domain:mode telemetry_key()
+│   │                         plus the bare pre-consolidation tool-name spellings
+│   ├── telemetry.rs        — per-call telemetry.jsonl writer
+│   └── budget.rs, toon.rs, lean.rs, lenient.rs, kneedle.rs, notifications.rs,
 │       completions.rs, prompts.rs, tokens.rs, background.rs, daemon_forward.rs,
 │       map_fingerprint.rs, identity.rs — response budgeting, TOON/lean output
 │       shaping, request leniency, daemon-forward plumbing for Seam B
@@ -228,11 +208,15 @@ src/
 ├── lance/                  — LanceDB schema + open/write helpers (feature intelligence)
 ├── search/                 — BM25 / exact / RRF keyword search over code chunks
 │                             (feature code-search)
-├── registry/                — daemon-side workspace/worktree/branch registry
-├── cli/                     — CLI subcommand groups: admin, agents (daemon-agent verbs),
-│                             code, git, memory, registry (the CLI-only `workspace` listings). Every
-│                             MCP tool has a command; shorthands and administrative
-│                             commands have no tool;
+├── shells/                 — agent-spawned shell sessions (attach/daemon/launcher,
+│                             feature shells)
+├── textcompress/           — delta-aware text-edit compression for large file writes
+├── web/                    — web crawl ingestion (feature crawl)
+├── registry/                — daemon-side worktree/branch claim registry
+├── cli/                     — CLI subcommand groups, 1:1 with the nine MCP domains: admin,
+│                             agents (daemon-agent verbs), code, git, graph, memory (absorbs
+│                             the old governance mine/proposals/accept/reject/audit),
+│                             registry (the `workspace` group), shell, web;
 │                             comms_daemon.rs is `basemind comms` — daemon lifecycle only
 │                             (daemon/start/stop/status/doctor)
 │                             choices.rs holds the clap value enums, exit.rs the exit-code
@@ -240,11 +224,10 @@ src/
 │                             context.rs the one-shot server (daemon-forwarding when one is up)
 ├── doctor_cli.rs, lang_cli.rs, comms_cli.rs — `doctor`, `lang`, and `comms`/`daemon`/`statusline`
 │                             entry points in the binary crate
-├── comms_stop.rs           — `comms stop` and `comms stop --all`: ask, wait, reclaim
 ├── queries/<pack-name>.scm — hand-written extraction queries (override TSLP tags.scm)
 ├── render.rs, hashing.rs, watcher.rs                   — supporting modules
 
-crates/                    — vendored tree-sitter-0.26 stack-graphs fork (workspace members):
+crates/                    — vendored stack-graph compatibility forks (workspace members):
                              stack-graphs, tree-sitter-graph, tree-sitter-stack-graphs,
                              lsp-positions
 ```
@@ -264,10 +247,9 @@ Walker (gitignore-aware)
         Store::write_l1               — content-addressed msgpack blob
         Store::write_l2 (if eager)
         grep bloom row (working tree) — built from the bytes already in hand
-  → collect FileResult { rel, l1_hash, l2_hash?, … }
-  → Forward to daemon via IPC (UDS)
-        IndexWriter::upsert_file(...) — Fjall secondary index
-        per-file commit               — atomic batch (daemon-side)
+        IndexWriter::upsert_file(...) — stage each file's atomic replacement
+        WorkerIndexBatch              — commit on file/byte/shared staging bounds
+  → absorb one bounded chunk of FileResult values, then release it
   → apply_outcomes:
         write Index meta
         prune deleted files via IndexWriter::remove_file
@@ -281,13 +263,18 @@ Walker (gitignore-aware)
         LANE_BM25_STATS     — recompute corpus-global BM25 N / avgdl
 ```
 
-The daemon is the sole writer to Fjall and LanceDB. Scan processes forward their extraction
-results to the daemon, which applies index updates atomically.
+The pipeline runs against the store owned by its caller: a local scan holds the
+workspace writer lock, while daemon rescans run through the workspace pool. A
+forwarded rescan asks the daemon to run the scan; it is not a per-file extraction
+result stream from a separate CLI process.
 
 Key invariants:
 
-- **Per-file commit** — every `process_file` commits its Fjall batch before
-  returning. Fjall handles cross-thread locking; the scanner does not.
+- **Bounded index commits** — each file stages its replacement atomically, while
+  `scanner_index_batch.rs` groups files into worker batches. File count, per-worker
+  staged bytes and a shared staged-byte ledger trigger commits; worker completion
+  flushes the remainder. Atomic per-file replacement does not imply one commit
+  per file.
 - **Atomic upsert** — `IndexWriter::upsert_file` is read-before-write: read
   existing primary entries first to derive secondary-index keys for deletion,
   then stage all deletes + inserts in one batch. No torn state on re-scan.
@@ -296,25 +283,17 @@ Key invariants:
   lane. Everything after the barrier — resolved-reference stitching, LanceDB
   document/code embedding batches, BM25 corpus stats — is enrichment: each lane
   runs inside `scanner_lanes::run_optional_lane` (`catch_unwind`-wrapped), so a
-  panic or hang in one lane degrades only that lane (e.g. "no resolved refs")
-  and never costs the code map itself. Source: `src/scanner_lanes.rs`.
-- **Code-only code map** — `code_symbols`, `code_outline`, `code_grep` and `code_refs` see code only.
+  caught panic degrades that lane (e.g. "no resolved refs") without losing the
+  already-persisted code map. `catch_unwind` is not a timeout or a process-crash
+  boundary; document guards and resource budgets handle other failure cases.
+  Source: `src/scanner_lanes.rs`.
+- **Code-only code map** — `symbols`, `outline`, `grep` and the reference tools see code only.
   Markdown, rst, asciidoc, vimdoc, csv, json, yaml, toml, ini, xml, properties, dotenv, diff,
   gitignore/gitattributes and fluent files are chunked and searched as documents (gated by
   `[documents] include` / `exclude` and the MIME allowlist). A path that changes tier is moved on the
   next full or incremental scan: the stale code-map rows are purged, and the stale blobs are reclaimed
   by the tier-aware sweep (see [Blob store and GC](#blob-store-and-gc)). A build without the
   `documents` feature keeps the grammars, since there is no other tier for those files to go to.
-- **Document feature tiers** — `documents` extracts text from PDFs (text layer), Office formats,
-  spreadsheets, email, HTML, XML, Markdown/MDX and Jupyter notebooks, with keywords, extractive
-  summaries, the reranker and embeddings. `documents-ocr` adds Tesseract OCR (raster images, PDFs
-  with no text layer), `documents-ner` adds ONNX named-entity recognition (`[documents.ner]`, the
-  `entity` filter of `docs_search`), and `documents-ocr-paddle` adds PaddleOCR as a fallback stage for source
-  builds. `full` enables the first three. Without `documents-ocr` a raster image is skipped like a
-  binary and a PDF with no text layer is indexed empty with a warning; without `documents-ner` a
-  `docs_search` with `entity` is an error and `[documents.ner] enabled = true` logs a warning. Archive
-  extraction and the LLM-backed summarization and NER backends are not compiled into any build.
-  Source: `src/extract/doc_tiers.rs`.
 - **Bounded scan** — per-file results are streamed to the index in chunks (`scanner_drive.rs`), never
   accumulated; the footprint gate pauses the drive between chunks and shrinks it when it cannot
   hold the ceiling (see [Resource governance](#resource-governance)).
@@ -327,7 +306,7 @@ Key invariants:
 
 ## Code intelligence (precise resolution)
 
-basemind's default navigation (`code_refs`) is a name-based scan over
+basemind's default navigation (`code` modes `references` / `callers`) is a name-based scan over
 the tree-sitter code map: fast and complete, but it can't tell a shadowed local from an import
 or a same-named symbol in another scope. The `intel` tier (`src/intel/`) adds a second,
 precision layer: per-ecosystem engines that run their own parser, resolve scope and imports
@@ -362,38 +341,25 @@ oxc/stack-graphs engines are skipped and every language falls back to `locals`.
   (package `__init__.py`, TS barrels) up to 8 hops. The result is written straight to
   `refs_by_def` / `refs_by_path`; nothing cross-file is cached in the per-file blob, so an
   unchanged file whose *dependency* moved still gets re-stitched correctly.
-- **Probe index.** The stitch also records what each importer depended on. `import_targets` keeps
-  the stitch result per import binding, and `importers_by_probe` maps every path the resolver
-  consulted to the importers that consulted it: hit targets, every re-export hop file, failed
-  candidates (the `util.ts` tried before `util.js`, a missing `pkg/__init__.py`) and the
-  `tsconfig.json` / `package.json` files it read. JS/TS probes are captured by wrapping oxc's
-  `FileSystem` (the resolver's cache is cleared per importer so every probe reaches the recorder);
-  Python and Java record each candidate path their path arithmetic tests.
 - `intel::resolve_pass` has two entry points sharing this compute/stage machinery: `resolve_pass`
-  (wholesale, after a full `scan`) and `resolve_pass_incremental` (the watcher path). The
-  incremental pass restages the changed files' intra facts, then re-stitches the *changed paths
-  plus a prefix scan of `importers_by_probe`* for each changed, added or deleted path (and each of
-  its ancestor directories, since the resolver does not descend into a directory it found
-  missing). That set is exact, including re-export chains and shadowing files, and O(affected):
-  no blob outside it is read. An index without the `import_probe_ver` stamp in `meta` (created
-  before the probe keyspaces, or a wholesale pass that did not finish) runs the wholesale pass
-  once instead.
+  (wholesale, after a full `scan`) and `resolve_pass_incremental` (the watcher path — restages
+  only the changed files' intra facts and re-stitches only the affected importer set: the
+  changed files plus every file that imports one).
 
 ### The honest contract: name scan is the floor, resolution only annotates
 
-`code_refs` with a `path` (callers of the definition in that file) never narrows to "only the
-resolved subset" — it reports every call site the same call without `path` would (the same
-name-based, no-scope scan), so the two agree on `total` for an unambiguous name; that set is the
-answer to "what calls this?" and is complete unless truncated. Resolution *annotates* each hit with
-`resolved: Option<bool>` (`true` = proven to bind to this definition) and reports `resolved_total`
-on the response — a call without `path` carries no `resolved` annotation, since it never resolves a
-definition to check against. `resolved: false`
+`code` mode `callers` never narrows to "only the resolved subset" — it reports every call site
+mode `references` would (the same name-based, no-scope scan), so the two agree on `total` for an
+unambiguous name; that set is the answer to "what calls this?" and is complete unless truncated.
+Resolution *annotates* each hit with `resolved: Option<bool>` (`true` = proven to bind to this
+definition) and reports `resolved_total` on the response — mode `references` itself carries no
+`resolved` annotation, since it never resolves a definition to check against. `resolved: false`
 is not evidence a hit isn't a real caller — resolution can't see through a module-object import
 (`from pkg import mod` then `mod.f()`) or an unresolvable path alias — so a caller wanting
 completeness should trust `total`, not `resolved_total`; a caller wanting precision filters on
-`resolved`. `code_refs` with `relation: "definition"`
+`resolved`. `code` mode `definition`
 (`src/mcp/helpers_intel.rs`) is the direct read surface over this tier: it resolves a
-`path:line:column` position (1-based) to its definition, following one cross-file hop when the in-file
+`path:line:column` position to its definition, following one cross-file hop when the in-file
 binding is an import, and returns no `definition` (not an error) when the position holds no
 resolved binding.
 
@@ -419,29 +385,19 @@ process per directory, so the daemon holds it and sessions reach it through the 
 | `symbols_by_path` | Per-file outline lookups. |
 | `symbols_by_name` | `name`-prefix range scans for symbol search. |
 | `calls_by_path` | Per-file call lookups. |
-| `calls_by_callee` | `callee`-prefix range scans — drives the `code_refs` call-site lookup. |
-| `imports_by_module` | `module`-prefix range scans — drives `code_refs` with `relation: "importers"`. |
+| `calls_by_callee` | `callee`-prefix range scans — drives `code` mode `references`. |
+| `imports_by_module` | `module`-prefix range scans — drives `code` mode `dependents`. |
 | `imports_by_path` | Per-file import lookups. |
-| `implementations_by_trait` | `trait`-prefix range scans — drives `code_refs` with `relation: "implementations"`. |
+| `implementations_by_trait` | `trait`-prefix range scans — drives `code` mode `implementations`. |
 | `implementations_by_path` | Per-file implementation lookups. |
-| `refs_by_def` | Scope/import-resolved reference edges keyed by defining site — backs the `resolved` annotation on `code_refs` caller hits and the cross-file hop of `relation: "definition"`. |
+| `refs_by_def` | Scope/import-resolved reference edges keyed by defining site — backs the `resolved` annotation on `code` mode `callers` and the cross-file hop in mode `definition`. |
 | `refs_by_path` | `refs_by_def` companion keyed by the USE file — O(prefix) delete on re-resolve. |
-| `import_targets` | Stitch result per import binding (importer + binding offset → definition), plus one reserved probe-manifest row per importer; O(prefix) delete on re-stitch. |
-| `importers_by_probe` | Probed path hash → importers whose resolution consulted it; the affected-importer lookup of the incremental re-stitch. |
 | `code_bm25_postings` | Code-search BM25 keyword postings (feature `code-search`). |
 | `code_bm25_by_path` | Per-file companion of `code_bm25_postings` — O(prefix) delete on re-index. |
-| `grep_bloom` | One trigram bloom filter per indexed file, keyed by path, with the `(size, mtime_ns)` it was built under; the `code_grep` prefilter ([ADR-0012](adr/0012-grep-content-prefilter.md)). |
+| `grep_bloom` | One trigram bloom filter per indexed file, keyed by path, with the `(size, mtime_ns)` it was built under; the `code grep` prefilter ([ADR-0012](adr/0012-grep-content-prefilter.md)). |
 | `embeddings` | Reserved for in-Fjall vector index; LanceDB owns the live vectors. |
-
-The user-authored keyspaces are NOT in the per-view database. They live in a per-repo-group Fjall
-database at `<cache>/cache/repos/<group>/memory.fjall/` (see [Split memory](#split-memory)):
-
-| Keyspace (in `memory.fjall`) | Purpose |
-|---|---|
-| `memory_by_key` | Agent memory (`memory_save` / `memory_search`); LanceDB owns the embeddings. |
-
-A store written before the audit and mining features were removed also holds `memory_archive` and
-`proposals`. They are never opened and never deleted.
+| `memory_by_key` | Agent memory (`memory` modes `put` / `get`); LanceDB owns the embeddings. |
+| `memory_archive`, `proposals` | Archived memory entries and mined co-change proposals (governance tier). |
 
 Key shapes (length-prefixed, see `src/index/keys.rs`):
 
@@ -453,9 +409,6 @@ calls_by_callee     u16:len(callee) ‖ callee ‖ u16:len(rel) ‖ rel ‖ star
 imports_by_module   u16:len(module) ‖ module ‖ u16:len(rel) ‖ rel ‖ start_byte:u32_be
 refs_by_def         u16:len(def_path) ‖ def_path ‖ def_start:u32_be ‖ u16:len(use_path) ‖ use_path ‖ use_start:u32_be
 refs_by_path        u16:len(use_path) ‖ use_path ‖ use_start:u32_be ‖ u16:len(def_path) ‖ def_path ‖ def_start:u32_be
-import_targets      u16:len(importer) ‖ importer ‖ local_start:u32_be  →  u16:len(def_path) ‖ def_path ‖ def_start:u32_be
-                    (local_start = u32::MAX is the manifest row: the importer's probe hashes, 8 bytes each)
-importers_by_probe  blake3(probed_path)[..8] ‖ importer  →  (empty)
 grep_bloom          rel (the path bytes)  →  version:u8 ‖ size:u64 ‖ mtime_ns:i64 ‖ bloom bits
 ```
 
@@ -465,22 +418,19 @@ on open drops the whole `index.fjall/` directory and the next scan rebuilds it.
 
 ### Index reads and resident lookup structures
 
-The `code_refs` call-site, caller and implementation lookups scan `calls_by_callee` and
-`implementations_by_trait` with a *substring* filter (the tool then keeps exact identifier matches
-unless `match: "substring"`). The keys are length-prefixed, so a prefix scan cannot serve them and the
+`references`, `callers` and `implementations` are *substring* matches over `calls_by_callee` and
+`implementations_by_trait`, whose keys are length-prefixed, so a prefix scan cannot serve them and the
 naive shape walks every key. Two resident structures keep the common queries in the millisecond range
 without changing a single result:
 
 - **Name dictionary** (`src/index/name_dict.rs`). The distinct callee and trait names (orders of
   magnitude fewer than the keys; a few MB at monorepo scale) live in one contiguous allocation. A
   query is a `memmem` sweep over it, and only the matching names' key ranges are scanned; keys, order,
-  totals, the scan cap (`truncated_reason: "scan_cap"`) and cursors are those of the full walk. The
-  writer records a name before staging its key, so the dictionary is a superset and a stale name
-  costs one empty range scan.
+  totals, the `total_is_partial` cap and cursors are those of the full walk. The writer records a name
+  before staging its key, so the dictionary is a superset and a stale name costs one empty range scan.
   The first query after the index opens still walks the partition while a background pass builds it,
   and a needle matching over 5 % of the distinct names goes back to the walk.
-- **Term index** (`src/mcp/term_index.rs`). `code_symbols` and the `code_refs` importer lookup search
-  only names and import
+- **Term index** (`src/mcp/term_index.rs`). `symbols` and `dependents` search only names and import
   strings, held per file with no spans or signatures; a hit fetches its span and signature from the
   outline cache by `(path, symbol index)`, so only the returned page is decoded. It is built in the
   background when a full cache is published and patched, not rebuilt, by an incremental rescan.
@@ -494,14 +444,14 @@ forwards an `IndexRead` request over the socket; the daemon runs the same scan f
 `src/mcp/index_read.rs`, so results, totals and cursors equal a writer's and the session holds no
 projection), or `InRam` (nothing reachable: a lazily built, byte-budgeted projection of the blobs that
 can be truncated and says so with a `projections_capped` notice). A failed forward degrades to
-`InRam` rather than erroring. The same request type carries the `code_grep` bloom lookup
+`InRam` rather than erroring. The same request type carries the `code grep` bloom lookup
 (`IndexReadQuery::GrepBloom`, at most 16,384 paths per request).
 
 ### Grep prefilter
 
-`code_grep` is a sweep over every indexed file that passes the language/path filters. A per-file
+`code grep` is a sweep over every indexed file that passes the language/path filters. A per-file
 trigram bloom (`grep_bloom`: size/8 bytes clamped to 64 B–256 KiB, two hash positions per trigram,
-about 12.8 % of the indexed code bytes) lets it skip files that cannot match: the pattern's
+about 12.8 % of the indexed code bytes) lets it skip files that cannot match: the regex's
 required literals (`regex-syntax`'s literal extractor, prefix and suffix sets, each at least 3 bytes)
 are tested against the bloom, and a file is skipped only if its row rejects them AND a `stat` still
 shows the `(size, mtime_ns)` the row was built under. The real regex still runs on every candidate, so
@@ -515,9 +465,7 @@ Two on-disk schemas track `RELEASE_MINOR` from `src/version.rs`, plus a finer-gr
 
 - `INDEX_SCHEMA_VER` in `src/index/mod.rs` — Fjall partition / key encoding: `RELEASE_MINOR` plus
   `INDEX_PARTITION_REVISION`, bumped when the keyspace layout changes between releases. A wholly new
-  keyspace whose absence reads as "nothing known" (such as `grep_bloom`) needs no bump. The probe
-  keyspaces are the variant that is not harmless empty, so they carry a `meta` stamp
-  (`import_probe_ver`) instead: absent means "run the wholesale resolve pass once", with no wipe.
+  keyspace whose absence reads as "nothing known" (such as `grep_bloom`) needs no bump.
 - `SCHEMA_VER` in `src/extract/mod.rs` — msgpack blob format
 - `EXTRACT_EPOCH` in `src/extract/mod.rs` — extraction *output* revision; see below.
 
@@ -539,9 +487,7 @@ on-disk component, is in [UPGRADING.md](UPGRADING.md).
 ## Blob store and GC
 
 Extraction results live in a content-addressed blob store shared by every workspace on the machine
-(`<cache>/cache/blobs/v<schema>/`, one namespace per blob schema, so two installed versions never read
-or overwrite each other's blobs; the sweep also removes un-namespaced blobs and older namespaces once
-past the grace period, and leaves a newer namespace alone); a workspace's `files` (code lane) and `doc_files` (document lane) entries
+(`<cache>/cache/blobs/`); a workspace's `files` (code lane) and `doc_files` (document lane) entries
 reference blobs by hash. The sweep (`src/store_gc.rs`, `src/store_gc_live.rs`) is tier-aware: a `.doc`
 blob is live only if some workspace's `doc_files` references the hash, and `.fm` / `.chunk` / `.rref`
 blobs only if a `files` entry does. That matters when a path changes tier (a markdown file that used
@@ -549,56 +495,96 @@ to be code-mapped keeps its content hash, so its dead code-lane blobs would othe
 live `.doc` blob forever). The sweep is reference-counted against every workspace on the machine, keeps
 blobs younger than 6 hours (`BASEMIND_BLOB_GC_GRACE_SECS`), and is serialised by `cache/gc.lock`. It
 runs after any scan that migrated, refreshed or reset something (the daemon does so a minute later),
-hourly in the daemon, and on `basemind cache gc`. There is no MCP tool for it: a session cannot sweep
-without racing its own rescans. The size-budget enforcer and the last
+hourly in the daemon, and on `basemind cache gc`; the MCP `admin` mode `gc` is a non-destructive report
+because a session cannot sweep without racing its own rescans. The size-budget enforcer and the last
 sweep's health (`gc-state.json`, shown as `last_gc` by `cache stats`) are in `src/store_gc_budget.rs`.
 Budget eviction never touches a locked, most-recently-used or recently built workspace (even over
 budget, which is reported instead); the rules live in `src/store_gc_protect.rs`.
 
-Two installed versions share the cache, and the older one must leave the newer one's data alone. A
-namespace of a blob schema newer than the binary's is not counted towards the budget that binary
-enforces (it could never free those bytes, and would evict a workspace every cycle to make up for
-them) and is never swept. A view whose file map a newer version wrote is never evicted (reported as
-`newer_version`), never healed away as damaged, and has no vote in the sweep of an older namespace,
-which it cannot reference. A file map's version is read on its own before the rest of it, so a newer
-map the binary cannot decode still reads as newer. The sweep of superseded namespaces needs no live
-set and runs even when the current namespace cannot be swept.
+### Cache identity and layout
 
-A file map also records the layout of the blob store it was written for (`blob_layout`; `1` is
-the namespaced store). A map without it was written when blobs lay flat in `cache/blobs/`: it is
-discarded with the index built from it and the workspace is scanned again, whatever schema it carries.
+`store_layout.rs` resolves the data root from `BASEMIND_DATA_HOME`, otherwise the
+platform application data directory. Runtime cache data is outside the checkout:
 
-### Durability
+```text
+<data-root>/cache/
+├── blobs/                         shared, content-addressed extraction artifacts
+├── gc.lock                        serializes cross-workspace sweeps
+└── workspaces/<workspace-key>/
+    ├── workspace.json             canonical root marker
+    ├── status.json                cheap statusline snapshot
+    ├── .lock                      workspace writer ownership
+    ├── views/<view>/              view metadata and secondary index
+    ├── lance/                     lazily opened intelligence tables
+    └── git-history.fjall/         precomputed history index
+```
 
-Blobs are written to a temporary file and renamed, without an fsync; the file map is fsynced, after
-the Fjall index sealed the same generation. So after a power loss a file map can name a blob whose
-bytes never reached the disk. Two records make the next scan a full one that decodes each combined
-and document blob instead of trusting it for existing (`verify-blobs` in the workspace cache
-directory): the breadcrumb of a scan that never finished, and the marker of a daemon
-(`hosting/<pid>`, holding the boot it was started in and its process start) left from an earlier boot
-of the machine. The second asks every workspace at once, since the marker does not say which ones its
-daemon served, and the markers go only after every request is written. A daemon killed while the
-machine stayed up tore nothing (a blob is renamed into place whole) and asks for nothing; a pid alone
-is not trusted, because after a restart another process has the number. The boot is the platform's
-per-boot id (Linux `boot_id`, macOS `kern.bootsessionuuid`, Windows `BootId`), not a boot time a
-clock step moves, and a live pid whose process started when the marker's did, in the same boot, is
-the daemon itself. A workspace created later and seeded from a sibling's file map inherits the
-sibling's request, since it names the same blobs; one that starts empty takes no file as unchanged,
-and the blobs it reuses are decoded.
-Apart from that pass, only paths named in `basemind rescan <paths>` or `index_rescan paths` have
-their blobs validated; a watcher batch asks whether the blob exists.
+This is a navigation sketch; constants in `store_layout.rs` and component open
+functions define exact paths. A workspace key hashes the canonical checkout
+path. Linked worktrees therefore get distinct view state while sharing identical
+blobs. Views distinguish `working`, `staged`, and `rev-<sha7>`. Memory scope can
+span clones of a repository and is not the same identifier as a workspace key.
+Git history is shared with the main checkout for linked worktrees via
+`git_history::shared_history_basemind_dir`, while view indexes remain separate.
+The comms broker has its own store and lifecycle; it is not a view of the code
+index. Cache administration must account for the machine-wide blob scope.
 
-Vector rows are written after the file map. The paths whose rows are owed are kept beside it
-(`pending-vectors.msgpack`, written before the map that claims them, after embedding: the
-embeddings are in the blobs) and written by a later scan from the cached blobs: all of them by a
-full scan, 64 per incremental or cancelled one. Nothing drains them while no scan runs. LanceDB
-commits are not fsynced by basemind, and the vector store can be wiped or deleted on its own, so
-the view also records which store its rows went to (`vector-store-id`; the store's own id is in
-`lance/store-id`). A scan that finds another store there, or none, owes every indexed path its
-rows again, and so does the pass that verifies blobs.
+## Configuration and trust
 
-An open that does not hold the workspace lock writes nothing: it stamps no version in the index or
-in the notes store, flushes no journal and creates no placeholder.
+`config/mod.rs` discovers the project config (root `basemind.toml` or supported
+`.config/` locations), parses TOML, validates the selected schema and loads
+`ConfigV1`. The model separates scan/watch/cache/MCP settings from documents,
+code search, memory, comms, shells, crawl, LLM and resource settings.
+
+For supported document overrides, precedence is MCP over CLI over environment
+over file over defaults. `config/layered.rs` explicitly merges fields and records
+provenance; it is not an automatic override mechanism for every config field.
+`config/daemon.rs` and the workspace pool detect configuration changes while a
+scan uses its captured config snapshot.
+
+Repository configuration is a separate trust layer from operator arguments and
+environment. `config/trust.rs` sanitizes repository-supplied external endpoints,
+secret environment references and symlink settings unless the appropriate
+operator grant exists. `config/root_guard.rs` bounds admitted workspace roots;
+extra-root containment lives in scanner enumeration. `url.rs` validates crawl
+targets and private-host policy. Config symlinks must resolve inside the
+workspace. Changes to these boundaries need the trust/root/security tests, not
+only a config round-trip test.
+
+## Privacy and protected workspaces
+
+Document extraction and the explicit `redact_text` tool share redaction machinery
+but have different output contracts. The tool can return redacted text,
+detections and the token-to-original rehydration map to a caller. It accepts
+custom patterns/terms and pseudonym dictionaries; `pii/` supplies pattern
+validation, relabeling, translation and pseudonym handling. Optional Candle NER
+uses `mcp/ner_windowing.rs` for tokenizer-aware coverage. `require_ner` makes
+fallback or incomplete NER an error rather than a successful pattern-only result.
+
+The scan path does not persist the rehydration map or derive a decryption key
+from workspace identifiers. `rehydration_ref` remains empty for compatibility;
+old map blobs are handled by cleanup/GC. `vault` encrypts/decrypts or edits maps
+in memory, while its caller owns persistence and keys. This is distinct from
+encryption of the full index at rest, which is a deployment/volume concern.
+
+A `safe/` entry marks a protected workspace (`protected.rs`), including a symlink
+or an inspection failure. Without the gateway capability, the agent-facing
+server withholds `redact_text` and `vault`, rejects their direct calls, restricts
+shared-memory operations, and refuses ordinary index/memory resource URIs.
+The CLI redaction/vault paths enforce the corresponding boundary too.
+
+Safe mirror files are served separately as `basemind://safe/<path>` by
+`mcp/safe_resources.rs`, with bounded listing/reading, symlink refusal and checks
+on the opened file. The gateway capability is a cooperation contract with an
+external application; OS sandboxing must prevent agent processes from reaching
+original files or launching an unrestricted same-user engine. Basemind's tool
+filter alone is not that sandbox. The gateway application itself is outside
+this repository.
+
+Read [ADR-0015: privacy gateway](adr/0015-privacy-gateway-boundary.md) and
+[ADR-0013: encryption at rest](adr/0013-encryption-at-rest-comes-from-the-volume.md)
+before changing these contracts. Tests include `mcp_protected_surface`,
+`mcp_safe_resources`, `pii_patterns_smoke` and module-level redaction/NER tests.
 
 ## MCP surface
 
@@ -607,75 +593,52 @@ relays a client's stdio to it, and HTTP-native clients dial the daemon's streama
 directly (opt-in via `BASEMIND_ALLOW_HTTP`, bearer token in `<comms_dir>/http.addr`). The live
 contract is `tests/mcp_smoke.rs`.
 
-The surface is **one tool per job**, each with its own exact schema
-([ADR-0018](adr/0018-mcp-verb-tools.md), which supersedes ADR-0011). There is no `mode` argument.
-`src/mcp/types_tools.rs` is the single source of the tool names (`VERB_TOOLS`) and their arguments.
+The main surface groups operations into domain tools with a required `mode`
+(ADR-0011). The documents build also adds the `vault` domain and the standalone
+`redact_text` tool. `BasemindServer::assemble_router` in `src/mcp/mod.rs` defines
+registration; `server_handler.rs` applies protected-workspace visibility.
+`src/mcp/mode.rs` (`define_mode!`) defines mode wire spellings and telemetry keys.
+CLI correspondence is checked by `tests/cli_parity/`, with documented exceptions
+(see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). Incomplete GraphRAG modes are
+called out in the [feature catalog](agents/features.md#incomplete-and-proposed-work).
 
-| Area | Tools | Gate |
+| Tool / CLI group | `mode` values | Gate |
 |---|---|---|
-| Code | `code_outline`, `code_symbols`, `code_read`, `code_grep`, `code_search`², `code_refs`, `find_files` | always |
-| Documents | `docs_search` | always¹ |
-| Git | `git_log`, `git_blame`, `git_diff` | always |
-| Memory | `memory_save`, `memory_search` | always¹ |
-| Index | `index_status`, `index_rescan` | always |
-| Agents | `agents` (mode-dispatched: register, list, thread_start, thread_list, join, leave, members, add_member, remove_member, archive, post, history, message, inbox, ack, wait, cleanup, status) | `comms` |
+| `code` | outline, symbols, grep, files, find, definition, references, callers, implementations, dependents, expand, semantic, chunk | always |
+| `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open; entities, rag | core always; entity modes require `graphrag`, with incomplete retrieval/CLI support |
+| `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search, show | always |
+| `memory` | put, get, list, search, delete, audit, documents, mine, proposals, accept, reject | always¹ |
+| `admin` | status, repo, rescan, cache_stats, gc, cache_clear, telemetry, compress, delta, checkpoint, waste | always |
+| `web` | scrape, crawl, map | `crawl` |
+| `agents` | register, list, thread_start, thread_list, join, leave, members, add_member, remove_member, archive, post, history, message, inbox, ack, wait, cleanup, status | `comms` |
+| `workspace` | workspaces, worktrees, branches, claim, release | `comms` |
+| `shell` | spawn, send, capture, kill, list, broadcast | `shells` |
+| `vault` | encrypt, decrypt, find, forget, inspect | `documents`; protected-workspace restrictions |
+| `redact_text` / CLI `redact` | direct parameters, no mode | `documents`; protected-workspace restrictions |
 
-¹ Advertised always, body-gated on the `memory` / `documents` features: a build without the feature
-answers with an `isError` result naming it.
-² Body-gated on `code-search` the same way.
+¹ Advertised always, body-gated on the `memory` / `documents` features.
 
-`agents` keeps the ADR-0011 domain shape until its own redesign; `src/mcp/mode.rs`
-holds its `mode` vocabulary and nothing else. Churn, changed-path regex search, chunk fetch, memory
-deletion, cache maintenance and telemetry are CLI commands with no tool.
+Conventions:
 
-Contract of the 15 tools (`src/mcp/tool_contract.rs`, `src/mcp/strict.rs`):
-
-- **Exact arguments.** Each tool has its own `deny_unknown_fields` struct with required fields
-  required in the schema. Arguments are deserialized through `Strict<T>`, which never fails at the
-  protocol layer: an unknown key is answered with a did-you-mean suggestion and the accepted list, not
-  dropped. A stringified integer or boolean (`"limit":"10"`) is coerced; any other type error names
-  the field. "Exactly one of" constraints cannot be stated in the flat schema subset hosts accept
-  (`tests/mcp_schema_wire.rs` forbids `$ref` / `$defs` / `oneOf` / `anyOf` / `allOf`) and are checked
-  in the tool body.
-- **Positions.** `path` is a `RelPath` (byte-precise, repo-relative, forward slashes). `line`,
-  `end_line` and `column` are 1-based in arguments and responses.
-- **Lists.** Every list takes `limit` and `cursor` and returns `next_cursor`. A default `max_tokens`
-  budget of 6000 applies; a trimmed list sets `budgeted`. Index scans use `scan_cap = limit * 8` to
-  bound work on common names. The ranked tools (`code_search`, `docs_search`) page by offset over a
-  larger top-k (`src/mcp/helpers_page.rs`).
-- **Errors.** A failure the caller can fix is a tool result with `isError: true` whose text names the
-  fix: a path that is not indexed says whether it is a document (use `docs_search`) or needs
-  `index_rescan`; an empty index says to run `index_rescan` or `basemind scan`; a compiled-out
-  feature names the Cargo feature. An empty index is never a plain empty result: responses carry a
-  `notice` with `state: "empty_index"`.
-- **Inline results.** Every call is answered inline. For a client that declared the Tasks extension,
-  `index_rescan`, `code_search` and `docs_search` run on their own task and are handed to the task
-  manager only when still running after 3 s (`TASK_THRESHOLD` in `src/mcp/tasks.rs`); until then the
-  answer is an ordinary `tools/call` result.
-- **Always loaded.** Every verb-tool definition carries `_meta["anthropic/alwaysLoad"]: true`, so a
-  host that defers MCP tools loads the schemas at session start and no tool-search round trip is
-  needed. `agents` is not marked and stays deferred
-  ([ADR-0020](adr/0020-verb-tool-contract-amendments.md)).
-- **Cursors.** A `next_cursor` is bound to the query that issued it (`src/mcp/cursor_bind.rs`): the
-  tool name and the arguments that select the list, hashed. Passed to another query, or used after
-  the index or HEAD moved, it is an `isError` result saying to call again without `cursor`.
-- **Paths.** A caller-supplied path is read from the working tree only after it is found in the
-  index and shown to stay inside the repository (`tool_contract::working_file`): an absolute path, a
-  `..` component and a symlink pointing outside are refused.
-- **Annotations.** Exact per tool: everything is read-only except `memory_save` and `index_rescan`,
-  and nothing is destructive. No `output_schema`.
-- **Size.** `tools/list` for the 15 tools is about 18 KB (about 4.5k tokens), down from about 25 KB
-  (about 6.3k tokens) for the four domain tools they replace. `tests/mcp_schema_wire.rs` enforces a
-  20,000-byte ceiling; a description that pushes past it is shortened, the ceiling is not raised.
-- **Descriptions.** Each description says when to use the tool and carries one example call; field
-  descriptions are kept to a clause because every session pays for them.
-- **Telemetry.** The telemetry key of a call is the tool name.
-- **CLI parity.** Every MCP tool has a CLI command, checked by `tests/cli_parity/`
-  ([ADR-0014](adr/0014-cli-mcp-parity-guard.md), amended by ADR-0018); the CLI also has shorthands and
-  administrative commands with no tool.
-- **Layout.** Tool bodies live in `src/mcp/helpers*.rs`, area-sliced (see
-  [Source layout](#source-layout)); `tools.rs` and the `tools_<area>.rs` siblings contain `#[tool]`
-  shims only.
+- Code-map paths use `RelPath` (byte-precise, repo-relative). Other boundaries
+  have their own contracts: redaction accepts a document path and safe resources
+  validate mirror-relative URIs. Apply the owning boundary's validation.
+- Responses are `JsonSchema`-derived and stable; new fields are additive with
+  `#[serde(default)]`.
+- Lists are capped (`limit`, default 100, max 1000). Index scans use
+  `scan_cap = limit * 8` to bound work on common names.
+- Mode descriptions are the routing surface for agents — hosts defer MCP tools and surface
+  them by keyword search, so the description carries the retrieval vocabulary; semantics
+  (substring vs prefix, scope-aware vs name-only) are stated honestly.
+- Tool bodies live in `src/mcp/helpers*.rs`, area-sliced (`helpers_calls.rs`,
+  `helpers_documents.rs`, `helpers_graph.rs`, `helpers_grep.rs`, `helpers_impls.rs`,
+  `helpers_intel.rs`, `helpers_web.rs`, and more — see [Source layout](#source-layout));
+  `tools.rs` and the `tools_<area>.rs` siblings contain `#[tool]` shims only, one per domain.
+- No `output_schema` on the consolidated domain tools (each domain's modes return different response
+  shapes; SEP-2106 allows one per tool). Annotations coarsen to the union of a domain's modes,
+  resolving toward the side effect (e.g. `shell` advertises `destructive_hint` because `kill` is
+  one of its modes, while `code` and `git` keep `read_only_hint: true` since none of their modes
+  write). See [ADR-0011](adr/0011-mcp-tool-surface-redesign.md).
 
 ## Git layer
 
@@ -694,9 +657,9 @@ Drop the disk cache with `basemind cache clear`.
 ### Git-history index
 
 A separate, per-workspace Fjall store at `git-history.fjall/` in the workspace cache directory — distinct from the
-`git-cache/` blame/log tier above. It turns `git_log` (recent commits, commits touching a path, the
-commit walk behind `path` + `symbol`, and full-text `query` / `author` search) and the CLI's
-`git churn` and `git by-path` from live history walks into posting-list lookups. Source:
+`git-cache/` blame/log tier above. It turns the `git` tool's history modes (`touching`, `recent`,
+`by_path`, `churn`, the `symbol_history` commit walk, and full-text `search`) from live history
+walks into posting-list lookups. Source:
 `src/git_history/{mod,builder,reader,fts,keys,encoding,proto,remote}.rs`.
 
 - It is repo-global (identical across the working/staged/rev views) and carries its own
@@ -712,7 +675,7 @@ commit walk behind `path` + `symbol`, and full-text `query` / `author` search) a
     that forwards each history query over the socket rather than trying (and failing) to open it.
 - A process that can reach neither backend falls back to the live walk (`git_history: None`). The
   index is a pure accelerator: tools use it only when `last_indexed_head == HEAD` and otherwise
-  live-walk and report `truncated_reason: "live_walk"`, so it can never serve stale results.
+  live-walk and report `partial: true`, so it can never serve stale results.
 - A linked worktree shares the MAIN worktree's index (keyed on the main worktree root) rather than
   rebuilding its own, since the commit graph is identical across worktrees of one clone.
   The index tracks one head: a linked worktree whose HEAD descends from it appends the new commits,
@@ -722,27 +685,37 @@ commit walk behind `path` + `symbol`, and full-text `query` / `author` search) a
 
 ## Resource governance
 
+MCP request admission is separate from scanner memory backpressure.
+`mcp/admission.rs` shares a bounded heavy-operation semaphore across hosted
+connections and returns a retryable `server_busy` response when its bounded queue
+wait expires. Control calls bypass those permits so health, coordination and
+task status remain responsive. `mcp/tasks.rs` defines slow-call offloading and
+the read-only operations that can be safely abandoned on cancellation.
+
 The `[resources]` config table (`src/config/resources.rs`) is the single place an operator bounds
 basemind's footprint on a constrained machine:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `scan_threads` | `0` (auto: rayon's per-core default) | Cap on the code-map scanner's rayon pool. |
-| `embed_threads` | `0` (auto: `max(2, logical_cpus / 4)`) | Cap on the ONNX embedding pool. |
-| `embed_batch_size` | `32` | Chunks submitted to ONNX per batch. |
-| `max_concurrent_documents` | `0` (unbounded) | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Document extraction then passes `FootprintGate::admit_exclusive`: over `max_footprint_mb` only one document runs at a time, and a document whose header-derived estimate (`src/extract/doc_cost.rs`) exceeds the whole ceiling is skipped as too large. Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
-| `document_models` | `full` | Model families document extraction runs: `full` (every configured post-processor the build has; OCR needs `documents-ocr`, NER needs `documents-ner`) \| `code_only` (embeddings only, no keywords/NER/summarization/OCR) \| `none` (metadata + keyword search only). |
-| `onnx_provider` | `cpu` | ONNX execution provider for embeddings, reranker and NER: `cpu` \| `auto` \| `coreml` \| `cuda` \| `tensorrt`. `auto` on macOS means CoreML, which compiles per input shape and measured 7.6 GB for one tiny document vs 0.8 GB on CPU. |
-| `max_footprint_mb` | `0` (auto) | Ceiling on process memory footprint. A positive integer is an explicit mebibyte ceiling; `0` or `"auto"` derives one from the environment (75% of an enforced cgroup limit, else 25% of machine RAM, floored at 2048 MiB); `"off"` disables the gate. |
-| `max_map_cache_mb` | `256` | Byte budget for the MCP read stack's decoded-outline cache (`src/mcp/l1_cache.rs`), per workspace. `0` = unbounded. A miss costs one blob read and never changes an answer. A read-only session's projected call / implementation indexes are charged against it. |
+| `scan_threads` | `2` | Cap on the code-map scanner's rayon pool. |
+| `embed_threads` | `2` | Cap on the ONNX embedding pool. |
+| `embed_batch_size` | `16` | Chunks submitted to ONNX per batch. |
+| `max_concurrent_documents` | `1` | Cap on concurrent document extraction, enforced by a counting semaphore (`src/backpressure.rs`). Document extraction then passes `FootprintGate::admit_exclusive`: over `max_footprint_mb` only one document runs at a time, and a document whose header-derived estimate (`src/extract/doc_cost.rs`) exceeds the whole ceiling is skipped as too large. Distinct from `max_footprint_mb`, which reacts to memory already allocated: an extraction's spike lands faster than the 50 ms sampler sees it, so this bounds how many spikes may overlap before the first one starts. |
+| `document_models` | `full` | Model families document extraction runs: `full` \| `code_only` (embeddings only, no keywords/NER/summarization/OCR) \| `none` (metadata + keyword search only). |
+| `keep_models_warm` | `false` | Keep ONNX embedding/NER engines resident after a pass. Enable for a long-lived daemon to avoid cold model reloads; it trades memory for latency. |
+| `onnx_provider` | `cpu` | ONNX execution provider for embeddings, reranker, layout and NER: `cpu` \| `auto` \| `coreml` \| `cuda` \| `tensorrt`. `auto` on macOS means CoreML, which compiles per input shape and measured 7.6 GB for one tiny document vs 0.8 GB on CPU. |
+| `max_footprint_mb` | `0` (auto) | Ceiling on process memory footprint. A positive integer is an explicit mebibyte ceiling; `0` or `"auto"` derives one from the environment; `"off"` disables the gate. |
+| `max_map_cache_mb` | `128` | Byte budget for the MCP read stack's decoded-outline cache (`src/mcp/l1_cache.rs`), per workspace. `0` = unbounded. A miss costs one blob read and never changes an answer. The code-graph memo is charged at half this value, and a read-only session's projected call / implementation indexes are charged against it too. |
 
 In the shared daemon these values are ceilings, not settings: `src/config/daemon.rs` applies
-`min(file, cap)` to each (and to `[scan]` / `[documents]` limits), with `0` / `"auto"` /
+`min(file, cap)` to each (and to `[scan]` / `[documents]` / `[crawl]` limits), with `0` / `"auto"` /
 `"off"` resolving to the cap, and the operator raises a cap through `BASEMIND_DAEMON_MAX_*` in the
 daemon's environment. ONNX Runtime memory is bounded in every process (`embeddings::bound_ort_memory`:
 no memory-pattern planning, no retained CPU arena; intra-op threads are the auto embed-thread count, or
-2 in the daemon), and the daemon drops resident embedding engines when the last concurrent embedding
-pass ends.
+2 in the daemon). By default the daemon drops resident embedding engines when the last concurrent
+full embedding pass ends; `[resources] keep_models_warm = true` opts into retaining them for
+low-latency repeated full scans and queries. Incremental Inline batches retain engines between edits
+for watcher latency, while still using the release barrier for overlapping work.
 
 Other bounds that are not `[resources]` keys:
 
@@ -799,23 +772,23 @@ imposes, which is what makes `auto` possible:
 
 | Platform | Usage | Limit |
 |---|---|---|
-| Linux, cgroup v2 with an enforced limit | `memory.current` − `inactive_file` | `memory.max`, minimum over the hierarchy |
-| Linux, cgroup v1 with an enforced limit | `memory.usage_in_bytes` − `total_inactive_file` | `memory.limit_in_bytes` (sentinel = none) |
-| Linux, no enforced limit (no cgroup, no `memory.max`, or one above RAM) | `/proc/self/statm` resident pages | `MemTotal` from `/proc/meminfo`, marked *not enforced* |
+| Linux, cgroup v2 | `memory.current` − `inactive_file` | `memory.max`, minimum over the hierarchy |
+| Linux, cgroup v1 | `memory.usage_in_bytes` − `total_inactive_file` | `memory.limit_in_bytes` (sentinel = none) |
+| Linux, neither | `/proc/self/statm` resident pages | `MemTotal` from `/proc/meminfo` |
+| Linux, cgroup with no limit | as above | falls back to `MemTotal`, marked *not enforced* |
 | macOS | mach `TASK_VM_INFO` `phys_footprint` | `hw.memsize` |
 | Windows | `K32GetProcessMemoryInfo` working set | `GlobalMemoryStatusEx` total physical |
 | anything else | unavailable — the gate is a no-op | unavailable |
 
 A reading reports whether its limit is *enforced* (a cgroup limit the kernel kills you for
-crossing). Only an enforced limit is measured against the cgroup's working set. Without one — no
-`memory.max`, the default for a plain `docker run`, or a limit larger than `MemTotal` — the cgroup
-is often shared (a CI runner's service, a desktop session's scope), and its working set counts other
-processes and active page cache that throttling this process can never release, so the reading
-falls back to the process's own RSS against `MemTotal`.
+crossing) separately from where the usage figure came from, because a container with a cgroup but
+no `memory.max` — the default for a plain `docker run` — reads its usage from cgroup v2 and is
+nevertheless bounded only by the size of the machine. A cgroup limit larger than `MemTotal` is
+demoted the same way.
 
 Readings are cached for 50 ms so an admit point called per file from every rayon worker does not
-turn a memory problem into a syscall storm. `auto` budgets **75%** of an enforced limit or **25%**
-of an advisory one, floored at 2 GiB so a small container cannot produce a ceiling the ONNX
+turn a memory problem into a syscall storm. `auto` budgets **75%** of an enforced limit or **50%**
+of an advisory one, floored at 512 MiB so a small container cannot produce a ceiling the ONNX
 runtime alone would sit above.
 
 **Not a memory bound, and not a bug:** `SCANNER_STACK_SIZE` (256 MiB, `src/scanner_file.rs`) is the
@@ -836,19 +809,19 @@ cargo test --release --test harden -- --ignored --nocapture
 
 It clones 8 upstream repos under `/tmp/basemind-harden/` (`ripgrep`, `tokio`,
 `typescript`, `react`, `django`, `requests`, `gin`, plus a shallow `ripgrep`
-variant), runs `basemind scan` on each, then sweeps the code tools plus
-a representative subset of `git_log` / `git_blame` / `git_diff` calls. Canary assertions catch
-regressions:
+variant), runs `basemind scan` on each, then sweeps every `code`/`graph` mode plus
+a representative subset of `git` modes. Canary assertions catch regressions:
 
-- **tokio**: `code_refs {name: "spawn"}` ≥ 50 · `find_files {query: "src"}` ≥ 100 ·
-  `code_grep {pattern: "fn spawn"}` ≥ 20 · `code_refs {name: "Future", relation: "implementations"}` ≥ 20
-- **django**: `code_refs {name: "get"}` ≥ 50 · `git_log {query: "fixed"}` ≥ 20 commits ·
-  `git_log {path: "django/db/models/query.py"}` ≥ 10 commits · `git_log {author: …}` ≥ 1 hit
-- **react**: `code_symbols {name: "useState"}` > 0
+- **tokio**: `references("spawn")` ≥ 50 · `find("src")` ≥ 100 · `grep("fn spawn")` ≥ 20 ·
+  `implementations("Future")` ≥ 20 · `calls("spawn", callers, depth=2)` ≥ 5 nodes ·
+  `map(module)` ≥ 5 nodes and ≥ 1 import edge
+- **django**: `references("get")` ≥ 50 · `git search("fixed", message)` ≥ 20 commits ·
+  `git touching("django/db/models/query.py")` ≥ 10 commits · author search ≥ 1 hit
+- **react**: `symbols("useState")` > 0
 - **ripgrep-shallow**: `any_truncated == true` (shallow-clone signal surfaces)
 
 Every threshold sits well below the `limit` the capture call passes (react captures at `limit: 20`,
-django `code_refs` at `limit: 200`), so a canary can never be satisfied merely by hitting the cap —
+django `references` at `limit: 200`), so a canary can never be satisfied merely by hitting the cap —
 and never fails because upstream churn moved a count.
 
 Per-repo metrics land at `/tmp/basemind-harden-*.log`.
@@ -859,107 +832,29 @@ The daemon owns a separate Fjall store for agent communication (singleton per us
 
 ```mermaid
 flowchart TB
-  subgraph agents["Agents (same machine, multiple repos)"]
-    A1["Agent A — repo X"]
-    A2["Agent B — repo Y (same workspace)"]
-    HK["SessionStart hook\n(boot-subscribe + inject)"]
+  A1["Agent A"] --> R1["serve relay"]
+  A2["Agent B"] --> R2["serve relay"]
+  R1 --> MCP
+  R2 --> MCP
+  HTTP["Authenticated HTTP client"] --> MCP
+  Hook["Session hook / coordination CLI"] --> Broker
+  subgraph Daemon["User-global comms daemon"]
+    MCP["MCP router / per-session identity"] --> Pool["Workspace pool / shared read stacks"]
+    MCP --> Broker["Thread discovery, membership and delivery"]
+    Broker --> CommsStore["Comms Fjall store: agents, threads, messages, cursors"]
+    Broker --> Registry["Worktree registry and advisory claims"]
+    Pool --> Memory["Scoped memory index / optional LanceDB enrichment"]
   end
-  subgraph serve["basemind serve (per session: stdio relay to the daemon-hosted MCP router)"]
-    MT["MCP tools: memory + agents"]
-    CC["CommsClient (proxy)"]
-    PEER["rmcp Peer (push, best-effort)"]
-  end
-  subgraph daemon["basemind daemon (singleton, user-global)"]
-    FE["Front-ends: UDS"]
-    THREADS["Thread registry\n(scope: repo | path-glob | subject)"]
-    BR["Broker: explicit join, fan-out, refcount"]
-    CS["CommsStore (Fjall):\nthreads · members · messages_by_thread(front-matter)\n· message_body · subs · cursors · agents · registry"]
-  end
-  subgraph cache["Global cache\n~/.local/share/basemind"]
-    MEM["memory_by_key (scope, visibility, owner)"]
-    LAN["LanceDB memory (+agent_id +visibility)"]
-  end
-  A1 --> serve
-  A2 -->|own serve| daemon
-  HK -->|discover threads| daemon
-  CC -->|len-prefixed msgpack / JSON-RPC over UDS| FE --> BR --> THREADS --> CS
-  BR -. push .-> CC -. notify .-> PEER
-  MT --> cache
 ```
 
 ### Why a separate daemon
 
-The daemon is the sole Fjall writer (across all repos on the machine). This allows N `basemind serve`
-sessions on the same repo to read concurrently without downgrade-to-read-only races. The daemon is
-a singleton enforced by socket-bind-as-lock (a Unix domain socket whose successful bind IS the lock);
-stale sockets are reclaimed probe-before-unlink. It auto-starts on first need and stops on explicit `comms stop`.
-
-#### Comms directory layout and protocol generations
-
-The comms directory is `comms/` under the per-user data directory (`~/.local/share/basemind` on
-Linux, `~/Library/Application Support/basemind` on macOS, `%APPDATA%\basemind\data` on Windows), or
-`BASEMIND_COMMS_DIR`. Everything a daemon owns lives in a protocol-generation subdirectory of it:
-
-```text
-comms/
-  g1/                 protocol generation 1 (RENDEZVOUS_GENERATION in src/daemon_lock.rs)
-    comms.sock        Unix socket; on Windows the pipe \\.\pipe\basemind-comms-<USER>-<hash of this dir>
-    daemon.lock       single-owner flock, held for the daemon's lifetime
-    daemon.pid        the holder's record
-    store.fjall/      threads, messages, agent roster
-    daemon.log  http.addr  last-fatal.json
-  comms.sock ...      releases up to 0.33: the same files, unscoped
-```
-
-A binary only looks inside its own protocol generation, so two installed releases of different
-generations each run their own daemon and never contact, stop or signal the other's. The protocol
-generation is not the comms protocol version (`PROTO_VER`), the scan generation or an index base
-generation; it only names where a daemon and its clients meet. A protocol-version mismatch inside one
-generation is reported, not resolved by a new directory. `<comms_dir>` elsewhere in
-this document means the generation directory. The generation is bumped only when a release must stay
-invisible to binaries already released into the current one; a new generation starts with an empty
-comms store, and the previous generation's daemon runs until its own sessions end. Generations are
-retired by disuse: `basemind comms cleanup` (`src/comms/generation_cleanup.rs`) removes another
-generation's directory, or the unscoped files of releases up to 0.33, when its `daemon.lock` is free
-and its newest file is older than 30 days. It reads the lock and file ages only, never this binary's
-own generation, and runs only when asked.
-
-The machine registry of live daemons is scoped the same way: a daemon registers under
-`<data_home>/daemons/g1/`, where a release up to 0.33, which reads only the files directly in
-`daemons/`, does not see it. `comms stop --all` and `comms doctor` (`--probe` included) list and
-address the daemons of their own generation only. The ceiling on live daemons (`MAX_LIVE_DAEMONS`)
-counts every generation's, by reading their registry records and never by contacting them.
-
-Three things are not per generation, and bound what coexistence gives:
-
-- **The workspace stores.** The code index, memory notes, vectors and git history are keyed by
-  workspace or repository group and admit one process. When daemons of two generations want the
-  same workspace, the first holds it and the second serves no index, memory or git history for it
-  until the first exits.
-- **The plugin launcher of 0.33 and older.** It still kills every basemind process of another
-  version started from the plugin cache, on each of its own launches. Coexistence is complete only
-  once no such plugin is installed.
-- **The HTTP front-end's default port.** With `BASEMIND_ALLOW_HTTP`, each daemon prefers
-  `127.0.0.1:51786`; the second to start binds an OS-assigned port and records it in its own
-  `http.addr`. An address set with `BASEMIND_HTTP_ADDR` is never substituted.
-
-Inside one generation there is one daemon, and a client that finds a daemon from another build never
-signals one that answers. A daemon of the same or a newer release is never asked to stop: it is
-used, or, when it is newer and speaks another protocol, reported (`update this basemind`). An older
-one is asked to stop and, if it refuses because it is serving other sessions, is used when the
-protocol matches and reported otherwise; until it goes, clients of the newer build on another
-protocol have no daemon, and a `basemind serve` relay, at session start as after a restart, holds
-requests for ten seconds (longer while a connection attempt that has not failed is running) and
-then answers the host itself while it retries with a growing back-off: `initialize`, `ping` and
-`tools/list` from the binary (`src/mcp/offline.rs`), any other request with that error. Once it
-connects it replays the host's `initialize` to the daemon and sends
-`notifications/tools/list_changed`. A daemon that closed its socket gets the whole exit window to
-leave. SIGTERM and SIGKILL are reserved for a process still there after it, silent to `Stop` and
-`Ping` when asked once more, that the generation's `daemon.pid` names at that moment: the process
-whose start and boot are the ones the record holds (a record of an earlier release, which holds
-neither, names a process that started no later than it was written). `comms stop`
-and `comms stop --all` reclaim a daemon by the same steps and the same function. The full table is
-the module doc of `src/comms/singleton.rs`.
+The daemon owns the comms store and its active workspace writers. Multiple
+`basemind serve` sessions therefore share those writers and read stacks. Startup
+acquires the daemon lock before binding its endpoint; Unix socket reclamation
+uses probe-before-unlink. Windows has a named-pipe transport. Spawn-on-demand,
+explicit stop, version replacement and idle cleanup are coordinated by
+`comms/singleton*.rs`, `daemon_lock.rs` and `comms/daemon_lifecycle.rs`.
 
 ### Daemon lifecycle and resource containment
 
@@ -989,12 +884,10 @@ ceiling is real rather than merely configured — ships at `docs/systemd/basemin
 ### Request correlation, timeouts and the daemon log
 
 Every client request after `Hello` travels as a `Call { id, request }` and is answered by a
-`Reply { id, response }` (since protocol version 4; the current version is 6, which added the batched
-memory reads `MemoryOp::GetMany`, at most 256 keys and 8 MiB of notes per reply, and
-`MemoryOp::Stamps`, and the `verify` flag of `Rescan`; `ensure_daemon` asks an older daemon to stop
-on its version check, and a skewed peer fails `Hello` with `proto_skew`). A client that abandons a
-request mid-flight (a timeout, a cancelled tool call) therefore cannot mistake the late reply for the
-next request's answer: stale ids are discarded, and only a drop in the middle of writing a frame forces
+`Reply { id, response }` (protocol version 4; `ensure_daemon` replaces an older daemon on its
+version check, and a skewed peer fails `Hello` with `proto_skew`). A client that abandons a request
+mid-flight (a timeout, a cancelled tool call) therefore cannot mistake the late reply for the next
+request's answer: stale ids are discarded, and only a drop in the middle of writing a frame forces
 a reconnect. Bare requests (status probes, `Hello`) still get an uncorrelated `Response`.
 
 Nothing waits forever. A coordination request must be answered within
@@ -1042,9 +935,9 @@ once (5 s replay timeout), but only when re-sending is safe:
 
 - the read methods `ping`, `tools/list`, `resources/list`, `resources/read`,
   `resources/templates/list`, `prompts/list`, `prompts/get` and `completion/complete`;
-- every call to a read-only code or git tool;
-- `agents` modes `list`, `thread_list`, `members`, `history`, `message`, `ack`, `wait` and
-  `status`, and `inbox` unless it sets `mark_read`;
+- every `code`, `git` and `graph` call;
+- `agents` modes `list`, `thread_list`, `members`, `history`, `message`, `inbox`, `ack`, `wait` and
+  `status`;
 - `agents` `post`, which the relay stamps with a `relay-` key when the caller gave none.
 
 Every other in-flight request is answered with a retryable `-32001 backend_restarted` rather than
@@ -1098,45 +991,11 @@ plus an optional long body.
 Repo memory is namespaced by `(scope, visibility, owner)`: the `memory_by_key` Fjall key is
 `(scope, vis_byte, owner, key)` and the LanceDB memory table has `agent_id` + `visibility` columns.
 Group memory (`visibility=group`, default, `owner=""`) is shared across agents in a repo; individual
-memory (`visibility=individual`, `owner=agent_id`) is private to one agent. The vector tables are
-guarded by `MEMORY_SCHEMA_VER` (derives from `RELEASE_MINOR`); a mismatch wipes and rebuilds them.
-The notes are not: `memory.fjall` carries its own version (`store_meta`), is never wiped, and a
-store a newer basemind wrote is refused for memory operations only ("written by a newer
-basemind"), while the code index of the same workspace opens and serves as usual.
-
-The Fjall half (`memory_by_key`) is the truth for a note. Its vector row only makes the note findable
-by meaning: `memory_search` joins every hit against `memory_by_key`, drops a hit whose note is gone or
-was rewritten since the row was embedded, and answers from the note. The rows live beside the notes
-(`<cache>/cache/repos/<group>/memory.lance/<model>-<dim>-<hash>/`, one store per embedding model) and are
-rebuilt from them: a search embeds the notes without a current row and removes the rows whose note
-is gone or has no text, a bounded number per call, which is also what fills a store after it is
-wiped or first opened. A row holds the note's vector and tags, never its text. A save or a delete
-is fsynced before it is acknowledged.
-
-A process stops looking once it has found a namespace level, for five minutes, doubled after each
-look that found nothing to do up to an hour. A save that wrote no row (the embedding failed, or was
-left for later) ends that at once: in its own process directly, and in every other by rewriting
-`memory-rows-owed` in the group directory, which a search reads before it trusts a namespace to be
-level. A note saved again while a backfill is embedding it keeps the row of the
-later save: a write removes only rows of the same or an earlier write of the note, and the backfill
-reads the notes it embedded once more before it calls the namespace level. The join tells a current
-row from a stale one by the notes' `updated_at` alone and reads whole only the notes it may serve, in
-batches of at most 256 keys per request (the daemon refuses a larger one) and 8 MiB of notes per
-reply (the daemon stops early and the caller asks again for the rest).
-
-The Fjall half is stored once per repo group, not per
-view: `<cache>/cache/repos/<group>/memory.fjall/`, where `<group>` is the blake3 of the canonical main
-worktree root (the parent of the git common dir), so every linked worktree of a clone shares it; a
-root outside git uses its own workspace key. The daemon stays the sole writer and holds one handle per
-group. No garbage collector lists `repos/`: budget eviction and the orphan reaper only touch
-`workspaces/<key>/`, so evicting a cold workspace never deletes memory. On open, rows an older build
-left in a view's own `memory_by_key` keyspace are merged into the group store (last writer wins by
-`updated_at`; ties keep the larger payload) and the view's keyspace is dropped, before any
-schema-mismatch wipe. A seeded worktree view therefore carries no memory after its first open.
+memory (`visibility=individual`, `owner=agent_id`) is private to one agent. Schema is guarded by
+`MEMORY_SCHEMA_VER` (derives from `RELEASE_MINOR`); a mismatch wipes and rebuilds.
 
 ### Worktree registry
 
-The daemon maintains a registry of the workspaces it has seen and each repo's worktrees and local
-branches, populated from git plumbing as sessions connect. It is read-only to serving sessions and
-listed by `basemind workspace workspaces` / `worktrees` / `branches`; it has no MCP tool and holds
-no claims.
+The daemon maintains an advisory registry of active worktrees and branches per workspace. Agents can
+claim a worktree+branch via `workspace` mode `claim` and release via mode `release`. Claims are
+advisory (no locking); the registry helps avoid collisions and is read-only to serving sessions.

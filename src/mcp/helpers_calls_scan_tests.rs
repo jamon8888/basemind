@@ -7,10 +7,8 @@ use crate::extract::{Call, FileMapL1, FileMapL2, Implementation};
 use crate::index::IndexDb;
 use crate::path::RelPath;
 
-use super::{CallScanPage, scan_calls_by_name, scan_calls_examining, scan_calls_in_ram_examining};
-use crate::mcp::helpers_impls::{scan_impls_examining, scan_impls_fjall};
-use crate::mcp::helpers_refs_match::Matching;
-use crate::mcp::types::ReferenceHit;
+use super::scan_calls_by_name;
+use crate::mcp::helpers_impls::scan_impls_fjall;
 
 /// Deterministic xorshift, so a failure reproduces.
 struct Rng(u64);
@@ -44,7 +42,7 @@ fn vocabulary() -> Vec<String> {
         "spawn_blocking",
         "unspawn",
         "é",
-        "caf\u{e9}",
+        "na\u{ef}ve",
         "日本語",
         "日本",
         "Display",
@@ -145,7 +143,7 @@ fn write_file(db: &IndexDb, rng: &mut Rng, vocab: &[String], i: usize) {
 type CallPage = (u32, bool, Vec<Vec<u8>>, Vec<(String, u32, u32)>, bool);
 
 fn call_page(db: &IndexDb, needle: &str, limit: usize, cursor: Option<&[u8]>) -> CallPage {
-    let page = scan_calls_by_name(&db.view(), needle, Matching::Substring, limit, cursor).unwrap();
+    let page = scan_calls_by_name(db, needle, limit, cursor).unwrap();
     let hits = page.hits.iter().map(|h| (h.callee.clone(), h.line, h.column)).collect();
     (
         page.total,
@@ -160,9 +158,8 @@ type ImplPage = (usize, bool, Vec<Vec<u8>>, bool);
 
 fn impl_page(db: &IndexDb, needle: &str, language: Option<&str>, limit: usize, cursor: Option<&[u8]>) -> ImplPage {
     let page = scan_impls_fjall(
-        &db.view(),
+        db,
         needle,
-        Matching::Substring,
         language,
         limit,
         cursor,
@@ -201,9 +198,9 @@ fn assert_equivalent(db: &IndexDb, label: &str) {
         for limit in [2usize, 50, 400] {
             let (mut want_cursor, mut got_cursor): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
             for step in 0..10 {
-                db.callee_dict().set_disabled(true);
+                db.callee_names.set_disabled(true);
                 let want = call_page(db, needle, limit, want_cursor.as_deref());
-                db.callee_dict().set_disabled(false);
+                db.callee_names.set_disabled(false);
                 let got = call_page(db, needle, limit, got_cursor.as_deref());
                 assert_eq!(want, got, "{label}: calls needle={needle:?} limit={limit} step={step}");
                 if !want.4 {
@@ -218,9 +215,9 @@ fn assert_equivalent(db: &IndexDb, label: &str) {
             for limit in [2usize, 100] {
                 let mut cursor: Option<Vec<u8>> = None;
                 for step in 0..10 {
-                    db.trait_dict().set_disabled(true);
+                    db.trait_names.set_disabled(true);
                     let want = impl_page(db, needle, language, limit, cursor.as_deref());
-                    db.trait_dict().set_disabled(false);
+                    db.trait_names.set_disabled(false);
                     let got = impl_page(db, needle, language, limit, cursor.as_deref());
                     assert_eq!(
                         want, got,
@@ -238,12 +235,10 @@ fn assert_equivalent(db: &IndexDb, label: &str) {
 
 fn build_dicts(db: &IndexDb) {
     // Without this the small test vocabulary routes most needles to the walk and proves nothing.
-    db.callee_dict().always_use_dictionary();
-    db.trait_dict().always_use_dictionary();
-    db.callee_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::CallsByCallee));
-    db.trait_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::ImplementationsByTrait));
+    db.callee_names.always_use_dictionary();
+    db.trait_names.always_use_dictionary();
+    db.callee_names.build_blocking(&db.calls_by_callee);
+    db.trait_names.build_blocking(&db.implementations_by_trait);
 }
 
 #[test]
@@ -257,13 +252,13 @@ fn dictionary_scans_match_the_full_walk() {
     }
     build_dicts(&db);
     assert!(
-        db.callee_dict().len() > 100,
+        db.callee_names.len() > 100,
         "dictionary should hold the distinct callees"
     );
     assert_equivalent(&db, "after build");
 
     // The corpus must exercise the cap, or the partial-total path is untested.
-    let capped = scan_calls_by_name(&db.view(), "run", Matching::Substring, 1, None).unwrap();
+    let capped = scan_calls_by_name(&db, "run", 1, None).unwrap();
     assert!(capped.total_is_partial, "hot name must hit scan_cap");
 
     // Rescan: rewrite some files (names change, old keys are removed), drop others, add new files
@@ -286,10 +281,8 @@ fn dictionary_scans_match_the_full_walk() {
     assert_equivalent(&db, "after new names");
 
     // A fold merges the new names into the snapshot without changing any answer.
-    db.callee_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::CallsByCallee));
-    db.trait_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::ImplementationsByTrait));
+    db.callee_names.build_blocking(&db.calls_by_callee);
+    db.trait_names.build_blocking(&db.implementations_by_trait);
     assert_equivalent(&db, "after rebuild");
 }
 
@@ -305,7 +298,7 @@ fn names_recorded_before_the_build_completes_are_not_lost() {
     // Written while no snapshot exists (as during a background build): recorded, not yet folded.
     write_file(&db, &mut rng, &["late_arrival".to_string()], 99);
     build_dicts(&db);
-    let page = scan_calls_by_name(&db.view(), "late_arrival", Matching::Substring, 10, None).unwrap();
+    let page = scan_calls_by_name(&db, "late_arrival", 10, None).unwrap();
     assert!(page.total > 0);
     assert_equivalent(&db, "late arrival");
 }
@@ -319,9 +312,9 @@ fn unbuilt_dictionary_still_answers_via_the_walk() {
     for i in 0..30 {
         write_file(&db, &mut rng, &vocab, i);
     }
-    db.callee_dict().set_disabled(true);
+    db.callee_names.set_disabled(true);
     let want = call_page(&db, "run", 20, None);
-    db.callee_dict().set_disabled(false);
+    db.callee_names.set_disabled(false);
     // First query: kicks off the background build and is served by the walk.
     let first = call_page(&db, "run", 20, None);
     assert_eq!(want, first);
@@ -340,21 +333,19 @@ fn time_name_scans() {
     };
     let db = IndexDb::open(std::path::Path::new(&view)).unwrap();
     let t = Instant::now();
-    db.callee_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::CallsByCallee));
+    db.callee_names.build_blocking(&db.calls_by_callee);
     eprintln!(
         "callee dictionary: {} names, {} KiB resident, built in {:?}",
-        db.callee_dict().len(),
-        db.callee_dict().snapshot_bytes() / 1024,
+        db.callee_names.len(),
+        db.callee_names.snapshot_bytes() / 1024,
         t.elapsed()
     );
     let t = Instant::now();
-    db.trait_dict()
-        .build_blocking(db.keyspace_for_test(crate::index::view::Part::ImplementationsByTrait));
+    db.trait_names.build_blocking(&db.implementations_by_trait);
     eprintln!(
         "trait dictionary: {} names, {} KiB resident, built in {:?}",
-        db.trait_dict().len(),
-        db.trait_dict().snapshot_bytes() / 1024,
+        db.trait_names.len(),
+        db.trait_names.snapshot_bytes() / 1024,
         t.elapsed()
     );
     let needles = [
@@ -373,11 +364,11 @@ fn time_name_scans() {
         let mut dict = Vec::new();
         let mut first = None;
         for round in 0..5 {
-            db.callee_dict().set_disabled(true);
+            db.callee_names.set_disabled(true);
             let t = Instant::now();
             let want = call_page(&db, needle, 50, None);
             walk.push(t.elapsed());
-            db.callee_dict().set_disabled(false);
+            db.callee_names.set_disabled(false);
             let t = Instant::now();
             let got = call_page(&db, needle, 50, None);
             dict.push(t.elapsed());
@@ -393,461 +384,4 @@ fn time_name_scans() {
             dict[2]
         );
     }
-}
-
-/// Exact matching is applied on the key, before a hit counts toward the scan cap. Applied after the
-/// scan instead, the 17,000 calls to `zapx` (which sort before the qualified `ns::zap`) used up the
-/// cap of every round and the exact call sites were never reached.
-#[test]
-fn an_exact_call_scan_is_not_starved_by_substring_only_callees() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = IndexDb::open(dir.path()).unwrap();
-    let mut calls: Vec<Call> = (0..17_000).map(|k| call("zapx", k)).collect();
-    calls.extend((0..3).map(|k| call("ns::zap", 20_000 + k)));
-    let mut writer = db.writer();
-    writer.upsert_file(&path(0), &l1(&[]), Some(&l2(calls))).unwrap();
-    writer.commit().unwrap();
-
-    for stage in ["walk", "dictionary"] {
-        let exact = scan_calls_by_name(&db.view(), "zap", Matching::Exact, 10, None).unwrap();
-        let callees: Vec<&str> = exact.hits.iter().map(|hit| hit.callee.as_str()).collect();
-        assert_eq!(callees, ["ns::zap"; 3], "{stage}");
-        assert_eq!(exact.total, 3, "{stage}");
-        assert!(!exact.total_is_partial, "{stage}: the exact scan reached the end");
-        assert!(exact.next_cursor.is_none(), "{stage}");
-
-        let substring = scan_calls_by_name(&db.view(), "zap", Matching::Substring, 10, None).unwrap();
-        assert!(
-            substring.total_is_partial,
-            "{stage}: the substring scan still stops at its cap"
-        );
-        assert!(substring.hits.iter().all(|hit| hit.callee == "zapx"), "{stage}");
-        build_dicts(&db);
-    }
-}
-
-#[test]
-fn an_exact_impl_scan_is_not_starved_by_substring_only_traits() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = IndexDb::open(dir.path()).unwrap();
-    let mut impls: Vec<(String, String)> = (0..17_000)
-        .map(|k| ("IteratorExt".to_string(), format!("Ty{k}")))
-        .collect();
-    impls.extend((0..2).map(|k| ("std::iter::Iterator<Item = u8>".to_string(), format!("Exact{k}"))));
-    let mut writer = db.writer();
-    writer
-        .upsert_file(&path(0), &l1(&impls), Some(&l2(Vec::new())))
-        .unwrap();
-    writer.commit().unwrap();
-
-    let scan = |matching| {
-        scan_impls_fjall(
-            &db.view(),
-            "Iterator",
-            matching,
-            None,
-            10,
-            None,
-            |_, _| true,
-            |_, _| (0, 0),
-        )
-        .unwrap()
-    };
-    let exact = scan(Matching::Exact);
-    let types: Vec<&str> = exact.hits.iter().map(|hit| hit.impl_type.as_str()).collect();
-    assert_eq!(types, ["Exact0", "Exact1"]);
-    assert_eq!(exact.total, 2);
-    assert!(!exact.total_is_partial && !exact.has_more);
-    assert!(scan(Matching::Substring).total_is_partial);
-}
-
-/// Keys the capped-scan fixtures below hold: 17,000 that only contain the name, then 3 that are it.
-const STARVING_KEYS: usize = 17_003;
-const EXAMINE_CAP: usize = 5_000;
-
-/// An exact scan rejects substring-only keys without counting them toward `scan_cap`, so it needs
-/// its own bound: it stops after examining `EXAMINE_CAP` keys, says the total is partial, and hands
-/// back a cursor that continues from the last key it looked at, so paging still reaches every hit.
-#[test]
-fn an_exact_call_scan_stops_at_the_examined_keys_cap_and_resumes() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = IndexDb::open(dir.path()).unwrap();
-    let mut calls: Vec<Call> = (0..17_000).map(|k| call("zapx", k)).collect();
-    calls.extend((0..3).map(|k| call("ns::zap", 20_000 + k)));
-    let mut writer = db.writer();
-    writer.upsert_file(&path(0), &l1(&[]), Some(&l2(calls))).unwrap();
-    writer.commit().unwrap();
-
-    for stage in ["walk", "dictionary"] {
-        let scan = |cursor: Option<&[u8]>, cap| {
-            scan_calls_examining(&db.view(), "zap", Matching::Exact, 10, cursor, cap).unwrap()
-        };
-        let first = scan(None, EXAMINE_CAP);
-        assert!(first.hits.is_empty(), "{stage}: no exact call among the first keys");
-        assert!(first.total_is_partial, "{stage}: the scan did not reach the end");
-        assert!(first.stopped_after.is_some() && first.next_cursor.is_some(), "{stage}");
-
-        let mut callees: Vec<String> = Vec::new();
-        let mut pages = 1;
-        let mut page = first;
-        while let Some(cursor) = page.next_cursor.take() {
-            let after = cursor.decode_fjall().unwrap();
-            page = scan(Some(&after), EXAMINE_CAP);
-            callees.extend(page.hits.iter().map(|hit| hit.callee.clone()));
-            pages += 1;
-            assert!(pages <= 10, "{stage}: paging must terminate");
-        }
-        assert_eq!(callees, ["ns::zap"; 3], "{stage}: every exact call is reached, once");
-        assert_eq!(pages, STARVING_KEYS.div_ceil(EXAMINE_CAP), "{stage}");
-        assert!(!page.total_is_partial, "{stage}: the last page ran to the end");
-
-        let whole = scan(None, STARVING_KEYS);
-        assert!(
-            !whole.total_is_partial && whole.next_cursor.is_none(),
-            "{stage}: a scan that ends exactly at the cap is complete"
-        );
-        assert_eq!(whole.total, 3, "{stage}");
-        build_dicts(&db);
-    }
-}
-
-#[test]
-fn an_exact_impl_scan_stops_at_the_examined_keys_cap_and_resumes() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = IndexDb::open(dir.path()).unwrap();
-    let mut impls: Vec<(String, String)> = (0..17_000)
-        .map(|k| ("IteratorExt".to_string(), format!("Ty{k}")))
-        .collect();
-    impls.extend((0..3).map(|k| ("std::iter::Iterator<Item = u8>".to_string(), format!("Exact{k}"))));
-    let mut writer = db.writer();
-    writer
-        .upsert_file(&path(0), &l1(&impls), Some(&l2(Vec::new())))
-        .unwrap();
-    writer.commit().unwrap();
-
-    let scan = |cursor: Option<&[u8]>| {
-        scan_impls_examining(
-            &db.view(),
-            "Iterator",
-            Matching::Exact,
-            None,
-            10,
-            cursor,
-            |_, _| true,
-            |_, _| (0, 0),
-            EXAMINE_CAP,
-        )
-        .unwrap()
-    };
-    let mut page = scan(None);
-    assert!(page.hits.is_empty() && page.total_is_partial && !page.has_more);
-    let mut types: Vec<String> = Vec::new();
-    let mut pages = 1;
-    while let Some(after) = page.stopped_after.take() {
-        page = scan(Some(&after));
-        types.extend(page.hits.iter().map(|hit| hit.impl_type.clone()));
-        pages += 1;
-        assert!(pages <= 10, "paging must terminate");
-    }
-    assert_eq!(types, ["Exact0", "Exact1", "Exact2"]);
-    assert_eq!(pages, STARVING_KEYS.div_ceil(EXAMINE_CAP));
-    assert!(!page.total_is_partial);
-}
-
-/// The in-RAM projection a read-only session scans has the same bound and the same cursor.
-#[test]
-fn the_in_ram_call_scan_has_the_same_examined_keys_cap() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let mut source = String::from("fn caller() {\n");
-    source.push_str(&"    zapx();\n".repeat(300));
-    source.push_str("    ns::zap();\n    ns::zap();\n}\n");
-    std::fs::write(root.join("a.rs"), source).unwrap();
-    let mut store = crate::store::Store::open(root, crate::store::VIEW_WORKING).unwrap();
-    crate::scanner::scan(
-        root,
-        &mut store,
-        &crate::config::ConfigV1::with_defaults(),
-        crate::scanner::ScanSource::WorkingTree,
-        crate::scanner::EmbedMode::Inline,
-    )
-    .unwrap();
-    let cache = crate::mcp::MapCache::build(&store, 0);
-    let scan = |cursor: Option<&[u8]>| {
-        scan_calls_in_ram_examining(cache.calls_projection(), "zap", Matching::Exact, 10, cursor, 100)
-    };
-
-    let mut page = scan(None);
-    assert!(page.total_is_partial && page.stopped_after.is_some());
-    let mut callees: Vec<String> = page.hits.iter().map(|hit| hit.callee.clone()).collect();
-    let mut pages = 1;
-    while let Some(cursor) = page.next_cursor.take() {
-        let after = cursor.decode_fjall().unwrap();
-        page = scan(Some(&after));
-        callees.extend(page.hits.iter().map(|hit| hit.callee.clone()));
-        pages += 1;
-        assert!(pages <= 10, "paging must terminate");
-    }
-    assert_eq!(callees.len(), 2, "both exact calls, once each: {callees:?}");
-    assert!(callees.iter().all(|callee| callee.ends_with("zap")), "{callees:?}");
-    assert_eq!(pages, 302usize.div_ceil(100));
-    assert!(!page.total_is_partial);
-
-    let zero = scan_calls_in_ram_examining(cache.calls_projection(), "zap", Matching::Exact, 10, None, 0);
-    assert!(zero.total_is_partial && zero.stopped_after.is_some());
-}
-
-/// A cap of zero would examine nothing and so have no key to resume from; it examines one.
-#[test]
-fn an_examined_keys_cap_of_zero_still_yields_a_resumable_page() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = IndexDb::open(dir.path()).unwrap();
-    let impls: Vec<(String, String)> = (0..3).map(|k| ("IteratorExt".to_string(), format!("Ty{k}"))).collect();
-    let mut writer = db.writer();
-    writer
-        .upsert_file(
-            &path(0),
-            &l1(&impls),
-            Some(&l2((0..3).map(|k| call("zapx", k)).collect())),
-        )
-        .unwrap();
-    writer.commit().unwrap();
-
-    let calls = scan_calls_examining(&db.view(), "zap", Matching::Exact, 10, None, 0).unwrap();
-    assert!(calls.total_is_partial && calls.stopped_after.is_some() && calls.next_cursor.is_some());
-    let impls = scan_impls_examining(
-        &db.view(),
-        "Iterator",
-        Matching::Exact,
-        None,
-        10,
-        None,
-        |_, _| true,
-        |_, _| (0, 0),
-        0,
-    )
-    .unwrap();
-    assert!(impls.total_is_partial && impls.stopped_after.is_some());
-}
-
-fn hit(callee: &str) -> ReferenceHit {
-    ReferenceHit {
-        path: path(0),
-        line: 1,
-        column: 0,
-        callee: callee.to_string(),
-        resolved: None,
-    }
-}
-
-/// A daemon that predates `exact` answers with substring hits. Dropping this page's share of them
-/// leaves a total that still counts the ones on later pages, an upper bound; no scan cap was hit, so
-/// the page must not report one.
-#[test]
-fn dropping_hits_from_a_forwarded_page_does_not_report_a_scan_cap() {
-    let page = || {
-        CallScanPage::finish(
-            40,
-            false,
-            vec![hit("zap"), hit("zapx"), hit("ns::zap")],
-            vec![vec![1], vec![2], vec![3]],
-            vec![10, 20, 30],
-            true,
-            None,
-        )
-    };
-    let mut filtered = page();
-    filtered.retain(|hit| Matching::Exact.accepts_callee(&hit.callee, "zap"));
-    assert_eq!(filtered.hits.len(), 2);
-    assert_eq!(filtered.hit_keys, [vec![1], vec![3]]);
-    assert_eq!(filtered.hit_starts, [10, 30]);
-    assert_eq!(
-        filtered.total, 39,
-        "an upper bound: later pages hold more substring hits"
-    );
-    assert!(!filtered.total_is_partial, "no scan cap was hit");
-
-    let mut untouched = page();
-    untouched.retain(|_| true);
-    assert_eq!(untouched.total, 40);
-    assert!(!untouched.total_is_partial, "nothing dropped, nothing to qualify");
-
-    let implementation = |trait_name: &str| crate::mcp::types_impls::ImplementationHit {
-        path: path(0),
-        trait_name: trait_name.to_string(),
-        impl_type: "Ty".to_string(),
-        start_row: 1,
-        start_col: 0,
-    };
-    let mut impls = crate::mcp::helpers_impls::ImplScanPage {
-        total: 9,
-        total_is_partial: false,
-        hits: vec![implementation("IteratorExt"), implementation("Iterator")],
-        hit_keys: vec![vec![1], vec![2]],
-        has_more: true,
-        stopped_after: None,
-    };
-    impls.retain(|hit| Matching::Exact.accepts_trait(&hit.trait_name, "Iterator"));
-    assert_eq!(impls.hit_keys, [vec![2]]);
-    assert_eq!(impls.total, 8);
-    assert!(!impls.total_is_partial, "no scan cap was hit");
-}
-
-/// The caller-scan half of `index::layered_view`'s pinned-overlay test: a name scan over the layered
-/// view pages exactly like the same scan over the standalone database holding the same rows.
-#[test]
-fn pinned_overlay_caller_scans_match_standalone() {
-    use crate::index::view::IndexView;
-
-    let fixture = crate::index::layered_view::pinned_overlay_fixture();
-    let (view, alpha) = (&fixture.view, &fixture.alpha);
-    let scan = |view: &dyn IndexView, after: Option<&[u8]>| {
-        let page = crate::mcp::scan_calls_by_name(view, "run", crate::mcp::Matching::Substring, 1, after).unwrap();
-        (
-            page.hit_keys,
-            page.total,
-            page.total_is_partial,
-            page.next_cursor.map(|cursor| cursor.0),
-        )
-    };
-    let reference = fixture.reference.view();
-    assert_eq!(scan(view, None), scan(&reference, None));
-    assert_eq!(scan(view, Some(alpha)), scan(&reference, Some(alpha)));
-}
-
-/// A caller scan over a layered view pages exactly like the same scan over a standalone scan of the
-/// merged tree, across generated worktree edits.
-#[test]
-fn scanned_caller_pages_match_after_generated_worktree_edits() {
-    use crate::config::Config as ScanConfig;
-    use crate::index::layered_shadow::DeltaManifest;
-    use crate::index::layered_view::LayeredView;
-    use crate::index::view::IndexView;
-    use crate::path::RelPath;
-    use crate::scanner::{EmbedMode, ScanSource, scan, scan_paths};
-    use crate::store::Store;
-    use ahash::AHashMap;
-    use proptest::prelude::*;
-    use proptest::test_runner::{Config, TestRunner};
-
-    fn fixture(files: &[(String, String)], incremental: bool) -> (tempfile::TempDir, Store) {
-        let directory = tempfile::tempdir().unwrap();
-        for (name, text) in files {
-            std::fs::write(directory.path().join(name), text).unwrap();
-        }
-        let mut store = Store::open(directory.path(), "working").unwrap();
-        let mut config = ScanConfig::with_defaults();
-        config.documents.enabled = false;
-        let root = directory.path();
-        let report = if incremental {
-            let candidates = files.iter().map(|(name, _)| root.join(name)).collect::<Vec<_>>();
-            scan_paths(root, &mut store, &config, &candidates, EmbedMode::Deferred)
-        } else {
-            scan(root, &mut store, &config, ScanSource::WorkingTree, EmbedMode::Deferred)
-        }
-        .unwrap();
-        assert_eq!(report.stats.read_failed + report.stats.extract_failed, 0);
-        assert_eq!(store.index.files.len(), files.len());
-        (directory, store)
-    }
-
-    fn pages(view: &dyn IndexView) -> Vec<serde_json::Value> {
-        let mut output = Vec::new();
-        let mut after = None;
-        loop {
-            let page =
-                crate::mcp::scan_calls_by_name(view, "target", crate::mcp::Matching::Substring, 2, after.as_deref())
-                    .unwrap();
-            after = page.hit_keys.last().cloned();
-            let cursor = page.next_cursor.map(|cursor| cursor.0);
-            let done = cursor.is_none();
-            output.push(serde_json::json!({
-                "hits": page.hits,
-                "keys": page.hit_keys,
-                "total": page.total,
-                "partial": page.total_is_partial,
-                "cursor": cursor,
-            }));
-            if done {
-                return output;
-            }
-            assert!(output.len() < 10);
-        }
-    }
-
-    crate::store::init_isolated_cache();
-    let original = vec![
-        ("keep.rs".into(), "fn a() { target(); }".into()),
-        ("edit.rs".into(), "fn b() { target(); }".into()),
-        ("delete.rs".into(), "fn c() { target(); }".into()),
-        ("rename.rs".into(), "fn d() { target(); }".into()),
-    ];
-    let (_base_root, base) = fixture(&original, false);
-    let counts = base.index.files.values().fold(AHashMap::new(), |mut counts, entry| {
-        *counts.entry(entry.hash_hex.as_str()).or_default() += 1;
-        counts
-    });
-    let case_count = std::env::var("BASEMIND_LAYERED_CASES")
-        .map_or(12, |value| value.parse::<u32>().expect("integer layered case count"));
-    assert!(case_count > 0);
-    let executed = std::cell::Cell::new(0);
-    let cases = (2usize..5, 0u8..8, 0u8..3);
-    let mut runner = TestRunner::new(Config {
-        cases: case_count,
-        failure_persistence: None,
-        ..Config::default()
-    });
-    runner
-        .run(&cases, |(calls, flags, worktree)| {
-            executed.set(executed.get() + 1);
-            let delete = flags & 1 != 0;
-            let rename = flags & 2 != 0;
-            let duplicate = flags & 4 != 0;
-            let mut changed = vec![
-                ("edit.rs".into(), format!("fn b() {{ {} }}", "target(); ".repeat(calls))),
-                ("added.rs".into(), format!("fn worktree_{worktree}() {{ target(); }}")),
-            ];
-            if rename {
-                changed.push(("renamed.rs".into(), original[3].1.clone()));
-            }
-            if duplicate {
-                changed.push(("duplicate.rs".into(), original[0].1.clone()));
-            }
-            let (_overlay_root, overlay) = fixture(&changed, true);
-            let mut working = changed;
-            working.push(original[0].clone());
-            if !delete {
-                working.push(original[2].clone());
-            }
-            if !rename {
-                working.push(original[3].clone());
-            }
-            let (_reference_root, reference) = fixture(&working, false);
-            let mut delta = DeltaManifest::empty(1, "fixture".into(), 1);
-            for (path, entry) in &overlay.index.files {
-                delta.upsert(path.clone(), entry.clone(), base.index.files.get(path));
-            }
-            if delete {
-                delta.delete(RelPath::from("delete.rs"));
-            }
-            if rename {
-                delta.delete(RelPath::from("rename.rs"));
-            }
-            let shadow = delta.shadow(&counts, |path| base.index.files.get(path));
-            let view = LayeredView::new(
-                base.index_db.as_ref().unwrap(),
-                overlay.index_db.as_ref().unwrap(),
-                shadow,
-            )
-            .unwrap();
-            let expected = pages(&reference.index_view().unwrap());
-            prop_assert!(expected.len() >= 2);
-            prop_assert_eq!(pages(&view), expected);
-            crate::index::verify_shared_base(&view, &reference.index_view().unwrap())
-                .map_err(|error| TestCaseError::fail(error.to_string()))?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(executed.get(), case_count);
-    eprintln!("verified {case_count} layered parity cases");
 }

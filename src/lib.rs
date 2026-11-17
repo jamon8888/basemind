@@ -2,7 +2,6 @@
 
 pub mod alloc_tag;
 pub mod backpressure;
-mod boot_identity;
 #[cfg(feature = "code-search")]
 pub mod chunk;
 /// The scan pipeline's one chunked-drive primitive: a serial loop over weight-bounded chunks with
@@ -12,9 +11,8 @@ pub mod cli;
 pub mod comms;
 pub mod config;
 /// Single-owner daemon lock + pidfile + the machine-wide, kind-tagged live-daemon registry and
-/// ceiling, shared by every daemon family.
+/// ceiling, shared by every daemon family (the comms broker, shells).
 pub mod daemon_lock;
-pub mod disk_space;
 #[cfg(feature = "intelligence")]
 pub mod embeddings;
 pub mod eval;
@@ -34,36 +32,35 @@ pub mod lang;
 pub mod lang_rules;
 pub mod mcp;
 pub mod path;
-pub mod process_start;
+pub mod pii;
+/// Protected-workspace detection: the boundary that keeps the true values out of the
+/// agent's reach inside a `safe/` mirror workspace.
+pub mod protected;
 pub mod query;
 pub mod registry;
 pub mod render;
-pub(crate) mod retrieval_wiring;
 pub mod scan_evidence;
-mod scan_evidence_hosts;
-pub mod scan_phase_peaks;
-pub(crate) mod scan_retrieval;
+pub mod scan_metrics;
 pub mod scanner;
 pub(crate) mod scanner_candidates;
 #[cfg(feature = "code-search")]
 pub mod scanner_code;
+pub(crate) mod scanner_doc_lane;
+#[cfg(feature = "documents")]
+pub mod scanner_doc_links;
 #[cfg(feature = "documents")]
 pub mod scanner_docs;
-#[cfg(feature = "documents")]
-pub(crate) mod scanner_docs_lane;
 pub(crate) mod scanner_drive;
 pub mod scanner_file;
 pub(crate) mod scanner_filter;
-pub(crate) mod scanner_flush;
 pub(crate) mod scanner_index_batch;
-pub(crate) mod scanner_integrity;
 pub mod scanner_lanes;
 pub(crate) mod scanner_policy;
-pub(crate) mod scanner_vectors;
+pub(crate) mod scanner_scope;
 pub mod search;
+#[cfg(all(feature = "shells", any(unix, windows)))]
+pub mod shells;
 pub mod store;
-pub mod store_base;
-mod store_base_retention;
 pub mod store_blob;
 mod store_blob_codec;
 pub mod store_cache_admin;
@@ -71,19 +68,19 @@ pub mod store_doc_tombstone;
 pub mod store_gc;
 pub mod store_gc_budget;
 pub(crate) mod store_gc_live;
-mod store_gc_namespaces;
 pub mod store_gc_protect;
 pub mod store_gc_workspace;
-mod store_hash_refs;
 pub mod store_layout;
 mod store_lock;
-mod store_migration;
-pub mod store_pending;
 mod store_seed;
 pub mod sysres;
-pub mod textmatch;
+pub mod textcompress;
+#[cfg(feature = "crawl")]
+pub mod url;
 pub mod version;
 pub mod watcher;
+#[cfg(feature = "crawl")]
+pub mod web;
 
 pub use config::Config;
 

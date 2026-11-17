@@ -1,9 +1,18 @@
-//! Bodies of the index verb tools: `index_status` and `index_rescan`. Kept out of `helpers.rs` so
-//! that file stays under the 1000-line cap.
+//! Helper bodies for the consolidated `admin` domain tool — one `run_<mode>` per [`AdminMode`],
+//! plus the [`run_admin`] dispatcher the `#[tool]` shim and the CLI both call. Kept out of
+//! `helpers.rs` so that file stays under the 1000-line cap.
 //!
-//! The cache operations (`stats`, `gc`, `clear`) have no MCP tool: `basemind cache …` runs them
-//! offline against `store_gc`, which is the only safe place to sweep a blob store shared by every
-//! workspace on the machine.
+//! The four text-compression modes (`compress` / `delta` / `checkpoint` / `waste`) keep their
+//! bodies in `helpers_compress.rs`, alongside `expand`'s, which shares their machinery.
+//!
+//! ## GC is a non-destructive report while the blob store is machine-global
+//!
+//! The blob store is a single machine-global directory shared by every workspace, so the MCP
+//! `cache_gc` tool (this file) cannot mark-and-sweep from inside a session: it would race that
+//! session's own rescans. It returns a non-destructive report ([`crate::store_gc::gc_report_only`],
+//! `removed == 0`). The cross-workspace reference-counted sweep is the daemon's maintenance task
+//! and the offline CLI `cache gc` ([`crate::store_gc::run_gc`]), both via
+//! [`crate::store_gc::gc_global_blobs`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,30 +21,180 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 
 use super::ServerState;
-use super::helpers::{elapsed_us, json_result, scan_and_refresh};
-use super::tools::{count_fm_blobs, index_note};
-use super::types::StatusResponse;
-use super::types_tools::IndexRescanParams;
+use super::helpers::{elapsed_us, json_result, require_git_repo, scan_and_refresh};
+use super::mode::{AdminMode, reject_unsupported};
+use super::tools::{blob_divergence_note, count_fm_blobs};
+use super::types::{
+    CacheClearParams, CacheClearResponse, CacheGcParams, CacheGcResponse, CacheStatsParams, CacheStatsResponse,
+    RepoInfoResponse, StatusResponse,
+};
+use super::types_admin::AdminParams;
+use super::types_compress::{CheckpointParams, CompressParams, DeltaParams, DetectWasteParams};
+use crate::store_gc::{self, CacheComponent};
 
-/// Where `index_rescan` reports progress: the calling peer and the progress token it sent, if any.
+/// The progress channel `rescan` reports on: the calling peer and the progress token it supplied.
+/// `None` on the CLI path, which has no MCP peer.
 pub(super) type Progress<'a> = Option<(&'a rmcp::Peer<rmcp::RoleServer>, Option<rmcp::model::ProgressToken>)>;
 
-/// `index_status`: index health plus repository identity.
-pub(super) async fn index_status(state: &ServerState) -> Result<CallToolResult, McpError> {
-    run_status(state).await
+/// Fail a mode that was given a field belonging to some other mode.
+///
+/// Inverted against `allowed` rather than listing every rejected field per mode: with eleven modes
+/// and fifteen sibling fields, an explicit per-mode reject list is where a newly added field
+/// silently becomes accept-everywhere.
+fn reject_foreign_fields(mode: AdminMode, present: &[(&str, bool)], allowed: &[&str]) -> Result<(), McpError> {
+    let foreign: Vec<(&str, bool)> = present
+        .iter()
+        .filter(|(field, _)| !allowed.contains(field))
+        .copied()
+        .collect();
+    reject_unsupported(AdminMode::DOMAIN, mode.as_str(), &foreign)
 }
 
-/// `index_rescan`: re-index the given paths, or the whole workspace when none is given.
-pub(super) async fn index_rescan(
+/// Unwrap a field this mode cannot run without, naming the exact `mode`/field pair.
+fn require_field<T>(mode: AdminMode, field: &str, value: Option<T>) -> Result<T, McpError> {
+    value
+        .ok_or_else(|| McpError::invalid_params(format!("`admin` mode=\"{}\" requires `{field}`", mode.as_str()), None))
+}
+
+/// Dispatch the single `admin` tool onto the per-operation helper its `mode` selects.
+///
+/// Fields belonging to another mode are rejected rather than dropped: a silently ignored
+/// `component` on a `gc` call reads to an agent as a successful targeted clear.
+pub(super) async fn run_admin(
     state: Arc<ServerState>,
-    p: IndexRescanParams,
+    params: AdminParams,
     progress: Progress<'_>,
 ) -> Result<CallToolResult, McpError> {
-    let (peer, token) = progress.map_or((None, None), |(peer, token)| (Some(peer), token));
-    run_rescan(state, super::types::RescanParams { paths: p.paths }, peer, token).await
+    let AdminParams {
+        mode,
+        paths,
+        full,
+        window,
+        tool,
+        component,
+        confirm,
+        text,
+        path,
+        level,
+        preserve_code,
+        target_tokens,
+        old,
+        new,
+        log,
+    } = params;
+    let present = [
+        ("paths", paths.is_some()),
+        ("full", full.is_some()),
+        ("window", window.is_some()),
+        ("tool", tool.is_some()),
+        ("component", component.is_some()),
+        ("confirm", confirm.is_some()),
+        ("text", text.is_some()),
+        ("path", path.is_some()),
+        ("level", level.is_some()),
+        ("preserve_code", preserve_code.is_some()),
+        ("target_tokens", target_tokens.is_some()),
+        ("old", old.is_some()),
+        ("new", new.is_some()),
+        ("log", log.is_some()),
+    ];
+    let reject = |allowed: &[&str]| reject_foreign_fields(mode, &present, allowed);
+
+    match mode {
+        AdminMode::Status => {
+            reject(&[])?;
+            run_status(&state).await
+        }
+        AdminMode::Repo => {
+            reject(&[])?;
+            run_repo(&state)
+        }
+        AdminMode::Rescan => {
+            reject(&["paths", "full"])?;
+            let (peer, token) = progress.map_or((None, None), |(peer, token)| (Some(peer), token));
+            run_rescan(
+                state,
+                super::types::RescanParams {
+                    paths,
+                    full: full.unwrap_or(false),
+                },
+                peer,
+                token,
+            )
+            .await
+        }
+        AdminMode::CacheStats => {
+            reject(&[])?;
+            run_cache_stats(state, CacheStatsParams {}).await
+        }
+        AdminMode::Gc => {
+            reject(&[])?;
+            run_cache_gc(state, CacheGcParams {}).await
+        }
+        AdminMode::CacheClear => {
+            reject(&["component", "confirm"])?;
+            run_cache_clear(
+                state,
+                CacheClearParams {
+                    component: require_field(mode, "component", component)?,
+                    confirm: confirm.unwrap_or(false),
+                },
+            )
+            .await
+        }
+        AdminMode::Telemetry => {
+            reject(&["window", "tool"])?;
+            super::helpers::run_telemetry_summary(&state, super::types::TelemetrySummaryParams { window, tool }).await
+        }
+        AdminMode::Compress => {
+            reject(&["text", "path", "level", "preserve_code", "target_tokens"])?;
+            super::helpers_compress::run_compress(
+                &state,
+                CompressParams {
+                    text,
+                    path,
+                    level,
+                    preserve_code: preserve_code.unwrap_or(true),
+                    target_tokens,
+                },
+            )
+            .await
+        }
+        AdminMode::Delta => {
+            reject(&["old", "new"])?;
+            super::helpers_compress::run_delta(
+                &state,
+                DeltaParams {
+                    old: require_field(mode, "old", old)?,
+                    new: require_field(mode, "new", new)?,
+                },
+            )
+            .await
+        }
+        AdminMode::Checkpoint => {
+            reject(&["text"])?;
+            super::helpers_compress::run_checkpoint(
+                &state,
+                CheckpointParams {
+                    text: require_field(mode, "text", text)?,
+                },
+            )
+            .await
+        }
+        AdminMode::Waste => {
+            reject(&["log"])?;
+            super::helpers_compress::run_detect_waste(
+                &state,
+                DetectWasteParams {
+                    log: require_field(mode, "log", log)?,
+                },
+            )
+            .await
+        }
+    }
 }
 
-/// Body of `index_status`: index health for the served view — file counts, per-language
+/// Body for `admin` mode `status`: index health for the served view — file counts, per-language
 /// breakdown, on-disk blob count, and the lifecycle flags a client needs to tell "still indexing"
 /// apart from "nothing indexed".
 ///
@@ -57,7 +216,6 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
         (ms > 0).then_some(ms)
     };
     let notice = state.lifecycle_notice();
-    let identity = repo_identity(state);
     let store = match state.shared.store.try_read() {
         Ok(store) => store,
         Err(_) => {
@@ -69,10 +227,7 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
                      lock); index counts are unavailable until it completes"
                         .to_string(),
                 ),
-                rescan_needed: false,
                 rebuild_in_progress: true,
-                partial: false,
-                degraded: None,
                 indexing,
                 index_build_ms,
                 warming,
@@ -80,8 +235,9 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
                 notice,
                 total_size_bytes: 0,
                 languages: BTreeMap::new(),
-                cache_dir: cache_dir(state),
-                grammar_dir: grammar_dir(),
+                cache_dir: crate::lang::grammar_cache_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unresolved)".to_string()),
                 schema_version: crate::extract::SCHEMA_VER,
                 root: state.shared.root.display().to_string(),
                 submodules: state
@@ -91,9 +247,6 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
                     .map(|r| r.submodule_paths())
                     .unwrap_or_default(),
                 config_stamp: config_stamp(state),
-                branch: identity.branch.clone(),
-                head_sha: identity.head_sha.clone(),
-                head_short_sha: identity.head_short_sha.clone(),
                 elapsed_us: elapsed_us(body),
             });
         }
@@ -105,6 +258,9 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
         total_size = total_size.saturating_add(entry.size_bytes);
     }
     let by_lang: BTreeMap<String, usize> = by_lang_ref.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let cache_dir = crate::lang::grammar_cache_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unresolved)".to_string());
     let submodules = state
         .shared
         .repo
@@ -113,19 +269,12 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
         .unwrap_or_default();
     let file_count = store.index.files.len();
     let blob_count = count_fm_blobs();
-    let rescan_needed = store.rescan_owed();
-    let note = index_note(rescan_needed, file_count, blob_count);
-    let last_scan = crate::store::read_status_sidecar(&store.basemind_dir);
+    let note = blob_divergence_note(file_count, blob_count);
     json_result(&StatusResponse {
         file_count,
         blob_count,
         note,
-        rescan_needed,
         rebuild_in_progress: false,
-        partial: last_scan.as_ref().is_some_and(|status| status.partial),
-        degraded: last_scan
-            .as_ref()
-            .and_then(crate::store::StatusSidecar::degraded_summary),
         indexing,
         index_build_ms,
         warming,
@@ -133,56 +282,155 @@ async fn run_status(state: &ServerState) -> Result<CallToolResult, McpError> {
         notice,
         total_size_bytes: total_size,
         languages: by_lang,
-        cache_dir: cache_dir(state),
-        grammar_dir: grammar_dir(),
+        cache_dir,
         schema_version: crate::extract::SCHEMA_VER,
         root: state.shared.root.display().to_string(),
         submodules,
         config_stamp: config_stamp(state),
-        branch: identity.branch,
-        head_sha: identity.head_sha,
-        head_short_sha: identity.head_short_sha,
         elapsed_us: elapsed_us(body),
     })
-}
-
-/// Where basemind keeps this workspace's index, views and caches.
-fn cache_dir(state: &ServerState) -> String {
-    crate::store::workspace_cache_dir(&state.shared.root)
-        .display()
-        .to_string()
-}
-
-/// Where the tree-sitter grammars are cached; shared with every other user of the language pack.
-fn grammar_dir() -> Option<String> {
-    crate::lang::grammar_cache_dir().map(|dir| dir.display().to_string())
-}
-
-/// Branch and HEAD of the served repository; all `None` outside a git repository.
-struct RepoIdentity {
-    branch: Option<String>,
-    head_sha: Option<String>,
-    head_short_sha: Option<String>,
-}
-
-fn repo_identity(state: &ServerState) -> RepoIdentity {
-    let info = state.shared.repo.as_ref().and_then(|repo| repo.info().ok());
-    RepoIdentity {
-        branch: info.as_ref().and_then(|info| info.branch.clone()),
-        head_sha: info.as_ref().and_then(|info| info.head_sha.clone()),
-        head_short_sha: info.and_then(|info| info.head_short_sha),
-    }
 }
 
 fn config_stamp(state: &ServerState) -> String {
     crate::config::daemon::ConfigStamp::of(&state.shared.root).to_string()
 }
 
-/// Body of `index_rescan`. Re-indexes the working tree (or `paths`) in-process and,
+/// Body for `admin` mode `repo`: repository identity — workdir, branch, full + short HEAD sha.
+fn run_repo(state: &ServerState) -> Result<CallToolResult, McpError> {
+    let body = std::time::Instant::now();
+    let repo = require_git_repo(state)?;
+    let info = repo
+        .info()
+        .map_err(|e| McpError::internal_error(format!("repo info: {e}"), None))?;
+    json_result(&RepoInfoResponse {
+        workdir: info.workdir.display().to_string(),
+        head_sha: info.head_sha,
+        head_short_sha: info.head_short_sha,
+        branch: info.branch,
+        elapsed_us: elapsed_us(body),
+    })
+}
+
+/// Body for `admin` mode `cache_stats`. Read-only: takes a `blocking_read()` store
+/// guard inside `spawn_blocking` and gathers per-component sizes + blob accounting.
+async fn run_cache_stats(state: Arc<ServerState>, _params: CacheStatsParams) -> Result<CallToolResult, McpError> {
+    let state_for_stats = Arc::clone(&state);
+    let stats = tokio::task::spawn_blocking(move || {
+        let store = state_for_stats.shared.store.blocking_read();
+        store_gc::cache_stats(&store.basemind_dir)
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("cache_stats join: {e}"), None))?
+    .map_err(|e| McpError::internal_error(format!("cache_stats: {e}"), None))?;
+
+    json_result(&CacheStatsResponse::from(stats))
+}
+
+/// Body for `admin` mode `gc`. Reports blob-store accounting without deleting.
+///
+/// The blob store is machine-global now (shared by every workspace), so a single serve session can
+/// only enumerate ONE workspace's references — never the full live set across all workspaces. A
+/// mark-and-sweep from here would reap blobs other workspaces still need, so the in-process GC is a
+/// non-destructive report (`removed == 0`); reference-counted GC that spans every workspace is the
+/// daemon's job (Track E). `scanned` still reflects the blobs inspected so callers see the store
+/// size.
+async fn run_cache_gc(state: Arc<ServerState>, _params: CacheGcParams) -> Result<CallToolResult, McpError> {
+    let _ = &state;
+    let report = tokio::task::spawn_blocking(store_gc::gc_report_only)
+        .await
+        .map_err(|e| McpError::internal_error(format!("cache_gc join: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("cache_gc: {e}"), None))?;
+
+    json_result(&CacheGcResponse::from(report))
+}
+
+/// Body for `admin` mode `cache_clear`. Parses + validates the component token,
+/// gates the destructive (live-index-backing) components behind `confirm=true`, and
+/// rebuilds the live state after a destructive clear so queries recover.
+async fn run_cache_clear(state: Arc<ServerState>, params: CacheClearParams) -> Result<CallToolResult, McpError> {
+    if let Some(name) = params.component.strip_prefix("views:") {
+        let name = name.to_string();
+        let active_view = state.shared.store.read().await.view.clone();
+        if name == active_view {
+            return Err(McpError::invalid_request(
+                format!(
+                    "view `{name}` is the one this server is serving; clearing it would break \
+                     the live index. Stop the server and run `basemind cache clear --component \
+                     views:{name}`, or serve a different view."
+                ),
+                None,
+            ));
+        }
+        let dir = state.shared.store.read().await.basemind_dir.clone();
+        tokio::task::spawn_blocking(move || store_gc::clear_single_view(&dir, &name))
+            .await
+            .map_err(|e| McpError::internal_error(format!("cache_clear join: {e}"), None))?
+            .map_err(|e| McpError::invalid_request(format!("cache_clear: {e}"), None))?;
+        return json_result(&CacheClearResponse {
+            component: params.component.clone(),
+            cleared: true,
+        });
+    }
+
+    let component: CacheComponent = params.component.parse().map_err(|e: String| {
+        McpError::invalid_request(
+            format!("{e} (valid: blobs|views|lance|git-cache|telemetry|all, or views:<name>)"),
+            None,
+        )
+    })?;
+
+    match component {
+        CacheComponent::All | CacheComponent::Views => Err(McpError::invalid_request(
+            format!(
+                "clearing `{}` removes the live Fjall index out from under the running \
+                 server; stop the server and run `basemind cache clear --component {}`",
+                component.as_str(),
+                component.as_str()
+            ),
+            None,
+        )),
+        CacheComponent::Blobs => {
+            if !params.confirm {
+                return Err(McpError::invalid_request(
+                    "clearing `blobs` drops cached extractions; pass confirm=true to proceed \
+                     (a rescan runs afterwards to rebuild them)",
+                    None,
+                ));
+            }
+            clear_live_component(Arc::clone(&state), component).await?;
+            scan_and_refresh(state, None, crate::scanner::EmbedMode::Inline).await?;
+            json_result(&CacheClearResponse {
+                component: component.as_str().to_string(),
+                cleared: true,
+            })
+        }
+        CacheComponent::Lance | CacheComponent::GitCache | CacheComponent::Telemetry => {
+            clear_live_component(Arc::clone(&state), component).await?;
+            json_result(&CacheClearResponse {
+                component: component.as_str().to_string(),
+                cleared: true,
+            })
+        }
+    }
+}
+
+/// Clear a single component under a `blocking_write()` store guard. The write guard
+/// serializes against `scan_and_refresh` and the stats/GC read guards for the wipe.
+async fn clear_live_component(state: Arc<ServerState>, component: CacheComponent) -> Result<(), McpError> {
+    tokio::task::spawn_blocking(move || {
+        let store = state.shared.store.blocking_write();
+        store_gc::clear_component(&store.basemind_dir, component)
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("cache_clear join: {e}"), None))?
+    .map_err(|e| McpError::internal_error(format!("cache_clear: {e}"), None))
+}
+
+/// Body for `admin` mode `rescan`. Re-indexes the working tree (or `paths`) in-process and,
 /// because it is one of the few genuinely slow operations, emits MCP progress (when the client
 /// supplies a token); the summary counts are in the tool result.
 ///
-/// `peer` is `None` on the CLI path: a one-shot `basemind rescan` has no MCP peer to notify,
+/// `peer` is `None` on the CLI path: a one-shot `basemind admin rescan` has no MCP peer to notify,
 /// so the progress notifications are skipped while the scan itself is identical.
 async fn run_rescan(
     state: Arc<ServerState>,
@@ -191,13 +439,13 @@ async fn run_rescan(
     progress_token: Option<rmcp::model::ProgressToken>,
 ) -> Result<CallToolResult, McpError> {
     let started = std::time::Instant::now();
-    let scoped_paths: Option<Vec<std::path::PathBuf>> = match params.paths {
+    let scoped_paths: Option<Vec<std::path::PathBuf>> = match params.paths.filter(|_| !params.full) {
         None => None,
         Some(requested) => {
             let mut out = Vec::with_capacity(requested.len());
             for p in requested {
                 let normalized = crate::path::normalize_query_path(&p, &state.shared.root).ok_or_else(|| {
-                    McpError::invalid_params(format!("`index_rescan`: path {p:?} escapes the repository root"), None)
+                    McpError::invalid_params(format!("rescan: path {p:?} escapes the repository root"), None)
                 })?;
                 out.push(state.shared.root.join(normalized));
             }
@@ -213,6 +461,24 @@ async fn run_rescan(
 
     let stats = fetch_rescan_stats(&state, scoped_paths).await?;
 
+    if let Some(peer) = peer {
+        #[allow(deprecated)]
+        super::notifications::emit_log(
+            peer,
+            &state.log_level,
+            rmcp::model::LoggingLevel::Info,
+            "basemind.rescan",
+            serde_json::json!({
+                "event": "rescan_complete",
+                "scanned": stats.scanned,
+                "updated": stats.updated,
+                "removed": stats.removed,
+                "extract_failed": stats.extract_failed,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+        )
+        .await;
+    }
     if let (Some(peer), Some(token)) = (peer, progress_token) {
         let scanned = stats.scanned as f64;
         super::notifications::emit_progress(
@@ -269,7 +535,7 @@ async fn fetch_rescan_stats(
 ) -> Result<RescanStats, McpError> {
     #[cfg(all(feature = "comms", any(unix, windows)))]
     if state.shared.daemon_writer {
-        let report = super::daemon_forward::writer_rescan_and_refresh(state, scoped_paths, false, true, true).await?;
+        let report = super::daemon_forward::writer_rescan_and_refresh(state, scoped_paths, false, true).await?;
         return Ok(RescanStats {
             scanned: report.scanned,
             updated: report.updated,
@@ -283,7 +549,7 @@ async fn fetch_rescan_stats(
             extract_failed: 0,
         });
     }
-    let report = scan_and_refresh(Arc::clone(state), scoped_paths, crate::scanner::EmbedMode::Inline, true).await?;
+    let report = scan_and_refresh(Arc::clone(state), scoped_paths, crate::scanner::EmbedMode::Inline).await?;
     Ok(RescanStats {
         scanned: report.stats.scanned,
         updated: report.stats.updated,

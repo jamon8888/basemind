@@ -10,68 +10,16 @@
 //! if a live daemon answers a ping, we back off; if nothing answers, the socket is an orphan
 //! from a crashed daemon and we unlink + rebind. This probe-before-unlink keeps two daemons
 //! from racing into a split brain.
-//!
-//! ## Protocol generations
-//!
-//! Everything a daemon owns — socket (or named pipe), `daemon.lock`, `daemon.pid`, `store.fjall/`,
-//! `daemon.log`, `http.addr` — lives in a per-generation subdirectory of the comms directory, named
-//! by [`RENDEZVOUS_GENERATION`]. A binary only ever looks inside its own generation, so two installed
-//! releases of different generations each run their own daemon and cannot see, stop or signal the
-//! other's. The machine registry is scoped the same way (see [`crate::daemon_lock`]), so
-//! `comms stop --all` and `comms doctor` reach this generation's daemons only. Releases up to 0.33
-//! predate this and use the comms directory itself; that unscoped layout is their generation, and
-//! this binary never opens it.
-//!
-//! ## Takeover within a generation
-//!
-//! One generation holds exactly one daemon. A client that finds one running reads its `Status`
-//! and decides ([`ensure_daemon`]):
-//!
-//! | Running daemon is | same protocol | different protocol |
-//! |---|---|---|
-//! | newer than this binary | use it | fail with `NewerDaemon`; it is not asked to stop |
-//! | the same version | use it | use it; no two releases differ this way, and `Hello` reports the mismatch |
-//! | older than this binary | ask it to stop | ask it to stop |
-//!
-//! A daemon of the same or a newer release is therefore never asked to stop. "Ask it to stop" sends
-//! `Stop` and then follows the daemon's answer:
-//!
-//! | Answer to `Stop` | Result |
-//! |---|---|
-//! | accepted | wait for it to exit, then spawn this binary's daemon |
-//! | refused with `store_error` | never signalled: fail with `FailingPredecessor`, which names the store |
-//! | refused (`daemon_busy`, or any other error) | never signalled: use it when the protocol matches, else fail with `BusyPredecessor` |
-//! | none, but it still answers `Ping` | never signalled: fail with `StalePredecessor` |
-//! | none, and `Ping` goes unanswered too | wait the exit window as for an accepted `Stop` |
-//!
-//! A daemon whose socket has gone quiet has the whole exit window to leave by itself, because it is
-//! usually draining for someone else: another client's `Stop`, or its own idle exit. If its process
-//! is still there afterwards it is asked once more, `Stop` and then `Ping`; if it is silent to both
-//! it gets SIGTERM then SIGKILL — but only while `daemon.lock` in this generation reads held and
-//! `daemon.pid`, read at that moment, names the pid it reported. Otherwise the call fails with
-//! `StalePredecessor`. `basemind comms stop` and `comms stop --all` reclaim a daemon through the
-//! same steps ([`reclaim_holder`]), identifying it by the lock and `daemon.pid` alone.
-//!
-//! Silent means asked and unanswered. A `Ping` that could not be sent ([`Liveness::Unknown`])
-//! establishes nothing: the daemon is not signalled and none is spawned beside it.
-//!
-//! A daemon that does not answer `Status` at all is not classified: if it answers `Ping` it is
-//! used, and the handshake reports what is wrong with it; if it is silent, one is spawned, and the
-//! spawned daemon defers to whoever holds `daemon.lock`. With `BASEMIND_NO_AUTOSPAWN` set, nothing
-//! is ever asked to stop, because nothing could replace it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use directories::ProjectDirs;
 
-use super::protocol::{CommsRequest, CommsResponse, PROTO_VER, StatusReport};
+use super::protocol::{CommsOut, CommsRequest, CommsResponse, PROTO_VER, StatusReport};
 
-/// Subdirectory under the user data dir holding the comms generations.
+/// Subdirectory under the user data dir holding the comms socket + store.
 const COMMS_SUBDIR: &str = "comms";
-
-pub use crate::daemon_lock::RENDEZVOUS_GENERATION;
-
 /// The Unix socket file name within [`COMMS_SUBDIR`]. Unused on Windows, where the endpoint is
 /// a named pipe resolved by [`comms_socket_path`] rather than a file under `comms_dir`.
 #[cfg(not(windows))]
@@ -93,10 +41,16 @@ const SUN_PATH_MAX: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval while waiting for a spawned daemon.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to wait for a previous / incompatible daemon to release the socket after we ask it to
+/// stop, before giving up and surfacing a clear error.
+const TAKEOVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a predecessor that ignored `Stop` gets to exit on SIGTERM before it is killed.
+const TAKEOVER_TERM_GRACE: Duration = Duration::from_secs(5);
+
 /// Resolved per-user comms paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommsPaths {
-    /// This generation's directory (`<data_dir>/comms/g<N>/`) holding the store, lock and socket.
+    /// The `<data_dir>/comms/` directory holding the store and socket.
     pub comms_dir: PathBuf,
     /// The Unix socket path (Unix) — clients connect here.
     pub socket_path: PathBuf,
@@ -140,63 +94,6 @@ pub enum SingletonError {
         /// The platform's limit.
         limit: usize,
     },
-    /// A newer daemon holds this generation and speaks a protocol this binary does not. It is
-    /// never stopped from here: the newer install owns the daemon, and replacing it with an older
-    /// one would sever its sessions only for them to take it back.
-    #[error(
-        "a newer basemind comms daemon (v{version}, pid {pid}, protocol {daemon_proto}) is running \
-         and this basemind (v{ours}, protocol {our_proto}) cannot talk to it; update this basemind, \
-         or stop that daemon with `basemind comms stop` once its sessions are done"
-    )]
-    NewerDaemon {
-        /// The running daemon's build version.
-        version: String,
-        /// The running daemon's process id.
-        pid: u32,
-        /// The protocol version the daemon reported.
-        daemon_proto: u32,
-        /// This binary's version.
-        ours: String,
-        /// This binary's protocol version.
-        our_proto: u32,
-    },
-    /// A daemon this binary cannot use answered `Stop` with a refusal. It is left running — the
-    /// refusal protects the sessions attached to it — and the caller is told why.
-    #[error(
-        "a basemind comms daemon from another build (v{version}, pid {pid}) refused to stop \
-         [{code}]: {message}. It was left running; close the sessions using it (it exits once \
-         idle) or run `basemind comms stop`, then retry"
-    )]
-    BusyPredecessor {
-        /// The running daemon's build version.
-        version: String,
-        /// The running daemon's process id.
-        pid: u32,
-        /// The daemon's stable refusal token (`daemon_busy`, …).
-        code: String,
-        /// The daemon's rendered refusal.
-        message: String,
-    },
-    /// A daemon from an older build answered `Stop` with a store error: it holds this generation but
-    /// cannot serve from its store, and no session ending will change that. It is left running —
-    /// it answered — and the caller is told which store failed and how to reclaim the daemon.
-    #[error(
-        "a basemind comms daemon from another build (v{version}, pid {pid}) cannot serve: its \
-         store at {} failed with: {message}. It was left running and will not recover by itself; \
-         run `basemind comms doctor --probe` to confirm, then `basemind comms stop --all` to \
-         reclaim it, and retry",
-        store.display()
-    )]
-    FailingPredecessor {
-        /// The running daemon's build version.
-        version: String,
-        /// The running daemon's process id.
-        pid: u32,
-        /// The comms store the daemon could not use.
-        store: PathBuf,
-        /// The daemon's rendered store error.
-        message: String,
-    },
     /// A previous / incompatible daemon held the socket and would not stop, so we could not take
     /// over. Surfaced instead of silently talking to an incompatible daemon (which is how the
     /// pre-0.10 version-skew bug manifested as an opaque "connection closed").
@@ -223,16 +120,6 @@ pub enum SingletonError {
         count: usize,
         /// The effective ceiling.
         max: usize,
-    },
-    /// The endpoint could not be asked whether a daemon is there: the exchange never started.
-    /// Nothing was spawned or signalled on a guess.
-    #[error(
-        "could not ask the basemind comms daemon at {socket} whether it is running, so none was \
-         started or stopped; retry"
-    )]
-    EndpointUnknown {
-        /// The endpoint that could not be asked.
-        socket: PathBuf,
     },
     /// No daemon answered and [`NO_AUTOSPAWN_ENV`] forbids starting one. The operator asked for
     /// connect-only behaviour; saying so is the whole point, so this is an error rather than a
@@ -279,121 +166,48 @@ pub enum SpawnPolicy {
     Explicit,
 }
 
-/// Environment override for the comms directory. When set, it replaces the per-user
-/// `directories::ProjectDirs` location. Intended for tests, CI, and users who want the broker's
-/// socket + store in a custom (e.g. sandboxed) location.
-///
-/// The override names the comms directory, not a generation: [`RENDEZVOUS_GENERATION`] applies inside
-/// it exactly as it does inside the default location, so two binaries of different generations
-/// pointed at one override still do not meet.
+/// Environment override for the comms data directory. When set, it is used verbatim as the
+/// `comms_dir` instead of the per-user `directories::ProjectDirs` location. Intended for tests,
+/// CI, and users who want the broker's socket + store in a custom (e.g. sandboxed) location.
 pub const COMMS_DIR_ENV: &str = "BASEMIND_COMMS_DIR";
 
-/// This binary's generation directory inside a comms directory: `<comms_base>/g<N>`. The one place
-/// the generation enters a path — the socket, lock, pidfile, store and log are all derived from the
-/// directory this returns, and on Windows the pipe name is a hash of it.
-pub fn generation_dir(comms_base: &Path) -> PathBuf {
-    comms_base.join(format!("g{RENDEZVOUS_GENERATION}"))
-}
-
-/// The comms directory itself, which holds one subdirectory per generation: the [`COMMS_DIR_ENV`]
-/// override when set, else `comms/` under the per-user data directory. Creates nothing.
-pub fn comms_base_dir() -> Result<PathBuf, SingletonError> {
-    match std::env::var_os(COMMS_DIR_ENV) {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+/// Resolve the per-user comms paths via `directories::ProjectDirs::from("", "", "basemind")`,
+/// or the [`COMMS_DIR_ENV`] override when set. Creates the dir (mode 0700 on Unix) as a side effect.
+pub fn resolve_paths() -> Result<CommsPaths, SingletonError> {
+    let comms_dir = match std::env::var_os(COMMS_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => {
             let dirs = ProjectDirs::from("", "", "basemind").ok_or(SingletonError::NoDataDir)?;
-            Ok(dirs.data_dir().join(COMMS_SUBDIR))
+            dirs.data_dir().join(COMMS_SUBDIR)
         }
-    }
-}
-
-/// Resolve the per-user comms paths: this generation's directory under
-/// `directories::ProjectDirs::from("", "", "basemind")`, or under the [`COMMS_DIR_ENV`] override
-/// when set. Creates the directories (mode 0700 on Unix) as a side effect.
-pub fn resolve_paths() -> Result<CommsPaths, SingletonError> {
-    let comms_base = comms_base_dir()?;
-    let comms_dir = generation_dir(&comms_base);
+    };
     std::fs::create_dir_all(&comms_dir).map_err(|source| SingletonError::Io {
         path: comms_dir.clone(),
         source,
     })?;
     #[cfg(unix)]
-    {
-        set_mode(&comms_base, OWNER_ONLY_DIR)?;
-        set_mode(&comms_dir, OWNER_ONLY_DIR)?;
-    }
+    set_mode(&comms_dir, OWNER_ONLY_DIR)?;
 
     let socket_path = comms_socket_path(&comms_dir);
     Ok(CommsPaths { comms_dir, socket_path })
 }
 
-/// The socket path for a generation directory (see [`generation_dir`]). On Unix,
-/// `<comms_dir>/comms.sock`. On Windows, the named pipe [`pipe_name`] gives the directory, resolved
-/// first so that every spelling of one directory, which is one `daemon.lock`, is one pipe.
+/// The socket path for a resolved comms dir. On Windows, a named-pipe path; on Unix,
+/// `<comms_dir>/comms.sock`.
 pub fn comms_socket_path(comms_dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
+        use std::hash::{Hash, Hasher};
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".to_string());
-        let resolved = std::fs::canonicalize(comms_dir)
-            .or_else(|_| std::path::absolute(comms_dir))
-            .unwrap_or_else(|_| comms_dir.to_path_buf());
-        PathBuf::from(pipe_name(&user, &resolved.to_string_lossy()))
+        let mut hasher = std::hash::DefaultHasher::new();
+        comms_dir.hash(&mut hasher);
+        let dir_hash = hasher.finish();
+        PathBuf::from(format!(r"\\.\pipe\basemind-comms-{user}-{dir_hash:016x}"))
     }
     #[cfg(not(windows))]
     {
         comms_dir.join(SOCKET_FILE)
     }
-}
-
-/// Hex digits of the hash carried in a pipe name: 64 bits, enough to keep one user's comms
-/// directories apart.
-#[cfg(any(windows, test))]
-const PIPE_HASH_HEX_LEN: usize = 16;
-/// Characters of the account name shown in a pipe name. The whole name is in the hash.
-#[cfg(any(windows, test))]
-const PIPE_USER_LEN: usize = 32;
-
-/// The named pipe of the daemon that owns `comms_dir`:
-/// `\\.\pipe\basemind-comms-<user>-<hash of the user and the directory's components>`. The path is
-/// the generation directory, so the generation is in the hash and two generations in one comms
-/// directory get two pipes. The hash covers the path's components, not its bytes: `C:\x\comms`,
-/// `C:\x\comms\` and `C:/x/comms` are one directory and give one name, with or without the
-/// `\\?\` prefix canonicalisation adds. BLAKE3 rather than the standard library's hasher, whose
-/// output is not specified across toolchains: every binary of a generation must compute the same
-/// name. The account name appears only as letters, digits, `.`, `_` and `-`, since `USERNAME` is
-/// free text and a backslash would end the pipe's name. Releases up to 0.33 named their pipe from
-/// another hash of the unscoped directory; this binary never computes that name.
-#[cfg(any(windows, test))]
-fn pipe_name(user: &str, comms_dir: &str) -> String {
-    fn feed(hasher: &mut blake3::Hasher, part: &str) {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
-    let unprefixed = comms_dir
-        .strip_prefix(r"\\?\UNC\")
-        .or_else(|| comms_dir.strip_prefix(r"\\?\"))
-        .unwrap_or(comms_dir);
-    let mut hasher = blake3::Hasher::new();
-    feed(&mut hasher, user);
-    for component in unprefixed
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty() && *part != ".")
-    {
-        feed(&mut hasher, component);
-    }
-    let digest = hasher.finalize().to_hex();
-    let shown: String = user
-        .chars()
-        .take(PIPE_USER_LEN)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!(r"\\.\pipe\basemind-comms-{shown}-{}", &digest[..PIPE_HASH_HEX_LEN])
 }
 
 #[cfg(unix)]
@@ -552,35 +366,9 @@ pub async fn ensure_daemon_with_policy(
     is_alive: impl Fn(&Path) -> bool,
     spawn: impl FnOnce(&CommsPaths) -> std::io::Result<()>,
 ) -> Result<(), SingletonError> {
-    let probe = |socket: &Path| {
-        if is_alive(socket) {
-            Liveness::Answers
-        } else {
-            Liveness::Silent
-        }
-    };
-    ensure_daemon_probing(paths, policy, probe, spawn).await
-}
-
-/// [`ensure_daemon_with_policy`] with a probe that can say it does not know. A daemon is spawned
-/// only when the probe found the endpoint silent: one that could not be asked may be serving, and
-/// a second daemon would only exit on the lock the first holds.
-async fn ensure_daemon_probing(
-    paths: &CommsPaths,
-    policy: SpawnPolicy,
-    probe: impl Fn(&Path) -> Liveness,
-    spawn: impl FnOnce(&CommsPaths) -> std::io::Result<()>,
-) -> Result<(), SingletonError> {
-    let is_alive = |socket: &Path| probe(socket) == Liveness::Answers;
     // Ahead of the opt-out on purpose: connect-only means *do not start one*, not *do not use one*.
-    match probe(&paths.socket_path) {
-        Liveness::Answers => return Ok(()),
-        Liveness::Silent => {}
-        Liveness::Unknown => {
-            return Err(SingletonError::EndpointUnknown {
-                socket: paths.socket_path.clone(),
-            });
-        }
+    if is_alive(&paths.socket_path) {
+        return Ok(());
     }
     if policy == SpawnPolicy::Auto && autospawn_disabled() {
         return Err(SingletonError::AutospawnDisabled {
@@ -606,9 +394,14 @@ async fn ensure_daemon_probing(
     Err(SingletonError::SpawnTimeout)
 }
 
-/// Ensure a daemon this binary can use is running in its generation, replacing one from another
-/// build only when that daemon agrees to go. The rules are the decision table in the module doc; in
-/// short, a daemon that answers is never signalled, and a newer one is never even asked to stop.
+/// Ensure a healthy, current daemon is running, taking over from a previous one on the way.
+///
+/// On load this reaps the kind of stale process that used to pile up: if the socket is held by a
+/// daemon from an OLDER build (or one speaking a different protocol version), we ask it to stop and
+/// spawn a fresh daemon in its place — converging the singleton on the newest binary. A daemon at
+/// our version (or newer) is reused as-is, so concurrent same-version sessions still share one
+/// broker. If the predecessor will not yield the socket, we error out clearly
+/// ([`SingletonError::StalePredecessor`]) rather than silently talking to an incompatible daemon.
 pub async fn ensure_daemon(paths: &CommsPaths) -> Result<(), SingletonError> {
     ensure_daemon_with_spawn_policy(paths, SpawnPolicy::Auto).await
 }
@@ -620,102 +413,81 @@ pub async fn ensure_daemon_explicit(paths: &CommsPaths) -> Result<(), SingletonE
     ensure_daemon_with_spawn_policy(paths, SpawnPolicy::Explicit).await
 }
 
-/// [`ensure_daemon`] for a caller that retries and must not send an older daemon `Stop` on every
-/// attempt. With `may_ask_stop` false the daemon is not asked: it is used if it speaks this
-/// binary's protocol and reported as [`SingletonError::StalePredecessor`] otherwise; once it has
-/// gone, this spawns as usual. Returns the outcome and whether this call sent a `Stop`, which is
-/// what the caller paces on: most calls find nothing to ask.
-pub async fn ensure_daemon_paced(paths: &CommsPaths, may_ask_stop: bool) -> (Result<(), SingletonError>, bool) {
-    let takeover = if may_ask_stop { Takeover::Ask } else { Takeover::Wait };
-    let mut stop_sent = false;
-    let ensured = ensure_daemon_as(paths, SpawnPolicy::Auto, takeover, &mut stop_sent).await;
-    (ensured, stop_sent)
-}
-
 async fn ensure_daemon_with_spawn_policy(paths: &CommsPaths, policy: SpawnPolicy) -> Result<(), SingletonError> {
-    ensure_daemon_as(paths, policy, Takeover::Ask, &mut false).await
-}
-
-async fn ensure_daemon_as(
-    paths: &CommsPaths,
-    policy: SpawnPolicy,
-    takeover: Takeover,
-    stop_sent: &mut bool,
-) -> Result<(), SingletonError> {
-    let ours = takeover::Ours {
-        version: env!("CARGO_PKG_VERSION"),
-        proto_ver: PROTO_VER,
-    };
-    let settled =
-        takeover::settle_existing(paths, policy, takeover, ours, takeover::Timings::PRODUCTION, stop_sent).await?;
-    if settled == takeover::Existing::Use {
-        return Ok(());
+    if let Some(report) = off_worker(|| daemon_status(&paths.socket_path)) {
+        let ours = env!("CARGO_PKG_VERSION");
+        let compatible = report.proto_ver == PROTO_VER && !version_is_older(&report.version, ours);
+        if compatible {
+            return Ok(());
+        }
+        // Never stop a daemon we are then forbidden to replace. Under connect-only the takeover
+        // would leave the operator with no daemon at all — strictly worse than an old one, whose
+        // skew the handshake reports precisely.
+        if policy == SpawnPolicy::Auto && autospawn_disabled() {
+            tracing::warn!(
+                daemon_version = %report.version,
+                daemon_pid = report.pid,
+                ours,
+                env = NO_AUTOSPAWN_ENV,
+                "comms: a previous/incompatible daemon holds the socket, but auto-spawn is disabled; using it as-is"
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            daemon_version = %report.version,
+            daemon_pid = report.pid,
+            ours,
+            "comms: a previous/incompatible daemon holds the socket; taking over"
+        );
+        request_stop(&paths.socket_path);
+        let deadline = std::time::Instant::now() + TAKEOVER_DRAIN_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            if !off_worker(|| probe_alive(&paths.socket_path)) {
+                break;
+            }
+            tokio::time::sleep(SPAWN_POLL_INTERVAL).await;
+        }
+        // A predecessor that ignores `Stop` (busy store, held-open clients, a build that predates
+        // the drain) would otherwise wedge every new session until an operator kills it by hand.
+        // Escalate by pid: SIGTERM drains cleanly, SIGKILL is the last resort.
+        if off_worker(|| probe_alive(&paths.socket_path)) {
+            let pid = report.pid;
+            off_worker(|| force_terminate(pid, TAKEOVER_TERM_GRACE));
+        }
+        if off_worker(|| probe_alive(&paths.socket_path)) {
+            return Err(SingletonError::StalePredecessor {
+                version: report.version,
+                pid: report.pid,
+            });
+        }
     }
     // No compatible daemon answered — we are about to spawn one. Enforce the machine ceiling for the
     // comms family first so a runaway (each isolated comms dir spawning its own detached daemon) is
     // refused loudly, not silently piled up. Counting per kind keeps another family's daemons from
-    // consuming the comms budget. The count covers every generation's daemons, read from the
-    // registry without contacting them, and prunes this generation's dead holders as a side effect.
+    // consuming the comms budget. The count prunes dead holders as a side effect.
     let live = crate::daemon_lock::count_live_daemons_of(crate::daemon_lock::DaemonKind::Comms);
     let max = crate::daemon_lock::max_live_daemons();
     if live >= max {
         return Err(SingletonError::TooManyDaemons { count: live, max });
     }
-    ensure_daemon_probing(
+    ensure_daemon_with_policy(
         paths,
         policy,
-        |socket| off_worker(|| probe_liveness(socket)),
+        |socket| off_worker(|| probe_alive(socket)),
         spawn_detached_daemon,
     )
     .await
 }
 
-/// True when version `daemon` is strictly older than `ours` by semantic-version precedence: the
-/// `MAJOR.MINOR.PATCH` core first, then the pre-release, so `0.34.0-rc.1` is older than `0.34.0`
-/// and `rc.2` older than `rc.10`. Build metadata (`+…`) is ignored, and a part that is not a number
-/// counts as zero.
+/// True when `daemon`'s `MAJOR.MINOR.PATCH` is strictly older than `ours`. Pre-release suffixes
+/// (`-rc.N`) are ignored — close enough for the "is this a previous build?" takeover decision.
 fn version_is_older(daemon: &str, ours: &str) -> bool {
-    use std::cmp::Ordering;
-
-    fn parts(version: &str) -> ([u64; 3], Option<&str>) {
-        let version = version.split('+').next().unwrap_or(version);
-        let (core, pre) = match version.split_once('-') {
-            Some((core, pre)) => (core, Some(pre)),
-            None => (version, None),
-        };
-        let mut numbers = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
-        let core = std::array::from_fn(|_| numbers.next().unwrap_or(0));
-        (core, pre)
+    fn triple(v: &str) -> (u64, u64, u64) {
+        let core = v.split('-').next().unwrap_or(v);
+        let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
     }
-    /// Numeric identifiers order by value and below alphanumeric ones; a longer list of otherwise
-    /// equal identifiers is the later one.
-    fn compare_pre(a: &str, b: &str) -> Ordering {
-        let (mut a, mut b) = (a.split('.'), b.split('.'));
-        loop {
-            let ordering = match (a.next(), b.next()) {
-                (None, None) => return Ordering::Equal,
-                (None, Some(_)) => return Ordering::Less,
-                (Some(_), None) => return Ordering::Greater,
-                (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    (Ok(_), Err(_)) => Ordering::Less,
-                    (Err(_), Ok(_)) => Ordering::Greater,
-                    (Err(_), Err(_)) => x.cmp(y),
-                },
-            };
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-        }
-    }
-    let ((daemon_core, daemon_pre), (our_core, our_pre)) = (parts(daemon), parts(ours));
-    let ordering = daemon_core.cmp(&our_core).then_with(|| match (daemon_pre, our_pre) {
-        (None, None) => Ordering::Equal,
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(a), Some(b)) => compare_pre(a, b),
-    });
-    ordering == Ordering::Less
+    triple(daemon) < triple(ours)
 }
 
 /// One-shot `Status` request against a live daemon — returns its [`StatusReport`] (pid / version /
@@ -727,19 +499,11 @@ fn daemon_status(socket_path: &Path) -> Option<StatusReport> {
     }
 }
 
-/// What to do about a daemon that is already running in this generation.
-#[path = "singleton_takeover.rs"]
-mod takeover;
-use takeover::Takeover;
-pub use takeover::{ReclaimRules, Reclaimed, reclaim_holder};
-
 /// Serviceability probing + forced reclaim. See [`singleton_probe`](probe) for why these are not
 /// the same question as [`probe_alive`].
 #[path = "singleton_probe.rs"]
 mod probe;
-pub use probe::{
-    DaemonProbe, StopOutcome, force_terminate, probe_serving, request_stop_classified, request_stop_within,
-};
+pub use probe::{DaemonProbe, StopOutcome, force_terminate, probe_serving, request_stop_classified};
 
 /// Best-effort `Stop` request asking a daemon to drain and exit. Errors are ignored — the caller
 /// polls the socket to confirm the daemon actually went away. Public so `comms stop --all` can
@@ -752,31 +516,48 @@ pub fn request_stop(socket_path: &Path) {
 /// Connect to the daemon endpoint, send one length-delimited msgpack request, and decode the one
 /// framed reply. `None` on any transport/codec failure. Bounds the response to 64 KiB.
 ///
-/// The daemon frames every reply as a [`CommsOut`](super::protocol::CommsOut) envelope (see
-/// `frontend_uds::send`), so that is what is decoded and its `Response` unwrapped. Decoding a bare [`CommsResponse`] here silently
+/// The daemon frames every reply as a [`CommsOut`] envelope (see `frontend_uds::send`), so we
+/// decode `CommsOut` and unwrap its `Response`. Decoding a bare [`CommsResponse`] here silently
 /// failed for every reply — which left [`daemon_status`] returning `None` and the version-gated
 /// takeover in [`ensure_daemon`] never firing against a live daemon.
 fn roundtrip(socket_path: &Path, req: &CommsRequest) -> Option<CommsResponse> {
-    roundtrip_within(socket_path, req, ENDPOINT_TIMEOUT)
-}
-
-/// How long [`roundtrip`] waits on each read and write: enough for a daemon that is serving, short
-/// enough that probing a wedged one does not stall bring-up.
-const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(800);
-
-/// [`roundtrip`] with an explicit bound, for a request whose answer is worth waiting for.
-fn roundtrip_within(socket_path: &Path, req: &CommsRequest, timeout: Duration) -> Option<CommsResponse> {
+    use std::io::{Read, Write};
+    let mut stream = open_endpoint(socket_path)?;
     let body = rmp_serde::to_vec_named(req).ok()?;
-    endpoint::exchange(socket_path, body, timeout)
+    let len = u32::try_from(body.len()).ok()?;
+    stream.write_all(&len.to_be_bytes()).ok()?;
+    stream.write_all(&body).ok()?;
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).ok()?;
+    let rlen = u32::from_be_bytes(prefix) as usize;
+    if rlen > 64 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; rlen];
+    stream.read_exact(&mut buf).ok()?;
+    match rmp_serde::from_slice::<CommsOut>(&buf).ok()? {
+        CommsOut::Response(resp) | CommsOut::Reply { response: resp, .. } => Some(resp),
+        CommsOut::Notification(_) => None,
+    }
 }
 
-/// One-shot blocking exchanges with a daemon's endpoint. See [`singleton_endpoint`](endpoint) for
-/// what bounds them on each platform.
-#[path = "singleton_endpoint.rs"]
-mod endpoint;
-pub use endpoint::Liveness;
-pub(crate) use endpoint::endpoint_accepts;
-use endpoint::probe_once;
+/// Open the platform endpoint (Unix socket / Windows named pipe) with short read/write timeouts.
+#[cfg(unix)]
+fn open_endpoint(socket_path: &Path) -> Option<impl std::io::Read + std::io::Write> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(800)));
+    Some(stream)
+}
+
+#[cfg(windows)]
+fn open_endpoint(socket_path: &Path) -> Option<impl std::io::Read + std::io::Write> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(socket_path)
+        .ok()
+}
 
 /// Run blocking `work` without parking an async worker: on a multi-thread runtime the worker is
 /// handed off via `block_in_place`; on a current-thread runtime (or none) it just runs inline, since
@@ -801,27 +582,78 @@ const PROBE_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Probe whether a daemon is alive at `socket_path` by connecting and pinging it. Synchronous
 /// (uses a blocking connect with a short timeout) so it can be used as the `probe` in
 /// [`bind_listener`] too. Retries a few times before giving up so a momentarily-busy daemon is
-/// not falsely reclaimed. `false` also when the daemon could not be asked; a caller about to
-/// signal or spawn uses [`probe_liveness`], which keeps that case apart.
+/// not falsely reclaimed.
+#[cfg(any(unix, windows))]
 pub fn probe_alive(socket_path: &Path) -> bool {
-    probe_liveness(socket_path) == Liveness::Answers
-}
-
-/// [`probe_alive`] with the third answer kept: [`Liveness::Silent`] only when every attempt was
-/// made and none was answered, [`Liveness::Unknown`] when any could not be made.
-pub fn probe_liveness(socket_path: &Path) -> Liveness {
-    let mut verdict = Liveness::Silent;
     for attempt in 0..PROBE_ATTEMPTS {
-        match probe_once(socket_path) {
-            Liveness::Answers => return Liveness::Answers,
-            Liveness::Silent => {}
-            Liveness::Unknown => verdict = Liveness::Unknown,
+        if probe_once(socket_path) {
+            return true;
         }
         if attempt + 1 < PROBE_ATTEMPTS {
             std::thread::sleep(PROBE_RETRY_BACKOFF);
         }
     }
-    verdict
+    false
+}
+
+/// One connect+ping attempt against the Unix socket. See [`probe_alive`] for the retrying wrapper.
+#[cfg(unix)]
+fn probe_once(socket_path: &Path) -> bool {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let Ok(mut stream) = UnixStream::connect(socket_path) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+
+    let body = match rmp_serde::to_vec_named(&super::protocol::CommsRequest::Ping) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let len = match u32::try_from(body.len()) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    if stream.write_all(&len.to_be_bytes()).is_err() || stream.write_all(&body).is_err() {
+        return false;
+    }
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).is_ok()
+}
+
+/// One connect+ping attempt against the Windows named pipe. See [`probe_alive`] for the retrying
+/// wrapper. A `\\.\pipe\...` path opens as an ordinary [`std::fs::File`], so we open it blocking
+/// and write the SAME framed `Ping` the Unix probe sends (u32-be length prefix + msgpack), then
+/// read a 4-byte response prefix. Any successful read ⇒ alive. A transient busy/not-found at open
+/// time ⇒ not alive (the caller treats that as "reclaimable").
+#[cfg(windows)]
+fn probe_once(socket_path: &Path) -> bool {
+    use std::io::{Read, Write};
+
+    let Ok(mut stream) = std::fs::OpenOptions::new().read(true).write(true).open(socket_path) else {
+        return false;
+    };
+
+    let body = match rmp_serde::to_vec_named(&super::protocol::CommsRequest::Ping) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let len = match u32::try_from(body.len()) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    if stream.write_all(&len.to_be_bytes()).is_err() || stream.write_all(&body).is_err() {
+        return false;
+    }
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).is_ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn probe_alive(_socket_path: &Path) -> bool {
+    false
 }
 
 /// Daemon binary resolution + detached spawn. See [`singleton_spawn`](spawn) for why re-exec'ing
@@ -831,5 +663,203 @@ mod spawn;
 pub use spawn::{DAEMON_BINARY_ENV, daemon_log_path, spawn_detached_daemon, trim_daemon_log};
 
 #[cfg(test)]
-#[path = "singleton_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_is_older_orders_releases_and_ignores_prerelease() {
+        assert!(version_is_older("0.6.3", "0.10.0"));
+        assert!(version_is_older("0.9.0", "0.10.0"));
+        assert!(version_is_older("0.10.0", "0.10.1"));
+        assert!(!version_is_older("0.10.0", "0.10.0"));
+        assert!(!version_is_older("0.11.0", "0.10.0"));
+        assert!(!version_is_older("1.0.0", "0.10.0"));
+        assert!(!version_is_older("0.10.0-rc.1", "0.10.0"));
+        assert!(version_is_older("0.9.0-rc.2", "0.10.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_as_lock_admits_exactly_one_winner_in_a_race() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("race.sock");
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        const N: usize = 16;
+        let listeners = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for _ in 0..N {
+            let socket = socket.clone();
+            let winners = winners.clone();
+            let listeners = listeners.clone();
+            handles.push(std::thread::spawn(move || {
+                let probe = |p: &std::path::Path| p.exists();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("rt");
+                let result = rt.block_on(async { bind_listener(&socket, probe) });
+                if let Ok(listener) = result {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                    listeners.lock().expect("lock").push((listener, rt));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one binder may win the singleton lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_decodes_the_commsout_response_envelope() {
+        use super::super::protocol::{CommsOut, CommsResponse, StatusReport};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("status.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+
+        let want = StatusReport {
+            pid: 4242,
+            version: "0.22.4".to_string(),
+            build_id: "deadbeef1234".to_string(),
+            proto_ver: PROTO_VER,
+            uptime_secs: 99,
+            threads: 3,
+            subscribers: 0,
+        };
+        let reply = want.clone();
+        // A faithful daemon: read the framed request, reply with the SAME CommsOut::Response ~keep
+        // envelope the real UDS front-end sends (`frontend_uds::send`), not a bare CommsResponse. ~keep
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).expect("read len");
+            let len = u32::from_be_bytes(prefix) as usize;
+            let mut req = vec![0u8; len];
+            stream.read_exact(&mut req).expect("read req");
+            let body = rmp_serde::to_vec_named(&CommsOut::Response(CommsResponse::Status(reply))).expect("encode");
+            let out_len = u32::try_from(body.len()).expect("len fits");
+            stream.write_all(&out_len.to_be_bytes()).expect("write len");
+            stream.write_all(&body).expect("write body");
+        });
+
+        let got = daemon_status(&socket).expect("daemon_status must decode the CommsOut envelope");
+        server.join().expect("server thread");
+        assert_eq!(got.pid, want.pid);
+        assert_eq!(got.version, want.version);
+        assert_eq!(got.proto_ver, want.proto_ver);
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_noops_when_already_alive() {
+        let paths = CommsPaths {
+            comms_dir: PathBuf::from("/tmp/x"),
+            socket_path: PathBuf::from("/tmp/x/comms.sock"),
+        };
+        let spawned = std::cell::Cell::new(false);
+        let res = ensure_daemon_with(
+            &paths,
+            |_| true,
+            |_| {
+                spawned.set(true);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(res.is_ok());
+        assert!(!spawned.get(), "must not spawn when a daemon already answers");
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_spawns_then_waits_for_ready() {
+        let paths = CommsPaths {
+            comms_dir: PathBuf::from("/tmp/x"),
+            socket_path: PathBuf::from("/tmp/x/comms.sock"),
+        };
+        let alive = std::sync::atomic::AtomicBool::new(false);
+        let res = ensure_daemon_with(
+            &paths,
+            |_| alive.load(std::sync::atomic::Ordering::SeqCst),
+            |_| {
+                alive.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "daemon became ready after spawn");
+    }
+
+    #[test]
+    fn spawn_ready_timeout_covers_a_cold_full_feature_start() {
+        const MINIMUM_COLD_START_BUDGET: Duration = Duration::from_secs(30);
+
+        assert!(
+            SPAWN_READY_TIMEOUT >= MINIMUM_COLD_START_BUDGET,
+            "the comms daemon needs at least the agent daemon's ten-second cold-start budget"
+        );
+    }
+
+    /// A socket path past `sun_path` can never be bound, so the caller must be told that — not
+    /// left to wait out the readiness timeout and report a hang. Asserting the error is NOT
+    /// `SpawnTimeout` is the point: that is the misleading message this replaces.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_rejects_a_socket_path_past_the_platform_limit() {
+        let comms_dir = PathBuf::from("/tmp").join("d".repeat(SUN_PATH_MAX));
+        let paths = CommsPaths {
+            socket_path: comms_socket_path(&comms_dir),
+            comms_dir,
+        };
+        let spawned = std::cell::Cell::new(false);
+        let res = ensure_daemon_with(
+            &paths,
+            |_| false,
+            |_| {
+                spawned.set(true);
+                Ok(())
+            },
+        )
+        .await;
+
+        let err = res.expect_err("an unbindable path must fail");
+        assert!(
+            matches!(err, SingletonError::SocketPathTooLong { .. }),
+            "must name the path-length limit, not blame a timeout: {err}"
+        );
+        assert!(
+            err.to_string().contains("BASEMIND_COMMS_DIR"),
+            "the message must say which knob to change: {err}"
+        );
+        assert!(!spawned.get(), "must not spawn a daemon that cannot possibly bind");
+    }
+
+    /// Pins the boundary rather than a comfortable middle: an off-by-one here would either reject
+    /// paths the kernel accepts or let through the one length that fails at `bind`.
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_accepts_the_longest_bindable_path_and_rejects_one_byte_more() {
+        let at_limit = PathBuf::from("/".to_string() + &"a".repeat(SUN_PATH_MAX - 1));
+        assert_eq!(at_limit.as_os_str().len(), SUN_PATH_MAX);
+        check_socket_path_len(&at_limit).expect("a path exactly at the limit is bindable");
+
+        let over = PathBuf::from("/".to_string() + &"a".repeat(SUN_PATH_MAX));
+        assert!(
+            matches!(
+                check_socket_path_len(&over),
+                Err(SingletonError::SocketPathTooLong { .. })
+            ),
+            "one byte past the limit must be rejected"
+        );
+    }
+}

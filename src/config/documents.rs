@@ -6,6 +6,11 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod pii_patterns;
+mod retrieval;
+
+pub use retrieval::{CitationsConfig, FtsConfig, FusionConfig};
+
 /// Top-level `[documents]` table. Each sub-config has `#[serde(default)]` so
 /// adding a new tier never breaks older TOML files.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -26,12 +31,8 @@ pub struct DocumentsConfig {
     #[schemars(inner(length(min = 1)))]
     pub include: Vec<String>,
     /// Deny-list of globs applied to document indexing itself (not just embedding): matching files
-    /// are not extracted, chunked or searchable as documents. Same syntax as `include`. The default
-    /// drops low-value bulk: `*.svg`, lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`,
-    /// `Cargo.lock`, `poetry.lock`, `*.lock`) and test-data directories (`test_data`, `testdata`,
-    /// `fixtures`, `__snapshots__`). Setting the key replaces the default list; `exclude = []`
-    /// indexes all of them, and a custom list must repeat any default entry it still wants.
-    #[serde(default = "DocumentsConfig::default_exclude")]
+    /// are not extracted, chunked or searchable as documents. Same syntax as `include`.
+    #[serde(default)]
     #[schemars(inner(length(min = 1)))]
     pub exclude: Vec<String>,
     /// Per-document size cap in bytes, independent of `[scan] max_file_bytes` (which only bounds
@@ -103,7 +104,13 @@ pub struct DocumentsConfig {
     #[serde(default = "DocumentsConfig::default_overlap")]
     #[schemars(range(min = 0))]
     pub overlap: usize,
-    /// Xberg embedding preset name. Defaults to "balanced".
+    /// Xberg embedding preset name. Defaults to "multilingual"
+    /// (multilingual-e5-base, 768-dim, 100+ languages).
+    ///
+    /// The preset feeds the LanceDB `(dim, embedding_model, schema_ver)` triple,
+    /// so changing it wipes and re-embeds every existing workspace index — pick
+    /// deliberately before indexing. Set `embedding_preset = "balanced"` for an
+    /// English-focused 768-dim alternative.
     #[serde(default = "DocumentsConfig::default_embedding_preset")]
     pub embedding_preset: String,
     /// Generate embeddings (`true`) or skip vector storage entirely (`false`).
@@ -123,20 +130,21 @@ pub struct DocumentsConfig {
     #[serde(default)]
     #[schemars(inner(length(min = 1)))]
     pub embed_exclude: Vec<String>,
-    /// Deprecated and ignored: archive extraction was removed, so archives and compressed
-    /// containers (`.zip/.tar/.jar/...`) are always skipped. Accepted so existing files keep
-    /// loading; `true` logs a warning.
+    /// Route archives (`.zip/.tar/.jar/...`) into xberg's recursive archive extractor. Default
+    /// `false`: archives and compressed containers are rejected by the built-in floor before any
+    /// extraction, so a single archive can't explode into thousands of embeds. Flip to `true` to opt
+    /// into extracting the files *inside* archives — at the cost of the extra recursion + embedding
+    /// work. True binaries (`.so/.wasm/.exe/...`) are always rejected regardless of this flag.
     #[serde(default = "DocumentsConfig::default_extract_archives")]
     pub extract_archives: bool,
-    /// Cap on the total *uncompressed* bytes xberg may unpack from the zip container of one Office
-    /// document (`.docx/.pptx/.xlsx/.odt`). A document past the cap fails extraction (counted as an
-    /// extract failure) instead of being unpacked into memory. Default 64 MiB; xberg's own default
-    /// is 500 MB.
+    /// Cap on the total *uncompressed* bytes xberg may unpack from one archive when
+    /// `extract_archives = true`. An archive past the cap fails extraction (counted as an extract
+    /// failure) instead of being unpacked into memory. Default 64 MiB; xberg's own default is 500 MB.
     #[serde(default = "DocumentsConfig::default_max_archive_bytes")]
     #[schemars(range(min = 1024))]
     pub max_archive_bytes: u64,
-    /// Cap on the number of entries in the zip container of one Office document
-    /// (`.docx/.pptx/.xlsx/.odt`). Default 1000; xberg's own default is 10,000.
+    /// Cap on the number of entries in one archive when `extract_archives = true`. Default 1000;
+    /// xberg's own default is 10,000.
     #[serde(default = "DocumentsConfig::default_max_archive_entries")]
     #[schemars(range(min = 1))]
     pub max_archive_entries: usize,
@@ -155,12 +163,27 @@ pub struct DocumentsConfig {
     /// Document summarization at ingest time.
     #[serde(default)]
     pub summarization: SummarizationConfig,
+    /// PII redaction / anonymisation at ingest time.
+    #[serde(default)]
+    pub redaction: RedactionConfig,
     /// OCR backend selection for image / scanned-PDF inputs.
     #[serde(default)]
     pub ocr: OcrConfig,
     /// Response wire format for the document MCP tools.
     #[serde(default)]
     pub output: OutputConfig,
+    /// Lexical retrieval controls (`[documents.fusion]`).
+    #[serde(default)]
+    pub fusion: FusionConfig,
+    /// Tokenizer settings for the lexical index (`[documents.fts]`).
+    #[serde(default)]
+    pub fts: FtsConfig,
+    /// GraphRAG entity graph (`[graphrag]`).
+    #[serde(default)]
+    pub graphrag: GraphragConfig,
+    /// Identifier extraction for the exact lane (`[documents.citations]`).
+    #[serde(default)]
+    pub citations: CitationsConfig,
     /// Maximum number of threads dedicated to ONNX embedding. `0` means
     /// "auto = max(2, logical_cpus / 4)" — a bounded fraction of available
     /// cores so the embedder never pins the machine. Both the document and
@@ -176,33 +199,16 @@ impl DocumentsConfig {
         true
     }
     fn default_max_characters() -> usize {
-        1000
+        800
     }
     fn default_overlap() -> usize {
-        200
+        100
     }
     fn default_embedding_preset() -> String {
-        "balanced".to_string()
+        "multilingual".to_string()
     }
     fn default_embed() -> bool {
         true
-    }
-    fn default_exclude() -> Vec<String> {
-        [
-            "*.svg",
-            "pnpm-lock.yaml",
-            "package-lock.json",
-            "yarn.lock",
-            "Cargo.lock",
-            "poetry.lock",
-            "*.lock",
-            "**/test_data/**",
-            "**/testdata/**",
-            "**/fixtures/**",
-            "**/__snapshots__/**",
-        ]
-        .map(String::from)
-        .to_vec()
     }
     fn default_extract_archives() -> bool {
         false
@@ -245,7 +251,7 @@ impl Default for DocumentsConfig {
             enabled: Self::default_enabled(),
             mime_allowlist: Vec::new(),
             include: Vec::new(),
-            exclude: Self::default_exclude(),
+            exclude: Vec::new(),
             max_file_bytes: Self::default_max_file_bytes(),
             extension_denylist: Vec::new(),
             max_chunks_per_document: Self::default_max_chunks_per_document(),
@@ -269,8 +275,13 @@ impl Default for DocumentsConfig {
             keywords: KeywordsConfig::default(),
             ner: NerConfig::default(),
             summarization: SummarizationConfig::default(),
+            redaction: RedactionConfig::default(),
             ocr: OcrConfig::default(),
             output: OutputConfig::default(),
+            fusion: FusionConfig::default(),
+            fts: FtsConfig::default(),
+            citations: CitationsConfig::default(),
+            graphrag: GraphragConfig::default(),
             embed_max_threads: 0,
         }
     }
@@ -333,128 +344,20 @@ impl Default for DocLanguageConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RerankerConfig {
-    /// Master switch — off by default; the reranker model download + per-query
-    /// latency means users should opt in explicitly.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Xberg reranker preset name (`bge-reranker-base` is the small default;
-    /// `bge-reranker-large` and `bge-reranker-v2-m3` are heavier alternatives).
-    #[serde(default = "RerankerConfig::default_preset")]
-    pub preset: String,
-    /// How many hits to rerank. The vector search returns `top_k` candidates
-    /// which the cross-encoder then reorders.
-    #[serde(default = "RerankerConfig::default_top_k")]
-    #[schemars(range(min = 1))]
-    pub top_k: usize,
-}
-
-impl RerankerConfig {
-    fn default_preset() -> String {
-        "bge-reranker-base".to_string()
-    }
-    fn default_top_k() -> usize {
-        10
-    }
-}
-
-impl Default for RerankerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            preset: Self::default_preset(),
-            top_k: Self::default_top_k(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct KeywordsConfig {
-    /// Master switch — off by default; YAKE / RAKE add ingest-time CPU cost.
-    /// Maps to `Some(KeywordConfig)` / `None` on `ExtractionConfig.keywords`;
-    /// xberg's own `KeywordConfig` has no `enabled` field — gating is via
-    /// the wrapping `Option`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Algorithm: YAKE (statistical, multi-language) or RAKE (rapid automatic
-    /// keyword extraction).
-    #[serde(default)]
-    pub algorithm: KeywordAlgorithm,
-    /// Maximum keywords to extract per document. Matches xberg's
-    /// `KeywordConfig.max_keywords` default of 10.
-    #[serde(default = "KeywordsConfig::default_max_keywords")]
-    #[schemars(range(min = 1))]
-    pub max_keywords: usize,
-    /// Minimum score threshold. Matches xberg's `KeywordConfig.min_score`
-    /// default of 0.0 (i.e. surface every candidate). Score ranges differ
-    /// between YAKE (lower = better) and RAKE (higher = better) — see
-    /// `xberg::keywords::config::KeywordConfig.min_score`.
-    #[serde(default)]
-    #[schemars(range(min = 0.0))]
-    pub min_score: f32,
-    /// N-gram range as `[min, max]`. Matches xberg's
-    /// `KeywordConfig.ngram_range` default of `(1, 3)`. Encoded as an array of
-    /// length 2 so the JSON Schema stays human-readable; values map back to a
-    /// `(usize, usize)` tuple at the boundary.
-    #[serde(default = "KeywordsConfig::default_ngram_range")]
-    #[schemars(length(min = 2, max = 2))]
-    pub ngram_range: Vec<usize>,
-    /// Optional YAKE tuning (passed through to xberg unchanged). Shape
-    /// matches `xberg::keywords::YakeParams`; bad JSON is logged and
-    /// xberg's defaults are used instead of failing the scan.
-    #[serde(default)]
-    pub yake_params: Option<serde_json::Value>,
-    /// Optional RAKE tuning (passed through to xberg unchanged). Shape
-    /// matches `xberg::keywords::RakeParams`; bad JSON is logged and
-    /// xberg's defaults are used instead of failing the scan.
-    #[serde(default)]
-    pub rake_params: Option<serde_json::Value>,
-}
-
-impl KeywordsConfig {
-    fn default_max_keywords() -> usize {
-        10
-    }
-    fn default_ngram_range() -> Vec<usize> {
-        vec![1, 3]
-    }
-}
-
-impl Default for KeywordsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            algorithm: KeywordAlgorithm::default(),
-            max_keywords: Self::default_max_keywords(),
-            min_score: 0.0,
-            ngram_range: Self::default_ngram_range(),
-            yake_params: None,
-            rake_params: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum KeywordAlgorithm {
-    #[default]
-    Yake,
-    Rake,
-}
-
+// Re-exported from `enrichment` (split out to stay under the 1000-line cap).
+pub use super::enrichment::{
+    CustomRerankerModel, KeywordAlgorithm, KeywordsConfig, RerankerConfig, ResolvedRerankerModel,
+};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NerConfig {
-    /// Master switch — off by default; the ONNX backend downloads gline-rs weights on first use.
-    /// Needs a build with the `documents-ner` Cargo feature (the published binaries have it);
-    /// without it the switch has no effect and a warning is logged.
+    /// Master switch — off by default; ONNX backend downloads gline-rs weights on
+    /// first use, LLM backend costs API tokens. Maps to `Some(NerConfig)` /
+    /// `None` on `ExtractionConfig.ner`.
     #[serde(default)]
     pub enabled: bool,
-    /// Backend selection. `onnx` uses gline-rs locally. `llm` is accepted but not supported: no
-    /// entities are extracted and a warning is logged.
+    /// Backend selection. `onnx` uses gline-rs locally; `llm` routes through the
+    /// shared `[llm]` config.
     #[serde(default)]
     pub backend: NerBackend,
     /// Override the ONNX model name (xberg has a default catalogue when unset).
@@ -467,12 +370,58 @@ pub struct NerConfig {
     /// boundary. Empty means "use the backend default".
     #[serde(default)]
     pub categories: Vec<String>,
-    /// Arbitrary user-supplied entity labels for gline-rs zero-shot inference. Matches xberg's
+    /// Arbitrary user-supplied entity labels for gline-rs zero-shot inference
+    /// (and the LLM backend's structured-output schema). Matches xberg's
     /// `NerConfig.custom_labels`. Useful for domain-specific types like
     /// `"Treatment"`, `"Vessel"` without forking GLiNER's taxonomy. Custom
     /// labels surface as `EntityCategory::Custom(_)` in the entity stream.
     #[serde(default)]
     pub custom_labels: Vec<String>,
+}
+
+/// GraphRAG entity graph configuration (spec 0016).
+///
+/// When `enabled = true` (and the `graphrag` feature is compiled), the scanner
+/// builds `graph_entities` and `graph_edges` Lance tables from the NER sidecar
+/// at scan time. The `graph entities` and `graph rag` tool modes become available.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GraphragConfig {
+    /// Master switch — off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Labels to project as graph nodes. Default: person, organization, location + custom_labels.
+    /// Numeric/secret labels (email, phone, iban, swift_bic, ip_address, api_key, password,
+    /// ssn, credit_card, date_of_birth) are excluded by default.
+    #[serde(default = "default_graphrag_labels")]
+    pub labels: Vec<String>,
+    /// Max rows returned by Cypher queries (server-side budget).
+    #[serde(default = "default_graphrag_max_rows")]
+    pub max_rows: usize,
+    /// Hop depth for graph rag expansion (1 or 2).
+    #[serde(default = "default_graphrag_hops")]
+    pub hops: u8,
+}
+
+impl Default for GraphragConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            labels: default_graphrag_labels(),
+            max_rows: default_graphrag_max_rows(),
+            hops: default_graphrag_hops(),
+        }
+    }
+}
+
+fn default_graphrag_labels() -> Vec<String> {
+    vec!["person".into(), "organization".into(), "location".into()]
+}
+fn default_graphrag_max_rows() -> usize {
+    200
+}
+fn default_graphrag_hops() -> u8 {
+    2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -491,8 +440,10 @@ pub struct SummarizationConfig {
     /// surfaces on `FileMapDoc.summary` and `DocumentSearchHit.summary`.
     #[serde(default)]
     pub enabled: bool,
-    /// Strategy: `extractive` (TextRank). `abstractive` is deprecated: LLM summarization was
-    /// removed, so it logs a warning and produces extractive summaries.
+    /// Strategy: `extractive` (TextRank, no LLM) or `abstractive` (routed via
+    /// the top-level `[llm]` config). When `abstractive` is set but `[llm].model`
+    /// is empty, the boundary falls back to `extractive` with a warning so the
+    /// scan still completes.
     #[serde(default)]
     pub strategy: SummarizationStrategy,
     /// Soft cap on summary length in tokens. `None` lets xberg pick a default
@@ -510,22 +461,253 @@ pub enum SummarizationStrategy {
     Abstractive,
 }
 
+/// PII redaction / anonymisation config.
+///
+/// When `enabled = true`, xberg's redaction post-processor runs at the Late stage
+/// of document extraction and rewrites every textual field (content, tables, metadata,
+/// URIs, form fields, OCR, Djot, etc.) with `[TYPE_N]` tokens via `TokenReplace`.
+/// The rehydration map is NOT stored by basemind — it is returned to the caller
+/// via `ExtractedDocument.redaction_report`. Use `basemind vault-encrypt` to
+/// encrypt and persist the map separately.
+///
+/// Requires `xberg/redaction` (enabled in the `documents` feature) and
+/// `xberg/redaction-rehydrate` (also enabled in the `documents` feature) for the
+/// `TokenReplace` strategy that enables later rehydration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionConfig {
+    /// Master switch — off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// PII categories to redact. Empty = all categories supported by the engine.
+    /// Accepted values: `email`, `phone`, `ssn`, `credit_card`, `iban`,
+    /// `ip_address`, `swift_bic`, `postal_code`, `person`, `organization`,
+    /// `location`, `date_of_birth`. Categories suffixed with `_strict` use
+    /// checksum validation where applicable (e.g. `iban_strict`).
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Redaction strategy. `token_replace` (default) assigns stable `[TYPE_N]`
+    /// tokens per category and is reversible via the rehydration map. `mask`
+    /// replaces with `[REDACTED]` irreversibly. `hash` replaces with
+    /// `[HASH:...` irreversibly. `drop` removes the span with no marker.
+    #[serde(default)]
+    pub strategy: RedactionStrategy,
+    /// NER backend config for PERSON / ORGANIZATION / LOCATION categories.
+    #[serde(default)]
+    pub ner: Option<NerRedactionConfig>,
+    /// Preserve chunk byte ranges after redaction (default: `true`).
+    #[serde(default = "default_true")]
+    pub preserve_offsets: bool,
+    /// Custom literal terms to redact. Each hit surfaces as `Custom(<label>)`
+    /// in the redaction report.
+    #[serde(default)]
+    pub custom_terms: Vec<RedactionCustomTerm>,
+    /// Custom regex patterns to redact. Each hit surfaces as `Custom(<label>)`
+    /// in the redaction report.
+    #[serde(default)]
+    pub custom_patterns: Vec<RedactionCustomPattern>,
+}
+
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            categories: Vec::new(),
+            strategy: RedactionStrategy::TokenReplace,
+            ner: None,
+            preserve_offsets: true,
+            custom_terms: Vec::new(),
+            custom_patterns: Vec::new(),
+        }
+    }
+}
+
+impl RedactionConfig {
+    pub fn eu_national_id_patterns() -> Vec<RedactionCustomPattern> {
+        pii_patterns::eu_national_id_patterns()
+    }
+
+    pub fn code_security_patterns() -> Vec<RedactionCustomPattern> {
+        pii_patterns::code_security_patterns()
+    }
+
+    pub fn phone_patterns() -> Vec<RedactionCustomPattern> {
+        pii_patterns::phone_patterns()
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RedactionStrategy {
+    #[default]
+    #[serde(alias = "token_replace")]
+    TokenReplace,
+    Mask,
+    Hash,
+    Drop,
+}
+
+/// NER backend config for redaction (separate from the extraction-tier NER config).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NerRedactionConfig {
+    /// NER backend: `onnx` (local GLiNER) or `llm` (provider API).
+    #[serde(default)]
+    pub backend: NerBackend,
+    /// Override the ONNX model name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Categories to detect via NER.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Custom labels for zero-shot detection.
+    #[serde(default)]
+    pub custom_labels: Vec<String>,
+}
+
+/// A literal string to redact, surfaced as `Custom(<label>)` in the report.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionCustomTerm {
+    /// Label shown in the redaction report for each hit.
+    pub label: String,
+    /// Literal value to find and redact.
+    pub value: String,
+    /// Case-sensitive match (default: false, i.e. case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+/// A regex pattern to redact, surfaced as `Custom(<label>)` in the report.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionCustomPattern {
+    /// Label shown in the redaction report for each hit.
+    pub label: String,
+    /// Regex pattern (Rust dialect, no look-around).
+    pub pattern: String,
+    /// Case-sensitive match (default: false, i.e. case-insensitive).
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+#[cfg(feature = "intelligence")]
+impl RedactionConfig {
+    /// Translate the basemind-side `RedactionConfig` into xberg's `RedactionConfig`.
+    /// Returns `None` when redaction is disabled.
+    pub fn to_xberg(&self) -> Option<xberg::RedactionConfig> {
+        if !self.enabled {
+            return None;
+        }
+
+        #[allow(clippy::unnecessary_filter_map)]
+        let categories: Vec<xberg::types::redaction::PiiCategory> = if self.categories.is_empty() {
+            Vec::new()
+        } else {
+            self.categories
+                .iter()
+                .filter_map(|c| match c.to_lowercase().as_str() {
+                    "email" => Some(xberg::types::redaction::PiiCategory::Email),
+                    "phone" => Some(xberg::types::redaction::PiiCategory::Phone),
+                    "ssn" => Some(xberg::types::redaction::PiiCategory::Ssn),
+                    "credit_card" => Some(xberg::types::redaction::PiiCategory::CreditCard),
+                    "iban" => Some(xberg::types::redaction::PiiCategory::Iban),
+                    "ip_address" => Some(xberg::types::redaction::PiiCategory::IpAddress),
+                    "swift_bic" => Some(xberg::types::redaction::PiiCategory::SwiftBic),
+                    "postal_code" => Some(xberg::types::redaction::PiiCategory::PostalCode),
+                    "date_of_birth" => Some(xberg::types::redaction::PiiCategory::DateOfBirth),
+                    "person" => Some(xberg::types::redaction::PiiCategory::Person),
+                    "organization" => Some(xberg::types::redaction::PiiCategory::Organization),
+                    "location" => Some(xberg::types::redaction::PiiCategory::Location),
+                    s => Some(xberg::types::redaction::PiiCategory::Custom(s.into())),
+                })
+                .collect()
+        };
+
+        let strategy = match self.strategy {
+            RedactionStrategy::TokenReplace => xberg::types::redaction::RedactionStrategy::TokenReplace,
+            RedactionStrategy::Mask => xberg::types::redaction::RedactionStrategy::Mask,
+            RedactionStrategy::Hash => xberg::types::redaction::RedactionStrategy::Hash,
+            RedactionStrategy::Drop => xberg::types::redaction::RedactionStrategy::Drop,
+        };
+
+        let ner = self.ner.as_ref().map(|n| xberg::core::config::ner::NerConfig {
+            backend: match n.backend {
+                super::NerBackend::Onnx => xberg::core::config::ner::NerBackendKind::Onnx,
+                super::NerBackend::Llm => xberg::core::config::ner::NerBackendKind::Llm,
+            },
+            categories: n
+                .categories
+                .iter()
+                .cloned()
+                .map(xberg::types::entity::EntityCategory::from)
+                .collect(),
+            model: n.model.clone(),
+            llm: None,
+            custom_labels: n.custom_labels.clone(),
+        });
+
+        let custom_terms = self
+            .custom_terms
+            .iter()
+            .map(|t| xberg::RedactionTerm {
+                label: t.label.clone(),
+                value: t.value.clone(),
+                case_sensitive: t.case_sensitive,
+            })
+            .collect();
+
+        let custom_patterns = self
+            .custom_patterns
+            .iter()
+            .map(|p| xberg::RedactionPattern {
+                label: p.label.clone(),
+                pattern: p.pattern.clone(),
+                case_sensitive: p.case_sensitive,
+            })
+            .collect();
+
+        Some(xberg::RedactionConfig {
+            categories: std::collections::HashSet::from_iter(categories),
+            strategy,
+            ner,
+            preserve_offsets: self.preserve_offsets,
+            custom_terms,
+            custom_patterns,
+            // External-inspection findings (xberg >= 1.3): basemind runs its own
+            // detection and supplies none inline or through a findings file.
+            findings: Vec::new(),
+            min_score: None,
+            findings_path: None,
+            findings_offset_encoding: xberg::RedactionOffsetEncoding::default(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OcrConfig {
     /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
-    /// non-default value); OCR runs with xberg's defaults.
+    /// non-default value). Tesseract remains the document-tier OCR backend for now.
     #[serde(default)]
     pub backend: OcrBackend,
-    /// Reserved: parsed but currently has no effect (a load-time warning is logged when set to a
-    /// non-default value).
+    /// Tesseract / PaddleOCR language packs (ISO 639-3 codes like `"eng"`). These are passed to
+    /// the document OCR backend. The default document build bundles English plus the six EU
+    /// national-ID languages (DE, FR, ES, IT, NL, PL), so OCR is ready offline.
     #[serde(default = "OcrConfig::default_languages")]
     pub languages: Vec<String>,
 }
 
 impl OcrConfig {
     fn default_languages() -> Vec<String> {
-        vec!["eng".to_string()]
+        ["eng", "deu", "fra", "spa", "ita", "nld", "pol"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -561,14 +743,19 @@ pub enum OutputFormat {
     #[default]
     Json,
     Toon,
+    Markdown,
 }
 
-/// Deprecated and ignored: LLM credentials + model selection for the removed LLM summarization
-/// and LLM entity recognition. Nothing reads it; it stays typed so existing files keep loading
-/// under the strict schema and a literal `api_key` keeps serialising as `"<redacted>"`.
+/// Shared LLM credentials + model selection. Consumed by every LLM-backed
+/// capability (ner-llm, summarization-llm, reranker-llm, VLM OCR).
+///
+/// Mirrors xberg's `LlmConfig` field-for-field with one safety upgrade:
+/// `api_key` is the [`ApiKey`] tri-state (literal / env-ref / unset) instead of
+/// `Option<String>`, so credentials are never stored as bare literals in TOML.
+/// At the boundary the env-ref is resolved into a [`SecretString`] and then
+/// exposed via [`SecretString::expose`] when constructing xberg's struct.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
-#[schemars(extend("deprecated" = true))]
 pub struct LlmConfig {
     /// Combined provider/model string following liter-llm's routing format:
     /// `"openai/gpt-4o"`, `"anthropic/claude-sonnet-4-20250514"`,
@@ -578,12 +765,18 @@ pub struct LlmConfig {
     pub model: String,
     /// API key — either a literal (discouraged; keeps secrets in version control)
     /// or an `{ env = "OPENAI_API_KEY" }` reference. `Unset` lets the underlying
-    /// provider SDK fall back to its standard environment variable lookup. Never resolved: nothing
-    /// reads `[llm]` any more.
+    /// provider SDK fall back to its standard environment variable lookup. In the repository's
+    /// own `basemind.toml`, an env reference is honoured only for the chosen provider's standard
+    /// variable (`OPENAI_API_KEY` for `openai/...`, `ANTHROPIC_API_KEY` for `anthropic/...`, ...)
+    /// or `BASEMIND_LLM_API_KEY`; any other name is ignored with a warning unless
+    /// `BASEMIND_ALLOW_REPO_LLM=1` is set.
     #[serde(default)]
     pub api_key: ApiKey,
-    /// Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). Never contacted:
-    /// nothing reads `[llm]` any more.
+    /// Override the provider base URL (for self-hosted vLLM, Azure OpenAI, …). **Ignored (with a
+    /// warning) when it comes from the repository's own `basemind.toml`** unless the operator sets
+    /// `BASEMIND_ALLOW_REPO_LLM=1` in the environment: a cloned repository could otherwise point
+    /// the summarizer and NER at a host that collects your API key and document text. A value
+    /// passed by CLI flag or environment override is operator-supplied and always honoured.
     #[serde(default)]
     pub base_url: Option<String>,
     /// Sampling temperature. Provider-default when unset.
@@ -600,6 +793,36 @@ pub struct LlmConfig {
     /// Maximum tokens to generate. Provider-default when unset.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+}
+
+#[cfg(feature = "intelligence")]
+impl LlmConfig {
+    /// Translate the basemind-side `LlmConfig` into xberg's `LlmConfig`.
+    ///
+    /// Returns `None` when `model` is empty — every LLM-backed feature treats
+    /// `None` as "no LLM configured" and falls back to the non-LLM path. The
+    /// `ApiKey` enum is resolved here: `Unset` and missing env vars become
+    /// `None` (letting the provider SDK fall back to its own env-var lookup),
+    /// `Literal` and resolved env-refs are exposed via [`SecretString::expose`].
+    pub fn to_xberg(&self) -> Option<xberg::LlmConfig> {
+        if self.model.is_empty() {
+            return None;
+        }
+        Some(xberg::LlmConfig {
+            model: self.model.clone(),
+            api_key: self.api_key.resolve().map(|s| s.expose().to_string()),
+            base_url: self.base_url.clone(),
+            timeout_secs: self.timeout_secs,
+            max_retries: self.max_retries,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            // `None` preserves the prior behavior: basemind resolves the api key itself, ~keep
+            // adds no custom provider headers, and leaves xberg's env handling default. ~keep
+            load_env: None,
+            headers: None,
+            ..Default::default()
+        })
+    }
 }
 
 /// Tri-state API key wrapper. Serde-deserialised as `null` (`Unset`), a plain
@@ -701,103 +924,7 @@ impl fmt::Display for SecretString {
     }
 }
 
+/// The module's tests live in a subdirectory by the 1000-line module cap
+/// (`tests/max_lines.rs`), the same shape `pii_patterns` above uses.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secret_string_redacts_in_debug() {
-        let s = SecretString::new("hunter2".to_string());
-        assert_eq!(format!("{s:?}"), "\"<redacted>\"");
-        assert_eq!(format!("{s}"), "<redacted>");
-        assert_eq!(s.expose(), "hunter2");
-    }
-
-    #[test]
-    fn api_key_unset_resolves_to_none() {
-        assert!(ApiKey::Unset.resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_literal_resolves_to_value() {
-        let k = ApiKey::Literal("sk-test".to_string());
-        let resolved = k.resolve().expect("literal resolves");
-        assert_eq!(resolved.expose(), "sk-test");
-    }
-
-    #[test]
-    fn api_key_literal_empty_resolves_to_none() {
-        assert!(ApiKey::Literal(String::new()).resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_env_reads_environment() {
-        // SAFETY: scoped to this single test; the env var name is uniquely
-        unsafe {
-            std::env::set_var("BASEMIND_TEST_API_KEY_PRESENT", "value-123");
-        }
-        let k = ApiKey::Env {
-            env: "BASEMIND_TEST_API_KEY_PRESENT".to_string(),
-        };
-        let resolved = k.resolve().expect("env resolves");
-        assert_eq!(resolved.expose(), "value-123");
-        unsafe {
-            std::env::remove_var("BASEMIND_TEST_API_KEY_PRESENT");
-        }
-    }
-
-    #[test]
-    fn api_key_env_missing_resolves_to_none() {
-        // SAFETY: the variable is removed before the test so the env lookup
-        unsafe {
-            std::env::remove_var("BASEMIND_TEST_API_KEY_MISSING");
-        }
-        let k = ApiKey::Env {
-            env: "BASEMIND_TEST_API_KEY_MISSING".to_string(),
-        };
-        assert!(k.resolve().is_none());
-    }
-
-    #[test]
-    fn api_key_deserialises_literal_string() {
-        let k: ApiKey = serde_json::from_str("\"sk-test\"").expect("parse");
-        match k {
-            ApiKey::Literal(s) => assert_eq!(s, "sk-test"),
-            other => panic!("expected Literal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn api_key_deserialises_env_table() {
-        let k: ApiKey = serde_json::from_str(r#"{"env":"OPENAI_API_KEY"}"#).expect("parse");
-        match k {
-            ApiKey::Env { env } => assert_eq!(env, "OPENAI_API_KEY"),
-            other => panic!("expected Env, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn api_key_literal_never_serializes_cleartext() {
-        let key = ApiKey::Literal("sk-supersecret".to_string());
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert!(!json.contains("sk-supersecret"), "raw secret leaked: {json}");
-        assert!(json.contains("<redacted>"), "redaction marker missing: {json}");
-    }
-
-    #[test]
-    fn api_key_env_serializes_env_name_only() {
-        let key = ApiKey::Env {
-            env: "OPENAI_API_KEY".to_string(),
-        };
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert!(json.contains("OPENAI_API_KEY"), "env name missing: {json}");
-        assert!(json.contains("\"env\""), "env field missing: {json}");
-    }
-
-    #[test]
-    fn api_key_unset_serializes_to_null() {
-        let key = ApiKey::Unset;
-        let json = serde_json::to_string(&key).expect("serialize");
-        assert_eq!(json, "null");
-    }
-}
+mod tests;

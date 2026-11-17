@@ -90,7 +90,7 @@ fn request_timeout(req: &CommsRequest) -> Option<std::time::Duration> {
         | CommsRequest::IndexRead { .. }
         | CommsRequest::CodeSearchLanes { .. } => None,
         #[cfg(feature = "memory")]
-        CommsRequest::Memory { .. } => None,
+        CommsRequest::Memory { .. } | CommsRequest::Governance { .. } => None,
         _ => Some(timeout_from_env(REQUEST_TIMEOUT_ENV, DEFAULT_REQUEST_TIMEOUT_SECS)),
     }
 }
@@ -575,7 +575,6 @@ fn is_connection_lost(err: &CommsClientError) -> bool {
 
 #[path = "client_ops.rs"]
 mod ops;
-pub use ops::{WaitOutcome, WaitReason};
 
 #[cfg(all(test, feature = "comms", unix))]
 #[path = "client_tests.rs"]

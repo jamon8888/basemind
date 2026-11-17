@@ -6,6 +6,22 @@ use anyhow::{Context, Result, anyhow};
 use xberg::embeddings::EMBEDDING_PRESETS;
 use xberg::{EmbeddingConfig, EmbeddingModelType};
 
+/// Custom HF repos usable without a preset-table entry: repo id → vector dims.
+/// xberg Custom models resolve `onnx/model.onnx` with Mean pooling from the repo.
+const KNOWN_CUSTOM_DIMENSIONS: &[(&str, usize)] = &[("Infojura/mmlw-retrieval-e5-small-onnx", 384)];
+
+/// Resolve vector dims for a preset name or a known custom HF repo id.
+/// Shared by the loader and the scanner so both agree (a mismatch would write
+/// a LanceDB table with the wrong dim and force a later wipe-and-rebuild).
+pub(crate) fn resolve_embedding_dims(name: &str) -> Option<usize> {
+    if let Some(meta) = EMBEDDING_PRESETS.iter().find(|p| p.name == name) {
+        return Some(meta.dimensions);
+    }
+    KNOWN_CUSTOM_DIMENSIONS
+        .iter()
+        .find(|(id, _)| *id == name)
+        .map(|(_, dims)| *dims)
+}
 use crate::config::OnnxProvider;
 
 /// Translate `[resources] onnx_provider` into xberg's acceleration setting. `Auto` yields `None`, so
@@ -46,10 +62,18 @@ pub fn bound_ort_memory(intra_threads: usize) {
 /// Drop every resident embedding engine so its ONNX session, weights and arena are freed. The next
 /// embedding reloads the model. Returns how many engines were dropped.
 pub fn release_engines() -> usize {
+    #[cfg(test)]
+    ENGINE_RELEASE_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     xberg::clear_engine_caches()
 }
 
 static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Set for the current overlapping-pass period when any participant requested warm retention.
+/// The bit is consumed only when the final pass ends, so a cold pass cannot override a warm pass
+/// merely because it happens to drop last.
+static WARM_RETENTION_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ENGINE_RELEASE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Serializes [`begin_embed_pass`] against the last pass's release. Without it, a new pass could
 /// increment the counter in the window between the final decrement and [`release_engines`], and
@@ -57,23 +81,43 @@ static EMBED_PASSES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomi
 /// (and the release), never across the embedding work itself.
 static PASS_GATE: Mutex<()> = Mutex::new(());
 
-/// RAII marker for one embedding pass in this process. When the LAST concurrent pass ends, resident
-/// engines are released, so a pass for one workspace never frees the model out from under (or forces a
-/// reload for) a pass that is still running for another.
+/// RAII marker for one full embedding pass in this process. When the LAST concurrent guarded pass
+/// ends, resident engines are released, so a pass for one workspace never frees the model out from
+/// under (or forces a reload for) a pass that is still running for another. Inline incremental
+/// batches use the same guard, so the default cold-release policy cannot leave engines resident
+/// indefinitely; daemons that need warm watcher latency can opt into `keep_models_warm`.
 #[must_use = "the engines are released when this guard drops"]
-pub struct EmbedPass(());
+pub struct EmbedPass {
+    _private: (),
+}
 
 /// Register the start of an embedding pass; see [`EmbedPass`].
 pub fn begin_embed_pass() -> EmbedPass {
+    begin_embed_pass_with_policy(false)
+}
+
+/// Register an embedding pass with an explicit model-retention policy.
+/// Keeping engines warm is useful for a long-lived daemon serving repeated
+/// scans/searches; the default remains cold-release for bounded memory.
+pub fn begin_embed_pass_with_policy(keep_warm: bool) -> EmbedPass {
     let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
     EMBED_PASSES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    EmbedPass(())
+    if keep_warm {
+        WARM_RETENTION_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    EmbedPass { _private: () }
 }
 
 impl Drop for EmbedPass {
     fn drop(&mut self) {
         let _gate = PASS_GATE.lock().unwrap_or_else(PoisonError::into_inner);
-        if EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        let last_pass = EMBED_PASSES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
+        let retain_engines = if last_pass {
+            WARM_RETENTION_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+        } else {
+            false
+        };
+        if last_pass && !retain_engines {
             tracing::info!(
                 dropped = release_engines(),
                 "embedding pass finished; released resident embedding engines"
@@ -86,7 +130,6 @@ impl Drop for EmbedPass {
 pub fn embed_passes_in_flight() -> usize {
     EMBED_PASSES_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire)
 }
-
 /// Global bounded rayon `ThreadPool` for all ONNX embed calls. Initialized once
 /// on first use; subsequent calls to `embed_pool` return the same pool regardless
 /// of the `max_threads` argument (the pool size is fixed for the process).
@@ -123,46 +166,20 @@ pub fn embed_pool(max_threads: usize) -> &'static rayon::ThreadPool {
     })
 }
 
-/// What stands in for the model in a test: the vector for a text.
-#[cfg(test)]
-pub(crate) type FakeEmbed = fn(&str) -> Result<Vec<f32>>;
-
-/// Vector length of `preset`, or the error [`SharedEmbedder::load`] gives for it: the preset table
-/// lookup alone, with no model or config built.
-fn preset_dimension(preset: &str) -> Result<u16> {
-    let meta = EMBEDDING_PRESETS.iter().find(|p| p.name == preset).ok_or_else(|| {
-        anyhow!(
-            "unknown embedding preset '{preset}'; \
-                 available: fast, balanced, quality, multilingual"
-        )
-    })?;
-    u16::try_from(meta.dimensions)
-        .with_context(|| format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions))
-}
-
-/// The scan's [`Embedder`](crate::scan_retrieval::Embedder). `dim` reads the preset table;
-/// `embed_batch` loads a [`SharedEmbedder`] and embeds through it.
-#[cfg(feature = "code-search")]
-pub(crate) struct ScanEmbedder;
-
-#[cfg(feature = "code-search")]
-impl crate::scan_retrieval::Embedder for ScanEmbedder {
-    fn dim(
-        &self,
-        spec: &crate::scan_retrieval::EmbedderSpec<'_>,
-    ) -> Result<u16, crate::scan_retrieval::RetrievalError> {
-        preset_dimension(spec.preset).map_err(|error| crate::scan_retrieval::RetrievalError(format!("{error:#}")))
-    }
-
-    fn embed_batch(
-        &self,
-        spec: &crate::scan_retrieval::EmbedderSpec<'_>,
-        texts: &[&str],
-    ) -> Result<Vec<Vec<f32>>, crate::scan_retrieval::RetrievalError> {
-        SharedEmbedder::load_with_provider(spec.preset, spec.max_threads, spec.batch_size, spec.provider)
-            .and_then(|embedder| embedder.embed_batch(texts))
-            .map_err(|error| crate::scan_retrieval::RetrievalError(format!("{error:#}")))
-    }
+/// Run `work` on the bounded embed pool and return its result.
+///
+/// Every embed call goes through here rather than `embed_pool(..).install(..)`. Called from a
+/// worker of another rayon pool (the scanner's), `install` does not park the caller: while it
+/// waits it keeps running that pool's jobs. A scan worker holding the document slot would then
+/// start the next document and wait forever for a slot it holds itself (basemind#30). The call is
+/// therefore made from a short-lived plain thread, so the scan worker blocks without taking on
+/// more work.
+pub fn on_embed_pool<R: Send>(max_threads: usize, work: impl FnOnce() -> R + Send) -> R {
+    let pool = embed_pool(max_threads);
+    std::thread::scope(|scope| match scope.spawn(|| pool.install(work)).join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
 }
 
 /// Loaded, ready-to-query embedding engine. `Clone` is cheap (config is stack-only).
@@ -175,22 +192,9 @@ pub struct SharedEmbedder {
     /// auto heuristic inside `resolve_embed_threads`; first caller wins for the
     /// global pool.
     max_embed_threads: usize,
-    /// A stand-in for the model: tests exercise the callers of an embedder without loading one.
-    #[cfg(test)]
-    fake: Option<FakeEmbed>,
 }
 
 impl SharedEmbedder {
-    /// An embedder that reports `model` and `dim` and answers every text with `embed`.
-    #[cfg(all(test, feature = "memory"))]
-    pub(crate) fn fake(model: &str, dim: u16, embed: FakeEmbed) -> Self {
-        let mut embedder = Self::load("fast", 1, 8).expect("the fast preset exists");
-        embedder.dim = dim;
-        embedder.model_name = model.to_string();
-        embedder.fake = Some(embed);
-        embedder
-    }
-
     /// Build a `SharedEmbedder` from a named xberg preset.
     ///
     /// `max_embed_threads` bounds the process-wide embedding pool (see
@@ -210,11 +214,40 @@ impl SharedEmbedder {
         batch_size: usize,
         provider: OnnxProvider,
     ) -> Result<Self> {
-        let dim = preset_dimension(preset)?;
+        let (model, dim, model_name) = match EMBEDDING_PRESETS.iter().find(|p| p.name == preset) {
+            Some(meta) => {
+                let dim = u16::try_from(meta.dimensions)
+                    .with_context(|| format!("preset '{preset}' dimension {} exceeds u16", meta.dimensions))?;
+                (
+                    EmbeddingModelType::Preset {
+                        name: preset.to_string(),
+                    },
+                    dim,
+                    preset.to_string(),
+                )
+            }
+            None => {
+                let dimensions = resolve_embedding_dims(preset).ok_or_else(|| {
+                    anyhow!(
+                        "unknown embedding preset '{preset}'; \
+                             available: fast, balanced, quality, multilingual, \
+                             Infojura/mmlw-retrieval-e5-small-onnx"
+                    )
+                })?;
+                let dim = u16::try_from(dimensions)
+                    .with_context(|| format!("custom model '{preset}' dimension {dimensions} exceeds u16"))?;
+                (
+                    EmbeddingModelType::Custom {
+                        model_id: preset.to_string(),
+                        dimensions,
+                    },
+                    dim,
+                    preset.to_string(),
+                )
+            }
+        };
         let config = EmbeddingConfig {
-            model: EmbeddingModelType::Preset {
-                name: preset.to_string(),
-            },
+            model,
             normalize: true,
             batch_size,
             show_download_progress: false,
@@ -226,10 +259,8 @@ impl SharedEmbedder {
         Ok(Self {
             config,
             dim,
-            model_name: preset.to_string(),
+            model_name,
             max_embed_threads,
-            #[cfg(test)]
-            fake: None,
         })
     }
 
@@ -251,10 +282,6 @@ impl SharedEmbedder {
         if text.is_empty() {
             return Err(anyhow!("embed: input text must not be empty"));
         }
-        #[cfg(test)]
-        if let Some(fake) = self.fake {
-            return fake(text);
-        }
         let (config, model, text) = (self.config.clone(), self.model_name.clone(), text.to_string());
         self.run_on_embed_pool(move || {
             let mut results = xberg::embeddings::embed_texts(&[text.as_str()], &config)
@@ -266,20 +293,17 @@ impl SharedEmbedder {
     }
 
     /// Embed a batch of texts in one call. Returns one `Vec<f32>` of length `self.dim()` per
-    /// input, in order.
+    /// input, in order. Used by the code-search scanner to embed a file's chunks in bulk.
     ///
     /// Errors if any input text is empty (xberg rejects empty strings, which produce meaningless
     /// embeddings). An empty batch returns an empty vector without touching the model.
     ///
     /// The call is routed through the process-wide bounded [`embed_pool`] so it
     /// cannot saturate the global rayon pool used by the code-map scanner.
+    #[cfg(any(feature = "code-search", feature = "documents"))]
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
-        }
-        #[cfg(test)]
-        if let Some(fake) = self.fake {
-            return texts.iter().map(|text| fake(text)).collect();
         }
         let (config, model) = (self.config.clone(), self.model_name.clone());
         let owned: Vec<String> = texts.iter().map(|t| (*t).to_string()).collect();
@@ -325,8 +349,12 @@ impl SharedEmbedder {
 mod tests {
     use super::*;
 
+    static EMBED_PASS_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static EMBED_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn embed_pass_guards_nest_and_count_down() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let base = embed_passes_in_flight();
         let first = begin_embed_pass();
         let second = begin_embed_pass();
@@ -339,6 +367,48 @@ mod tests {
         drop(second);
     }
 
+    #[test]
+    fn mixed_pass_policies_retain_in_either_drop_order() {
+        let _serial = EMBED_PASS_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let base_passes = embed_passes_in_flight();
+        let base_releases = ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire);
+        let _cold = begin_embed_pass_with_policy(false);
+        let warm = begin_embed_pass_with_policy(true);
+        drop(warm);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        drop(_cold);
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
+
+        let warm = begin_embed_pass_with_policy(true);
+        let cold = begin_embed_pass_with_policy(false);
+        drop(cold);
+        assert!(WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        drop(warm);
+        assert_eq!(embed_passes_in_flight(), base_passes);
+        assert_eq!(
+            ENGINE_RELEASE_COUNT.load(std::sync::atomic::Ordering::Acquire),
+            base_releases
+        );
+        if base_passes == 0 {
+            assert!(!WARM_RETENTION_REQUESTED.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
     /// The scan deadlock: a scan worker holding a document slot blocked on the embed pool via
     /// `ThreadPool::install`, which parks a rayon worker in a loop that executes other queued jobs of
     /// ITS pool. It picked up a second document, which blocked on the slot the first frame held.
@@ -348,6 +418,7 @@ mod tests {
         use std::sync::{Arc, Mutex, mpsc};
         use std::time::Duration;
 
+        let _serial = EMBED_POOL_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let embedder = SharedEmbedder::load("fast", 2, 8).expect("fast preset");
         let scan_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -356,13 +427,13 @@ mod tests {
         let slot = Arc::new(Mutex::new(()));
         let (done_tx, done_rx) = mpsc::channel();
         let (first_in_tx, first_in_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
 
         let (holder_slot, holder_embedder, holder_done) = (Arc::clone(&slot), embedder.clone(), done_tx.clone());
         scan_pool.spawn(move || {
             let _held = holder_slot.lock().unwrap();
             first_in_tx.send(()).ok();
-            // Give the second job time to be queued behind us, then wait on the embed pool.
-            std::thread::sleep(Duration::from_millis(50));
+            release_rx.recv().expect("release first job");
             let answer = holder_embedder.run_on_embed_pool(|| 7).expect("embed pool result");
             holder_done.send(("first", answer)).ok();
         });
@@ -372,13 +443,14 @@ mod tests {
             let _held = second_slot.lock().unwrap();
             done_tx.send(("second", 0)).ok();
         });
+        release_tx.send(()).expect("release first job");
 
         let mut finished = vec![
             done_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("deadlock: the waiting worker ran the second job inside the first"),
             done_rx
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(Duration::from_secs(30))
                 .expect("second job never ran"),
         ];
         finished.sort_unstable();
@@ -387,6 +459,7 @@ mod tests {
 
     #[test]
     fn a_panicking_embed_job_is_an_error_not_a_hang() {
+        let _serial = EMBED_POOL_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let embedder = SharedEmbedder::load("fast", 2, 8).expect("fast preset");
         let result = embedder.run_on_embed_pool(|| -> u8 { panic!("boom") });
         assert!(result.is_err());
@@ -437,5 +510,18 @@ mod tests {
             "resolve_embed_threads(0) should yield max(2, cores/4) = {expected}"
         );
         assert!(got >= 2, "auto embed cap must be >= 2, got {got}");
+    }
+
+    #[test]
+    fn load_known_custom_repo_falls_back_to_custom() {
+        let got =
+            SharedEmbedder::load("Infojura/mmlw-retrieval-e5-small-onnx", 0, 32).expect("known custom repo must load");
+        assert_eq!(got.dim(), 384);
+        assert!(matches!(got.config.model, EmbeddingModelType::Custom { .. }));
+    }
+
+    #[test]
+    fn load_unknown_name_still_errors() {
+        assert!(SharedEmbedder::load("nope-not-a-model", 0, 32).is_err());
     }
 }

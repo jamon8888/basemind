@@ -199,21 +199,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn default_true() -> bool {
-        true
-    }
-
-    /// A stand-in for a tool's parameters: one required field with an alias, two optional ones.
-    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-    struct WorkspaceGrepParams {
-        #[serde(alias = "query")]
-        pattern: String,
-        #[serde(default)]
-        limit: Option<u32>,
-        #[serde(default = "default_true")]
-        include_context: bool,
-    }
+    use crate::mcp::types::WorkspaceGrepParams;
 
     #[test]
     fn levenshtein_matches_known_distances() {

@@ -201,7 +201,7 @@ The standalone program, for scripts, headless runs, and CI.
 
 <Code code={`basemind scan                           # index the project once
 basemind code symbols "parseQuery"      # find a symbol by name
-basemind code refs "processFile"        # find everywhere it's called
+basemind code references "processFile"  # find everywhere it's called
 basemind git blame src/main.rs          # who last changed each line
 basemind watch                          # keep the index fresh as files change`} lang="bash" />
 
@@ -219,22 +219,18 @@ this for you.)
 | pip | `pip install basemind` | everything |
 | cargo | `cargo install basemind --locked` | code + git only |
 | cargo (full) | `cargo install basemind --features full --locked` | everything |
-| GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything |
+| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | documents + rehydration vault + memory + NER + graphrag focus release — see [Legal workspaces](/capabilities/legal-workspaces/) |
+| GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything (`basemind-hacienda-legal-<triple>` assets carry the focus release) |
 
-The Homebrew / npm / pip / GitHub downloads are built with `full` —
-documents, OCR, named-entity recognition, search, shared memory, and agent comms
+The Homebrew / npm / pip / GitHub downloads include the full feature set —
+documents, OCR, search, web crawl, shared memory, agent comms, and agent shells
 — so the first run downloads the models it needs. The plain `cargo install`
 builds the code-map and git tools only.
-
-In a source build, `--features documents` covers document search without OCR or named-entity
-recognition. Add `documents-ocr` (raster images and scanned PDFs) and `documents-ner` (the
-`entity_category` filter), or build with `full`, which has both. See
-[Cargo Features](/reference/configuration/#cargo-features).
 
 ### Using a local build with the plugin
 
 The plugin launcher (`scripts/mcp-launch.sh`) normally downloads the release binary that matches the
-plugin manifest into `~/.cache/basemind/versions/<version>/` and verifies its checksum. To run a binary you
+plugin manifest into `~/.cache/basemind/bin/<version>/` and verifies its checksum. To run a binary you
 built yourself, point `BASEMIND_BIN` at it in the environment your client starts the server from:
 
 <Code code={`cargo build --release --features full\nexport BASEMIND_BIN="$PWD/target/release/basemind"`} lang="bash" />

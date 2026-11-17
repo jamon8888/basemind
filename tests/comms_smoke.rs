@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use basemind::comms::client::{CommsClient, WaitReason};
+use basemind::comms::client::CommsClient;
 use basemind::comms::ids::AgentId;
-use basemind::comms::singleton::{CommsPaths, comms_socket_path, generation_dir, probe_alive};
+use basemind::comms::singleton::{CommsPaths, comms_socket_path, probe_alive};
 
 const BIN: &str = env!("CARGO_BIN_EXE_basemind");
 
@@ -34,7 +34,7 @@ struct Daemon {
 
 impl Daemon {
     fn start(comms_dir: &Path) -> Self {
-        let socket = comms_socket_path(&generation_dir(comms_dir));
+        let socket = comms_socket_path(comms_dir);
         let child = Command::new(BIN)
             .args(["comms", "daemon"])
             .env("BASEMIND_COMMS_DIR", comms_dir)
@@ -246,8 +246,8 @@ async fn client_recovers_when_daemon_dies_mid_session() {
 
     let mut daemon = Daemon::start(&comms_dir);
     let paths = CommsPaths {
-        comms_dir: generation_dir(&comms_dir),
-        socket_path: comms_socket_path(&generation_dir(&comms_dir)),
+        comms_dir: comms_dir.clone(),
+        socket_path: comms_socket_path(&comms_dir),
     };
     let spawn_dir = comms_dir.clone();
     let mut client = CommsClient::connect_with_respawn(
@@ -499,10 +499,10 @@ async fn rescan_rpc_indexes_a_workspace_and_reports_it_hot() {
 }
 
 /// Connecting a client with a git-repo cwd auto-registers it in the daemon's machine registry, so
-/// `list_workspaces` / `list_worktrees` / `list_branches` surface the repo. The daemon's registry is
-/// isolated to the tempdir via `BASEMIND_DATA_HOME`.
+/// `list_workspaces` / `list_worktrees` surface the repo, and a two-claimant worktree race resolves
+/// to exactly one holder. The daemon's registry is isolated to the tempdir via `BASEMIND_DATA_HOME`.
 #[tokio::test(flavor = "multi_thread")]
-async fn machine_registry_auto_registers_a_connecting_repo() {
+async fn machine_registry_auto_registers_and_worktree_claim_is_exclusive() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
     let repo = tmp.path().join("repo");
@@ -526,10 +526,50 @@ async fn machine_registry_auto_registers_a_connecting_repo() {
     let worktrees = alice.list_worktrees(repo_id.clone()).await.expect("list worktrees");
     assert_eq!(worktrees.len(), 1, "one (main) worktree");
     assert_eq!(worktrees[0].name, "(main)", "the main worktree name");
+    assert_eq!(worktrees[0].claimed_by, None, "unclaimed at first");
 
     let branches = alice.list_branches(repo_id.clone()).await.expect("list branches");
     assert_eq!(branches.len(), 1, "one local branch");
     assert_eq!(branches[0].name, "main", "the main branch");
+
+    let mut bob = connect(&socket, "agent-bob", &repo).await;
+    let a_won = alice
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-alice".to_string())
+        .await
+        .expect("alice claim");
+    let b_won = bob
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-bob".to_string())
+        .await
+        .expect("bob claim");
+    assert!(a_won, "alice's first claim wins");
+    assert!(!b_won, "bob cannot claim a worktree alice holds");
+
+    let worktrees = alice
+        .list_worktrees(repo_id.clone())
+        .await
+        .expect("list worktrees after claim");
+    assert_eq!(
+        worktrees[0].claimed_by.as_deref(),
+        Some("agent-alice"),
+        "the (main) worktree is claimed by alice"
+    );
+
+    let released = alice
+        .release_worktree(repo_id.clone(), "(main)".to_string(), "agent-alice".to_string())
+        .await
+        .expect("alice release");
+    assert!(released, "alice releases her own claim");
+    let b_won_now = bob
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-bob".to_string())
+        .await
+        .expect("bob claim after release");
+    assert!(b_won_now, "bob claims once the worktree is freed");
+
+    let unknown = bob
+        .claim_worktree(repo_id.clone(), "no-such-worktree".to_string(), "agent-bob".to_string())
+        .await
+        .expect("claim of unknown worktree returns Ok(false)");
+    assert!(!unknown, "an unknown worktree cannot be claimed");
 }
 
 /// `inbox_wait` against a REAL detached daemon (not the in-process/UDS-in-test-process setups used
@@ -587,127 +627,6 @@ async fn inbox_wait_delivers_peer_post_promptly() {
     );
 }
 
-/// Against a real daemon: a `wait` filtered to one thread ignores an unread message in another
-/// joined thread (reporting `Timeout`), and wakes with `Message` for a post in the filtered thread.
-#[tokio::test(flavor = "multi_thread")]
-async fn inbox_wait_thread_filter_ignores_other_threads() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let comms_dir = tmp.path().join("comms");
-    let root = tmp.path().to_path_buf();
-    let daemon = Daemon::start(&comms_dir);
-    let socket = daemon.socket().to_path_buf();
-
-    let mut alice = connect(&socket, "agent-alice", &root).await;
-    let mut bob = connect(&socket, "agent-bob", &root).await;
-    let watched = alice
-        .start_thread(Some("watched".to_string()), None, vec![agent("agent-bob")])
-        .await
-        .expect("start watched thread")
-        .id;
-    let other = alice
-        .start_thread(Some("other".to_string()), None, vec![agent("agent-bob")])
-        .await
-        .expect("start other thread")
-        .id;
-    alice
-        .post_message(other, "elsewhere".to_string(), Vec::new(), vec![], None)
-        .await
-        .expect("post to the other thread");
-
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let outcome = bob
-        .wait_inbox_unseen(
-            None,
-            None,
-            Some(watched.clone()),
-            None,
-            None,
-            100,
-            Duration::from_millis(500),
-            &cancel,
-            |_| false,
-        )
-        .await
-        .expect("filtered wait");
-    assert_eq!(
-        outcome.reason,
-        WaitReason::Timeout,
-        "another thread's unread message must not end the wait: {outcome:?}"
-    );
-    assert!(outcome.messages.is_empty());
-
-    alice
-        .post_message(watched.clone(), "here".to_string(), Vec::new(), vec![], None)
-        .await
-        .expect("post to the watched thread");
-    let outcome = bob
-        .wait_inbox_unseen(
-            None,
-            None,
-            Some(watched),
-            None,
-            None,
-            100,
-            Duration::from_secs(10),
-            &cancel,
-            |_| false,
-        )
-        .await
-        .expect("filtered wait");
-    assert_eq!(outcome.reason, WaitReason::Message);
-    let subjects: Vec<&str> = outcome.messages.iter().map(|row| row.meta.subject.as_str()).collect();
-    assert_eq!(subjects, ["here"]);
-}
-
-/// Against a real daemon: `mark_read` under a recency window leaves the message the window hid
-/// unread, so a read without the window still returns it.
-#[tokio::test(flavor = "multi_thread")]
-async fn inbox_mark_read_keeps_messages_outside_the_recency_window() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let comms_dir = tmp.path().join("comms");
-    let root = tmp.path().to_path_buf();
-    let daemon = Daemon::start(&comms_dir);
-    let socket = daemon.socket().to_path_buf();
-
-    let mut alice = connect(&socket, "agent-alice", &root).await;
-    let mut bob = connect(&socket, "agent-bob", &root).await;
-    let thread = alice
-        .start_thread(Some("window".to_string()), None, vec![agent("agent-bob")])
-        .await
-        .expect("start thread")
-        .id;
-    alice
-        .post_message(thread.clone(), "old".to_string(), Vec::new(), vec![], None)
-        .await
-        .expect("post old");
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    alice
-        .post_message(thread, "new".to_string(), Vec::new(), vec![], None)
-        .await
-        .expect("post new");
-
-    let (rows, _, _) = bob
-        .read_inbox(None, None, None, 100, false, None)
-        .await
-        .expect("unfiltered read");
-    assert_eq!(rows.len(), 2);
-    let window = Some(rows[1].meta.ts_micros);
-
-    let (shown, _, _) = bob
-        .read_inbox(None, None, None, 100, true, window)
-        .await
-        .expect("windowed mark_read");
-    let shown: Vec<&str> = shown.iter().map(|row| row.meta.subject.as_str()).collect();
-    assert_eq!(shown, ["new"]);
-
-    let (all, _, _) = bob
-        .read_inbox(None, None, None, 100, false, None)
-        .await
-        .expect("read all history");
-    let all: Vec<&str> = all.iter().map(|row| row.meta.subject.as_str()).collect();
-    assert_eq!(all, ["old", "new"], "the hidden message must still be unread");
-}
-
 /// Companion to [`inbox_wait_delivers_peer_post_promptly`]: with no peer posting anything, a real
 /// daemon's `inbox_wait` still returns `timed_out: true` once the timeout elapses.
 #[tokio::test(flavor = "multi_thread")]
@@ -747,7 +666,7 @@ async fn daemon_answers_ping_while_the_store_is_still_opening() {
     const OPEN_DELAY: Duration = Duration::from_secs(8);
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
-    let socket = comms_socket_path(&generation_dir(&comms_dir));
+    let socket = comms_socket_path(&comms_dir);
     let child = Command::new(BIN)
         .args(["comms", "daemon"])
         .env("BASEMIND_COMMS_DIR", &comms_dir)

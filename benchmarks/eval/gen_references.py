@@ -1,6 +1,6 @@
 """Gold for `references` and `callers`: a callee name -> every Python call site of it.
 
-basemind's `code_refs` (CLI `code refs NAME`) is name-only and call-site-only: `NAME(...)` and `x.NAME(...)`
+basemind's `code references NAME` is name-only and call-site-only: `NAME(...)` and `x.NAME(...)`
 count, a bare `NAME` (decorator without parentheses, argument, assignment) does not. It reports
 the line on which the call expression STARTS. The gold is every `ast.Call` whose callee
 identifier is NAME at that line, cross-checked against `git grep -n -w`: a call is kept only if
@@ -8,7 +8,7 @@ the word occurs on a line of the callee expression in the HEAD tree (drops nothi
 consistent tree; it guards against parse/line disagreements and is counted in the summary).
 
 `--mode callers` additionally restricts to names defined exactly once in the repo and passes that
-definition's path (`code_refs` with `name` and `path`; CLI `code callers PATH NAME`). `--mode both` emits both kinds.
+definition's path, matching how `code callers PATH NAME` is used. `--mode both` emits both kinds.
 
 Pyrefly note: `pyrefly` 1.x exposes no find-references CLI (only `check`, `infer`, `lsp`, ...);
 scope-resolved references would need a `textDocument/references` request to `pyrefly lsp`, which
@@ -32,7 +32,7 @@ def callee_name(func: ast.expr) -> str | None:
     return None
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901,PLR0912 - the gold grammar is a flat chain of filters, splitting it hides the shape
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     c.add_common_args(p)
     p.add_argument("--mode", choices=["references", "callers", "both"], default="references")
@@ -42,8 +42,10 @@ def main() -> None:
     a = p.parse_args()
 
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
-    calls: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
-    defs: dict[str, list[str]] = defaultdict(list)
+    calls: dict[str, list[tuple[str, int, int]]] = defaultdict(
+        list
+    )  # one entry per call site: the file path and the call line numbers (start, callee end)
+    defs: dict[str, list[str]] = defaultdict(list)  # one list of defining paths per name (def/class only)
     for path, src in repo.blobs(repo.files()):
         tree = c.parse_python(src)
         if tree is None:
@@ -110,10 +112,7 @@ def main() -> None:
                     "baseline": baseline,
                 }
             )
-    print(
-        f"cross-check dropped {dropped} ast call sites not confirmed by git grep -w",
-        file=sys.stderr,
-    )
+    sys.stderr.write(f"cross-check dropped {dropped} ast call sites not confirmed by git grep -w\n")
     c.emit(tasks, a.out)
 
 

@@ -8,15 +8,16 @@
 //! Split out of `state.rs` so the per-connection type and the shared type each stay well under the
 //! per-file size budget.
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use lru::LruCache;
 use tokio::sync::{Notify, RwLock};
 
-use super::{MapCache, OutlineCache, ServerOptions, telemetry};
-use crate::index::view::IndexView;
+use super::{MapCache, OUTLINE_CACHE_CAP, OutlineCache, ServerOptions, telemetry};
 use crate::store::Store;
 
 /// Heavy, workspace-level read state shared across every connection to one `(root, view)`.
@@ -50,9 +51,6 @@ pub(crate) struct SharedReadStack {
     /// `(blob_oid, lang) -> Arc<OutlineEntry>` cache that keeps `symbol_history` fast on
     /// hot files even when the symbol's source blob shows up in many adjacent commits.
     pub(crate) outline_cache: Arc<OutlineCache>,
-    /// The `[languages]` overrides of `config`, compiled on first use: the git tools and a stale
-    /// re-parse detect a language per call, and the table never changes while the server runs.
-    lang_rules: std::sync::OnceLock<crate::lang_rules::LangRules>,
     /// Scanner config (include / exclude globs, eager_l2, document tier knobs, …).
     /// Held on the server so the `rescan` MCP tool can re-run a scan in-process
     /// without re-reading `basemind.toml`.
@@ -70,36 +68,37 @@ pub(crate) struct SharedReadStack {
     /// against a stale generation can be detected and reported back as
     /// `cursor_invalidated = true`.
     pub(crate) cache_generation: AtomicU32,
-    /// Moves with `cache_generation` when the index may have changed (rescan, view watcher, daemon
-    /// refresh), but not when the map of the index the server opened is published (the boot warm,
-    /// the lazy build). Lists that never come from the empty boot placeholder stamp their cursors
-    /// with it — `code_search` / `docs_search` rank out of LanceDB, `code_outline` reads the map or
-    /// the one blob alike — so that publish landing between two pages is not a changed index.
-    pub(crate) index_generation: AtomicU32,
-    /// Ranked lists of recent `code_search` / `docs_search` retrievals, keyed by query and
-    /// `cache_generation`, so a later page does not rank the whole retrieval again.
-    #[cfg_attr(
-        not(any(feature = "code-search", feature = "documents")),
-        allow(dead_code, reason = "read only by the ranked tools, which this build lacks")
-    )]
-    pub(crate) ranked: super::ranked_cache::RankedCache,
+    /// Generation-keyed memo of built code-graphs, shared by every graph tool (`neighbors`/`path`/
+    /// `subgraph`/`communities`/`architecture_map`/`graph_export`). Keyed on the current
+    /// [`cache_generation`](Self::cache_generation), so it is invalidated wholesale on any `cache`
+    /// swap and never serves a stale graph. Byte-budgeted — a built graph is O(corpus), so without
+    /// one it would be the last unbounded resident structure on the read stack. See
+    /// [`super::codegraph::GraphMemo`].
+    pub(crate) graph_memo: Mutex<super::codegraph::GraphMemo>,
     /// Per-repo scope key for LanceDB tables and `memory_by_key` Fjall keyspace.
     /// Computed once at boot. Do NOT recompute per-call.
     #[allow(dead_code)]
     pub(crate) scope: String,
     /// LanceDB vector store. Lazy-init on first memory/document/code-search call.
     #[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
-    pub(crate) lance: super::lance_cell::LanceCell,
-    /// The repo group's memory vector store (see `memory_vectors`). Lazy-init on first use.
-    #[cfg(feature = "memory")]
-    pub(crate) memory_lance: super::lance_cell::LanceCell,
-    /// Memory namespaces `(vis_byte, owner)` whose vector rows a search in this process is bringing
-    /// up to date with the notes, or has.
-    #[cfg(feature = "memory")]
-    pub(crate) memory_backfill: std::sync::Mutex<ahash::AHashMap<(u8, String), super::memory_vectors::Backfill>>,
+    pub(crate) lance: tokio::sync::OnceCell<Arc<crate::lance::LanceStore>>,
     /// Shared embedding engine. Lazy-init on first embed call.
-    #[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
+    #[cfg(feature = "intelligence")]
     pub(crate) embedder: tokio::sync::OnceCell<Arc<crate::embeddings::SharedEmbedder>>,
+    /// Shared crawlberg engine. Initialised at server boot from the `[crawl]`
+    /// config section; `None` if engine construction failed (the web_* tools
+    /// will return an MCP error rather than crash).
+    #[cfg(feature = "crawl")]
+    pub(crate) crawl_engine: Option<crawlberg::CrawlEngineHandle>,
+    /// Embedded rmux-backed headless shell runtime. Lazily connects to (or
+    /// starts) the embedded daemon on the first `shell_*` tool call; cheap to
+    /// hold otherwise (no daemon spawn until first use).
+    ///
+    // NOTE: shared per-workspace here (it is a handle to the singleton rmux daemon). Flag for later
+    // ~keep review: sharing one shell runtime across connections means shell sessions are not isolated
+    // ~keep per connection identity.
+    #[cfg(all(feature = "shells", any(unix, windows)))]
+    pub(crate) shell_runtime: crate::shells::ShellRuntime,
     /// True while the boot-time initial scan (auto-scan of an empty index) is running. Lets a
     /// client polling `status` distinguish "index still building" from "index empty / no matches"
     /// so the build cost is not silently folded into the first query's latency.
@@ -125,6 +124,10 @@ pub(crate) struct SharedReadStack {
     /// watcher) is in flight. Surfaced as the `Rescanning` lifecycle so a client sees "results may be
     /// a moment stale" rather than treating a mid-rescan snapshot as final.
     pub(crate) rescan_active: AtomicBool,
+    /// Set from the moment the startup catch-up scan is scheduled until both of its passes are done.
+    /// Kept apart from `rescan_active`, which watcher batches raise and lower on their own; the
+    /// lifecycle reports either one as rescanning.
+    pub(crate) catch_up_active: AtomicBool,
     /// True when the in-RAM code map is built ON DEMAND — at the first
     /// [`await_cache_ready`](super::ServerState::await_cache_ready) barrier — instead of at construction.
     ///
@@ -163,29 +166,51 @@ pub(crate) struct SharedReadStack {
     pub(crate) host: Option<std::sync::Arc<dyn crate::mcp::HostBackend>>,
 }
 
-/// Whether the workspace's `status.json` records a partial or unresolved last scan. A missing or
-/// unreadable sidecar is not degraded: the empty-index checks above own the never-scanned case.
-fn last_scan_degraded(store: &Store) -> bool {
-    crate::store::read_status_sidecar(&store.basemind_dir).is_some_and(|status| status.is_degraded())
+/// Byte budget for the code-graph memo, derived from `[resources] max_map_cache_mb`.
+///
+/// Half the outline budget, because a graph is a rebuildable projection OF those outlines and
+/// should not outweigh them; `0` (unbounded outlines) stays unbounded here too. Derived rather than
+/// separately configurable so an operator bounds the whole read stack with one number.
+fn graph_memo_budget_bytes(resources: &crate::config::ResourcesConfig) -> u64 {
+    super::l1_cache::budget_bytes_from(resources) / 2
 }
 
-/// Boot decisions derived purely from the opened store + [`ServerOptions`]: whether an initial scan
-/// is needed (an empty index, or one whose last full scan was cancelled / aborted before covering the
-/// workspace or finishing its resolve pass: issues #79, #84), and whether the in-RAM cache preload is deferred to the background.
+/// Boot decisions derived purely from the opened store + [`ServerOptions`]: whether an empty-index
+/// initial scan is needed, and whether the in-RAM cache preload is deferred to the background.
 ///
 /// Factored out so [`SharedReadStack::new`] (which sets the `cache_warming` atomic + eager/deferred
 /// cache) and `BasemindServer::new_with_options` (which spawns the matching background tasks) agree
 /// by construction rather than by duplicated expressions.
-pub(crate) fn boot_plan(store: &Store, options: &ServerOptions) -> (bool, bool) {
+pub(crate) fn boot_plan(store: &Store, options: &ServerOptions, documents_enabled: bool) -> (bool, bool) {
     let view_is_working = store.view == crate::store::VIEW_WORKING;
     let fjall_index_empty = store
-        .index_view()
-        .map(|view| view.symbols_index_is_empty())
+        .index_db
+        .as_ref()
+        .map(|db| db.symbols_index_is_empty())
         .unwrap_or(false);
-    let needs_initial_scan = store.layered_read.is_none()
-        && (options.daemon_writer || !options.read_only)
-        && view_is_working
-        && (store.index.files.is_empty() || fjall_index_empty || last_scan_degraded(store));
+    // A documents-only scan deliberately leaves the code map empty. Treating that as an empty
+    // workspace starts a second background scan as soon as the MCP server opens, racing the first
+    // document search against the replacement of its Lance rows. The persisted document entries
+    // plus the completed-scan marker are the durable scan state for this feature set; cross-check
+    // both because a purge can remove entries without clearing the marker. The code-index gate is
+    // independent so a documents-only scan cannot suppress a missing symbol-index build.
+    // A completed documents pass is meaningful even when it found no document files, and a
+    // documents-disabled build has no document tier to warm. Treating either case as empty
+    // would launch a second scan every time a code-only workspace opens.
+    let documents_index_empty = documents_enabled && !store.index.documents_scan_completed;
+    // A documents-only workspace has no code map by design. Only require a code-index rebuild
+    // when code files exist but their secondary index is missing (and this build includes a code
+    // index tier), or when the whole workspace is empty.
+    let code_index_empty = (store.index.files.is_empty() && store.index.doc_files.is_empty())
+        || (store.index.files.iter().next().is_some()
+            && cfg!(any(
+                feature = "code-intel-js",
+                feature = "code-intel-stack",
+                feature = "code-search"
+            ))
+            && fjall_index_empty);
+    let needs_initial_scan =
+        (options.daemon_writer || !options.read_only) && view_is_working && (documents_index_empty || code_index_empty);
     let defer_warm = options.background && !needs_initial_scan;
     (needs_initial_scan, defer_warm)
 }
@@ -217,7 +242,7 @@ impl SharedReadStack {
             .map(|r| crate::git::scope_key(r))
             .unwrap_or_else(|| format!("path:{}", root.display()));
         let corpus_bytes: u64 = store.index.files.values().map(|e| e.size_bytes).sum();
-        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options);
+        let (_needs_initial_scan, defer_warm) = boot_plan(&store, &options, config.documents.enabled);
         let cache = if defer_warm || options.lazy_cache {
             Arc::new(MapCache::empty())
         } else {
@@ -235,8 +260,19 @@ impl SharedReadStack {
             lazy_cache = options.lazy_cache,
             "code map ready for MCP server (preloaded, warming in background, or lazy)"
         );
-        let outline_cache: Arc<OutlineCache> = Arc::new(OutlineCache::default());
+        let graph_memo_budget = graph_memo_budget_bytes(&config.resources);
+        let outline_cache: Arc<OutlineCache> = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(OUTLINE_CACHE_CAP).expect("OUTLINE_CACHE_CAP > 0"),
+        )));
         let telemetry_handle = Arc::new(telemetry::Telemetry::new(&store.basemind_dir));
+        #[cfg(feature = "crawl")]
+        let crawl_engine = match crate::web::build_engine(&config.crawl) {
+            Ok(e) => Some(e),
+            Err(error) => {
+                tracing::warn!(?error, "crawl engine init failed; web_* tools will report errors");
+                None
+            }
+        };
         Self {
             store: RwLock::new(store),
             root,
@@ -245,28 +281,27 @@ impl SharedReadStack {
             git_cache,
             git_history,
             outline_cache,
-            lang_rules: std::sync::OnceLock::new(),
             config,
             telemetry: telemetry_handle,
             corpus_bytes: AtomicU64::new(corpus_bytes),
             cache_generation: AtomicU32::new(1),
-            index_generation: AtomicU32::new(1),
-            ranked: Default::default(),
+            graph_memo: Mutex::new(super::codegraph::new_graph_memo(graph_memo_budget)),
             scope,
             #[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
-            lance: Default::default(),
-            #[cfg(any(feature = "memory", feature = "documents", feature = "code-search"))]
+            lance: tokio::sync::OnceCell::new(),
+            #[cfg(feature = "intelligence")]
             embedder: tokio::sync::OnceCell::new(),
-            #[cfg(feature = "memory")]
-            memory_lance: Default::default(),
-            #[cfg(feature = "memory")]
-            memory_backfill: std::sync::Mutex::new(ahash::AHashMap::new()),
+            #[cfg(feature = "crawl")]
+            crawl_engine,
+            #[cfg(all(feature = "shells", any(unix, windows)))]
+            shell_runtime: crate::shells::ShellRuntime::new(),
             initial_scan_active: AtomicBool::new(false),
             initial_scan_ms: AtomicU64::new(0),
             cache_warming: AtomicBool::new(defer_warm),
             cache_warm_ms: AtomicU64::new(0),
             cache_ready: Notify::new(),
             rescan_active: AtomicBool::new(false),
+            catch_up_active: AtomicBool::new(false),
             lazy_cache: options.lazy_cache,
             lazy_cache_built: tokio::sync::OnceCell::new(),
             read_only: options.read_only,
@@ -276,54 +311,18 @@ impl SharedReadStack {
             host,
         }
     }
-}
 
-impl SharedReadStack {
-    /// Whether a memory request crosses the daemon's socket, whose frame bounds its size, rather
-    /// than being answered in this process.
-    #[cfg(feature = "memory")]
-    pub(crate) fn memory_is_framed(&self) -> bool {
-        #[cfg(all(feature = "comms", any(unix, windows)))]
-        return self.daemon_writer && self.host.is_none();
-        #[cfg(not(all(feature = "comms", any(unix, windows))))]
-        false
-    }
-
-    /// The compiled `[languages]` overrides. A table that does not compile was already reported
-    /// when the config was loaded; detection then falls back to the built-in rules.
-    pub(crate) fn lang_rules(&self) -> &crate::lang_rules::LangRules {
-        self.lang_rules
-            .get_or_init(|| crate::lang_rules::LangRules::from_config(&self.config.languages).unwrap_or_default())
-    }
-
-    /// Record that the index may have changed under the published map: both generations move.
-    pub(crate) fn note_index_changed(&self) {
-        self.cache_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.index_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::store::{ScanHealth, VIEW_WORKING, write_status_sidecar};
-
-    #[test]
-    fn a_partial_or_unresolved_last_scan_is_degraded_and_a_clean_one_is_not() {
-        crate::store::init_isolated_cache();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open(dir.path(), VIEW_WORKING).expect("open store");
-        assert!(
-            !last_scan_degraded(&store),
-            "a workspace with no sidecar is not degraded"
-        );
-        for (health, degraded) in [
-            (ScanHealth::complete(), false),
-            (ScanHealth::resolving(), true),
-            (ScanHealth::partial("cancelled", 1, 9), true),
-        ] {
-            write_status_sidecar(&store.basemind_dir, 1, 1, &health);
-            assert_eq!(last_scan_degraded(&store), degraded, "{health:?}");
-        }
+    /// Build the shared code-graph for `opts`, served from [`graph_memo`](Self::graph_memo) when an
+    /// identical graph was already built for the same cache snapshot. This is the single entry point
+    /// every graph tool uses instead of calling [`super::codegraph::build`] directly, so repeat calls
+    /// against one snapshot collapse to an `Arc` clone. The memo keys on the cache's own content
+    /// fingerprint, so it invalidates itself the moment the caller's `cache` differs.
+    pub(crate) fn graph(
+        &self,
+        idx: Option<&crate::index::IndexDb>,
+        cache: &MapCache,
+        opts: &super::codegraph::BuildOpts,
+    ) -> Result<Arc<super::codegraph::CodeGraph>, rmcp::ErrorData> {
+        super::codegraph::build_memoized(&self.graph_memo, idx, cache, opts)
     }
 }

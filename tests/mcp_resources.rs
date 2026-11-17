@@ -46,13 +46,17 @@ async fn resources_list_read_and_complete() {
     let caps = service.peer_info().expect("info").capabilities.clone();
     assert!(caps.resources.is_some(), "resources capability must be advertised");
 
+    // Fork contract (see `tests/mcp_safe_resources.rs`): the list advertises only `safe/` mirror
+    // files — and nothing at all without safe lists configured, so this fixture lists nothing.
+    // Upstream's outline resources keep their direct-read dispatch (asserted below) but are
+    // never advertised.
     let resources = service.list_all_resources().await.expect("list");
     let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
-    assert_eq!(uris, ["basemind://status"], "the repo map resource is gone");
+    assert!(uris.iter().all(|uri| uri.starts_with("basemind://safe/")), "{uris:?}");
     let templates = service.list_all_resource_templates().await.expect("templates");
     assert!(templates.iter().any(|t| t.uri_template == "basemind://outline/{path}"));
 
-    // Outline resource equals the `code_outline` tool result.
+    // Outline resource equals the code tool result.
     let outline = service
         .read_resource(ReadResourceRequestParams::new("basemind://outline/lib.rs"))
         .await
@@ -61,8 +65,12 @@ async fn resources_list_read_and_complete() {
     assert!(body.contains("seed"), "{body}");
     let tool = service
         .call_tool(
-            CallToolRequestParams::new("code_outline")
-                .with_arguments(serde_json::json!({"path": "lib.rs"}).as_object().unwrap().clone()),
+            CallToolRequestParams::new("code").with_arguments(
+                serde_json::json!({"mode": "outline", "path": "lib.rs"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         )
         .await
         .expect("tool");
@@ -81,19 +89,16 @@ async fn resources_list_read_and_complete() {
     };
     assert_eq!(strip(&body), strip(&tool_body));
 
-    // Status reads fine; the removed repo map does not.
+    // Status and map read fine.
     let status = service
         .read_resource(ReadResourceRequestParams::new("basemind://status"))
         .await
         .expect("status");
     assert!(text_of(&status.contents).contains("file_count"));
-    assert!(
-        service
-            .read_resource(ReadResourceRequestParams::new("basemind://repo/map"))
-            .await
-            .is_err(),
-        "the repo map resource must be unknown"
-    );
+    service
+        .read_resource(ReadResourceRequestParams::new("basemind://repo/map"))
+        .await
+        .expect("map");
 
     // Policy and validation errors.
     // Markdown is code-mapped without the document tier, so only a `documents` build rejects it.

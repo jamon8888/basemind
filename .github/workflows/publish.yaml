@@ -6,14 +6,15 @@ on:
       - v[0-9]+.*
   workflow_dispatch:
     inputs:
-      plugins-only:
-        description: "Publish only missing plugin registry versions from main"
-        type: boolean
-        default: false
       tag:
         description: "Release tag to publish (e.g., v0.1.0)"
-        required: false
+        required: true
         type: string
+      github_only:
+        description: "Build and publish the GitHub release only — skip npm, PyPI, crates.io and homebrew"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # Key on the resolved release tag, not github.ref: a tag push (refs/tags/vX) and a ~keep
@@ -29,7 +30,6 @@ permissions:
 
 jobs:
   meta:
-    if: ${{ !inputs.plugins-only }}
     name: Resolve versions
     runs-on: ubuntu-latest
     outputs:
@@ -43,18 +43,22 @@ jobs:
       pypi_exists: ${{ steps.published.outputs.pypi_exists }}
       pypi_hermes_exists: ${{ steps.published.outputs.pypi_hermes_exists }}
       release_assets_exist: ${{ steps.release_assets.outputs.release_assets_exist }}
+      github_only: ${{ steps.skip_registries.outputs.github_only }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Setup Node.js and pnpm
-        uses: xberg-io/actions/setup-mise@v1
+      - uses: pnpm/action-setup@v4
         with:
-          install-args: node pnpm
-          config-ref: ${{ github.sha }}
+          version: 12.11.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
 
       - name: Extract version from tag
         id: version
@@ -120,13 +124,11 @@ jobs:
             fi
           fi
 
-          # Check the generated Hermes PyPI package. The committed package lives at
-          # plugin/.hermes/package (the build input every other workflow uses); the guard used to
-          # name .hermes/package, which never exists at this point, so it silently never ran.
-          if [ -f plugin/.hermes/package/pyproject.toml ]; then
-            hermes_pypi_version="$(awk '/^version = / {value=$3; gsub(/[\"\047]/, "", value); print value; exit}' plugin/.hermes/package/pyproject.toml)"
+          # Check generated Hermes PyPI package.
+          if [ -f .hermes/package/pyproject.toml ]; then
+            hermes_pypi_version="$(awk '/^version = / {value=$3; gsub(/[\"\047]/, "", value); print value; exit}' .hermes/package/pyproject.toml)"
             if [ "$hermes_pypi_version" != "$target_python_version" ]; then
-              echo "::error::plugin/.hermes/package/pyproject.toml version mismatch: expected $target_python_version, got $hermes_pypi_version"
+              echo "::error::.hermes/package/pyproject.toml version mismatch: expected $target_python_version, got $hermes_pypi_version"
               exit 1
             fi
           fi
@@ -158,13 +160,10 @@ jobs:
             fi
           fi
 
-          # Check .claude-plugin/marketplace.json. ai-rulez owns this index and emits a minimal
-          # entry for a `[marketplace] members` bundle — the version lives in the member's own
-          # manifest, which .claude-plugin/plugin.json (checked above) carries. The key is
-          # therefore legitimately absent; enforce it only when an entry declares one.
+          # Check .claude-plugin/marketplace.json
           if [ -f .claude-plugin/marketplace.json ]; then
-            marketplace_version="$(jq -r '.plugins[0].version // empty' .claude-plugin/marketplace.json)"
-            if [ -n "$marketplace_version" ] && [ "$marketplace_version" != "$target_version" ]; then
+            marketplace_version="$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)"
+            if [ "$marketplace_version" != "$target_version" ]; then
               echo "::error::.claude-plugin/marketplace.json version mismatch: expected $target_version, got $marketplace_version"
               exit 1
             fi
@@ -221,12 +220,12 @@ jobs:
           fi
 
           npm_exists=false
-          if pnpm view "basemind@${version}" version >/dev/null 2>&1; then
+          if npm view "@jamon8888/basemind-fork@${version}" version >/dev/null 2>&1; then
             npm_exists=true
           fi
 
           opencode_exists=false
-          if pnpm view "basemind-opencode@${version}" version >/dev/null 2>&1; then
+          if npm view "@jamon8888/basemind-fork-opencode@${version}" version >/dev/null 2>&1; then
             opencode_exists=true
           fi
 
@@ -255,6 +254,23 @@ jobs:
           echo "  PyPI:               $pypi_exists"
           echo "  PyPI (hermes):      $pypi_hermes_exists"
 
+      - name: Resolve whether to skip the package registries
+        id: skip_registries
+        env:
+          GITHUB_ONLY: ${{ inputs.github_only }}
+        run: |
+          set -euo pipefail
+          # Only a manual dispatch can ask for this. A tag push always publishes every registry,
+          # which is what a tag has always meant here — silently changing that would make a tag
+          # stop doing what previous tags did.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$GITHUB_ONLY" = "true" ]; then
+            echo "github_only=true" >> "$GITHUB_OUTPUT"
+            echo "GitHub release only — npm, PyPI, crates.io and homebrew are skipped."
+            echo "Those registries stay at their previous version; the next full publish picks them up."
+          else
+            echo "github_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Detect a COMPLETE existing release (all archives + checksums)
         id: release_assets
         env:
@@ -273,8 +289,10 @@ jobs:
           # a rerun (the v0.10.0 / release-window failure class).
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
+            "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"
             "basemind_${version}_checksums.txt"
           )
@@ -299,14 +317,13 @@ jobs:
   create_release:
     name: Create GitHub release
     needs: meta
-    if: >-
-      ${{ !inputs.plugins-only && (needs.meta.outputs.release_assets_exist != 'true') }}
+    if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.release_info.outputs.release_id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -345,7 +362,7 @@ jobs:
             # Create as a DRAFT. The build matrix uploads binaries to it, but it
             # stays invisible (assets not publicly downloadable) until the
             # finalize_release job promotes it — and that job only runs once
-            # checksums (which requires all 4 platform binaries) succeeds. A failed
+            # checksums (which requires all 6 platform binaries) succeeds. A failed
             # platform build therefore leaves a hidden draft, not a live release
             # with missing binaries and no checksums (the v0.10.0 failure mode that
             # broke the plugin launcher's checksum-verified download).
@@ -385,37 +402,63 @@ jobs:
   build-binaries:
     name: Build binaries / ${{ matrix.triple }}
     needs: [meta, create_release]
-    if: >-
-      ${{ !inputs.plugins-only && (needs.meta.outputs.release_assets_exist != 'true') }}
+    if: needs.meta.outputs.release_assets_exist != 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ~keep MACOSX_DEPLOYMENT_TARGET holds the minimum macOS at 14.0 for the Rust and CMake-built
-          # ~keep code; without it, cmake targets the macos-26 runner's SDK.
           - triple: aarch64-apple-darwin
-            os: macos-26
-            macos_deployment_target: "14.0"
+            os: macos-latest
+          # Reduced focus releases ship as separate optional assets; they are not in the
+          # required full-feature asset set, so promotion never waits on them.
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: hacienda
+            variant: hacienda
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: hacienda-legal
+            variant: hacienda-legal
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: full,ort-dynamic
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: hacienda,ort-dynamic
+            variant: hacienda
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: hacienda-legal,ort-dynamic
+            variant: hacienda-legal
           - triple: x86_64-pc-windows-msvc
             # Pinned to windows-2022 (VS2022 / MSVC 14.4x). `windows-latest` rolled to a VS18 /
             # MSVC 14.51 image that fails to compile xberg-libwpd's vendored C++
             # (`make_shared<WP6SubDocument>`); 14.4x — the toolchain that shipped every prior
             # release — compiles it. Revisit when the newer MSVC (or upstream libwpd) handles it.
             os: windows-2022
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            features: hacienda
+            variant: hacienda
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            features: hacienda-legal
+            variant: hacienda-legal
     runs-on: ${{ matrix.os }}
-    env:
-      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+    # Focus artifacts are optional release variants. A broken optional build must
+    # not prevent required full-feature archives or checksums, but checksums still
+    # wait for every matrix leg's upload attempt.
+    continue-on-error: ${{ matrix.variant != '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: ${{ matrix.triple }}
 
       - name: Install system dependencies
@@ -438,9 +481,9 @@ jobs:
           }
 
       - name: Setup cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.triple }}
+          key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}
 
       - name: Discard incomplete xberg Tesseract source cache
         shell: bash
@@ -458,12 +501,35 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          cargo build --release --features full --bin basemind \
+          cargo build --release --features "${{ matrix.features || 'full' }}" --bin basemind \
             --target "${{ matrix.triple }}"
 
       - name: Package release
         shell: bash
-        run: ./scripts/package-release.sh ${{ matrix.triple }}
+        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
+
+      - name: Smoke-test packaged Intel binary (ONNX Runtime loads)
+        if: matrix.triple == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          variant="${{ matrix.variant }}"
+          archive="basemind-${variant:+$variant-}x86_64-apple-darwin.tar.gz"
+          tar xzf "$archive" -C "$dir"
+          # Binary + its otool-discovered lib/ closure load, and the ad-hoc signature is
+          # valid (a bad install_name_tool rewrite would get the process SIGKILLed).
+          "$dir/basemind" --version
+          # ONNX Runtime is vendored next to the binary (pinned directly from a
+          # microsoft/onnxruntime release, see scripts/package-release.sh); ort/
+          # load-dynamic resolves it relative to the executable. dlopen the
+          # vendored dylib — the exact load ort performs at runtime — so a
+          # broken install name or invalid signature fails here. This only
+          # proves the dylib loads on THIS runner's macOS version; it does not
+          # catch an incompatible minos on an older macOS the runner doesn't
+          # test (see the pinned version's own LC_BUILD_VERSION instead).
+          test -f "$dir/libonnxruntime.dylib"
+          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./libonnxruntime.dylib'); print('libonnxruntime.dylib load OK')" )
 
       - name: Verify release state before upload
         shell: bash
@@ -483,12 +549,13 @@ jobs:
         run: |
           set -euo pipefail
           triple="${{ matrix.triple }}"
+          variant="${{ matrix.variant }}"
 
           if [ "$triple" = "x86_64-pc-windows-msvc" ]; then
-            archive="basemind-${triple}.zip"
+            archive="basemind-${variant:+$variant-}${triple}.zip"
             content_type="application/zip"
           else
-            archive="basemind-${triple}.tar.gz"
+            archive="basemind-${variant:+$variant-}${triple}.tar.gz"
             content_type="application/gzip"
           fi
 
@@ -498,10 +565,11 @@ jobs:
   build-linux-binaries:
     name: Build Linux binaries / ${{ matrix.triple }}
     needs: [meta, create_release]
-    if: >-
-      ${{ !inputs.plugins-only && (needs.meta.outputs.release_assets_exist != 'true') }}
+    if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.image }}
+    # Optional focus archives are allowed to fail without blocking the required release assets.
+    continue-on-error: ${{ matrix.variant != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -510,13 +578,44 @@ jobs:
             os: ubuntu-latest
             image: quay.io/pypa/manylinux_2_28_x86_64:latest
             protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
           - triple: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             image: quay.io/pypa/manylinux_2_28_aarch64:latest
             protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+          # Reduced focus releases are separate optional assets (not in the required set).
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
+            protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            features: hacienda
+            variant: hacienda
+          - triple: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+            protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+            features: hacienda
+            variant: hacienda
+          - triple: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64:latest
+            protoc_arch: linux-x86_64
+            rustup_sha256: 20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+            features: hacienda-legal
+            variant: hacienda-legal
+          - triple: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:latest
+            protoc_arch: linux-aarch_64
+            rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+            features: hacienda-legal
+            variant: hacienda-legal
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -531,8 +630,20 @@ jobs:
           # find it ("no default is configured"). Fixed paths remove the ambiguity.
           export CARGO_HOME=/opt/cargo
           export RUSTUP_HOME=/opt/rustup
-          curl -fsSL https://sh.rustup.rs | \
-            sh -s -- -y --profile minimal --default-toolchain stable
+          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
+          # Re-pin deliberately on toolchain upgrades (hash from a fresh
+          # HTTPS download of the official static archive).
+          # The archive is arch-specific and `matrix.triple` names it exactly:
+          # the aarch64 job runs ARM, so an x86_64 init dies with
+          # "Exec format error" before anything else runs (v0.32.x, v0.33.0).
+          rustup_ver="1.28.2"
+          rustup_sha256="${{ matrix.rustup_sha256 }}"
+          curl -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/${{ matrix.triple }}/rustup-init"
+          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain stable
+          rm -f /tmp/rustup-init
           export PATH="$CARGO_HOME/bin:$PATH"
           rustup default stable
           rustup target add "${{ matrix.triple }}"
@@ -580,10 +691,12 @@ jobs:
         run: |
           set -euo pipefail
           ver="1.23.0"
+          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
           d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
           cd "$d"
           curl -fsSL -o libheif.tar.gz \
             "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
+          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
           tar xzf libheif.tar.gz
           cd "libheif-${ver}"
           mkdir build && cd build
@@ -621,7 +734,7 @@ jobs:
           gcc -O2 -fPIC -c scripts/glibc228_compat.c -o "$shim_obj"
           rustflags_var="CARGO_TARGET_$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
           export "${rustflags_var}=-C link-arg=${shim_obj}"
-          cargo build --release --features full --bin basemind --target "$TRIPLE"
+          cargo build --release --features "${{ matrix.features || 'full' }}" --bin basemind --target "$TRIPLE"
 
       - name: Verify glibc floor (<= 2.28)
         shell: bash
@@ -639,7 +752,7 @@ jobs:
 
       - name: Package release
         shell: bash
-        run: ./scripts/package-release.sh ${{ matrix.triple }}
+        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
 
       - name: Verify release state before upload
         shell: bash
@@ -658,18 +771,222 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          variant="${{ matrix.variant }}"
           bash .github/scripts/release-asset.sh upload \
             "${{ needs.create_release.outputs.release_id }}" \
-            "basemind-${{ matrix.triple }}.tar.gz" application/gzip
+            "basemind-${variant:+$variant-}${{ matrix.triple }}.tar.gz" application/gzip
+
+  build-linux-noavx2:
+    name: Build Linux no-AVX2 binary (x86_64, SSE2 baseline)
+    needs: [meta, create_release]
+    if: needs.meta.outputs.release_assets_exist != 'true'
+    # The stock x86_64 release links ort's prebuilt ONNX Runtime, which is
+    # compiled with AVX2 and SIGILL-crashes on pre-Haswell CPUs (Sandy Bridge
+    # and older). This leg builds ONNX Runtime from source without AVX and
+    # basemind with `ort-dynamic` against it, so the same `full` feature set
+    # runs on any x86_64 CPU (MLAS dispatches to AVX2/AVX-512 at runtime where
+    # available). The result ships as a separate `-noavx2` archive; the stock
+    # leg is untouched.
+    runs-on: ubuntu-latest
+    container:
+      # Float on :latest like the stock build legs: a digest of a rotating
+      # tag is a time bomb — quay pruned the pinned manifest and every pull
+      # died with "manifest unknown". The glibc-floor audit below catches
+      # any drift the floating image introduces.
+      image: quay.io/pypa/manylinux_2_28_x86_64:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+          persist-credentials: false
+
+      - name: Install Rust (in container)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME=/opt/cargo
+          export RUSTUP_HOME=/opt/rustup
+          # Pinned rustup-init: sh.rustup.rs is a live script, never pipe it.
+          # Re-pin deliberately on toolchain upgrades (hash from a fresh
+          # HTTPS download of the official static archive).
+          rustup_ver="1.28.2"
+          rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+          curl -fsSL -o /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/${rustup_ver}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "${rustup_sha256}  /tmp/rustup-init" | sha256sum -c -
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --profile minimal --default-toolchain stable
+          rm -f /tmp/rustup-init
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustup default stable
+          rustup target add x86_64-unknown-linux-gnu
+          echo "CARGO_HOME=/opt/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/opt/rustup" >> "$GITHUB_ENV"
+          echo "/opt/cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install system dependencies (AlmaLinux 8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y epel-release
+          dnf install -y dnf-plugins-core
+          dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y \
+            gcc gcc-c++ make cmake pkgconfig \
+            openssl-devel \
+            tesseract \
+            libaom-devel \
+            patchelf gh git \
+            curl wget unzip python3
+          echo "gcc: $(gcc --version | head -1)"
+
+      - name: Install protoc from official release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="28.2"
+          zip="protoc-28.2-linux-x86_64.zip"
+          sha256="2febfd42b59ce93a28eb789019a470a3dd0449619bc04f84dad1333da261dec1"
+          mkdir -p /usr/local/protoc
+          cd /tmp
+          curl -fsSL -o "$zip" \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/${zip}"
+          echo "${sha256}  ${zip}" | sha256sum -c -
+          unzip -q "$zip" -d /usr/local/protoc
+          ln -sf /usr/local/protoc/bin/protoc /usr/local/bin/protoc
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+          protoc --version
+
+      - name: Build libheif from source (1.23.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="1.23.0"
+          sha256="4c9182b18897617182eed12ab5eb9f9d855b3aa3a736d6bdb31abc034ec7d393"
+          d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          curl -fsSL -o libheif.tar.gz \
+            "https://github.com/strukturag/libheif/releases/download/v${ver}/libheif-${ver}.tar.gz"
+          echo "${sha256}  libheif.tar.gz" | sha256sum -c -
+          tar xzf libheif.tar.gz
+          cd "libheif-${ver}"
+          mkdir build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DWITH_EXAMPLES=OFF \
+            -DWITH_GDK_PIXBUF=OFF \
+            -DBUILD_TESTING=OFF \
+            -DWITH_LIBDE265=OFF \
+            -DWITH_X265=OFF \
+            -DWITH_DAV1D=OFF \
+            -DWITH_AOM=ON
+          make -j"$(nproc)"
+          make install
+          ldconfig
+          {
+            echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ONNX Runtime from source (no AVX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ORT_VERSION must match ort-sys's dist.tsv for x86_64-unknown-linux-gnu.
+          ./scripts/build-ort-noavx2.sh /tmp/ort-src /tmp/ort-build /opt/ort
+
+      - name: Build release binary (full + ort-dynamic)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ort-dynamic loads libonnxruntime.so at runtime (no link-time ORT),
+          # so no ORT env vars are needed at build time. The .so is staged into
+          # release/deps next so package-release.sh bundles it into lib/.
+          cargo build --release --features full,ort-dynamic --bin basemind \
+            --target x86_64-unknown-linux-gnu
+          cp /opt/ort/lib/libonnxruntime.so* \
+            target/x86_64-unknown-linux-gnu/release/deps/
+          ls -la target/x86_64-unknown-linux-gnu/release/deps/ | grep onnxruntime
+
+      - name: Verify glibc floor (<= 2.28)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/x86_64-unknown-linux-gnu/release/basemind"
+          max="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1 || true)"
+          echo "highest glibc symbol required: ${max:-none}"
+          if [ -n "$max" ] && \
+             [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" != "GLIBC_2.28" ]; then
+            echo "::error::basemind requires $max (> GLIBC_2.28); a dependency pulled a newer glibc symbol"
+            exit 1
+          fi
+          echo "✓ glibc floor verified: ${max:-none} <= GLIBC_2.28"
+
+      - name: Package release (noavx2 archive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package-release.sh x86_64-unknown-linux-gnu
+          mv basemind-x86_64-unknown-linux-gnu.tar.gz \
+            basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz
+          tar tzf basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz | sort
+
+      - name: Smoke-test packaged noavx2 binary (ONNX Runtime loads)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
+          dir="$(mktemp -d)"
+          tar xzf "$archive" -C "$dir"
+          # Binary + its bundled ORT load — the exact runtime shape ort-dynamic
+          # resolves (binary RPATH $ORIGIN/lib, lib/ closure). A broken RPATH,
+          # SONAME, or missing bundled dep fails here instead of shipping.
+          "$dir/basemind" --version
+          test -f "$dir/lib/libonnxruntime.so.1"
+          # ponytail: no embedding session here on purpose — that needs a model
+          # download; linkage proof (dlopen name/RPATH/SONAME + real dlopen) is
+          # the deterministic gate that blocks a broken bundle before publish.
+          # ort-dynamic is load-dynamic: no DT_NEEDED entry exists for ORT, so
+          # ldd can never list it (the macOS twin builds the same way). Prove
+          # the other side of the chain instead — the binary carries the
+          # dlopen target name, and the RUNPATH/ctypes checks below resolve it.
+          # grep -a directly on the file: `strings | grep -q` dies under
+          # `set -o pipefail` (grep -q exits on first match, strings gets
+          # SIGPIPE, pipeline fails even when the match is there).
+          grep -aq "libonnxruntime" "$dir/basemind" || {
+            echo "::error::basemind binary has no libonnxruntime runtime reference"; exit 1
+          }
+          readelf -d "$dir/basemind" | grep -q "RUNPATH.*\$ORIGIN/lib" || {
+            echo "::error::basemind RUNPATH missing \$ORIGIN/lib"; readelf -d "$dir/basemind"; exit 1
+          }
+          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./lib/libonnxruntime.so.1'); print('libonnxruntime.so.1 load OK')" )
+
+      - name: Upload to GitHub release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.meta.outputs.tag }}"
+          archive="basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
+          if [ ! -f "$archive" ]; then
+            echo "::error::Archive not found: $archive"
+            exit 1
+          fi
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
+          gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
 
   checksums:
-    if: ${{ !inputs.plugins-only }}
     name: Generate and upload checksums
-    needs: [meta, create_release, build-binaries, build-linux-binaries]
+    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
@@ -682,7 +999,7 @@ jobs:
             "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}")"
           echo "release_id=$id" >>"$GITHUB_ENV"
 
-      - name: Verify all 4 platform archives are present
+      - name: Verify all 5 platform archives are present
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -691,12 +1008,12 @@ jobs:
           # what let v0.27.0 ship archives no downloader could verify.
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
             -q '.[].name' >/tmp/release_assets.txt
-
           missing=0
           for asset in \
             basemind-x86_64-unknown-linux-gnu.tar.gz \
             basemind-aarch64-unknown-linux-gnu.tar.gz \
             basemind-aarch64-apple-darwin.tar.gz \
+            basemind-x86_64-apple-darwin.tar.gz \
             basemind-x86_64-pc-windows-msvc.zip; do
             if ! grep -qx "$asset" /tmp/release_assets.txt; then
               echo "::error::release $release_id is missing $asset"
@@ -704,10 +1021,10 @@ jobs:
             fi
           done
           if [ "$missing" -gt 0 ]; then
-            echo "::error::$missing of 4 platform archives missing; refusing to checksum a partial release"
+            echo "::error::$missing of 5 platform archives missing; refusing to checksum a partial release"
             exit 1
           fi
-          echo "all 4 archives present on release $release_id"
+          echo "all 5 archives present on release $release_id"
 
       - name: Download archives and generate checksums
         env:
@@ -733,15 +1050,14 @@ jobs:
   finalize_release:
     name: Publish GitHub release
     needs: [meta, create_release, checksums]
-    if: >-
-      ${{ !inputs.plugins-only && (always() && needs.meta.result == 'success') }}
+    if: always() && needs.meta.result == 'success'
     runs-on: ubuntu-latest
     steps:
       # The promotion step runs `.github/scripts/release-asset.sh`; without a checkout the
       # workspace is empty and `bash` exits 127. Every other job that uses the script checks
       # out first — only this one was missed.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v6
 
       - name: Promote draft to a published release once complete
         env:
@@ -763,8 +1079,10 @@ jobs:
           # promoted with 3 of 5 archives and no checksums file, so every downloader broke.
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
+            "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"
             "basemind_${version}_checksums.txt"
           )
@@ -795,19 +1113,19 @@ jobs:
     # irreversible, so don't publish source unless the platform binaries built and the ~keep
     # release promoted — keeps the surfaces atomic across a partial failure. ~keep
     if: >-
-      ${{ !inputs.plugins-only && (always() && needs.meta.outputs.crates_publishable == 'true' && needs.meta.outputs.crates_exists != 'true' && needs.finalize_release.result == 'success') }}
+      always() && needs.meta.outputs.github_only != 'true' &&
+      needs.meta.outputs.crates_publishable == 'true' &&
+      needs.meta.outputs.crates_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Authenticate to crates.io
         uses: rust-lang/crates-io-auth-action@v1
@@ -844,21 +1162,24 @@ jobs:
   publish_npm:
     name: Publish npm
     needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (always() && needs.meta.outputs.npm_exists != 'true' && needs.finalize_release.result == 'success') }}
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.npm_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Setup Node.js and pnpm
-        uses: xberg-io/actions/setup-mise@v1
+      - uses: pnpm/action-setup@v4
         with:
-          install-args: node pnpm
-          config-ref: ${{ github.sha }}
+          version: 12.11.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Publish to npm
         env:
@@ -878,21 +1199,24 @@ jobs:
   publish_opencode:
     name: Publish npm (basemind-opencode, OpenCode and Pi)
     needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (always() && needs.finalize_release.result == 'success') }}
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.opencode_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-      - name: Setup Node.js and pnpm
-        uses: xberg-io/actions/setup-mise@v1
+      - uses: pnpm/action-setup@v4
         with:
-          install-args: node pnpm
-          config-ref: ${{ github.sha }}
+          version: 12.11.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Stage and verify the combined agent package
         run: |
@@ -910,15 +1234,7 @@ jobs:
           console.log(`Packed ${skills.length} skills, the Pi extension, and OpenCode adapters`);
           JS
 
-      - name: Verify exact legacy skill, extension and TUI archive bytes
-        run: |
-          set -euo pipefail
-          archive="$(jq -r '.filename' "$RUNNER_TEMP/pi-pack.json")"
-          [[ "$archive" == /* ]] || archive="$RUNNER_TEMP/$archive"
-          python3 scripts/verify_plugin_distribution.py legacy-npm "$archive"
-
       - name: Publish to npm
-        if: needs.meta.outputs.opencode_exists != 'true'
         env:
           NODE_AUTH_TOKEN: ""
         run: |
@@ -938,22 +1254,20 @@ jobs:
   publish_pypi:
     name: Publish PyPI
     needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (always() && needs.meta.outputs.pypi_exists != 'true' && needs.finalize_release.result == 'success') }}
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.pypi_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
       - name: Setup Python
-        uses: xberg-io/actions/setup-mise@v1
+        uses: actions/setup-python@v6
         with:
-          install-args: python
-          config-ref: ${{ github.sha }}
+          python-version: "3.8"
 
       - name: Build Python package
         run: |
@@ -963,208 +1277,50 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.14.3
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: pip-package/dist
           skip-existing: true
 
-  publish_plugin_npm:
-    name: Publish npm agent plugin (OpenCode and Pi)
-    needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (needs.finalize_release.result == 'success') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
-
-      - name: Install reviewed ai-rulez
-        uses: xberg-io/actions/setup-ai-rulez@v1
-
-      - name: Verify generated product bundles and public skills
-        run: |
-          ai-rulez verify --plugin
-          python3 scripts/sync_public_skills.py --check
-          python3 scripts/sync_plugin_version.py --check
-
-      - name: Setup Node.js and pnpm
-        uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: node pnpm
-          config-ref: ${{ github.sha }}
-
-      - name: Verify packed Pi and OpenCode resources
-        run: |
-          set -euo pipefail
-          pnpm --dir plugin pack --json --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/plugin-pack.json"
-          node - "$RUNNER_TEMP/plugin-pack.json" <<'JS'
-          const fs = require('node:fs');
-          const files = JSON.parse(fs.readFileSync(process.argv[2])).files.map((file) => file.path);
-          const skills = files.filter((file) => /^\.pi\/skills\/[^/]+\/SKILL\.md$/.test(file));
-          const prompts = files.filter((file) => /^\.pi\/prompts\/[^/]+\.md$/.test(file));
-          if (skills.length !== 10 || prompts.length !== 6 || !files.includes('.opencode/plugins/basemind.js')) {
-            throw new Error(`Incomplete plugin: ${skills.length} skills, ${prompts.length} prompts`);
-          }
-          console.log(`Packed ${skills.length} Pi skills, ${prompts.length} prompts, and the OpenCode adapter`);
-          JS
-
-      - name: Verify exact packaged Pi and OpenCode resource bytes
-        run: |
-          archive="$(jq -r '.filename' "$RUNNER_TEMP/plugin-pack.json")"
-          [[ "$archive" == /* ]] || archive="$RUNNER_TEMP/$archive"
-          python3 scripts/verify_plugin_distribution.py npm "$archive"
-
-      - name: Publish the agent package
-        run: |
-          set -euo pipefail
-          name="$(jq -r '.name' plugin/package.json)"
-          version="${{ needs.meta.outputs.version }}"
-          if ! pnpm view "$name" version >/dev/null 2>&1; then
-            echo "::error::$name needs a first manual publish and trusted publisher setup; see plugin/README.md."
-            exit 1
-          fi
-          if pnpm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version already published; skipping"
-            exit 0
-          fi
-          case "$version" in
-            *-rc.* | *-beta* | *-alpha*) npm_tag=next ;;
-            *) npm_tag=latest ;;
-          esac
-          unset NODE_AUTH_TOKEN
-          archive="$(jq -r '.filename' "$RUNNER_TEMP/plugin-pack.json")"
-          [[ "$archive" == /* ]] || archive="$RUNNER_TEMP/$archive"
-          for attempt in 1 2 3; do
-            if pnpm publish --no-git-checks "$archive" --provenance --access public --tag "$npm_tag"; then
-              break
-            fi
-            if pnpm view "$name@$version" version >/dev/null 2>&1; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep 5
-          done
-
-  publish_plugin_artifacts:
-    name: Publish all agent runtime archives and marketplaces
-    needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (needs.finalize_release.result == 'success') }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.meta.outputs.tag }}
-          fetch-depth: 0
-      - name: Install ai-rulez
-        uses: xberg-io/actions/setup-ai-rulez@v1
-      - name: Verify public skill exports
-        run: python3 scripts/sync_public_skills.py --check
-      - name: Package all supported plugin runtimes
-        uses: xberg-io/actions/package-ai-rulez-plugin@v1
-        with:
-          cursor-marketplace: "true"
-          tag: ${{ needs.meta.outputs.tag }}
-          config-directory: .ai-rulez
-          version-sync-script: scripts/sync_plugin_version.py
-      - name: Archive verified runtime bundles and marketplace indexes
-        shell: bash
-        env:
-          PLUGIN_TAG: ${{ needs.meta.outputs.tag }}
-          PLUGIN_PRODUCT: basemind
-        run: |
-          set -euo pipefail
-          test -n "$PLUGIN_TAG"
-          bundle="dist/${PLUGIN_PRODUCT}-plugins-${PLUGIN_TAG//\//-}.tar.gz"
-          tar --sort=name --mtime="@$(git show -s --format=%ct HEAD)" \
-            --owner=0 --group=0 --numeric-owner -cf - -C dist/plugin . | gzip -n > "$bundle"
-          (cd dist && sha256sum "$(basename "$bundle")") > "$bundle.sha256"
-      - name: Attach verified plugin archive and metadata
-        uses: xberg-io/actions/upload-release-assets@v1
-        with:
-          tag: ${{ needs.meta.outputs.tag }}
-          assets: |
-            dist/*-plugins-*.tar.gz
-            dist/*-plugins-*.tar.gz.sha256
-
   publish_pypi_hermes:
-    name: Publish Hermes plugin to PyPI
+    name: Publish PyPI (basemind-hermes-plugin)
     needs: [meta, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (needs.finalize_release.result == 'success') }}
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.meta.outputs.pypi_hermes_exists != 'true' && needs.finalize_release.result == 'success'
     runs-on: ubuntu-latest
     environment: pypi
-    permissions:
-      contents: read
-      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ needs.meta.outputs.tag }}
           fetch-depth: 0
-      - name: Install ai-rulez
-        uses: xberg-io/actions/setup-ai-rulez@v1
-      - name: Verify plugin versions and generated resources before publishing
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          python3 scripts/sync_plugin_version.py --expect "$VERSION"
-          python3 scripts/sync_public_skills.py --check
-          ai-rulez verify --plugin
-      - uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: python uv
-          config-ref: ${{ github.sha }}
-      - name: Read the verified Hermes package version
-        id: wheel-version
-        run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
 
-          project = tomllib.loads(Path('plugin/.hermes/package/pyproject.toml').read_text())['project']
-          if project['name'] != 'basemind-hermes-plugin' or not project['version']:
-              raise SystemExit('Missing or unexpected Hermes package identity')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f"version={project['version']}\n")
-          PY
-      - name: Build Hermes wheel
-        run: uv build --wheel --out-dir dist-hermes plugin/.hermes/package
-      - name: Validate Hermes distribution metadata
-        run: |
-          set -euo pipefail
-          wheels=(dist-hermes/*.whl)
-          test "${#wheels[@]}" -eq 1
-          test -f "${wheels[0]}"
-          uvx --from twine==7.0.0 --with packaging==26.3 twine check --strict "${wheels[0]}"
-      - name: Verify every packaged Hermes runtime resource
-        run: python3 scripts/verify_plugin_distribution.py wheel dist-hermes/*.whl
-      - name: Publish verified Hermes wheel
-        uses: xberg-io/actions/publish-pypi@v1
+      - name: Setup Python
+        uses: actions/setup-python@v6
         with:
-          expected-version: ${{ steps.wheel-version.outputs.version }}
-          packages-dir: dist-hermes
+          python-version: "3.11"
+
+      - name: Build Python package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+          cd .hermes/package
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: .hermes/package/dist
+          skip-existing: true
 
   publish_homebrew:
     name: Update Homebrew formula
     needs: [meta, create_release, finalize_release]
-    if: >-
-      ${{ !inputs.plugins-only && (always() && needs.finalize_release.result == 'success' && !contains(needs.meta.outputs.version, '-rc') && !contains(needs.meta.outputs.version, '-beta') && !contains(needs.meta.outputs.version, '-alpha')) }}
+    if: always() && needs.meta.outputs.github_only != 'true' && needs.finalize_release.result == 'success' && !contains(needs.meta.outputs.version, '-rc') && !contains(needs.meta.outputs.version, '-beta') && !contains(needs.meta.outputs.version, '-alpha')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
@@ -1202,134 +1358,3 @@ jobs:
             git commit -m "basemind ${version}"
             git push
           fi
-
-  plugin_release_report:
-    name: Verify all plugin distribution jobs succeeded
-    needs: [publish_plugin_artifacts, publish_plugin_npm, publish_pypi_hermes, publish_opencode]
-    if: >-
-      ${{ !inputs.plugins-only && (always()) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
-      - name: Reject failed or skipped plugin distribution jobs
-        env:
-          RESULTS_JSON: ${{ toJSON(needs) }}
-        run: python3 scripts/verify_plugin_release_results.py
-
-  dispatch-plugin-npm:
-    name: Publish missing npm plugin version
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.plugins-only && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-      - name: Install reviewed ai-rulez
-        uses: xberg-io/actions/setup-ai-rulez@v1
-      - name: Verify plugin versions and generated resources
-        uses: xberg-io/actions/verify-ai-rulez-plugin@v1
-        with:
-          version-sync-script: scripts/sync_plugin_version.py
-      - uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: node pnpm
-      - name: Read and check the exact npm version
-        id: package
-        shell: bash
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-          from pathlib import Path
-
-          package = json.loads(Path('plugin/package.json').read_text())
-          name, version = package['name'], package['version']
-          if not name or not version:
-              raise SystemExit('Missing plugin package identity')
-          url = 'https://registry.npmjs.org/' + urllib.parse.quote(name, safe='')
-          url += '/' + urllib.parse.quote(version, safe='')
-          try:
-              with urllib.request.urlopen(url, timeout=30) as response:
-                  published = json.load(response)
-              if published['name'] != name or published['version'] != version:
-                  raise SystemExit('Registry returned an unexpected package identity')
-              exists = True
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
-              exists = False
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f"version={version}\nexists={str(exists).lower()}\n")
-              output.write(f"tag={'next' if '-' in version else 'latest'}\n")
-          print(f"{name}@{version}: {'already published; skipping' if exists else 'not published'}")
-          PYTHON
-      - name: Verify the packed Pi and OpenCode resources
-        if: steps.package.outputs.exists != 'true'
-        shell: bash
-        run: |
-          npm pack ./plugin --json --ignore-scripts --pack-destination "$RUNNER_TEMP" > "$RUNNER_TEMP/plugin-pack.json"
-          archive="$(node -p "JSON.parse(require('node:fs').readFileSync(process.argv[1]))[0].filename" "$RUNNER_TEMP/plugin-pack.json")"
-          python3 scripts/verify_plugin_distribution.py npm "$RUNNER_TEMP/$archive"
-      - name: Publish missing npm version with trusted publishing
-        if: steps.package.outputs.exists != 'true'
-        uses: xberg-io/actions/publish-npm@v1
-        with:
-          package-dir: plugin
-          expected-version: ${{ steps.package.outputs.version }}
-          npm-tag: ${{ steps.package.outputs.tag }}
-          access: public
-          provenance: "true"
-
-  dispatch-plugin-hermes:
-    name: Publish missing Hermes plugin version
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.plugins-only && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-      - name: Install reviewed ai-rulez
-        uses: xberg-io/actions/setup-ai-rulez@v1
-      - name: Verify plugin versions and generated resources
-        uses: xberg-io/actions/verify-ai-rulez-plugin@v1
-        with:
-          version-sync-script: scripts/sync_plugin_version.py
-      - uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: python uv
-      - name: Read the verified Hermes version
-        id: package
-        shell: bash
-        run: |
-          python3 - <<'PYTHON'
-          import os
-          import tomllib
-          from pathlib import Path
-
-          package = tomllib.loads(Path('plugin/.hermes/package/pyproject.toml').read_text())['project']
-          if not package['name'].endswith('-hermes-plugin') or not package['version']:
-              raise SystemExit('Missing or unexpected Hermes package identity')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f"version={package['version']}\n")
-          PYTHON
-      - name: Build verified Hermes wheel
-        run: uv build --wheel --out-dir dist-hermes plugin/.hermes/package
-      - name: Verify every packaged Hermes runtime resource
-        run: python3 scripts/verify_plugin_distribution.py wheel dist-hermes/*.whl
-      - name: Publish missing Hermes version with trusted publishing
-        uses: xberg-io/actions/publish-pypi@v1
-        with:
-          packages-dir: dist-hermes
-          expected-version: ${{ steps.package.outputs.version }}

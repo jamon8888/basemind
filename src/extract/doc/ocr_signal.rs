@@ -1,0 +1,167 @@
+//! #95: the near-empty-OCR signal. An image whose OCR comes back empty or near-empty is a
+//! silent failure — seen with images carrying an alpha channel (decoded without being
+//! composited onto white) and with pages whose lines the OCR dictionary filter discards.
+//! `extract_doc` turns it into a warning and an `ocr_empty` metadata note.
+
+use std::path::Path;
+
+use super::DocumentModelProfile;
+
+/// Recover xberg's exact dictionary-filter count from its processing warning.
+///
+/// xberg currently uses the count to emit a warning, then removes the scratch metadata key before
+/// returning the document. Keeping the count here makes the loss observable to Basemind callers
+/// without depending on xberg's internal metadata map.
+pub(crate) fn dictionary_filtered_line_count(warnings: &[xberg::types::ProcessingWarning]) -> Option<usize> {
+    const MARKER: &str = "Tesseract removed ";
+    let marker_finder = memchr::memmem::Finder::new(MARKER.as_bytes());
+    warnings.iter().find_map(|warning| {
+        if !warning.source.trim().eq_ignore_ascii_case("tesseract") {
+            return None;
+        }
+        let start = marker_finder.find(warning.message.as_bytes())? + MARKER.len();
+        let rest = warning.message[start..].trim_start();
+        let digit_end = rest
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digit_end == 0 {
+            return None;
+        }
+        let after_count = rest[digit_end..].trim_start();
+        let after_line = after_count.strip_prefix("OCR line")?;
+        if after_line
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        rest[..digit_end].parse().ok()
+    })
+}
+
+/// Fewer non-whitespace characters than this on an image OCR is "near-empty".
+const NEAR_EMPTY_OCR_CHARS: usize = 20;
+
+/// True when an image's OCR output is empty or near-empty. A pure predicate, unit-testable
+/// without the xberg extraction runtime.
+pub(super) fn ocr_output_near_empty(mime_type: Option<&str>, content: &str) -> bool {
+    // SVG is text markup, extracted without OCR.
+    mime_type.is_some_and(|m| m.starts_with("image/") && m != "image/svg+xml")
+        && non_whitespace_chars(content) < NEAR_EMPTY_OCR_CHARS
+}
+
+/// The non-whitespace character count of a near-empty image OCR, logged as a warning; `None`
+/// when the profile ran no OCR (`CodeOnly`, `None_`) or the OCR read enough text.
+pub(crate) fn check(
+    path: &Path,
+    mime_type: Option<&str>,
+    profile: &DocumentModelProfile,
+    content: &str,
+) -> Option<usize> {
+    let ocr_ran = !matches!(profile, DocumentModelProfile::CodeOnly | DocumentModelProfile::None_);
+    if !(ocr_ran && ocr_output_near_empty(mime_type, content)) {
+        return None;
+    }
+    let ocr_chars = non_whitespace_chars(content);
+    let safe_path = sanitize_path_for_log(path);
+    tracing::warn!(
+        path = %safe_path,
+        mime = mime_type.unwrap_or(""),
+        ocr_chars,
+        "OCR of an image returned no (or very little) text; the page may be blank, low-resolution, or unreadable by the OCR engine"
+    );
+    Some(ocr_chars)
+}
+
+/// The `ocr_empty` metadata note carried by the document.
+pub(crate) fn note(ocr_chars: usize) -> (String, String) {
+    (
+        "ocr_empty".to_string(),
+        format!(
+            "OCR returned {ocr_chars} non-whitespace characters from an image; the page may be blank, low-resolution, or unreadable by the OCR engine"
+        ),
+    )
+}
+
+fn non_whitespace_chars(content: &str) -> usize {
+    content.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+fn sanitize_path_for_log(path: &Path) -> String {
+    let _ = path;
+    "<document>".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{dictionary_filtered_line_count, sanitize_path_for_log};
+    use std::path::Path;
+
+    #[test]
+    fn sanitize_path_for_log_removes_control_characters() {
+        assert_eq!(
+            sanitize_path_for_log(Path::new("docs/evil\n\r\tname.pdf")),
+            "<document>"
+        );
+    }
+
+    #[test]
+    fn log_path_drops_terminal_control_characters() {
+        let safe = sanitize_path_for_log(Path::new("scan\u{1b}[2J\ncontract.png"));
+        assert_eq!(safe, "<document>");
+    }
+
+    #[test]
+    fn preserves_xberg_dictionary_filter_count_from_warning() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "tesseract".into(),
+            message:
+                "Tesseract removed 33 OCR line(s) because their dictionary-checkable words were mostly not real words"
+                    .into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(33));
+    }
+
+    #[test]
+    fn ignores_unrelated_processing_warnings() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "chunking".into(),
+            message: "document was truncated".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), None);
+    }
+
+    #[test]
+    fn accepts_xberg_warning_context_and_whitespace() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "tesseract".into(),
+            message: "ocr: Tesseract removed   7 OCR line(s) because the dictionary changed".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(7));
+    }
+
+    #[test]
+    fn requires_tesseract_source_and_complete_line_token() {
+        let warnings = vec![
+            xberg::types::ProcessingWarning {
+                source: "chunking".into(),
+                message: "Tesseract removed 9 OCR line(s) because context changed".into(),
+            },
+            xberg::types::ProcessingWarning {
+                source: "tesseract".into(),
+                message: "Tesseract removed 9 OCR lineage records".into(),
+            },
+        ];
+        assert_eq!(dictionary_filtered_line_count(&warnings), None);
+    }
+
+    #[test]
+    fn accepts_tabs_between_count_and_line() {
+        let warnings = vec![xberg::types::ProcessingWarning {
+            source: "Tesseract".into(),
+            message: "Tesseract removed 12\tOCR line(s) because context changed".into(),
+        }];
+        assert_eq!(dictionary_filtered_line_count(&warnings), Some(12));
+    }
+}

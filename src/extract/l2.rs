@@ -1,7 +1,6 @@
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Node, Query, QueryMatch};
+use tree_sitter::{Query, QueryMatch};
 
-use super::rust_macro_items::MacroBodies;
 use super::{Call, DocComment, ExtractError, FileMapL2, SCHEMA_VER, capture_name};
 use crate::lang::{LangId, ParseOutcome, QueryKind, parse_with_default_timeout, try_get_query, with_parser};
 
@@ -14,27 +13,20 @@ pub fn extract_l2(lang: LangId, source: &[u8]) -> Result<FileMapL2, ExtractError
             return Err(ExtractError::ParseTimeout(crate::lang::DEFAULT_PARSE_TIMEOUT));
         }
     };
-    let bodies = MacroBodies::collect(lang, tree.root_node(), source)?;
-    extract_l2_from_tree(lang, &tree, source, &bodies)
+    extract_l2_from_tree(lang, &tree, source)
 }
 
 /// Extract L2 data (calls + docs) from a pre-parsed tree-sitter `Tree`. Separated from
 /// `extract_l2` so the scanner can share one parse between L1 and L2 when eager L2 is
-/// enabled, avoiding a second full parse per file on the hot path. `bodies` are the file's parsed
-/// macro bodies, shared with L1: their calls come from the calls query over their own parse, so the
-/// lexical token-tree match skips them.
-pub(super) fn extract_l2_from_tree(
+/// enabled, avoiding a second full parse per file on the hot path.
+pub(crate) fn extract_l2_from_tree(
     lang: LangId,
     tree: &tree_sitter::Tree,
     source: &[u8],
-    bodies: &MacroBodies,
 ) -> Result<FileMapL2, ExtractError> {
     let root = tree.root_node();
 
-    let mut calls = run_calls(lang, root, source, &|at| bodies.covers(at, 0))?;
-    bodies.extend_calls(source, &mut calls, |body_root, text, skip| {
-        run_calls(lang, body_root, text, skip)
-    })?;
+    let mut calls = run_calls(lang, root, source)?;
     if lang == "markdown" {
         calls.extend(markdown_references(source));
     }
@@ -48,13 +40,7 @@ pub(super) fn extract_l2_from_tree(
     })
 }
 
-/// The calls under `root`. `skip_lexical(byte)` drops a lexical token-tree match at that byte.
-fn run_calls(
-    lang: LangId,
-    root: tree_sitter::Node,
-    source: &[u8],
-    skip_lexical: &dyn Fn(usize) -> bool,
-) -> Result<Vec<Call>, ExtractError> {
+fn run_calls(lang: LangId, root: tree_sitter::Node, source: &[u8]) -> Result<Vec<Call>, ExtractError> {
     let Some(q) = try_get_query(lang, QueryKind::Calls)? else {
         return Ok(Vec::new());
     };
@@ -62,7 +48,7 @@ fn run_calls(
     crate::lang::with_query_cursor(|cursor| {
         let mut iter = cursor.matches(&q, root, source);
         while let Some(m) = iter.next() {
-            if let Some(call) = build_call(&q, m, source, skip_lexical) {
+            if let Some(call) = build_call(&q, m, source) {
                 out.push(call);
             }
         }
@@ -86,10 +72,9 @@ fn run_docs(lang: LangId, root: tree_sitter::Node, source: &[u8]) -> Result<Vec<
     Ok(out)
 }
 
-fn build_call(q: &Query, m: &QueryMatch, source: &[u8], skip_lexical: &dyn Fn(usize) -> bool) -> Option<Call> {
+fn build_call(q: &Query, m: &QueryMatch, source: &[u8]) -> Option<Call> {
     let mut callee: Option<String> = None;
     let mut range_node = None;
-    let mut lexical: (Option<Node>, Option<Node>) = (None, None);
     for cap in m.captures() {
         let cname = capture_name(q, cap.index);
         match cname {
@@ -97,16 +82,8 @@ fn build_call(q: &Query, m: &QueryMatch, source: &[u8], skip_lexical: &dyn Fn(us
                 callee = cap.node.utf8_text(source).ok().map(|s| s.to_string());
             }
             "call.range" => range_node = Some(cap.node),
-            "call.lexical_callee" => lexical.0 = Some(cap.node),
-            "call.lexical_args" => lexical.1 = Some(cap.node),
             _ => {}
         }
-    }
-    if let (Some(name), Some(args)) = lexical {
-        if skip_lexical(name.start_byte()) {
-            return None;
-        }
-        return lexical_macro_call(name, args, source);
     }
     let node = range_node?;
     let pos = node.start_position();
@@ -117,109 +94,6 @@ fn build_call(q: &Query, m: &QueryMatch, source: &[u8], skip_lexical: &dyn Fn(us
         start_row: pos.row as u32,
         start_col: pos.column as u32,
     })
-}
-
-/// Token kinds that, directly before `name(`, make it a definition or a binding pattern rather
-/// than a call.
-const DEFINITION_KEYWORDS: &[&str] = &["fn", "struct", "enum", "union", "let"];
-
-/// `Fn(A) -> B` and its siblings are trait bounds, not calls.
-const FN_TRAITS: &[&[u8]] = &[b"Fn", b"FnMut", b"FnOnce"];
-
-/// Macros whose arguments after the first comma are a pattern (`matches!(x, Some(_) if ok(x))`).
-const PATTERN_MACROS: &[&[u8]] = &[b"matches", b"assert_matches", b"debug_assert_matches"];
-
-/// A call inside a macro's unparsed token tree: `name` immediately followed by a `(`-delimited
-/// `args` tree (no `!` between, which would make it a nested macro), not preceded by a definition
-/// keyword or `let`, not inside an attribute (`#[cfg(all(..))]`) or a `matches!` pattern, and inside
-/// a `macro_invocation` (a `macro_rules!` body is a template, not a call site). Like every other
-/// call it is name-only; the range spans `name(..)`.
-fn lexical_macro_call(name: Node, args: Node, source: &[u8]) -> Option<Call> {
-    if name.next_sibling() != Some(args) || source.get(args.start_byte()) != Some(&b'(') {
-        return None;
-    }
-    let callee = source.get(name.start_byte()..name.end_byte())?;
-    if FN_TRAITS.contains(&callee) {
-        return None;
-    }
-    if name
-        .prev_sibling()
-        .is_some_and(|p| DEFINITION_KEYWORDS.contains(&p.kind()))
-    {
-        return None;
-    }
-    let mut owner = name.parent();
-    while let Some(n) = owner.filter(|n| n.kind() == "token_tree") {
-        if is_attribute_body(n, source) || in_pattern(n, name.start_byte(), source) {
-            return None;
-        }
-        owner = n.parent();
-    }
-    if owner?.kind() != "macro_invocation" {
-        return None;
-    }
-    let pos = name.start_position();
-    Some(Call {
-        callee: name.utf8_text(source).ok()?.to_string(),
-        start_byte: name.start_byte() as u32,
-        end_byte: args.end_byte() as u32,
-        start_row: pos.row as u32,
-        start_col: pos.column as u32,
-    })
-}
-
-/// `[..]` written as `#[..]` or `#![..]`. The `#` may be lexed together with the punctuation around it
-/// (`#!`), so the previous token is matched by its trailing bytes.
-fn is_attribute_body(tt: Node, source: &[u8]) -> bool {
-    if source.get(tt.start_byte()) != Some(&b'[') {
-        return false;
-    }
-    let Some(prev) = tt.prev_sibling() else {
-        return false;
-    };
-    let text = &source[prev.start_byte()..prev.end_byte()];
-    if text.ends_with(b"#") || text.ends_with(b"#!") {
-        return true;
-    }
-    text == b"!"
-        && prev
-            .prev_sibling()
-            .is_some_and(|p| source[p.start_byte()..p.end_byte()].ends_with(b"#"))
-}
-
-/// Whether byte `at` inside `tt` is not code: anywhere in the predicate of `cfg!(any(unix, ..))`, or
-/// in the pattern of a [`PATTERN_MACROS`] macro, after the first top-level comma and before an `if`
-/// guard.
-fn in_pattern(tt: Node, at: usize, source: &[u8]) -> bool {
-    let text = |n: Node| &source[n.start_byte()..n.end_byte()];
-    // Read the macro name off the bytes before `tt` (`name!(`, `name! (`): no sibling walk for the
-    // common case of a token tree that is no macro's argument list.
-    let before = source[..tt.start_byte()].trim_ascii_end();
-    let Some(before) = before.strip_suffix(b"!") else {
-        return false;
-    };
-    let before = before.trim_ascii_end();
-    let ident = before
-        .iter()
-        .rev()
-        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
-        .count();
-    let name = &before[before.len() - ident..];
-    if name == b"cfg" {
-        return true;
-    }
-    if !PATTERN_MACROS.contains(&name) {
-        return false;
-    }
-    let mut cursor = tt.walk();
-    let mut after_comma = false;
-    for child in tt.children(&mut cursor).take_while(|c| c.start_byte() < at) {
-        if child.kind() == "if" {
-            return false;
-        }
-        after_comma |= !child.is_named() && text(child).contains(&b',');
-    }
-    after_comma
 }
 
 fn build_doc(q: &Query, m: &QueryMatch, source: &[u8]) -> Option<DocComment> {

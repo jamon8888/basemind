@@ -236,37 +236,17 @@ async fn work_in_flight_blocks_the_idle_reap_even_with_no_links() {
     );
 }
 
-/// Every blob sweep records its outcome in the one GC state file of the process-wide test cache,
-/// so the tests that run a sweep and then assert on that file take turns. ~keep
-static GC_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Hold the blob-GC gate the way a running scan does, on a thread of its own, until the returned
-/// sender is dropped.
-fn hold_gate_as_a_scan(broker: &Broker) -> std::sync::mpsc::Sender<()> {
-    let gate = broker.workspaces.blob_gc_gate();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let (holding, held) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _scanning = gate.scanning();
-        let _ = holding.send(());
-        let _ = released.recv();
-    });
-    held.recv().expect("the gate is held");
-    release
-}
-
 /// The destructive global blob GC must not sweep while a rescan is in flight: a rescan writes new
 /// content-addressed blobs before its `index.msgpack` (which the GC reference-counts) is rewritten,
-/// so a mid-rescan sweep would see those blobs as orphans and reap them. A scan holds the blob-GC
-/// gate shared for its whole duration; `run_blob_gc` takes it exclusively — so the sweep waits
-/// until the scan releases.
+/// so a mid-rescan sweep would see those blobs as orphans and reap them. `on_rescan` holds the
+/// blob-GC READ lock for the whole scan; `run_blob_gc` takes the WRITE lock — so the sweep blocks
+/// until the rescan releases.
 #[tokio::test]
 async fn blob_gc_waits_for_an_in_flight_rescan() {
-    let _one_sweep = GC_STATE.lock().await;
     crate::store::init_isolated_cache();
     let (_d, broker) = temp_broker();
 
-    let rescan_guard = hold_gate_as_a_scan(&broker);
+    let rescan_guard = broker.blob_gc_lock.read().await;
 
     let mut gc = std::pin::pin!(broker.run_blob_gc());
     tokio::select! {
@@ -285,14 +265,13 @@ async fn blob_gc_waits_for_an_in_flight_rescan() {
 /// grew to 116 GB.
 #[tokio::test]
 async fn blob_gc_returns_starved_instead_of_hanging_behind_an_endless_rescan() {
-    let _one_sweep = GC_STATE.lock().await;
     crate::store::init_isolated_cache();
     let (_d, broker) = temp_broker();
 
     broker.run_blob_gc().await.expect("seed a completed sweep");
     let completed = crate::store_gc::read_gc_state().expect("completed sweep state");
 
-    let _rescan_guard = hold_gate_as_a_scan(&broker);
+    let _rescan_guard = broker.blob_gc_lock.read().await;
 
     let result = broker.run_blob_gc_with_lock_timeout(Duration::from_millis(50)).await;
     assert!(
@@ -322,7 +301,6 @@ async fn blob_gc_returns_starved_instead_of_hanging_behind_an_endless_rescan() {
 /// incident go unnoticed.
 #[tokio::test]
 async fn a_completed_sweep_persists_gc_state() {
-    let _one_sweep = GC_STATE.lock().await;
     crate::store::init_isolated_cache();
     let (_d, broker) = temp_broker();
 
@@ -338,12 +316,11 @@ async fn a_completed_sweep_persists_gc_state() {
 /// global blob sweep, repeatedly, must never leave the index pointing at a reaped blob. A rescan
 /// writes fresh content-addressed blobs but only rewrites `index.msgpack` (which the sweep
 /// reference-counts) at completion, so its just-written blobs are unreferenced for the whole scan;
-/// without the blob-GC gate a sweep landing mid-scan would reap them. The invariant
+/// without the `blob_gc_lock` serialization a sweep landing mid-scan would reap them. The invariant
 /// checked here is the outcome, which holds under any interleaving: every blob the final index
 /// references still exists on disk.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_rescan_and_blob_gc_never_reaps_a_referenced_blob() {
-    let _one_sweep = GC_STATE.lock().await;
     crate::store::init_isolated_cache();
     let (_d, broker) = temp_broker();
     let (tx, _rx) = mpsc::channel(8);
@@ -374,7 +351,6 @@ async fn concurrent_rescan_and_blob_gc_never_reaps_a_referenced_blob() {
                 paths: None,
                 full: true,
                 embed: false,
-                verify: false,
             },
             &mut session,
             &tx,
@@ -419,43 +395,6 @@ async fn archive_idle_threads_flips_stale_active_threads() {
     let archived = broker.archive_idle_threads(THREAD_IDLE_TTL).expect("archive");
     assert_eq!(archived, 1);
     assert!(!broker.store.get_thread(&thread).unwrap().unwrap().active);
-}
-
-/// The retention sweep rewrites thread records and deletes memberships, so it must queue behind the
-/// write gate the request handlers take instead of racing them.
-#[tokio::test]
-async fn retention_maintenance_waits_for_the_store_write_gate() {
-    crate::store::init_isolated_cache();
-    let (_d, broker) = temp_broker();
-    let gate = Arc::clone(&broker.store_write_gate);
-    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let holder = std::thread::spawn(move || {
-        let _held = gate.lock().expect("write gate");
-        let _ = held_tx.send(());
-        let _ = release_rx.recv();
-    });
-    held_rx.await.expect("the holder thread took the write gate");
-
-    let mut sweep = std::pin::pin!(broker.run_retention_maintenance());
-    tokio::select! {
-        biased;
-        () = &mut sweep => panic!("retention maintenance ran while a writer held the store write gate"),
-        () = tokio::time::sleep(Duration::from_millis(150)) => {}
-    }
-    assert_eq!(
-        broker.store.last_maintenance().expect("maintenance time"),
-        None,
-        "nothing may be swept before the gate is released"
-    );
-
-    release_tx.send(()).expect("release the write gate");
-    sweep.await;
-    holder.join().expect("holder thread");
-    assert!(
-        broker.store.last_maintenance().expect("maintenance time").is_some(),
-        "the sweep completes once it holds the gate"
-    );
 }
 
 /// A slow store call (injected latency on the blocking pool) must not stall other connections. The

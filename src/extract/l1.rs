@@ -1,7 +1,6 @@
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryMatch};
 
-use super::rust_macro_items::MacroBodies;
 use super::{ExtractError, FileMapL1, Implementation, Import, SCHEMA_VER, Symbol, SymbolKind, capture_name};
 use crate::lang::{
     CaptureClass, LangId, ParseOutcome, parse_with_default_timeout, try_get_classified_combined_l1_query, with_parser,
@@ -16,18 +15,16 @@ pub fn extract_l1(lang: LangId, source: &[u8]) -> Result<FileMapL1, ExtractError
             return Err(ExtractError::ParseTimeout(crate::lang::DEFAULT_PARSE_TIMEOUT));
         }
     };
-    let bodies = MacroBodies::collect(lang, tree.root_node(), source)?;
-    extract_l1_from_tree(lang, &tree, source, &bodies)
+    extract_l1_from_tree(lang, &tree, source)
 }
 
 /// Extract L1 data from a pre-parsed tree-sitter `Tree`. Separated from `extract_l1` so the
 /// scanner can share one parse between L1 and L2 when eager L2 is enabled, avoiding a second
-/// full parse per file on the hot path. `bodies` are the file's parsed macro bodies, shared with L2.
-pub(super) fn extract_l1_from_tree(
+/// full parse per file on the hot path.
+pub(crate) fn extract_l1_from_tree(
     lang: LangId,
     tree: &tree_sitter::Tree,
     source: &[u8],
-    bodies: &MacroBodies,
 ) -> Result<FileMapL1, ExtractError> {
     let root = tree.root_node();
 
@@ -37,9 +34,7 @@ pub(super) fn extract_l1_from_tree(
         (false, 0)
     };
 
-    let mut combined = run_combined(lang, root, source)?;
-    bodies.extend_l1(lang, source, &mut combined)?;
-    let (symbols, imports, implementations) = combined;
+    let (symbols, imports, implementations) = run_combined(lang, root, source)?;
     let rationale = super::rationale::extract_rationale(root, source);
 
     Ok(FileMapL1 {
@@ -74,13 +69,13 @@ fn count_error_nodes(root: Node) -> u32 {
 }
 
 /// Output triple of `run_combined`: symbols, imports, and implementations extracted in one pass.
-pub(super) type CombinedL1 = (Vec<Symbol>, Vec<Import>, Vec<Implementation>);
+type CombinedL1 = (Vec<Symbol>, Vec<Import>, Vec<Implementation>);
 
 /// Walk the combined L1 query (symbols + imports + implementations) once, dispatching each
 /// match by pre-classified capture index. Allocates one `QueryCursor` instead of three, cutting
 /// the per-file tree-walk cost to one pass. Dispatch is an integer array lookup
 /// (`classes[first_cap.index]`) instead of three `starts_with` comparisons per match.
-pub(super) fn run_combined(lang: LangId, root: tree_sitter::Node, source: &[u8]) -> Result<CombinedL1, ExtractError> {
+fn run_combined(lang: LangId, root: tree_sitter::Node, source: &[u8]) -> Result<CombinedL1, ExtractError> {
     let Some(cq) = try_get_classified_combined_l1_query(lang)? else {
         return Ok((Vec::new(), Vec::new(), Vec::new()));
     };
@@ -99,7 +94,7 @@ pub(super) fn run_combined(lang: LangId, root: tree_sitter::Node, source: &[u8])
                 .find(|class| !matches!(class, CaptureClass::Other));
             match class {
                 Some(CaptureClass::Symbol) => {
-                    if let Some(sym) = build_symbol(q, m, source, lang) {
+                    if let Some(sym) = build_symbol(q, m, source) {
                         symbols.push(sym);
                     }
                 }
@@ -109,7 +104,7 @@ pub(super) fn run_combined(lang: LangId, root: tree_sitter::Node, source: &[u8])
                     }
                 }
                 Some(CaptureClass::Impl) => {
-                    if let Some(imp) = build_implementation(q, m, source).filter(|_| !is_negative_impl(m)) {
+                    if let Some(imp) = build_implementation(q, m, source) {
                         implementations.push(imp);
                     }
                 }
@@ -162,7 +157,7 @@ fn dedupe_symbols(syms: Vec<Symbol>) -> Vec<Symbol> {
     keep
 }
 
-fn build_symbol(q: &Query, m: &QueryMatch, source: &[u8], lang: LangId) -> Option<Symbol> {
+fn build_symbol(q: &Query, m: &QueryMatch, source: &[u8]) -> Option<Symbol> {
     let mut name: Option<String> = None;
     let mut kind: Option<SymbolKind> = None;
     let mut start_byte = 0u32;
@@ -206,10 +201,7 @@ fn build_symbol(q: &Query, m: &QueryMatch, source: &[u8], lang: LangId) -> Optio
 
     // The outline is a map of what a file exposes, not of what its function bodies compute:
     // bindings and nested definitions inside a function/method/lambda are implementation detail.
-    // A Rust `fn` item is the exception: it is a named item callable by path in its scope (test
-    // fixtures, helpers), and a call to it would otherwise resolve to nothing.
-    let nested_rust_fn = |n: Node| lang == "rust" && n.kind() == "function_item";
-    if symbol_node.is_some_and(|n| !nested_rust_fn(n) && is_function_local(n)) {
+    if symbol_node.is_some_and(is_function_local) {
         return None;
     }
 
@@ -407,17 +399,6 @@ fn is_already_collapsed(slice: &str) -> bool {
         }
     }
     true
-}
-
-/// `impl !Send for X {}` declares that `X` does NOT implement the trait.
-fn is_negative_impl(m: &QueryMatch) -> bool {
-    m.captures().iter().any(|cap| {
-        let node = cap.node;
-        node.kind() == "impl_item" && {
-            let mut cursor = node.walk();
-            node.children(&mut cursor).any(|c| c.kind() == "!")
-        }
-    })
 }
 
 /// Build an `Implementation` from a query match that contains:
@@ -747,10 +728,10 @@ pub fn locked() {}
         let src = b"const TOP: u32 = 1;\nstruct S { f: u32 }\nimpl S { fn m(&self) { const LOCAL: u32 = 2; fn inner() {} } }\nfn free() { let x = 1; fn nested() {} }\n";
         let map = extract_l1("rust", src).expect("extract");
         let names = names_of(&map);
-        for want in ["TOP", "S", "m", "free", "inner", "nested"] {
+        for want in ["TOP", "S", "m", "free"] {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
-        for bad in ["LOCAL", "x"] {
+        for bad in ["LOCAL", "inner", "x", "nested"] {
             assert!(!names.contains(&bad), "{bad} must be excluded: {names:?}");
         }
     }

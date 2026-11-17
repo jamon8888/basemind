@@ -11,7 +11,7 @@
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-use super::{CodeSearchConfig, ConfigV1, DocumentsConfig, ResourcesConfig};
+use super::{CodeSearchConfig, ConfigV1, DocumentsConfig, LlmConfig, ResourcesConfig};
 
 /// Length of a config digest in hex characters.
 pub const DIGEST_LEN: usize = 16;
@@ -113,25 +113,22 @@ pub fn code_digest(cfg: &CodeSearchConfig) -> String {
 }
 
 /// Fingerprint of the settings that shape a document's extracted content, chunks, keywords,
-/// entities and summary. `output` (MCP response format) and the embedding preset / threads are
-/// deliberately excluded: they do not change what is stored.
-pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig) -> String {
+/// entities and summary. `output` (MCP response format), the embedding preset, and thread counts
+/// are deliberately excluded: they do not change extracted content. The ONNX provider remains in
+/// the digest because it can change model output and numerical results across runtimes.
+pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig, llm: &LlmConfig) -> String {
     // The splitter cutovers decide which chunker a text file gets, so they belong in the digest, but only
     // when moved off their defaults: folding the defaults in would change every existing digest and
     // re-extract every document on upgrade.
     let defaults = DocumentsConfig::default();
     let cutovers = (cfg.markdown_chunk_max_bytes, cfg.plain_text_chunk_max_bytes);
-    let mut tag = if cutovers == (defaults.markdown_chunk_max_bytes, defaults.plain_text_chunk_max_bytes) {
-        "doc/1".to_string()
+    let tag = if cutovers == (defaults.markdown_chunk_max_bytes, defaults.plain_text_chunk_max_bytes) {
+        // Bump this when extraction preprocessing or cache-key inputs change; this invalidates
+        // cached OCR and embeddings produced before provider identity became part of the key.
+        "doc/4".to_string()
     } else {
-        format!("doc/1/cutover={},{}", cutovers.0, cutovers.1)
+        format!("doc/4/cutover={},{}", cutovers.0, cutovers.1)
     };
-    // `extract::doc_tiers` is compiled only with `documents`, and this function is not.
-    tag.push_str(missing_tier_suffix(
-        cfg!(feature = "documents"),
-        cfg!(feature = "documents-ocr"),
-        cfg!(feature = "documents-ner"),
-    ));
     digest_of(
         &tag,
         &(
@@ -139,40 +136,26 @@ pub fn doc_digest(cfg: &DocumentsConfig, resources: &ResourcesConfig) -> String 
             cfg.overlap,
             cfg.max_chunks_per_document,
             cfg.max_pages,
-            // The slot `extract_archives` held before archive extraction was removed. Its default was
-            // `false`, so a config that left it there keeps its digest; one that set `true`
-            // re-extracts its documents once.
-            false,
-            // Only the knobs that reach the extractor: `preferred_languages` and `[ocr]` are
-            // reserved, so editing them must not re-extract every document.
+            cfg.extract_archives,
+            // Only the knobs that reach the extractor: `preferred_languages` and `[ocr] backend`
+            // remain reserved, while the OCR language list is live.
             (
                 cfg.language.auto_detect,
                 cfg.language.min_confidence.to_bits(),
                 cfg.language.detect_multiple,
             ),
+            &cfg.ocr.languages,
             &cfg.keywords,
             &cfg.ner,
             &cfg.summarization,
             resources.document_models,
-            // The slot `[llm] model` held before the LLM backends were removed. Its default was
-            // empty, so a config that left it unset keeps its digest; one that set a model
-            // re-extracts its documents once.
-            "",
+            // Provider selection affects ONNX-backed embeddings, NER, layout and OCR. Keep it in
+            // the extraction fingerprint so a cached document is never reused across runtimes
+            // with potentially different output or numerical behavior.
+            resources.onnx_provider,
+            &llm.model,
         ),
     )
-}
-
-/// Digest-tag suffix naming the document tiers this binary lacks. A document extracted without OCR or
-/// NER is missing text or entities that a build with the tier produces, so the two builds must not
-/// share a digest: swapping binaries then re-extracts. Empty when both tiers are compiled in, which
-/// keeps the digest of a full build what it was before the tiers existed.
-fn missing_tier_suffix(documents: bool, ocr: bool, ner: bool) -> &'static str {
-    match (documents, ocr, ner) {
-        (false, _, _) | (true, true, true) => "",
-        (true, false, true) => "/no-ocr",
-        (true, true, false) => "/no-ner",
-        (true, false, false) => "/no-ocr/no-ner",
-    }
 }
 
 /// Fingerprint of the limits a document's extraction ran under, for its timeout tombstone (see
@@ -197,8 +180,7 @@ pub fn doc_guard_digest(cfg: &DocumentsConfig, doc_digest: &str) -> String {
 /// re-flushes eligible files and purges the rows of files that are no longer eligible.
 pub fn embed_policy_digest(cfg: &ConfigV1) -> String {
     digest_of(
-        // Rebuild keyword postings that older scans may have deleted for duplicate content.
-        "embed-policy/2",
+        "embed-policy/1",
         &(
             cfg.code_search.enabled,
             cfg.code_search.embed,
@@ -225,12 +207,12 @@ mod tests {
     #[test]
     fn doc_digest_ignores_reserved_fields_but_tracks_live_ones() {
         let resources = ResourcesConfig::default();
+        let llm = LlmConfig::default();
         let base = DocumentsConfig::default();
-        let digest = |cfg: &DocumentsConfig| doc_digest(cfg, &resources);
+        let digest = |cfg: &DocumentsConfig| doc_digest(cfg, &resources, &llm);
 
         let mut reserved = base.clone();
         reserved.language.preferred_languages = vec!["fra".into()];
-        reserved.ocr.languages = vec!["deu".into()];
         reserved.ocr.backend = crate::config::documents::OcrBackend::Paddle;
         assert_eq!(
             digest(&base),
@@ -238,13 +220,9 @@ mod tests {
             "reserved keys must not invalidate documents"
         );
 
-        let mut archives = base.clone();
-        archives.extract_archives = !archives.extract_archives;
-        assert_eq!(
-            digest(&base),
-            digest(&archives),
-            "extract_archives is ignored, so toggling it must not invalidate documents"
-        );
+        let mut live = base.clone();
+        live.ocr.languages = vec!["fra".into()];
+        assert_ne!(digest(&base), digest(&live), "OCR languages must invalidate documents");
 
         let mut live = base.clone();
         live.language.detect_multiple = !live.language.detect_multiple;
@@ -252,28 +230,22 @@ mod tests {
         let mut live = base.clone();
         live.max_pages += 1;
         assert_ne!(digest(&base), digest(&live));
-    }
 
-    #[test]
-    fn the_digest_tag_names_only_the_tiers_a_documents_build_lacks() {
-        assert_eq!(missing_tier_suffix(true, true, true), "");
-        assert_eq!(missing_tier_suffix(true, false, true), "/no-ocr");
-        assert_eq!(missing_tier_suffix(true, true, false), "/no-ner");
-        assert_eq!(missing_tier_suffix(true, false, false), "/no-ocr/no-ner");
-        for (ocr, ner) in [(false, false), (false, true), (true, false), (true, true)] {
-            assert_eq!(
-                missing_tier_suffix(false, ocr, ner),
-                "",
-                "no documents feature, no suffix"
-            );
-        }
+        let mut provider = resources.clone();
+        provider.onnx_provider = crate::config::OnnxProvider::CoreMl;
+        assert_ne!(
+            doc_digest(&base, &resources, &llm),
+            doc_digest(&base, &provider, &llm),
+            "changing the ONNX provider must invalidate cached document outputs"
+        );
     }
 
     #[test]
     fn doc_digest_tracks_chunker_cutovers_only_off_their_defaults() {
         let resources = ResourcesConfig::default();
+        let llm = LlmConfig::default();
         let base = DocumentsConfig::default();
-        let digest = |cfg: &DocumentsConfig| doc_digest(cfg, &resources);
+        let digest = |cfg: &DocumentsConfig| doc_digest(cfg, &resources, &llm);
 
         let mut moved = base.clone();
         moved.markdown_chunk_max_bytes += 1;
@@ -449,23 +421,27 @@ mod tests {
 
     #[test]
     fn doc_digest_tracks_extraction_knobs_only() {
-        let (cfg, res) = (DocumentsConfig::default(), ResourcesConfig::default());
-        let digest = doc_digest(&cfg, &res);
+        let (cfg, res, llm) = (
+            DocumentsConfig::default(),
+            ResourcesConfig::default(),
+            LlmConfig::default(),
+        );
+        let digest = doc_digest(&cfg, &res, &llm);
         let mut other = cfg.clone();
         other.max_characters += 1;
-        assert_ne!(doc_digest(&other, &res), digest);
+        assert_ne!(doc_digest(&other, &res, &llm), digest);
         let mut other = cfg.clone();
         other.keywords.enabled = !other.keywords.enabled;
-        assert_ne!(doc_digest(&other, &res), digest);
+        assert_ne!(doc_digest(&other, &res, &llm), digest);
         let mut other = cfg.clone();
         other.summarization.enabled = !other.summarization.enabled;
-        assert_ne!(doc_digest(&other, &res), digest);
+        assert_ne!(doc_digest(&other, &res, &llm), digest);
         let mut other = cfg.clone();
         other.embedding_preset = "quality".to_string();
         other.embed_exclude = vec!["x".to_string()];
         other.embed_max_threads = 3;
         assert_eq!(
-            doc_digest(&other, &res),
+            doc_digest(&other, &res, &llm),
             digest,
             "embedding knobs are tracked elsewhere"
         );

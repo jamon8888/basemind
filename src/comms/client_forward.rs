@@ -1,6 +1,6 @@
 //! Daemon-forwarding half of [`CommsClient`](super::client::CommsClient): the write/read RPCs a
 //! `daemon_writer` serve ships to the daemon (the machine's sole fjall writer) rather than running
-//! in-process — rescan, CORE memory, precise resolved-refs, and git-history.
+//! in-process — rescan, CORE memory, PROPOSAL governance, precise resolved-refs, and git-history.
 //!
 //! Split out of `client.rs` to keep it under the 1000-line `rust-max-lines` cap. These are a second
 //! `impl CommsClient` block; the request/response correlation core stays in `client.rs`.
@@ -25,27 +25,12 @@ impl CommsClient {
         full: bool,
         embed: bool,
     ) -> Result<RescanReport, CommsClientError> {
-        self.rescan_as(root, paths, full, embed, false).await
-    }
-
-    /// [`rescan`](Self::rescan), with `verify` set when `paths` were named by a person or an agent
-    /// rather than seen changing by a watcher: the daemon then validates the blob of a named file
-    /// it would skip as unchanged.
-    pub async fn rescan_as(
-        &mut self,
-        root: PathBuf,
-        paths: Option<Vec<PathBuf>>,
-        full: bool,
-        embed: bool,
-        verify: bool,
-    ) -> Result<RescanReport, CommsClientError> {
         match self
             .request(CommsRequest::Rescan {
                 root,
                 paths,
                 full,
                 embed,
-                verify,
             })
             .await?
         {
@@ -89,6 +74,23 @@ impl CommsClient {
         }
     }
 
+    /// Forward a PROPOSAL governance operation to the daemon (the sole fjall writer). A
+    /// `daemon_writer` serve does the git-log mining / audit verdict / LanceDB embed on its side and
+    /// ships only the fjall reads/writes here. Idempotent for list/get; reject + promote are
+    /// terminal writes and mine-apply is tombstone-guarded, so a replayed retry is safe.
+    #[cfg(feature = "memory")]
+    pub async fn governance_op(
+        &mut self,
+        root: PathBuf,
+        scope: String,
+        op: crate::comms::proposals_proto::GovernanceOp,
+    ) -> Result<crate::comms::proposals_proto::GovernanceOutcome, CommsClientError> {
+        match self.request(CommsRequest::Governance { root, scope, op }).await? {
+            CommsResponse::Governance(outcome) => Ok(outcome),
+            other => Err(self.shape_err(other, "governance_op")),
+        }
+    }
+
     /// Forward a precise resolved-reference read to the daemon (the sole fjall writer, holding the
     /// cross-file `refs_by_def` / `refs_by_path` index a `daemon_writer` serve cannot see). Backs
     /// the precise cross-file `find_callers` / `goto_definition` path. A pure read, so the
@@ -120,7 +122,7 @@ impl CommsClient {
 
     /// Forward the code-search keyword (BM25) + exact (symbol-name) lanes to the daemon — the sole
     /// fjall writer, and therefore the only process that can read the BM25 postings and
-    /// `symbols_by_name`. Backs `code_search` on a reader session, where both lanes would
+    /// `symbols_by_name`. Backs `code` mode `semantic` on a reader session, where both lanes would
     /// otherwise return nothing. A pure read, so the transparent reconnect-and-retry is replay-safe.
     pub async fn code_search_lanes(
         &mut self,

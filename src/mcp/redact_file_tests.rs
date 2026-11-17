@@ -1,0 +1,963 @@
+//! `redact_text` input-source tests: inline `text` keeps working, and the
+//! new `file_path` routes through xberg extraction (any format) instead of
+//! assuming UTF-8.
+
+use rmcp::model::{CallToolResult, ContentBlock};
+use serde_json::Value;
+
+use super::{LEGAL_FR_PROFILE, RedactTextParams, run_redact};
+
+/// The JSON payload a tool returns (the first text content block).
+fn json_of(result: &CallToolResult) -> Value {
+    for content in &result.content {
+        if let ContentBlock::Text(text) = content {
+            return serde_json::from_str(&text.text).expect("tool payload is JSON");
+        }
+    }
+    panic!("tool returned no text content");
+}
+
+/// Inline-text params with every option at its default (no NER, not required).
+fn text_params(text: &str) -> RedactTextParams {
+    RedactTextParams {
+        text: text.to_string(),
+        file_path: None,
+        categories: vec![],
+        strategy: None,
+        custom_terms: vec![],
+        custom_patterns: vec![],
+        pseudonyms: vec![],
+        ner_model_dir: None,
+        ner_profile: None,
+        require_ner: false,
+    }
+}
+
+#[tokio::test]
+async fn unknown_ner_profile_is_rejected() {
+    let error = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@99".to_string()),
+        ..text_params("Alice Smith")
+    })
+    .await
+    .expect_err("unknown NER profiles must fail closed");
+    assert!(error.message.contains("unknown NER profile"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn ner_profile_metadata_reports_effective_labels_without_model() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Alice Smith works at Acme Corp.")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], LEGAL_FR_PROFILE);
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn legal_fr_v2_metadata_reports_named_places_and_act_dates() {
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some("legal-fr@2".to_string()),
+        ..text_params("Résidence Les Hortensias, le 3 septembre 2026")
+    })
+    .await
+    .expect("profile resolution does not require a model");
+    let profile = json_of(&result)["ner_profile"].clone();
+    assert_eq!(profile["name"], "legal-fr@2");
+    assert_eq!(
+        profile["labels"],
+        serde_json::json!([
+            "full_name",
+            "first_name",
+            "last_name",
+            "person",
+            "organization",
+            "address",
+            "street_address",
+            "city",
+            "postal_code",
+            "email",
+            "phone_number",
+            "iban",
+            "bank_account",
+            "tax_id",
+            "national_id_number",
+            "date_of_birth",
+            "named_place",
+            "document_date"
+        ])
+    );
+}
+
+#[test]
+fn legal_fr_v2_filters_ner_false_positives_without_dropping_pii() {
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "sécurité sociale",
+        "organization"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("RCS Bobigny", "iban"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "depuis le 1er janvier deux mil vingt-quatre",
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Europe", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "Union européenne",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "grand Sud-Ouest",
+        "named_place"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_value("en France,", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Ile de France", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("Pays Bas", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value("l'Europe", "named_place"));
+    assert!(super::should_skip_legal_fr_v2_ner_value(
+        "France métropolitaine",
+        "named_place"
+    ));
+
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "DISTRIBUTION LORMARIN SAS",
+        "organization"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1420041010050500013M02606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "FR1X 2004 1010 0505 0001 3M02 606",
+        "iban"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "date de naissance : 3 septembre 1980",
+        "date_of_birth"
+    ));
+    let date = "3 septembre 1980";
+    let text = format!("depuis le {date}");
+    let start = text.find(date).expect("date is present");
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
+        "date_of_birth"
+    ));
+    let text = format!("{date} sans contexte de naissance");
+    let start = text.find(date).expect("date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        &text,
+        start,
+        start + date.len(),
+        "date_of_birth"
+    ));
+    let mixed_dates = "Jean Dupont (3 septembre 1980). Contrat signé le 1 janvier 2026.";
+    let birth_start = mixed_dates.find("3 septembre 1980").expect("birth date is present");
+    let act_start = mixed_dates.find("1 janvier 2026").expect("act date is present");
+    assert!(!super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        birth_start,
+        birth_start + "3 septembre 1980".len(),
+        "date_of_birth"
+    ));
+    assert!(super::should_skip_legal_fr_v2_ner_span(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "date_of_birth"
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_span_with_categories(
+        mixed_dates,
+        act_start,
+        act_start + "1 janvier 2026".len(),
+        "document_date",
+        true
+    ));
+    assert!(!super::should_skip_legal_fr_v2_ner_value(
+        "Résidence Les Hortensias",
+        "named_place"
+    ));
+}
+
+#[tokio::test]
+async fn legal_fr_v2_keeps_legal_reference_numbers_readable() {
+    // Compact dates need an explicit date nearby (shared filter policy from #179): an
+    // eight-digit run without one stays a phone candidate and is redacted.
+    let text =
+        "Publié le 19 février 2026, annonce 20260219-AAA-0042. Référence devis : 2026-221. Contact : 06 12 34 56 78.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        redacted.contains("20260219-AAA-0042"),
+        "reference must stay: {redacted}"
+    );
+    assert!(redacted.contains("2026-221"), "reference must stay: {redacted}");
+    assert!(!redacted.contains("06 12 34 56 78"), "phone must redact: {redacted}");
+}
+
+#[tokio::test]
+async fn legal_fr_v2_phone_context_overrides_invoice_reference_cue() {
+    let text = "Facture 42. Téléphone Danemark : 32345678.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains("32345678"), "phone must redact: {redacted}");
+}
+
+/// A `ner_model_dir` pointing at nothing must never fail the call:
+/// NER degrades to pattern-only redaction and the response stays intact.
+#[tokio::test]
+async fn ner_model_dir_missing_model_still_redacts() {
+    let result = run_redact(RedactTextParams {
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Reach me at alice@example.com today")
+    })
+    .await
+    .expect("missing NER model degrades, never errors");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        !redacted.contains("alice@example.com"),
+        "PII must still be redacted: {redacted}"
+    );
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+}
+
+/// Callers that must not send anything unredacted need to tell "NER found
+/// nothing" from "NER never ran"; the payload says which.
+#[tokio::test]
+async fn ner_ran_is_false_when_the_model_is_unavailable() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let result = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            ..text_params("Reach me at alice@example.com today")
+        })
+        .await
+        .expect("degrades to pattern-only by default");
+        assert_eq!(json_of(&result)["ner_ran"], Value::Bool(false));
+    }
+}
+
+/// With `require_ner`, an unavailable model is an error, never a silent
+/// pattern-only result.
+#[tokio::test]
+async fn require_ner_fails_instead_of_degrading() {
+    for dir in [None, Some("/nonexistent/gliner2".to_string())] {
+        let error = run_redact(RedactTextParams {
+            ner_model_dir: dir,
+            require_ner: true,
+            ..text_params("Alice Smith owes 10 000 EUR")
+        })
+        .await
+        .expect_err("require_ner must not fall back to pattern-only redaction");
+        assert!(
+            error.message.contains("NER required"),
+            "error names the cause: {}",
+            error.message
+        );
+    }
+}
+
+/// The #71 coverage fields (`ner_windows`, `ner_window_chars`,
+/// `ner_truncated`) appear only when NER ran — an unavailable model claims
+/// nothing about windows it never read.
+#[tokio::test]
+async fn coverage_fields_appear_only_when_ner_ran() {
+    let result = run_redact(RedactTextParams {
+        ner_model_dir: Some("/nonexistent/gliner2".to_string()),
+        ..text_params("Reach me at alice@example.com today")
+    })
+    .await
+    .expect("degrades to pattern-only by default");
+    let payload = json_of(&result);
+    assert_eq!(payload["ner_ran"], Value::Bool(false));
+    for field in ["ner_windows", "ner_window_chars", "ner_truncated"] {
+        assert!(
+            payload.get(field).is_none(),
+            "{field} must not claim coverage when NER never ran: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn text_param_still_redacts() {
+    let result = run_redact(text_params("Reach me at alice@example.com today"))
+        .await
+        .expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        !redacted.contains("alice@example.com"),
+        "PII must be redacted: {redacted}"
+    );
+    assert!(
+        !payload["rehydration_map"].as_object().expect("map").is_empty(),
+        "rehydration_map must capture the original"
+    );
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+}
+
+#[tokio::test]
+async fn file_path_redacts_extracted_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("note.txt");
+    std::fs::write(&file, "Contact bob@corp.com for details").expect("write fixture");
+
+    let result = run_redact(RedactTextParams {
+        text: String::new(),
+        file_path: Some(file.to_string_lossy().into_owned()),
+        categories: vec![],
+        strategy: None,
+        custom_terms: vec![],
+        custom_patterns: vec![],
+        pseudonyms: vec![],
+        ner_model_dir: None,
+        ner_profile: None,
+        require_ner: false,
+    })
+    .await
+    .expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains("bob@corp.com"), "PII must be redacted: {redacted}");
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+}
+
+#[tokio::test]
+async fn file_path_missing_file_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("nope.txt");
+    let err = run_redact(RedactTextParams {
+        text: String::new(),
+        file_path: Some(missing.to_string_lossy().into_owned()),
+        categories: vec![],
+        strategy: None,
+        custom_terms: vec![],
+        custom_patterns: vec![],
+        pseudonyms: vec![],
+        ner_model_dir: None,
+        ner_profile: None,
+        require_ner: false,
+    })
+    .await
+    .expect_err("missing file must fail");
+    assert!(err.message.contains("cannot read"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn text_and_file_path_together_rejected() {
+    let err = run_redact(RedactTextParams {
+        text: "hello".to_string(),
+        file_path: Some("/tmp/whatever.txt".to_string()),
+        categories: vec![],
+        strategy: None,
+        custom_terms: vec![],
+        custom_patterns: vec![],
+        pseudonyms: vec![],
+        ner_model_dir: None,
+        ner_profile: None,
+        require_ner: false,
+    })
+    .await
+    .expect_err("both inputs must fail");
+    assert!(err.message.contains("not both"), "unexpected error: {}", err.message);
+}
+
+#[tokio::test]
+async fn oversized_extracted_content_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("big.txt");
+    std::fs::write(&file, "x".repeat(2 << 20)).expect("write fixture");
+
+    let err = run_redact(RedactTextParams {
+        text: String::new(),
+        file_path: Some(file.to_string_lossy().into_owned()),
+        categories: vec![],
+        strategy: None,
+        custom_terms: vec![],
+        custom_patterns: vec![],
+        pseudonyms: vec![],
+        ner_model_dir: None,
+        ner_profile: None,
+        require_ner: false,
+    })
+    .await
+    .expect_err("oversized extraction must fail");
+    assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
+}
+
+/// A raw file over the pre-extraction cap is rejected before xberg runs any
+/// PDF/image/OCR work — a sparse file proves the guard fires on the raw
+/// size alone, without paying for 64 MiB of content.
+#[tokio::test]
+async fn raw_file_size_capped_before_extraction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("huge.bin");
+    std::fs::File::create(&file)
+        .expect("create fixture")
+        .set_len(super::MAX_FILE_BYTES + 1)
+        .expect("extend to sparse size");
+
+    let err = run_redact(RedactTextParams {
+        text: String::new(),
+        file_path: Some(file.to_string_lossy().into_owned()),
+        ..text_params("")
+    })
+    .await
+    .expect_err("oversized raw file must fail before extraction");
+    assert!(err.message.contains("too large"), "unexpected error: {}", err.message);
+}
+
+/// NER-derived labels (`person`, `location`, …) surface as plain string
+/// categories in detections — never the `{"custom": …}` object the serde
+/// default renders, which the app-side parser would report as "unknown".
+#[tokio::test]
+async fn custom_term_labels_surface_in_detections() {
+    let result = run_redact(RedactTextParams {
+        text: "Alice visited Paris today".to_string(),
+        custom_terms: vec![
+            vec!["person".to_string(), "Alice".to_string()],
+            vec!["location".to_string(), "Paris".to_string()],
+        ],
+        ..text_params("Alice visited Paris today")
+    })
+    .await
+    .expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let detections = payload["detections"].as_array().expect("detections");
+    let categories: Vec<&str> = detections
+        .iter()
+        .map(|d| d["category"].as_str().unwrap_or("unknown"))
+        .collect();
+    assert!(
+        categories.contains(&"person"),
+        "person must surface as a plain string: {categories:?}"
+    );
+    assert!(
+        categories.contains(&"location"),
+        "location must surface as a plain string: {categories:?}"
+    );
+    assert!(
+        !categories.contains(&"unknown"),
+        "no detection may read unknown: {categories:?}"
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(redacted.contains("[PERSON_1]"), "person token missing: {redacted}");
+    assert!(redacted.contains("[LOCATION_1]"), "location token missing: {redacted}");
+}
+
+/// NER spans redact whole words only: a short span like "US" must never
+/// corrupt unrelated words ("because"), and regex metacharacters in a span
+/// must be escaped, not interpreted.
+#[test]
+fn ner_span_patterns_are_boundary_aware_and_escaped() {
+    let us = regex::Regex::new(&super::ner_span_pattern("US")).expect("valid regex");
+    assert!(us.is_match("US policy"));
+    assert!(!us.is_match("because"), "span must not match inside a word");
+
+    let dotted = regex::Regex::new(&super::ner_span_pattern("Acme Corp.")).expect("metacharacters must be escaped");
+    assert!(dotted.is_match("at Acme Corp. HQ"));
+    assert!(
+        dotted.find("Acme CorpX HQ").is_none(),
+        "literal dot must not match any char"
+    );
+
+    let tagged = regex::Regex::new(&super::ner_span_pattern("#42")).expect("valid regex");
+    assert!(tagged.is_match("issue #42 today"), "leading punctuation needs no \\b");
+    assert!(
+        !tagged.is_match("issue #425"),
+        "trailing \\b still bounds the word edge"
+    );
+}
+
+/// Download-gated (#37): set `BASEMIND_NER_MODEL_DIR` to the staged GLiNER2
+/// directory to verify real detection — honest categories plus confidence.
+/// Uses the multi-thread runtime because the candle backend calls
+/// `tokio::task::block_in_place` during inference.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn ner_model_dir_detects_entities_with_confidence() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let result = run_redact(RedactTextParams {
+        text: "Alice Smith met Bob Jones in Paris near Acme Corp.".to_string(),
+        ner_model_dir: Some(dir),
+        ..text_params("Alice Smith met Bob Jones in Paris near Acme Corp.")
+    })
+    .await
+    .expect("redact_text succeeds with a real model");
+    let payload = json_of(&result);
+    let detections = payload["detections"].as_array().expect("detections");
+    let categories: Vec<&str> = detections
+        .iter()
+        .map(|d| d["category"].as_str().unwrap_or("unknown"))
+        .collect();
+    // The 42-label list makes GLiNER2 pick the most specific label it was
+    // given (`full_name`, `city`, …) rather than the generic `person` /
+    // `location`, so assert on the families.
+    const PERSON_LABELS: &[&str] = &["person", "full_name", "first_name", "last_name"];
+    const LOCATION_LABELS: &[&str] = &[
+        "location",
+        "city",
+        "address",
+        "street_address",
+        "country",
+        "state_or_region",
+    ];
+    assert!(
+        categories.iter().any(|c| PERSON_LABELS.contains(c)),
+        "a person label must be detected: {categories:?}"
+    );
+    assert!(
+        categories.iter().any(|c| LOCATION_LABELS.contains(c)),
+        "a location label must be detected: {categories:?}"
+    );
+    assert!(
+        !categories.contains(&"unknown"),
+        "no detection may read unknown: {categories:?}"
+    );
+    assert!(
+        detections
+            .iter()
+            .any(|d| d.get("confidence").and_then(|c| c.as_f64()).is_some()),
+        "NER spans must carry confidence"
+    );
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains("Alice Smith"), "person must be redacted: {redacted}");
+}
+
+/// Download-gated (#97): the selected legal profile must reach the real NER
+/// backend, while the response records the exact ordered labels used for the
+/// coverage contract. This is intentionally ignored unless a model is staged.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn legal_profile_runs_ner_with_effective_labels() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let result = run_redact(RedactTextParams {
+        ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+        ner_model_dir: Some(dir),
+        ..text_params("Alice Smith works at Acme Corp.; email alice@example.com")
+    })
+    .await
+    .expect("legal profile NER succeeds");
+    let payload = json_of(&result);
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    assert_eq!(payload["ner_profile"]["name"], LEGAL_FR_PROFILE);
+    assert_eq!(payload["ner_profile"]["labels"].as_array().map(Vec::len), Some(16));
+    assert_eq!(payload["ner_truncated"], Value::Bool(false));
+    assert!(!payload["detections"].as_array().expect("detections").is_empty());
+    assert!(
+        !payload["redacted_text"]
+            .as_str()
+            .expect("redacted_text")
+            .contains("Alice Smith")
+    );
+}
+
+/// xberg's built-in phone pattern misses these formats (a `+` after a space
+/// defeats its leading `\b`; French numbers are written in digit pairs).
+#[tokio::test]
+async fn international_and_french_phone_formats_redact() {
+    for phone in [
+        "+33 6 12 34 56 78",
+        "+33612345678",
+        "06 12 34 56 78",
+        "06.12.34.56.78",
+        "+49 30 1234567",
+        "+44 20 7946 0958",
+        "+33 (0)1 42 68 53 00",
+    ] {
+        let text = format!("Appelez le {phone} demain");
+        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let payload = json_of(&result);
+        let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+        assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
+        let map = payload["rehydration_map"].as_object().expect("map");
+        assert!(
+            map.values().any(|v| v.as_str() == Some(phone)),
+            "rehydration map must hold {phone} verbatim: {map:?}"
+        );
+    }
+}
+
+/// The exact French pattern keeps every way of writing the nine digits that the
+/// generic pattern used to catch.
+#[tokio::test]
+async fn french_phone_formats_beyond_digit_pairs_redact() {
+    for phone in [
+        "+33 06 12 34 56 78",
+        "+33 (6) 12 34 56 78",
+        "+33 612 345 678",
+        "+33 1 4268 5300",
+    ] {
+        let text = format!("Appelez le {phone} demain");
+        let result = run_redact(text_params(&text)).await.expect("redact_text succeeds");
+        let payload = json_of(&result);
+        let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+        assert!(!redacted.contains(phone), "phone {phone} must be redacted: {redacted}");
+    }
+}
+
+/// A French number stops at its nine digits: the street number of an address that
+/// follows on the same line is not part of it (#114).
+#[tokio::test]
+async fn french_phone_does_not_swallow_a_following_street_number() {
+    let text = "Tél. +33 6 39 98 21 47 11 rue Ferdinand Quéniart, 82000 Montauban";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let map = payload["rehydration_map"].as_object().expect("map");
+    assert!(
+        map.values().any(|v| v.as_str() == Some("+33 6 39 98 21 47")),
+        "the phone must be exactly its nine digits: {map:?}"
+    );
+    assert!(
+        !map.values().any(|v| v.as_str().is_some_and(|v| v.contains("47 11"))),
+        "no value may run into the street number: {map:?}"
+    );
+}
+
+/// The phone patterns must not swallow dates, amounts or short numbers.
+#[tokio::test]
+async fn phone_patterns_leave_dates_and_amounts_alone() {
+    let text = "Réunion le 28/09/2026 à 14:30, montant 1 234,56 €, dossier 2026-09-28, page 12";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    for kept in ["28/09/2026", "14:30", "1 234,56", "2026-09-28", "page 12"] {
+        assert!(redacted.contains(kept), "{kept} must stay: {redacted}");
+    }
+}
+
+#[tokio::test]
+async fn legal_reference_numbers_are_not_redacted_as_phones() {
+    let text = "Jugement du 12 février 2026, annonce 20260219-AAA-0042. \
+                Facture F-2026-0012 du 9 janvier 2026. Période 2024-2025. \
+                Contact : 06 12 34 56 78.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some(LEGAL_FR_PROFILE.to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    for kept in ["20260219-AAA-0042", "F-2026-0012", "2024-2025"] {
+        assert!(redacted.contains(kept), "{kept} must stay: {redacted}");
+    }
+    assert!(
+        !redacted.contains("06 12 34 56 78"),
+        "the real phone must be redacted: {redacted}"
+    );
+}
+
+#[tokio::test]
+async fn uppercase_prose_is_not_redacted_as_a_swift_code_without_context() {
+    let text = "ATTESTATION D'EMPLOYEUR\n\nLa présente attestation est établie à la demande.";
+    let payload = json_of(
+        &run_redact(RedactTextParams {
+            ner_profile: Some("legal-fr@2".to_string()),
+            ..text_params(text)
+        })
+        .await
+        .expect("redact_text succeeds"),
+    );
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(redacted.contains("ATTESTATION"), "ordinary prose must stay: {redacted}");
+    assert!(
+        !payload["detections"]
+            .as_array()
+            .expect("detections")
+            .iter()
+            .any(|d| d["category"] == "swift_bic")
+    );
+}
+
+#[tokio::test]
+async fn a_valid_spaced_french_nir_redacts_as_one_national_id() {
+    let nir = "1 85 07 15 100 000 58";
+    let text = format!("Numéro de sécurité sociale : **{nir}**.");
+    let payload = json_of(&run_redact(text_params(&text)).await.expect("redact_text succeeds"));
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(!redacted.contains(nir), "the complete NIR must be redacted: {redacted}");
+    let detections = payload["detections"].as_array().expect("detections");
+    assert!(
+        detections
+            .iter()
+            .any(|d| d["category"] == "national_id_number" && d["text"] == nir),
+        "the complete NIR should be one detection: {detections:?}"
+    );
+}
+
+#[test]
+fn pdf_line_padding_is_removed_without_collapsing_content() {
+    let normalized =
+        super::trim_pdf_line_padding_with_map("Aurore Valcourt                                      \nB signe.  \n")
+            .text;
+    assert_eq!(normalized, "Aurore Valcourt\nB signe.\n");
+}
+
+#[test]
+fn pdf_line_padding_keeps_source_offsets_for_detections() {
+    let original = "Name                                      \nBIC ABCDUS33XXX\n";
+    let trimmed = super::trim_pdf_line_padding_with_map(original);
+    let start = trimmed.text.find("ABCDUS33XXX").expect("BIC in trimmed text");
+    let end = start + "ABCDUS33XXX".len();
+    assert_eq!(&original[trimmed.offsets[start]..trimmed.offsets[end]], "ABCDUS33XXX");
+    assert_eq!(trimmed.text, "Name\nBIC ABCDUS33XXX\n");
+}
+
+/// The AI Act citation pattern matches the regulation's own number and
+/// nothing else: prose that merely names the act, and every other EU
+/// regulation, must survive untouched.
+#[tokio::test]
+async fn ai_act_citation_redacts_only_the_2024_1689_number() {
+    let text = "Per the AI Act, Regulation (EU) 2024/1689 applies; see also Regulation (EU) 2022/2065.";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let redacted = payload["redacted_text"].as_str().expect("redacted_text");
+    assert!(
+        !redacted.contains("2024/1689"),
+        "AI Act citation must be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("the AI Act"),
+        "prose naming the act must stay: {redacted}"
+    );
+    assert!(
+        redacted.contains("2022/2065"),
+        "other regulations must stay: {redacted}"
+    );
+    let detections = payload["detections"].as_array().expect("detections");
+    assert!(
+        detections
+            .iter()
+            .any(|detection| detection["category"] == "ai_act_citation"),
+        "the citation must surface as ai_act_citation: {detections:?}"
+    );
+}
+
+// Offsets index the text the caller sent (#70). Inline text used to go through
+// xberg's plain-text extractor, which trims every paragraph, collapses blank-line
+// runs, turns CRLF into LF and folds decomposed accents, then reported offsets on
+// that rewritten text. A caller mapping spans back onto its own string was off by
+// the amount the extractor removed.
+
+/// Redacts `text` with no NER and returns the detections whose text is `needle`,
+/// asserting each one indexes `text` itself (UTF-8 bytes), not an extracted copy.
+async fn assert_spans_index_the_input(text: &str, needle: &str) -> Value {
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let payload = json_of(&result);
+    let detections = payload["detections"].as_array().expect("detections");
+    let found: Vec<&Value> = detections
+        .iter()
+        .filter(|d| d["text"].as_str().is_some_and(|t| t.contains(needle)))
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "no detection covers {needle:?} in {text:?}: {detections:?}"
+    );
+    for detection in found {
+        let start = detection["start"].as_u64().expect("start") as usize;
+        let end = detection["end"].as_u64().expect("end") as usize;
+        let slice = text.as_bytes().get(start..end).unwrap_or_default();
+        assert_eq!(
+            std::str::from_utf8(slice).unwrap_or("<not on a char boundary>"),
+            detection["text"].as_str().expect("detection text"),
+            "[{start},{end}) does not index the input {text:?}"
+        );
+    }
+    payload
+}
+
+#[tokio::test]
+async fn offsets_hold_with_leading_whitespace() {
+    for text in [
+        " Contact: jane.roe@exemple.fr merci",
+        "   Contact: jane.roe@exemple.fr merci",
+        "\n\nContact: jane.roe@exemple.fr merci",
+    ] {
+        assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+    }
+}
+
+#[tokio::test]
+async fn offsets_hold_after_blank_line_runs_and_indented_paragraphs() {
+    for text in [
+        "Intro\n\n\n\nContact: jane.roe@exemple.fr merci",
+        "Intro\n\n   Contact: jane.roe@exemple.fr merci",
+        "Intro   \n\nContact: jane.roe@exemple.fr merci",
+    ] {
+        assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+    }
+}
+
+#[tokio::test]
+async fn offsets_hold_with_windows_line_endings() {
+    assert_spans_index_the_input("Intro\r\nContact: jane.roe@exemple.fr\r\nmerci", "jane.roe@exemple.fr").await;
+}
+
+#[tokio::test]
+async fn offsets_hold_after_decomposed_accents() {
+    // "Hélène" written as e + combining accent: 2 bytes per mark.
+    let text = "Prénom H\u{65}\u{301}l\u{65}\u{300}ne Dubreuil écrit: jane.roe@exemple.fr";
+    assert_spans_index_the_input(text, "jane.roe@exemple.fr").await;
+}
+
+#[tokio::test]
+async fn redacted_text_keeps_the_surrounding_text_verbatim() {
+    let text = "  Intro\r\n\r\n\r\nContact: jane.roe@exemple.fr merci\n\n";
+    let result = run_redact(text_params(text)).await.expect("redact_text succeeds");
+    let redacted = json_of(&result)["redacted_text"]
+        .as_str()
+        .expect("redacted_text")
+        .to_string();
+    assert!(redacted.starts_with("  Intro\r\n\r\n\r\nContact: "), "{redacted:?}");
+    assert!(redacted.ends_with(" merci\n\n"), "{redacted:?}");
+    assert!(!redacted.contains("jane.roe@exemple.fr"), "{redacted:?}");
+}
+
+// #71 acceptance: the model reads the whole text, says so, and the result
+// carries the offset coverage a caller needs to prove it. Ignored like the
+// other real-model test: set BASEMIND_NER_MODEL_DIR to the staged GLiNER2
+// directory. The multi-thread runtime is required because the candle backend
+// calls `tokio::task::block_in_place` during inference.
+
+/// A 20 000-character body (a plausible extracted file) with a person name
+/// planted near the ticket's cutoff offsets — 0, 500, 700, 5 000 and 19 000 —
+/// detected at every offset, through `text`: NER windows internally and
+/// reports the coverage contract.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn ner_windows_read_the_whole_text() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let filler = "le rapport continue avec des mots sans aucune personne dedans. ";
+    let name_offsets = [0usize, 500, 700, 5_000, 19_000];
+    for offset in name_offsets {
+        let mut text = String::new();
+        while text.chars().count() + filler.chars().count() <= offset {
+            text.push_str(filler);
+        }
+        // Pad the remainder with spaces: `filler` ends in one itself, so the
+        // planted name starts a fresh word at exactly `offset`, and the
+        // word-based span lands where the assertion looks for it — a mid-word
+        // cut would glue the name to a partial token and shift the span.
+        while text.chars().count() < offset {
+            text.push(' ');
+        }
+        text.push_str("Jeanne Vasseur a signé chez Amélie Tissot. ");
+        while text.chars().count() < 20_000 {
+            text.push_str(filler);
+        }
+        let result = run_redact(RedactTextParams {
+            text: text.clone(),
+            ner_model_dir: Some(dir.clone()),
+            ..text_params(&text)
+        })
+        .await
+        .expect("redact_text succeeds with a real model over 20k characters");
+        let payload = json_of(&result);
+        assert_eq!(payload["ner_ran"], Value::Bool(true));
+        assert_eq!(
+            payload["ner_truncated"],
+            Value::Bool(false),
+            "no truncation at offset {offset}"
+        );
+        let windows = payload["ner_windows"].as_u64().expect("ner_windows");
+        let window_chars = payload["ner_window_chars"].as_u64().expect("ner_window_chars");
+        // The caller's gate: window sizes at most the window size it uses
+        // itself (400), and more than one window for a 20 000-character body.
+        assert!(
+            window_chars <= 400,
+            "`ner_window_chars` {window_chars} past the caller's gate"
+        );
+        assert!(windows > 1, "a 20 000-character body is {windows} windows");
+        // The planted name must surface, at the exact offsets it was sent at.
+        let start = find_char_byte(&text, offset).expect("offset within the text");
+        let detections = payload["detections"].as_array().expect("detections");
+        let name = detections.iter().find(|detection| {
+            detection["start"].as_u64() == Some(start as u64)
+                && detection["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Jeanne") || t.contains("Vasseur"))
+        });
+        let detection = name.unwrap_or_else(|| panic!("no detection at {start} for offset {offset}: {detections:?}"));
+        assert!(
+            detection["confidence"].as_f64().is_some(),
+            "an NER span carries its confidence: {detection:?}"
+        );
+    }
+}
+
+/// Text dense in tokens — digit runs, e-mail addresses, identifiers — must
+/// plan without truncation: the token budget shrinks windows before the char
+/// cap would misread anything.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the staged GLiNER2 model; set BASEMIND_NER_MODEL_DIR"]
+async fn dense_text_reports_no_truncation() {
+    let dir = std::env::var("BASEMIND_NER_MODEL_DIR").expect("set BASEMIND_NER_MODEL_DIR to run this ignored test");
+    let filler = format!(
+        "dossier 0123456789 expéditeur {} iban FR76 3000 4028 3700 0102 7654 319 réf 2026-04-2/1187. ",
+        "alice@exemple.fr"
+    );
+    let text = filler.repeat(500);
+    let result = run_redact(RedactTextParams {
+        text: text.clone(),
+        ner_model_dir: Some(dir),
+        ..text_params(&text)
+    })
+    .await
+    .expect("dense text redacts with a real model");
+    let payload = json_of(&result);
+    assert_eq!(
+        payload["ner_truncated"],
+        Value::Bool(false),
+        "dense text must not truncate: {payload}"
+    );
+    assert_eq!(payload["ner_ran"], Value::Bool(true));
+    let windows = payload["ner_windows"].as_u64().expect("ner_windows");
+    assert!(windows > 1, "a dense body windows out: {payload}");
+}
+
+/// Byte offset of the `index`th character — placement helper mirroring the
+/// ticket's character-tallied offsets.
+fn find_char_byte(text: &str, index: usize) -> Option<usize> {
+    text.char_indices().nth(index).map(|(byte, _)| byte)
+}

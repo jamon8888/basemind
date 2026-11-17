@@ -508,19 +508,6 @@ impl Store {
         self.blobs_dir.join(format!("{hash_hex}.fm.msgpack"))
     }
 
-    /// Whether the combined-filemap blob for `hash_hex` decodes as a current one. Reads and decodes
-    /// the blob, so it is for the pass after an unclean shutdown, where existing proves nothing
-    /// (see [`crate::scan_evidence::blobs_need_verifying`]); every other pass asks only `exists()`.
-    pub fn filemap_blob_is_intact(&self, hash_hex: &str) -> bool {
-        is_current_filemap_blob(&self.blob_path_fm_hex(hash_hex))
-    }
-
-    /// [`Self::filemap_blob_is_intact`] for a document blob.
-    #[cfg(feature = "documents")]
-    pub fn doc_blob_is_intact(&self, hash_hex: &str) -> bool {
-        is_current_single_blob(&self.blob_path_doc_hex(hash_hex))
-    }
-
     #[cfg(feature = "documents")]
     pub fn blob_path_doc(&self, hash: &Hash) -> PathBuf {
         let buf = hashing::hex_buf(hash);
@@ -536,22 +523,14 @@ impl Store {
     /// the frame — the trailing L2 bytes are read off disk but never decoded, so the common
     /// outline-only read path (`MapCache` build, `search_symbols`) pays no L2 decode cost.
     pub fn read_l1_by_hex(&self, hash_hex: &str) -> Result<Option<FileMapL1>, StoreError> {
-        let primary = read_l1_blob_in(&self.blobs_dir, hash_hex)?;
-        match (&self.fallback_blobs_dir, primary) {
-            (Some(fallback), None) => read_l1_blob_in(fallback, hash_hex),
-            (_, primary) => Ok(primary),
-        }
+        read_l1_blob_in(&self.blobs_dir, hash_hex)
     }
 
     /// Read the L2 calls from the combined-filemap blob. Returns `Ok(None)` both when the blob
     /// is absent and when it carries no L2 tier (the file was scanned with `eager_l2 = false`
     /// or L2 extraction failed) — callers escalate via `query::file_outline_l2`.
     pub fn read_l2_by_hex(&self, hash_hex: &str) -> Result<Option<FileMapL2>, StoreError> {
-        let primary = read_l2_blob_in(&self.blobs_dir, hash_hex)?;
-        match (&self.fallback_blobs_dir, primary) {
-            (Some(fallback), None) => read_l2_blob_in(fallback, hash_hex),
-            (_, primary) => Ok(primary),
-        }
+        read_l2_blob_in(&self.blobs_dir, hash_hex)
     }
 
     /// Write the combined-filemap blob for a file. Holds both tiers in one content-addressed blob,
@@ -585,28 +564,20 @@ impl Store {
     /// leaving it vectorless forever and re-embedding on every entry-less encounter. A `Deferred`
     /// pass cannot downgrade an embedded blob this way, because `cached_doc_is_reusable` accepts any
     /// readable blob when embedding is off (the reuse branch returns before this write).
-    ///
-    /// Generic over the document type, which the retrieval layer owns (`extract::doc::DocBlobs`).
     #[cfg(feature = "documents")]
-    pub fn write_doc_blob<T: serde::Serialize>(&self, hash: &Hash, map: &T) -> Result<(), StoreError> {
+    pub fn write_doc(&self, hash: &Hash, map: &crate::extract::doc::FileMapDoc) -> Result<(), StoreError> {
         write_blob_overwrite(self.blob_path_doc(hash), map)
     }
 
-    /// Read the document blob of `hash_hex` as `T`, refusing a blob whose schema version
-    /// (`schema_ver` of the decoded value) is not this build's.
     #[cfg(feature = "documents")]
-    pub(crate) fn read_doc_blob_by_hex<T: serde::de::DeserializeOwned>(
-        &self,
-        hash_hex: &str,
-        schema_ver: impl FnOnce(&T) -> u16,
-    ) -> Result<Option<T>, StoreError> {
+    pub fn read_doc_by_hex(&self, hash_hex: &str) -> Result<Option<crate::extract::doc::FileMapDoc>, StoreError> {
         let path = self.blob_path_doc_hex(hash_hex);
         let Some(bytes) = read_if_exists(&path)? else {
             return Ok(None);
         };
         let decoded = decode_single_or_legacy(&path, &bytes, BlobKind::Single)?;
-        let map: T = rmp_serde::from_slice(&decoded)?;
-        check_schema(schema_ver(&map))?;
+        let map: crate::extract::doc::FileMapDoc = rmp_serde::from_slice(&decoded)?;
+        check_schema(map.schema_ver)?;
         Ok(Some(map))
     }
 
@@ -633,6 +604,21 @@ impl Store {
         }
     }
 
+    #[cfg(feature = "documents")]
+    pub fn blob_path_rehydration_hex(&self, hash_hex: &str) -> PathBuf {
+        self.blobs_dir.join(format!("{hash_hex}.rehydration.blob"))
+    }
+
+    #[cfg(feature = "documents")]
+    pub fn write_rehydration(&self, hash_hex: &str, encrypted: &[u8]) -> Result<(), StoreError> {
+        write_bytes_atomic(self.blob_path_rehydration_hex(hash_hex), encrypted)
+    }
+
+    #[cfg(feature = "documents")]
+    pub fn read_rehydration(&self, hash_hex: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        read_if_exists(&self.blob_path_rehydration_hex(hash_hex))
+    }
+
     /// Path of a file's resolution blob (`<hash>.rref.msgpack`) — the per-file code-intelligence
     /// facts (intra-file resolved edges + import/export list). A sibling of the `.fm`/`.doc`
     /// blobs, content-addressed by source hash and stored as compressed single-map msgpack.
@@ -657,19 +643,9 @@ impl Store {
         &self,
         hash_hex: &str,
     ) -> Result<Option<crate::intel::model::FileResolvedRefs>, StoreError> {
-        let mut path = self.blob_path_rref_hex(hash_hex);
-        let bytes = match read_if_exists(&path)? {
-            Some(bytes) => bytes,
-            None => {
-                let Some(fallback) = &self.fallback_blobs_dir else {
-                    return Ok(None);
-                };
-                path = fallback.join(format!("{hash_hex}.rref.msgpack"));
-                let Some(bytes) = read_if_exists(&path)? else {
-                    return Ok(None);
-                };
-                bytes
-            }
+        let path = self.blob_path_rref_hex(hash_hex);
+        let Some(bytes) = read_if_exists(&path)? else {
+            return Ok(None);
         };
         let decoded = decode_single_or_legacy(&path, &bytes, BlobKind::Single)?;
         let refs: crate::intel::model::FileResolvedRefs = rmp_serde::from_slice(&decoded)?;

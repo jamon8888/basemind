@@ -126,27 +126,21 @@ async fn spawn_serve(root: &Path) -> rmcp::service::RunningService<rmcp::RoleCli
     ().serve(transport).await.expect("rmcp handshake")
 }
 
-/// `column` is the 0-based byte column of the reference; the tool takes it 1-based.
 async fn goto_definition(
     service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     path: &str,
     line: u64,
     column: u64,
-    name: &str,
 ) -> Value {
-    let result = service
-        .call_tool(call_params(
-            "code_refs",
-            json!({ "name": name, "relation": "definition", "path": path, "line": line, "column": column + 1 }),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("code_refs definition({path}, {line}, {column}) failed: {e}"));
-    assert_ne!(
-        result.is_error,
-        Some(true),
-        "code_refs definition({path}, {line}, {column}) failed: {result:?}"
-    );
-    decode_text(&result)
+    decode_text(
+        &service
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "definition", "path": path, "line": line, "column": column }),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("goto_definition({path}, {line}, {column}) failed: {e}")),
+    )
 }
 
 fn def_field<'a>(body: &'a Value, field: &str) -> &'a Value {
@@ -165,7 +159,7 @@ async fn python_local_shadow_resolves_to_local_not_module_x() {
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let body = goto_definition(&service, "app.py", 8, 11, "x").await;
+    let body = goto_definition(&service, "app.py", 8, 11).await;
     assert_eq!(
         def_field(&body, "path").as_str(),
         Some("app.py"),
@@ -178,7 +172,7 @@ async fn python_local_shadow_resolves_to_local_not_module_x() {
     );
     assert_eq!(
         def_field(&body, "column").as_u64(),
-        Some(5),
+        Some(4),
         "shadow x column must be 4: {body}"
     );
     assert_eq!(
@@ -199,7 +193,7 @@ async fn python_per_function_params_resolve_to_distinct_definitions() {
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let first = goto_definition(&service, "app.py", 12, 11, "x").await;
+    let first = goto_definition(&service, "app.py", 12, 11).await;
     assert_eq!(
         def_field(&first, "line").as_u64(),
         Some(11),
@@ -207,11 +201,11 @@ async fn python_per_function_params_resolve_to_distinct_definitions() {
     );
     assert_eq!(
         def_field(&first, "column").as_u64(),
-        Some(17),
+        Some(16),
         "first_param's x column must be 16: {first}"
     );
 
-    let second = goto_definition(&service, "app.py", 16, 11, "x").await;
+    let second = goto_definition(&service, "app.py", 16, 11).await;
     assert_eq!(
         def_field(&second, "line").as_u64(),
         Some(15),
@@ -219,7 +213,7 @@ async fn python_per_function_params_resolve_to_distinct_definitions() {
     );
     assert_eq!(
         def_field(&second, "column").as_u64(),
-        Some(18),
+        Some(17),
         "second_param's x column must be 17: {second}"
     );
 
@@ -249,7 +243,7 @@ async fn python_comprehension_variable_resolves_to_its_own_binding_not_outer_sco
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let comprehension_x = goto_definition(&service, "app.py", 21, 14, "x").await;
+    let comprehension_x = goto_definition(&service, "app.py", 21, 14).await;
     assert_eq!(
         def_field(&comprehension_x, "path").as_str(),
         Some("app.py"),
@@ -263,7 +257,7 @@ async fn python_comprehension_variable_resolves_to_its_own_binding_not_outer_sco
     );
     assert_eq!(
         def_field(&comprehension_x, "column").as_u64(),
-        Some(21),
+        Some(20),
         "comprehension x must resolve to column 20 (the `x` in `for x in range(3)`): {comprehension_x}"
     );
     assert_eq!(
@@ -272,7 +266,7 @@ async fn python_comprehension_variable_resolves_to_its_own_binding_not_outer_sco
         "resolved definition name must be x: {comprehension_x}"
     );
 
-    let outer_x = goto_definition(&service, "app.py", 22, 11, "x").await;
+    let outer_x = goto_definition(&service, "app.py", 22, 11).await;
     assert_eq!(
         def_field(&outer_x, "line").as_u64(),
         Some(21),
@@ -281,7 +275,7 @@ async fn python_comprehension_variable_resolves_to_its_own_binding_not_outer_sco
     );
     assert_eq!(
         def_field(&outer_x, "column").as_u64(),
-        Some(21),
+        Some(20),
         "KNOWN GAP: spec requires column 4 (the outer x) — got the comprehension binding's column \
          instead: {outer_x}"
     );
@@ -305,9 +299,12 @@ async fn python_cross_file_find_callers_resolves_real_call_site_not_self_referen
 
     let body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "f", "path": "mod.py" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "callers", "path": "mod.py", "name": "f" }),
+            ))
             .await
-            .expect("code_refs callers"),
+            .expect("code callers"),
     );
 
     assert_eq!(
@@ -328,9 +325,9 @@ async fn python_cross_file_find_callers_resolves_real_call_site_not_self_referen
         "def path: {body}"
     );
     assert_eq!(
-        def.get("line").and_then(Value::as_u64),
-        Some(4),
-        "def line (1-based): {body}"
+        def.get("start_row").and_then(Value::as_u64),
+        Some(3),
+        "def start_row (0-based): {body}"
     );
 
     let hits = body.get("hits").and_then(Value::as_array).expect("hits");
@@ -338,7 +335,7 @@ async fn python_cross_file_find_callers_resolves_real_call_site_not_self_referen
         hits.iter()
             .any(|h| h.get("path").and_then(Value::as_str) == Some("app.py")
                 && h.get("line").and_then(Value::as_u64) == Some(26)
-                && h.get("column").and_then(Value::as_u64) == Some(12)
+                && h.get("column").and_then(Value::as_u64) == Some(11)
                 && h.get("resolved").and_then(Value::as_bool) == Some(true)),
         "the real f() call site app.py:26:11 must be a resolved caller: {body}"
     );
@@ -356,7 +353,7 @@ async fn python_cross_file_find_callers_resolves_real_call_site_not_self_referen
         "no false self-referential mod.py hit: {body}"
     );
 
-    let goto_body = goto_definition(&service, "app.py", 26, 11, "f").await;
+    let goto_body = goto_definition(&service, "app.py", 26, 11).await;
     assert_eq!(
         def_field(&goto_body, "path").as_str(),
         Some("mod.py"),
@@ -369,7 +366,7 @@ async fn python_cross_file_find_callers_resolves_real_call_site_not_self_referen
     );
     assert_eq!(
         def_field(&goto_body, "column").as_u64(),
-        Some(5),
+        Some(4),
         "resolved span lands on the `f` identifier (column 4), not the `def` keyword: {goto_body}"
     );
     assert_eq!(
@@ -391,7 +388,7 @@ async fn java_field_vs_local_resolve_correctly() {
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let local = goto_definition(&service, "App.java", 10, 15, "value").await;
+    let local = goto_definition(&service, "App.java", 10, 15).await;
     assert_eq!(
         def_field(&local, "path").as_str(),
         Some("App.java"),
@@ -404,11 +401,11 @@ async fn java_field_vs_local_resolve_correctly() {
     );
     assert_eq!(
         def_field(&local, "column").as_u64(),
-        Some(13),
+        Some(12),
         "local value column: {local}"
     );
 
-    let field = goto_definition(&service, "App.java", 14, 20, "value").await;
+    let field = goto_definition(&service, "App.java", 14, 20).await;
     assert_eq!(
         def_field(&field, "line").as_u64(),
         Some(6),
@@ -416,7 +413,7 @@ async fn java_field_vs_local_resolve_correctly() {
     );
     assert_eq!(
         def_field(&field, "column").as_u64(),
-        Some(17),
+        Some(16),
         "field value column: {field}"
     );
 
@@ -431,7 +428,7 @@ async fn java_per_method_params_resolve_to_distinct_definitions() {
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let first = goto_definition(&service, "App.java", 18, 15, "value").await;
+    let first = goto_definition(&service, "App.java", 18, 15).await;
     assert_eq!(
         def_field(&first, "line").as_u64(),
         Some(17),
@@ -439,11 +436,11 @@ async fn java_per_method_params_resolve_to_distinct_definitions() {
     );
     assert_eq!(
         def_field(&first, "column").as_u64(),
-        Some(31),
+        Some(30),
         "firstParam's value column: {first}"
     );
 
-    let second = goto_definition(&service, "App.java", 22, 15, "value").await;
+    let second = goto_definition(&service, "App.java", 22, 15).await;
     assert_eq!(
         def_field(&second, "line").as_u64(),
         Some(21),
@@ -451,7 +448,7 @@ async fn java_per_method_params_resolve_to_distinct_definitions() {
     );
     assert_eq!(
         def_field(&second, "column").as_u64(),
-        Some(32),
+        Some(31),
         "secondParam's value column: {second}"
     );
 
@@ -482,7 +479,7 @@ async fn java_imported_class_method_not_conflated_with_local_decoy() {
     run_scan(root);
     let service = spawn_serve(root).await;
 
-    let body = goto_definition(&service, "App.java", 32, 19, "greet").await;
+    let body = goto_definition(&service, "App.java", 32, 19).await;
     assert_eq!(
         body.get("path").and_then(Value::as_str),
         Some("App.java"),
@@ -528,9 +525,12 @@ async fn java_cross_file_find_callers_distinguishes_imported_method_from_decoy()
 
     let foo_body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "greet", "path": "Foo.java" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "callers", "path": "Foo.java", "name": "greet" }),
+            ))
             .await
-            .expect("code_refs callers(Foo.java, greet)"),
+            .expect("code callers(Foo.java, greet)"),
     );
     assert_eq!(
         foo_body.get("resolved").and_then(Value::as_bool),
@@ -555,14 +555,14 @@ async fn java_cross_file_find_callers_distinguishes_imported_method_from_decoy()
         "def path: {foo_body}"
     );
     assert_eq!(
-        foo_def.get("line").and_then(Value::as_u64),
-        Some(4),
-        "def line (1-based): {foo_body}"
+        foo_def.get("start_row").and_then(Value::as_u64),
+        Some(3),
+        "def start_row (0-based): {foo_body}"
     );
     assert_eq!(
-        foo_def.get("column").and_then(Value::as_u64),
-        Some(5),
-        "def column (1-based): {foo_body}"
+        foo_def.get("start_col").and_then(Value::as_u64),
+        Some(4),
+        "def start_col (0-based): {foo_body}"
     );
     let foo_hits = foo_body.get("hits").and_then(Value::as_array).expect("hits");
     assert_eq!(
@@ -582,22 +582,25 @@ async fn java_cross_file_find_callers_distinguishes_imported_method_from_decoy()
     );
     assert_eq!(
         foo_hits[0].get("column").and_then(Value::as_u64),
-        Some(25),
+        Some(24),
         "call site column (Java's tags-fallback call.range captures the byte after the \
          identifier, at the opening `(` — see the spec's Java column-quirk note): {foo_body}"
     );
 
     let app_body = decode_text(
         &service
-            .call_tool(call_params("code_refs", json!({ "name": "greet", "path": "App.java" })))
+            .call_tool(call_params(
+                "code",
+                json!({ "mode": "callers", "path": "App.java", "name": "greet" }),
+            ))
             .await
-            .expect("code_refs callers(App.java, greet) [decoy]"),
+            .expect("code callers(App.java, greet) [decoy]"),
     );
     let app_def = app_body.get("definition").expect("definition echoed");
     assert_eq!(
-        app_def.get("line").and_then(Value::as_u64),
-        Some(27),
-        "decoy definition must resolve to App.java's own greet() at line 27: {app_body}"
+        app_def.get("start_row").and_then(Value::as_u64),
+        Some(26),
+        "decoy definition must resolve to App.java's own greet() at 0-based row 26 (line 27): {app_body}"
     );
     let app_hits = app_body.get("hits").and_then(Value::as_array).expect("hits");
     assert_eq!(
@@ -619,7 +622,7 @@ async fn java_cross_file_find_callers_distinguishes_imported_method_from_decoy()
     );
     assert_eq!(
         app_hits[0].get("column").and_then(Value::as_u64),
-        Some(25),
+        Some(24),
         "conflated hit column: {app_body}"
     );
 

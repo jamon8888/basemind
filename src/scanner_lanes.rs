@@ -25,7 +25,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 pub const LANE_RESOLVE: &str = "resolve";
 /// Document batches → LanceDB (`scanner_docs::flush_document_batches`).
 pub const LANE_DOC_BATCHES: &str = "doc_batches";
-/// Code-chunk batches → LanceDB (`scanner_vectors::flush_code_batches`).
+/// Code-chunk batches → LanceDB (`scanner_code::flush_code_batches`).
 pub const LANE_CODE_BATCHES: &str = "code_batches";
 /// Purge of `code_chunks` rows for files removed since the last scan.
 pub const LANE_CODE_REMOVALS: &str = "code_removals";
@@ -71,7 +71,7 @@ fn inject_fault(_lane: &str) {}
 ///
 /// The code map is already durable on disk by the time a lane runs, so a lane that dies degrades
 /// only its own tier. The failure is logged at WARN with the lane name and the panic message.
-pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) {
+pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) -> bool {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         inject_fault(lane);
         body();
@@ -82,6 +82,9 @@ pub(crate) fn run_optional_lane(lane: &str, body: impl FnOnce()) {
             reason = panic_reason(payload.as_ref()),
             "optional scan lane panicked; this tier is degraded for the scan but the code map is intact"
         );
+        false
+    } else {
+        true
     }
 }
 

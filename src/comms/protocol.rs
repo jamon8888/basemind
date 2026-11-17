@@ -21,19 +21,8 @@ use super::model::{AgentCard, MessageMeta, Thread};
 /// to a new daemon, or vice versa, now fails the Hello skew check instead of risking a decode
 /// error on the new variant); bumped 3→4 for request correlation ([`CommsRequest::Call`] /
 /// [`CommsOut::Reply`]), so a skewed peer fails the Hello check with a clear error and the daemon
-/// takeover in `ensure_daemon` replaces an older daemon; bumped 4→5 when the `governance`
-/// request and response variants were removed, so a client that could still send one is refused
-/// at Hello instead of failing to decode mid-session. The `worktree_claim` / `worktree_release`
-/// requests were removed WITHOUT a bump: only a deliberate claim from an older client can send one,
-/// the daemon fails to decode the frame and drops that one link, and the client reports a closed
-/// connection and reconnects. Nothing else on the wire changed, so refusing every older client at
-/// Hello would cost more than the one call it protects. Bumped 5→6 for the batched memory reads
-/// (`MemoryOp::GetMany` and `MemoryOp::Stamps` in `comms::memory_proto`): a daemon that predates
-/// them cannot decode the request, so a client that may send one is refused at Hello instead of
-/// failing mid-session. The
-/// same version carries the `verify` flag of [`CommsRequest::Rescan`], which a daemon that predates
-/// it would drop without a word.
-pub const PROTO_VER: u32 = 6;
+/// takeover in `ensure_daemon` replaces an older daemon.
+pub const PROTO_VER: u32 = 4;
 
 /// A request from a client to the broker. `method` selects the variant; `params` are the
 /// flattened fields.
@@ -212,10 +201,6 @@ pub enum CommsRequest {
         /// `ts_micros >= since_micros` surface. `None` returns ALL unread.
         #[serde(default)]
         since_micros: Option<i64>,
-        /// Restrict the read to this one thread; `None` reads every joined thread. Additive with
-        /// `#[serde(default)]`: an older client omits it and an older daemon ignores it.
-        #[serde(default)]
-        thread: Option<ThreadId>,
     },
     /// Acknowledge inbox messages by ADVANCING the calling agent's per-thread read cursors. This
     /// never deletes from the shared append-only log nor affects any other agent — it only moves
@@ -276,11 +261,6 @@ pub enum CommsRequest {
         /// vector-fill follow-up. `#[serde(default)]` keeps older front-ends wire-compatible.
         #[serde(default)]
         embed: bool,
-        /// The paths were named by a person or an agent (`basemind rescan <paths>`, `index_rescan
-        /// paths`), not seen changing by a watcher: a named file that reads as unchanged has its
-        /// blob validated instead of trusted for existing. Ignored by a full scan.
-        #[serde(default)]
-        verify: bool,
     },
     /// Forward a CORE memory operation to the daemon (the sole fjall writer). The namespace
     /// (`vis_byte` / `owner`) and `scope` are resolved serve-side; the daemon runs the op against
@@ -293,6 +273,19 @@ pub enum CommsRequest {
         scope: String,
         /// The operation to run.
         op: crate::comms::memory_proto::MemoryOp,
+    },
+    /// Forward a PROPOSAL governance operation to the daemon (the sole fjall writer). The `scope` is
+    /// resolved serve-side; the daemon runs the fjall reads/writes against the workspace's read-write
+    /// `proposals` (and, for a promote, `memory_by_key`) index. The compute halves — git-log mining,
+    /// the audit verdict, and the LanceDB embed — stay on serve.
+    #[cfg(feature = "memory")]
+    Governance {
+        /// Canonical workspace root (worktree root).
+        root: std::path::PathBuf,
+        /// Memory scope resolved serve-side (git scope key or `path:<root>`).
+        scope: String,
+        /// The operation to run.
+        op: crate::comms::proposals_proto::GovernanceOp,
     },
     /// Forward a git-history operation to the daemon. `git-history.fjall/` is a fjall database, and
     /// fjall's directory lock is exclusive — so exactly ONE process may hold a repo's history index.
@@ -353,6 +346,24 @@ pub enum CommsRequest {
         /// The repo id whose branches to list.
         repo_id: String,
     },
+    /// Advisory-claim a worktree for a claimant. Returns whether the claim is now held by them.
+    WorktreeClaim {
+        /// The owning repo id.
+        repo_id: String,
+        /// The worktree name (`"(main)"` or the linked-worktree directory name).
+        name: String,
+        /// The claimant id (an agent/session id) taking the advisory claim.
+        claimant: String,
+    },
+    /// Release an advisory worktree claim held by `claimant`.
+    WorktreeRelease {
+        /// The owning repo id.
+        repo_id: String,
+        /// The worktree name whose claim to release.
+        name: String,
+        /// The claimant id releasing its own claim.
+        claimant: String,
+    },
     /// Liveness probe. The daemon replies [`CommsResponse::Pong`].
     Ping,
     /// Ask the daemon to drain and stop. Used by `basemind comms stop`.
@@ -403,6 +414,8 @@ impl CommsRequest {
             Self::Rescan { .. } => "rescan",
             #[cfg(feature = "memory")]
             Self::Memory { .. } => "memory",
+            #[cfg(feature = "memory")]
+            Self::Governance { .. } => "governance",
             Self::GitHistory { .. } => "git_history",
             Self::ResolvedRefs { .. } => "resolved_refs",
             Self::IndexRead { .. } => "index_read",
@@ -411,6 +424,8 @@ impl CommsRequest {
             Self::WorkspacesList { .. } => "workspaces_list",
             Self::WorktreesList { .. } => "worktrees_list",
             Self::BranchesList { .. } => "branches_list",
+            Self::WorktreeClaim { .. } => "worktree_claim",
+            Self::WorktreeRelease { .. } => "worktree_release",
             Self::Ping => "ping",
             Self::Stop => "stop",
             Self::Status => "status",
@@ -535,6 +550,9 @@ pub enum CommsResponse {
     /// Reply to [`CommsRequest::Memory`]: the outcome of the forwarded memory operation.
     #[cfg(feature = "memory")]
     Memory(crate::comms::memory_proto::MemoryOutcome),
+    /// Reply to [`CommsRequest::Governance`]: the outcome of the forwarded proposal operation.
+    #[cfg(feature = "memory")]
+    Governance(crate::comms::proposals_proto::GovernanceOutcome),
     /// Reply to [`CommsRequest::AccessedPaths`]: the daemon's currently-hot workspaces.
     Accessed {
         /// One row per hot workspace, most-recently-used first.
@@ -554,6 +572,12 @@ pub enum CommsResponse {
     Branches {
         /// The branch rows, sorted by name.
         branches: Vec<crate::registry::BranchRecord>,
+    },
+    /// Reply to [`CommsRequest::WorktreeClaim`] / [`CommsRequest::WorktreeRelease`]: the outcome.
+    ClaimOutcome {
+        /// For a claim: `true` when the claim is now held by the claimant. For a release: `true`
+        /// when a claim by the claimant was cleared. `false` otherwise (unknown or held by another).
+        held: bool,
     },
     /// A request failed. `code` is a stable machine token; `message` is human detail.
     Error {
@@ -674,55 +698,6 @@ pub enum CommsOut {
 mod tests {
     use super::*;
 
-    /// A client older than the removal of worktree claims can still send one. The frame must fail
-    /// to decode as an error the link loop turns into a dropped connection — never a panic, and
-    /// never a silent match against some other variant.
-    #[test]
-    fn a_retired_worktree_claim_request_is_a_decode_error() {
-        #[derive(Serialize)]
-        struct Params {
-            repo_id: &'static str,
-            name: &'static str,
-            claimant: &'static str,
-        }
-        #[derive(Serialize)]
-        struct Frame {
-            method: &'static str,
-            params: Params,
-        }
-        for method in ["worktree_claim", "worktree_release"] {
-            let bytes = rmp_serde::to_vec_named(&Frame {
-                method,
-                params: Params {
-                    repo_id: "path:/repo",
-                    name: "(main)",
-                    claimant: "agent-a",
-                },
-            })
-            .expect("encode");
-            let error = rmp_serde::from_slice::<CommsRequest>(&bytes).expect_err("a retired method must not decode");
-            assert!(
-                error.to_string().contains(method),
-                "the error names the method: {error}"
-            );
-        }
-        let live = rmp_serde::to_vec_named(&Frame {
-            method: "worktrees_list",
-            params: Params {
-                repo_id: "path:/repo",
-                name: "(main)",
-                claimant: "agent-a",
-            },
-        })
-        .expect("encode");
-        assert_eq!(
-            rmp_serde::from_slice::<CommsRequest>(&live).expect("a live method decodes from the same frame shape"),
-            CommsRequest::WorktreesList {
-                repo_id: "path:/repo".to_string()
-            }
-        );
-    }
-
     #[test]
     fn request_round_trips_through_msgpack() {
         let req = CommsRequest::ThreadPost {
@@ -769,28 +744,6 @@ mod tests {
         };
         let bytes = rmp_serde::to_vec_named(&new).expect("encode");
         assert_eq!(rmp_serde::from_slice::<CommsResponse>(&bytes).expect("decode"), new);
-    }
-
-    #[test]
-    fn inbox_without_a_thread_filter_decodes_as_unfiltered() {
-        let old = serde_json::json!({
-            "method": "inbox",
-            "params": {"limit": 5, "mark_read": true}
-        });
-        let bytes = rmp_serde::to_vec_named(&old).expect("encode");
-        let back: CommsRequest = rmp_serde::from_slice(&bytes).expect("decode");
-        assert_eq!(
-            back,
-            CommsRequest::Inbox {
-                remote: None,
-                cwd: None,
-                cursor: None,
-                limit: Some(5),
-                mark_read: true,
-                since_micros: None,
-                thread: None,
-            }
-        );
     }
 
     #[test]
@@ -854,7 +807,6 @@ mod tests {
             id: id.to_string(),
             thread: ThreadId::parse("th-1").expect("thread"),
             from: AgentId::parse("agent-1").expect("agent"),
-            from_name: Some("Author".into()),
             ts_micros: 7,
             subject: "subj".to_string(),
             tags: vec!["t".to_string()],

@@ -10,7 +10,9 @@ use std::sync::Arc;
 use rmcp::model::{ArgumentInfo, CallToolResult, CompleteRequestParams, ContentBlock, Reference};
 use serde_json::Value;
 
-use super::params::{CodeOutlineParams, CodeSymbolsParams, IndexStatusParams};
+use super::mode::CodeMode;
+use super::params::{AdminMode, AdminParams, Lenient, Parameters};
+use super::types_code::CodeParams;
 use super::{BasemindServer, ServerState};
 use crate::config::ConfigV1;
 use crate::git_cache::GitCache;
@@ -48,7 +50,7 @@ fn mapped_files(state: &ServerState) -> usize {
 }
 
 /// A one-shot server must boot with an EMPTY code map, and a tool that never touches the map
-/// (`index_status`, a pure metadata query) must not cause it to be built. This is the whole point: the
+/// (`admin` mode `status` — a pure metadata query) must not cause it to be built. This is the whole point: the
 /// flat whole-corpus `MapCache::build` cost must not be charged to a query that never reads it.
 #[tokio::test]
 async fn one_shot_server_does_not_preload_the_code_map() {
@@ -62,9 +64,9 @@ async fn one_shot_server_does_not_preload_the_code_map() {
     );
 
     let result = server
-        .index_status_call(IndexStatusParams {})
+        .admin_cli(AdminParams::new(AdminMode::Status))
         .await
-        .expect("index_status");
+        .expect("admin mode=status");
     let payload = json_of(&result);
     assert_eq!(
         payload["file_count"].as_u64(),
@@ -88,13 +90,14 @@ async fn outline_answers_from_the_store_without_building_the_corpus_map() {
     let server = oneshot_server(tmp.path());
     assert_eq!(mapped_files(&server.state), 0, "starts unbuilt");
 
-    let params = CodeOutlineParams {
-        path: crate::path::RelPath::from("a.rs"),
-        limit: None,
-        cursor: None,
+    let params = CodeParams {
+        path: Some(crate::path::RelPath::from("a.rs")),
+        l2: Some(false),
         max_tokens: None,
+        format: None,
+        ..CodeParams::new(CodeMode::Outline)
     };
-    let result = server.code_outline_call(params).await.expect("outline");
+    let result = server.code(Parameters(Lenient(params))).await.expect("outline");
     let payload = json_of(&result);
 
     let names: Vec<&str> = payload["symbols"]
@@ -152,15 +155,16 @@ async fn corpus_tool_builds_the_map_on_demand_and_sees_every_file() {
     let server = oneshot_server(tmp.path());
     assert_eq!(mapped_files(&server.state), 0, "starts unbuilt");
 
-    let params = CodeSymbolsParams {
-        name: "_marker".to_string(),
+    let params = CodeParams {
+        name: Some("_marker".to_string()),
         kind: None,
-        fuzzy: None,
         limit: None,
-        cursor: None,
         max_tokens: None,
+        format: None,
+        cursor: None,
+        ..CodeParams::new(CodeMode::Symbols)
     };
-    let result = server.code_symbols_call(params).await.expect("code_symbols");
+    let result = server.code(Parameters(Lenient(params))).await.expect("search_symbols");
     let payload = json_of(&result);
 
     let names: Vec<&str> = payload["results"]
@@ -179,82 +183,4 @@ async fn corpus_tool_builds_the_map_on_demand_and_sees_every_file() {
         2,
         "the corpus tool built the map on demand"
     );
-}
-
-/// A store whose index a scan must rebuild says so in `index_status`: a flag, and a note naming the
-/// command. Without it every symbol query comes back empty with nothing to say why.
-#[tokio::test]
-async fn index_status_says_when_a_rescan_is_owed() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    crate::store::init_isolated_cache();
-    std::fs::write(tmp.path().join("a.rs"), b"pub fn alpha_marker() {}\n").expect("a.rs");
-    {
-        let mut store = Store::open(tmp.path(), VIEW_WORKING).expect("open rw");
-        let config = ConfigV1::with_defaults();
-        scan(
-            tmp.path(),
-            &mut store,
-            &config,
-            ScanSource::WorkingTree,
-            EmbedMode::Inline,
-        )
-        .expect("scan");
-        // The state a writer leaves when it emptied the file map for a rebuild and died before it.
-        store.index.rebuild_pending = true;
-        store.flush().expect("flush");
-    }
-    let store = Store::open_read_only(tmp.path(), VIEW_WORKING).expect("open ro");
-    assert!(store.rescan_owed());
-    let git_cache = Arc::new(GitCache::open(&store.basemind_dir, 16, false).expect("git cache"));
-    let config = Arc::new(ConfigV1::with_defaults());
-    let server = BasemindServer::new_oneshot(store, tmp.path().to_path_buf(), config, None, git_cache);
-
-    let result = server
-        .index_status_call(IndexStatusParams {})
-        .await
-        .expect("index_status");
-    let payload = json_of(&result);
-
-    assert_eq!(payload["rescan_needed"], true, "{payload}");
-    let note = payload["note"].as_str().expect("a note says what to run");
-    assert!(note.contains("basemind scan"), "{note}");
-}
-
-/// Publishing the map of the index the server opened changes no outline: a cursor cut before the
-/// lazy build (on `serve`, the boot-time warm) must still page after it. Both used to bump the one
-/// generation every cursor is stamped with, so the next page read as a changed index.
-#[tokio::test]
-async fn an_outline_cursor_survives_the_map_being_built() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join("c.rs"), b"pub fn one() {}\npub fn two() {}\n").expect("c.rs");
-    let server = oneshot_server(tmp.path());
-    let outline = |cursor| CodeOutlineParams {
-        path: crate::path::RelPath::from("c.rs"),
-        limit: Some(1),
-        cursor,
-        max_tokens: None,
-    };
-    let names = |payload: &Value| -> Vec<String> {
-        payload["symbols"]
-            .as_array()
-            .expect("symbols array")
-            .iter()
-            .filter_map(|symbol| symbol["name"].as_str().map(str::to_owned))
-            .collect()
-    };
-
-    let first = json_of(&server.code_outline_call(outline(None)).await.expect("first page"));
-    let cursor = first["next_cursor"].as_str().expect("a second page").to_owned();
-
-    server.state.await_cache_ready().await;
-    assert_eq!(mapped_files(&server.state), 3, "the barrier built the map");
-
-    let second = server
-        .code_outline_call(outline(Some(super::cursor::Cursor(cursor))))
-        .await
-        .expect("the cursor still pages after the map was built");
-    let second = json_of(&second);
-    assert_eq!(names(&first).len(), 1, "{first}");
-    assert_eq!(names(&second).len(), 1, "{second}");
-    assert_ne!(names(&first), names(&second), "the cursor advances: {second}");
 }

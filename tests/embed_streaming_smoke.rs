@@ -24,7 +24,6 @@
 #![cfg(all(feature = "documents", feature = "code-search"))]
 
 use basemind::config::ConfigV1;
-use basemind::extract::doc::DocBlobs;
 use basemind::scanner::{EmbedMode, ScanSource, scan};
 use basemind::store::{Store, VIEW_WORKING};
 
@@ -63,8 +62,6 @@ fn embed_config() -> ConfigV1 {
     let mut cfg = ConfigV1::with_defaults();
     cfg.code_search.embed = true;
     cfg.documents.embed = true;
-    // `*.svg` is a default `[documents] exclude`; clearing the list opts the fixture back in.
-    cfg.documents.exclude = Vec::new();
     cfg
 }
 
@@ -173,7 +170,7 @@ fn embed_results_land_and_rescan_is_a_near_noop() {
 ///
 /// `BM_FOOTPRINT_FILES` overrides the corpus size (default 600). Run with:
 /// ```bash
-/// arch -arm64 cargo test --features memory,comms,code-intel-js,code-search \
+/// arch -arm64 cargo test --features crawl,memory,comms,code-intel-js,code-search \
 ///   --test embed_streaming_smoke -- --ignored --nocapture
 /// ```
 #[test]

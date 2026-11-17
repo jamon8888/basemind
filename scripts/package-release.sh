@@ -3,19 +3,25 @@ set -euo pipefail
 
 # NOTE: the archive contents are at the ROOT (no leading staging-dir component) so
 
-if [ $# -ne 1 ]; then
-  echo "Usage: $0 <target-triple>" >&2
+# Optional second argument names a release VARIANT (e.g. "hacienda-legal"): the archive is
+# then `basemind-<variant>-<triple>.tar.gz` instead of `basemind-<triple>.tar.gz`. The
+# binary inside is still `basemind` — the variant only distinguishes the feature-built
+# archive on the release page.
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  echo "Usage: $0 <target-triple> [variant]" >&2
   exit 1
 fi
 
 TRIPLE="$1"
+VARIANT="${2:-}"
+NAME="basemind${VARIANT:+-$VARIANT}"
 
 case "$TRIPLE" in
 x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu)
   SYSTEM="linux"
   BINEXT=""
   ;;
-aarch64-apple-darwin)
+aarch64-apple-darwin | x86_64-apple-darwin)
   SYSTEM="macos"
   BINEXT=""
   ;;
@@ -58,7 +64,9 @@ linux)
   for bin_in_staging in "${BINS_IN_STAGING[@]}"; do
     while IFS= read -r line; do
       lib=$(awk '{ for (i=1;i<=NF;i++){ if ($i=="=>" && $(i+1) ~ /^\//){print $(i+1); exit} if ($i ~ /^\// && $i !~ /^\(/){print $i; exit} } }' <<<"$line")
-      [ -n "$lib" ] && [ -f "$lib" ] || continue
+      if [ -z "$lib" ] || [ ! -f "$lib" ]; then
+        continue
+      fi
       base=$(basename "$lib")
       case "$base" in
       libc.so* | libm.so* | libpthread.so* | libdl.so* | librt.so* | libresolv.so* | \
@@ -87,8 +95,8 @@ linux)
     # shellcheck disable=SC2016  # literal $ORIGIN is intended — patchelf/ld expands it at load time
     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
   done
-  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  tar czf "${NAME}-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created ${NAME}-${TRIPLE}.tar.gz"
   ;;
 
 macos)
@@ -154,8 +162,52 @@ macos)
     codesign --verify --strict "$bin_in_staging"
   done
 
-  tar czf "basemind-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
-  echo "✓ Created basemind-${TRIPLE}.tar.gz"
+  if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
+    # Pinned directly from microsoft/onnxruntime's GitHub releases instead of a
+    # Homebrew bottle: Homebrew's onnxruntime formula stopped shipping ANY
+    # Intel-macOS bottle as of v1.29.1 (2026-09-10, part of Homebrew 7.0's
+    # project-wide Tier-3 downgrade of Intel macOS), and the "sonoma" bottle
+    # this used to fetch required macOS 14+ at runtime regardless (its
+    # LC_BUILD_VERSION declared minos=14.0), breaking every macOS 13 (Ventura)
+    # user even before the bottle disappeared entirely. ort-dynamic
+    # (ort/load-dynamic) dlopen's this at runtime — it is never linked at
+    # compile time — so any compatible dylib is a drop-in replacement
+    # regardless of which toolchain built it.
+    #
+    # v1.23.2 is the last microsoft/onnxruntime release with an x86_64 macOS
+    # build (v1.24.1 onward ships arm64 only — see that release's own notes).
+    # Its dylib declares minos=13.4 (Ventura or later) and, unlike the
+    # Homebrew bottle, has zero external @rpath/Homebrew dependencies (its
+    # abseil/protobuf/re2 deps are statically linked in), so no dependency
+    # closure to vendor alongside it.
+    echo "Vendoring pinned ONNX Runtime for Intel macOS..."
+    ORT_VERSION="1.23.2"
+    ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
+    ORT_ASSET="onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+    ort_tmp="$(mktemp -d)"
+    curl -fsSL -o "$ort_tmp/$ORT_ASSET" \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ASSET}"
+    actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_ASSET" | awk '{print $1}')"
+    if [ "$actual_sha256" != "$ORT_SHA256" ]; then
+      echo "ONNX Runtime checksum mismatch: expected $ORT_SHA256, got $actual_sha256" >&2
+      exit 1
+    fi
+    tar xzf "$ort_tmp/$ORT_ASSET" -C "$ort_tmp"
+    ort_lib="$ort_tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
+    [ -f "$ort_lib" ] || {
+      echo "ONNX Runtime dylib not found at $ort_lib" >&2
+      exit 1
+    }
+    cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
+    chmod u+w "$STAGING_DIR/libonnxruntime.dylib"
+    install_name_tool -id "@loader_path/libonnxruntime.dylib" "$STAGING_DIR/libonnxruntime.dylib"
+    codesign --force --sign - "$STAGING_DIR/libonnxruntime.dylib"
+    rm -rf "$ort_tmp"
+    echo "✓ Vendored ONNX Runtime ${ORT_VERSION} (minos 13.4) next to the binary"
+  fi
+
+  tar czf "${NAME}-${TRIPLE}.tar.gz" -C "$STAGING_DIR" .
+  echo "✓ Created ${NAME}-${TRIPLE}.tar.gz"
   ;;
 
 windows)
@@ -169,7 +221,9 @@ windows)
     done
   fi
   for ort_path in "C:/Program Files/onnxruntime" "C:/Program Files (x86)/onnxruntime" "${ONNXRUNTIME_ROOT:-}"; do
-    [ -n "$ort_path" ] && [ -d "$ort_path/lib" ] || continue
+    if [ -z "$ort_path" ] || [ ! -d "$ort_path/lib" ]; then
+      continue
+    fi
     for dll in "$ort_path/lib"/*.dll; do
       [ -f "$dll" ] || continue
       base=$(basename "$dll")
@@ -179,13 +233,13 @@ windows)
   done
 
   (cd "$STAGING_DIR" && {
-    7z a -tzip "../basemind-${TRIPLE}.zip" . >/dev/null 2>&1 ||
-      zip -q -r "../basemind-${TRIPLE}.zip" . ||
-      powershell -Command "Compress-Archive -Path '*' -DestinationPath '../basemind-${TRIPLE}.zip' -Force"
+    7z a -tzip "../${NAME}-${TRIPLE}.zip" . >/dev/null 2>&1 ||
+      zip -q -r "../${NAME}-${TRIPLE}.zip" . ||
+      powershell -Command "Compress-Archive -Path '*' -DestinationPath '../${NAME}-${TRIPLE}.zip' -Force"
   })
-  echo "✓ Created basemind-${TRIPLE}.zip"
+  echo "✓ Created ${NAME}-${TRIPLE}.zip"
   ;;
 esac
 
 rm -rf "$STAGING_DIR"
-echo "✓ Release package ready: basemind-${TRIPLE}.$([ "$SYSTEM" = "windows" ] && echo "zip" || echo "tar.gz")"
+echo "✓ Release package ready: ${NAME}-${TRIPLE}.$([ "$SYSTEM" = "windows" ] && echo "zip" || echo "tar.gz")"

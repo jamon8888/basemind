@@ -23,9 +23,7 @@ use rmcp::ErrorData as McpError;
 use super::MapCache;
 use super::helpers_calls_scan::{CallRef, CallScanPage, calls_in_file_fjall, scan_calls_by_name, scan_calls_in_ram};
 use super::helpers_impls::{ImplScanPage, scan_impls_in_ram, scan_impls_session};
-use super::helpers_refs_match::Matching;
-use crate::index::grep_bloom::GrepEntry;
-use crate::index::view::{IndexView, StandaloneView};
+use crate::index::IndexDb;
 use crate::path::RelPath;
 
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -38,7 +36,7 @@ use {
 /// How a session reaches the fjall index its reference reads need.
 pub(super) enum IndexRoute {
     /// This session's own open index.
-    Local(Box<dyn IndexView>),
+    Local(IndexDb),
     /// The daemon's workspace pool, in-process (daemon-hosted connection).
     #[cfg(all(feature = "comms", any(unix, windows)))]
     Host {
@@ -58,33 +56,8 @@ pub(super) enum IndexRoute {
 impl IndexRoute {
     /// Decide the route for this session. Never fails: an unreachable daemon is the `InRam` route.
     pub(super) async fn resolve(state: &super::ServerState) -> Self {
-        Self::resolve_with_layering(
-            state,
-            std::env::var_os("BASEMIND_INDEX_LAYERED").is_some_and(|value| value == "1"),
-        )
-        .await
-    }
-
-    async fn resolve_with_layering(state: &super::ServerState, enabled: bool) -> Self {
-        if enabled && let Some(view) = state.shared.store.read().await.layered_read.clone() {
-            return Self::Local(Box::new(crate::index::view::SharedView(view)));
-        }
-        if enabled && state.shared.store.read().await.view == crate::store::VIEW_WORKING {
-            let root = state.shared.root.clone();
-            let config = std::sync::Arc::clone(&state.shared.config);
-            let view = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Box<dyn IndexView>>> {
-                if let Some(base) = crate::store_base::open_existing_worktree_base(&root, &config)? {
-                    return Ok(Some(Box::new(base)));
-                }
-                crate::store_base::open_dirty_worktree(&root, &config)
-            })
-            .await;
-            if let Ok(Ok(Some(view))) = view {
-                return Self::Local(view);
-            }
-        }
         if let Some(idx) = state.shared.store.read().await.index_db.clone() {
-            return Self::Local(Box::new(StandaloneView(idx)));
+            return Self::Local(idx);
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         {
@@ -139,28 +112,28 @@ impl IndexRoute {
         }
     }
 
-    /// Which of `entries` provably cannot match the grep `pattern` (`true` = skip), per the per-file
+    /// Which of `paths` provably cannot match the grep `pattern` (`true` = skip), per the per-file
     /// trigram blooms. `None` means "no prefilter available" (no reachable index, a forward that
     /// failed, an unusable reply): the caller then sweeps every file, which is always correct.
     pub(super) async fn grep_skip(
         &self,
         root: &std::path::Path,
         pattern: &str,
-        entries: &[GrepEntry],
+        paths: &[&RelPath],
     ) -> Option<Vec<bool>> {
         if let Self::Local(idx) = self {
             let needle = crate::index::grep_bloom::Needle::compile(pattern)?;
-            return Some(blocking(|| idx.grep_skip_verdicts(root, entries, &needle)));
+            return Some(blocking(|| idx.grep_skip_verdicts(root, paths, &needle)));
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         {
             // Compiled here too so a pattern with no usable literal costs no round trip.
             crate::index::grep_bloom::Needle::compile(pattern)?;
-            let mut skip = Vec::with_capacity(entries.len());
-            for chunk in entries.chunks(crate::comms::index_read_proto::MAX_GREP_BLOOM_PATHS) {
+            let mut skip = Vec::with_capacity(paths.len());
+            for chunk in paths.chunks(crate::comms::index_read_proto::MAX_GREP_BLOOM_PATHS) {
                 let query = IndexReadQuery::GrepBloom {
                     pattern: pattern.to_owned(),
-                    entries: chunk.to_vec(),
+                    paths: chunk.iter().map(|&path| path.clone()).collect(),
                 };
                 match self.forward(query).await {
                     Some(Ok(IndexReadResult::GrepSkip(part))) if part.len() == chunk.len() => skip.extend(part),
@@ -186,30 +159,22 @@ impl IndexRoute {
         &self,
         cache: &MapCache,
         name: &str,
-        matching: Matching,
         limit: usize,
         cursor_after: Option<&[u8]>,
     ) -> Result<CallScanPage, McpError> {
         if let Self::Local(idx) = self {
-            return blocking(|| scan_calls_by_name(&**idx, name, matching, limit, cursor_after));
+            return scan_calls_by_name(idx, name, limit, cursor_after);
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         match self
             .forward(IndexReadQuery::CallScan {
                 name: name.to_owned(),
-                exact: matching == Matching::Exact,
                 limit: u32::try_from(limit).unwrap_or(u32::MAX),
                 cursor: cursor_after.map(<[u8]>::to_vec),
             })
             .await
         {
-            Some(Ok(IndexReadResult::CallScan(page))) => {
-                let mut page = super::index_read::call_page_from_wire(page);
-                // A daemon that predates `exact` ignores it and answers with substring hits. Only
-                // this page's share of them can be dropped here, so `retain` marks the total partial.
-                page.retain(|hit| matching.accepts_callee(&hit.callee, name));
-                return Ok(page);
-            }
+            Some(Ok(IndexReadResult::CallScan(page))) => return Ok(super::index_read::call_page_from_wire(page)),
             Some(Ok(_)) => {
                 tracing::warn!("daemon answered a call scan with the wrong reply; using the in-RAM projection")
             }
@@ -217,7 +182,7 @@ impl IndexRoute {
             None => {}
         }
         Ok(blocking(|| {
-            scan_calls_in_ram(cache.calls_projection(), name, matching, limit, cursor_after)
+            scan_calls_in_ram(cache.calls_projection(), name, limit, cursor_after)
         }))
     }
 
@@ -228,7 +193,7 @@ impl IndexRoute {
         paths: &[RelPath],
     ) -> Result<Vec<Vec<CallRef>>, McpError> {
         if let Self::Local(idx) = self {
-            return paths.iter().map(|path| calls_in_file_fjall(&**idx, path)).collect();
+            return paths.iter().map(|path| calls_in_file_fjall(idx, path)).collect();
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         match self
@@ -258,30 +223,24 @@ impl IndexRoute {
         &self,
         cache: &MapCache,
         trait_name: &str,
-        matching: Matching,
         language: Option<&str>,
         limit: usize,
         cursor_after: Option<&[u8]>,
     ) -> Result<ImplScanPage, McpError> {
         if let Self::Local(idx) = self {
-            return scan_impls_session(&**idx, cache, trait_name, matching, language, limit, cursor_after);
+            return scan_impls_session(idx, cache, trait_name, language, limit, cursor_after);
         }
         #[cfg(all(feature = "comms", any(unix, windows)))]
         match self
             .forward(IndexReadQuery::ImplScan {
                 trait_name: trait_name.to_owned(),
-                exact: matching == Matching::Exact,
                 language: language.map(str::to_owned),
                 limit: u32::try_from(limit).unwrap_or(u32::MAX),
                 cursor: cursor_after.map(<[u8]>::to_vec),
             })
             .await
         {
-            Some(Ok(IndexReadResult::ImplScan(page))) => {
-                let mut page = super::index_read::impl_page_from_wire(page);
-                page.retain(|hit| matching.accepts_trait(&hit.trait_name, trait_name));
-                return Ok(page);
-            }
+            Some(Ok(IndexReadResult::ImplScan(page))) => return Ok(super::index_read::impl_page_from_wire(page)),
             Some(Ok(_)) => {
                 tracing::warn!("daemon answered an impl scan with the wrong reply; using the in-RAM projection")
             }
@@ -293,7 +252,6 @@ impl IndexRoute {
                 cache.impls_projection(),
                 cache,
                 trait_name,
-                matching,
                 language,
                 limit,
                 cursor_after,
@@ -302,12 +260,10 @@ impl IndexRoute {
     }
 }
 
-/// Run blocking work (a corpus sweep, blob or file IO, a git walk) without stalling the
+/// Run work that may build the whole-corpus projection (rayon + blob IO) without stalling the
 /// reactor. `block_in_place` needs the multi-thread runtime the CLI builds; on a `current_thread`
 /// runtime (tests) it runs inline, which is safe because that runtime has no other task to starve.
-pub(super) fn blocking<R>(work: impl FnOnce() -> R) -> R {
-    #[cfg(test)]
-    BLOCKING_CALLS.with(|calls| calls.set(calls.get() + 1));
+fn blocking<R>(work: impl FnOnce() -> R) -> R {
     let multi_thread = tokio::runtime::Handle::try_current()
         .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         .unwrap_or(false);
@@ -316,122 +272,4 @@ pub(super) fn blocking<R>(work: impl FnOnce() -> R) -> R {
     } else {
         work()
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static BLOCKING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// How many times [`blocking`] was entered on this thread: what a test reads to see that a call
-/// site still goes through it.
-#[cfg(all(test, feature = "memory"))]
-pub(super) fn blocking_calls() -> usize {
-    BLOCKING_CALLS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn prepared_clean_base_answers_calls_and_dirty_worktree_uses_standalone() {
-    use crate::config::Config;
-    use crate::scanner::{EmbedMode, ScanSource, scan};
-    use crate::store::{Store, VIEW_WORKING};
-    use std::{fs, process::Command, sync::Arc};
-
-    crate::store::init_isolated_cache();
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
-    let git = |args: &[&str]| {
-        assert!(
-            Command::new("git")
-                .current_dir(root)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.test")
-                .args(args)
-                .status()
-                .unwrap()
-                .success()
-        );
-    };
-    git(&["init", "-q"]);
-    git(&["config", "core.autocrlf", "false"]);
-    let path = root.join("sample.rs");
-    fs::write(&path, "fn sample() { target(); }").unwrap();
-    git(&["add", "sample.rs"]);
-    git(&["-c", "commit.gpgsign=false", "commit", "-qm", "fixture"]);
-    let mut config = Config::with_defaults();
-    config.documents.enabled = false;
-    config.documents.embed = false;
-    config.code_search.enabled = false;
-    config.code_search.embed = false;
-    let mut store = Store::open(root, VIEW_WORKING).unwrap();
-    scan(root, &mut store, &config, ScanSource::WorkingTree, EmbedMode::Deferred).unwrap();
-    let standalone = store.index_db.clone().unwrap();
-    assert!(crate::store_base::open_clean_worktree(root, &config).unwrap().is_some());
-    let cache = MapCache::build(&store, 0);
-    let shared = super::SharedReadStack::new(
-        store,
-        root.to_path_buf(),
-        Arc::new(config),
-        None,
-        Arc::new(crate::git_cache::GitCache::open(root, 1, false).unwrap()),
-        None,
-        super::ServerOptions::default(),
-        #[cfg(all(feature = "comms", any(unix, windows)))]
-        None,
-    );
-    let state = super::ServerState::for_connection(Arc::new(shared), "test".into());
-    let expected = IndexRoute::resolve_with_layering(&state, false)
-        .await
-        .scan_calls(&cache, "target", Matching::Substring, 10, None)
-        .await
-        .unwrap();
-    assert_eq!(expected.total, 1);
-    let key = expected.hit_keys.first().unwrap();
-    let (_, rel, start) = crate::index::keys::parse_call_by_callee(key).unwrap();
-    let mut writer = standalone.writer();
-    writer.remove_file(&rel).unwrap();
-    writer.commit().unwrap();
-    let base = IndexRoute::resolve_with_layering(&state, true)
-        .await
-        .scan_calls(&cache, "target", Matching::Substring, 10, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        (base.total, base.hit_keys, base.hit_starts),
-        (1, expected.hit_keys, vec![start])
-    );
-    fs::write(path, "fn sample() { changed(); }").unwrap();
-    if !cfg!(any(feature = "code-intel-js", feature = "code-intel-stack")) {
-        let mut store = state.shared.store.write().await;
-        crate::scanner::scan_paths(
-            root,
-            &mut store,
-            &state.shared.config,
-            &[root.join("sample.rs")],
-            EmbedMode::Deferred,
-        )
-        .unwrap();
-        let reference = store.index_view().unwrap();
-        assert!(crate::store_base::publish_dirty_worktree(root, &state.shared.config, &reference).unwrap());
-        drop(store);
-        let mut writer = standalone.writer();
-        writer.remove_file(&rel).unwrap();
-        writer.commit().unwrap();
-        let dirty = IndexRoute::resolve_with_layering(&state, true)
-            .await
-            .scan_calls(&cache, "changed", Matching::Substring, 10, None)
-            .await
-            .unwrap();
-        assert_eq!(dirty.total, 1);
-    }
-    fs::write(root.join("policy.toml"), "").unwrap();
-    let fallback = IndexRoute::resolve_with_layering(&state, true)
-        .await
-        .scan_calls(&cache, "target", Matching::Substring, 10, None)
-        .await
-        .unwrap();
-    assert_eq!(fallback.total, 0);
 }

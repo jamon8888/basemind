@@ -35,6 +35,7 @@ pub(super) fn write_index_with(fx: &Fixture, code_hash: Option<&str>, doc_hash: 
                 embedded: true,
                 embed_attempted: true,
                 config_digest: String::new(),
+                rehydration_ref: None,
             },
         );
     }
@@ -119,7 +120,7 @@ fn cache_stats_counts_cross_tier_orphans() {
     write_all_suffixes(&fx, &stem);
     write_index_with(&fx, None, Some(&stem));
 
-    let stats = cache_stats_in(&fx.basemind_dir, &fx.blobs()).expect("cache_stats");
+    let stats = cache_stats_in(&fx.basemind_dir, &fx.blobs_dir).expect("cache_stats");
 
     // 3 stale code-lane blobs + the fixture's unreferenced `b..` orphan + its now-unreferenced `a..` fm.
     assert_eq!(stats.orphan_blob_count, 5);

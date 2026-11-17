@@ -6,35 +6,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATUSLINE="$REPO_ROOT/.claude-plugin/statusline.sh"
 
-# The checkout the binary is built from. Under poly's commit gate this script runs in a snapshot of
-# the staged index, which holds no build output and whose files all carry the snapshot's creation
-# time, so the sources and the binary are taken from the checkout the snapshot was made from. A
-# linked worktree's git dir names its checkout in the `gitdir` file.
-checkout_root() {
-  local git_dir link
-  git_dir="$(git -C "$REPO_ROOT" rev-parse --absolute-git-dir 2>/dev/null)" || git_dir=""
-  if [[ -n "$git_dir" && -f "$git_dir/gitdir" ]]; then
-    link="$(<"$git_dir/gitdir")"
-    [[ "$link" == /* ]] || link="$git_dir/$link"
-    git_dir="$link"
-  fi
-  if [[ -n "$git_dir" && -f "$(dirname "$git_dir")/Cargo.toml" ]]; then
-    (cd "$(dirname "$git_dir")" && pwd)
-  else
-    printf '%s\n' "$REPO_ROOT"
-  fi
-}
-
-CHECKOUT_ROOT="$(checkout_root)"
-
-# poly's commit gate exports GIT_DIR and GIT_INDEX_FILE so a hook reaches the committing repository
-# from the snapshot. Every repository below is a fixture: with those variables set, `git init`
-# re-initialises the committing repository instead (marking it bare from a linked worktree), and
-# basemind opens it in place of the fixture.
-while IFS= read -r git_var; do
-  unset "$git_var"
-done < <(git rev-parse --local-env-vars)
-
 [[ -x "$STATUSLINE" ]] || chmod +x "$STATUSLINE"
 
 FIXTURE="$(mktemp -d)"
@@ -48,12 +19,8 @@ done
 : >"$FIXTURE/.basemind/views/working/index.msgpack"
 
 now_us="$(($(date +%s) * 1000000))"
-# One row per bucket under the tool-name keys, plus rows an older binary wrote (`domain:mode` keys
-# and a bare pre-consolidation name) so a telemetry log that spans an upgrade still buckets.
-for tool in code_outline code_grep index_status git_log docs_search memory_search \
-  code:outline git:recent memory:documents memory:get outline; do
-  printf '{"ts_micros": %d, "tool": "%s", "est_tokens_saved": 500}\n' "$now_us" "$tool"
-done >"$FIXTURE/.basemind/telemetry.jsonl"
+printf '{"ts_micros": %d, "tool": "outline", "est_tokens_saved": 500}\n' "$now_us" \
+  >"$FIXTURE/.basemind/telemetry.jsonl"
 
 payload="$(printf '{"workspace":{"current_dir":"%s"}}' "$FIXTURE")"
 output="$(printf '%s' "$payload" | "$STATUSLINE")"
@@ -84,26 +51,6 @@ assert_contains '◆' 'brand glyph ◆ present'
 assert_contains 'basemind' 'name present'
 assert_contains '●' 'liveness dot present'
 assert_contains '7' 'file count 7 from blob fixture'
-
-if command -v jq >/dev/null 2>&1; then
-  # The per-bucket segment is rendered in the full tier only; pin it instead of relying on the width.
-  plain="$(printf '%s' "$payload" | BASEMIND_STATUSLINE=full "$STATUSLINE" | sed $'s/\033\\[[0-9;]*m//g')"
-  assert_plain_contains() {
-    if [[ "$plain" == *"$1"* ]]; then
-      printf '  ok  %s\n' "$2"
-    else
-      printf '  FAIL %s — expected %q in: %s\n' "$2" "$1" "$plain" >&2
-      fail=1
-    fi
-  }
-  assert_plain_contains '11 calls' 'every telemetry row counted'
-  assert_plain_contains '5 srch' 'code_*, index_* and legacy code rows bucket as searches'
-  assert_plain_contains '2 git' 'git_log and legacy git:recent bucket as git'
-  assert_plain_contains '2 docs' 'docs_search and legacy memory:documents bucket as docs'
-  assert_plain_contains '2 mem' 'memory_search and legacy memory:get bucket as mem'
-else
-  printf '  skip telemetry bucket assertions (jq unavailable)\n'
-fi
 
 plugin_version=""
 if command -v jq >/dev/null 2>&1; then
@@ -207,40 +154,16 @@ fi
 # Global-cache mode: no in-repo .basemind/. The shell must delegate to `basemind statusline --root`,
 # which reads the status.json sidecar the scanner writes into the machine-global cache. Needs the
 # real binary (for the real workspace_key); skips cleanly if it can't be built.
-
-# A binary is current when no build input of the checkout is newer than it.
-binary_is_current() {
-  local bin="$1" root="$2" input
-  [[ -x "$bin" ]] || return 1
-  for input in src build.rs Cargo.toml Cargo.lock; do
-    [[ -e "$root/$input" ]] || continue
-    [[ -z "$(find "$root/$input" -newer "$bin" -print -quit 2>/dev/null)" ]] || return 1
-  done
-}
-
-gc_root="$CHECKOUT_ROOT"
-gc_target="${CARGO_TARGET_DIR:-$gc_root/target}"
 gc_bin=""
-for candidate in "$gc_target/release/basemind" "$gc_target/debug/basemind"; do
-  if binary_is_current "$candidate" "$gc_root"; then
-    gc_bin="$candidate"
-    printf '  ..  reusing %s (current with %s)\n' "$gc_bin" "$gc_root"
-    break
-  fi
+for candidate in "$REPO_ROOT/target/release/basemind" "$REPO_ROOT/target/debug/basemind"; do
+  [[ -x "$candidate" ]] && gc_bin="$candidate" && break
 done
 if [[ -z "$gc_bin" ]] && command -v cargo >/dev/null 2>&1; then
-  printf '  ..  building basemind into %s for the global-cache-mode check\n' "$gc_target"
-  # Built in the checkout, where cargo's fingerprints hold, so only what changed is rebuilt.
-  if (cd "$gc_root" && CARGO_TARGET_DIR="$gc_target" cargo build --quiet --features comms --bin basemind); then
-    gc_bin="$gc_target/debug/basemind"
-  fi
+  printf '  .. building basemind for global-cache-mode check\n'
+  (cd "$REPO_ROOT" && cargo build --quiet --features comms --bin basemind) && gc_bin="$REPO_ROOT/target/debug/basemind"
 fi
 
 if [[ -x "$gc_bin" ]]; then
-  # The binary under test is a different build from the one serving this machine. Without its own
-  # comms directory it takes over the live daemon's socket.
-  BASEMIND_COMMS_DIR="$(mktemp -d)"
-  export BASEMIND_COMMS_DIR
   gc_data="$(mktemp -d)"
   gc_repo="$(mktemp -d)"
   printf 'fn main() { println!("a"); }\n' >"$gc_repo/a.rs"
@@ -249,7 +172,7 @@ if [[ -x "$gc_bin" ]]; then
   git -C "$gc_repo" init -q >/dev/null 2>&1 || true
   BASEMIND_DATA_HOME="$gc_data" "$gc_bin" scan --root "$gc_repo" >/dev/null 2>&1 || true
 
-  gc_keydir="$(find "$gc_data/cache/workspaces" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1 || true)"
+  gc_keydir="$(find "$gc_data/cache/workspaces" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"
   if [[ -n "$gc_keydir" && -f "$gc_keydir/status.json" ]]; then
     printf '  ok  scan wrote status.json sidecar into the global-cache workspace dir\n'
   else
@@ -257,11 +180,9 @@ if [[ -x "$gc_bin" ]]; then
     fail=1
   fi
 
-  if [[ -n "$gc_keydir" ]]; then
-    gc_now_us="$(($(date +%s) * 1000000))"
-    printf '{"ts_micros":%d,"tool":"outline","resp_bytes":10,"est_tokens_saved":500,"saved_baseline":"read"}\n' \
-      "$gc_now_us" >"$gc_keydir/telemetry.jsonl"
-  fi
+  gc_now_us="$(($(date +%s) * 1000000))"
+  printf '{"ts_micros":%d,"tool":"outline","resp_bytes":10,"est_tokens_saved":500,"saved_baseline":"read"}\n' \
+    "$gc_now_us" >"$gc_keydir/telemetry.jsonl"
 
   # The shell resolves the repo root upward, so point current_dir at the scanned root itself. Put the
   # real binary first on PATH so the shell's `command -v basemind` finds it, and export the isolated
@@ -299,16 +220,13 @@ if [[ -x "$gc_bin" ]]; then
   gc_output2="$(printf '%s' "$gc_payload2" |
     PATH="$(dirname "$gc_bin"):$PATH" BASEMIND_DATA_HOME="$gc_data2" "$STATUSLINE")"
   gc_clean2="$(printf '%s' "$gc_output2" | sed -E $'s/\033\\[[0-9;:]*m//g')"
-  rm -rf "$gc_repo2"
+  rm -rf "$gc_data2" "$gc_repo2"
   if [[ "$gc_clean2" == *'no index'* && "$gc_clean2" == *'basemind scan'* ]]; then
     printf '  ok  unscanned repo delegates to the actionable no-index hint (real binary)\n'
   else
     printf '  FAIL unscanned repo should delegate to no-index hint; got: %q\n' "$gc_clean2" >&2
     fail=1
   fi
-  BASEMIND_DATA_HOME="$gc_data2" "$gc_bin" comms stop >/dev/null 2>&1 || true
-  rm -rf "$gc_data2" "$BASEMIND_COMMS_DIR"
-  unset BASEMIND_COMMS_DIR
 else
   printf '  skip global-cache-mode check (no basemind binary and no cargo to build one)\n'
 fi

@@ -1,4 +1,4 @@
-//! Safe plumbing for `basemind rescan`.
+//! Safe `rescan` plumbing shared by `basemind rescan` and `basemind admin rescan`.
 //!
 //! Two concerns live here, both about not racing the machine daemon (the sole index writer):
 //!
@@ -28,8 +28,7 @@ pub fn resolve_paths(root: &Path, raw: &[String]) -> Result<Vec<PathBuf>> {
     for spelling in raw {
         let Some(rel) = normalize_query_path(spelling, root) else {
             problems.push(format!(
-                "{spelling:?} is outside the repository root or names the root itself (pass no path to rescan \
-                 everything)"
+                "{spelling:?} is outside the repository root or names the root itself (use --full to rescan everything)"
             ));
             continue;
         };
@@ -113,9 +112,8 @@ pub fn rescan_via_daemon(root: &Path, paths: Option<Vec<PathBuf>>, full: bool) -
         let mut client = CommsClient::ensure_and_connect(agent, remote, cwd)
             .await
             .map_err(|e| CliExit::unavailable(format!("connect to the basemind daemon: {e}")))?;
-        // Paths given on the command line were named, not watched: their blobs are validated.
         client
-            .rescan_as(root.to_path_buf(), paths, full, true, true)
+            .rescan(root.to_path_buf(), paths, full, true)
             .await
             .map_err(|e| anyhow::anyhow!("daemon rescan failed: {e}"))
     })

@@ -33,13 +33,6 @@ jobs:
     with:
       setup-rust: true
 
-  toolchain:
-    name: toolchain baseline
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: xberg-io/actions/check-toolchain@v1
-
   test:
     name: test / ${{ matrix.os }} / ${{ matrix.features }}
     runs-on: ${{ matrix.os }}
@@ -65,37 +58,51 @@ jobs:
             # ~keep both `full` legs (Linux 38m -> 79m, macOS 55m -> past 90m). The ceiling has to
             # ~keep cover the cold run, because a leg that times out never saves a cache and so stays
             # ~keep cold on every retry.
-            timeout_minutes: 180
+            # ~keep 135 then proved too tight once `full` gained the candle/ort stack (ner-candle,
+            # ~keep PR #26): the 2026-09-27 cold run burned the whole 135m inside `cargo test` and
+            # ~keep was cancelled before any step could save a cache. 240 covers cold + candle.
+            timeout_minutes: 240
             debug: "0"
-          # ~keep `documents` without `documents-ocr` / `documents-ner`: the only leg that compiles and
-          # ~keep runs the tests gated on a missing tier.
-          - os: ubuntu-latest
-            features: "comms documents"
-            timeout_minutes: 180
-            debug: "0"
-          - os: macos-26
+          - os: macos-latest
             features: ""
             timeout_minutes: 180
             debug: "1"
-          - os: macos-26
+          - os: macos-latest
             features: "full"
-            # ~keep Keep the cold-cache test budget independent of the full release build.
-            timeout_minutes: 180
-            # ~keep Debug info off, as on the Linux `full` leg: building the test binaries grew
-            # ~keep `target` from 15 to 65 GB and left 27 of 97 GiB free (run 43863171731), the
-            # ~keep pressure behind the earlier Fjall EIO on store open.
-            debug: "0"
+            # ~keep Same cold-cache budget as the Linux `full` leg above (including the candle note:
+            # ~keep macOS cold + candle also blew 135m, PR #26).
+            timeout_minutes: 240
+            debug: "1"
+          # macos-latest is the ARM64 coverage leg. Intel macOS cannot use ort-sys's static runtime
+          # artifact, so keep a native x86_64 leg on the dynamic profile used by publish.yaml.
+          - os: macos-15-intel
+            features: "intel-macos"
+            timeout_minutes: 240
+            debug: "1"
           - os: windows-latest
-            features: "comms"
+            features: "comms shells"
             timeout_minutes: 180
             debug: "1"
+          # ~keep The hacienda-legal focus release (documents + memory + ner-candle +
+          # ~keep graphrag, no comms/shells/crawl/code-intel) gets its own legs so the
+          # ~keep feature combination is compiled and tested on every push — `full` does
+          # ~keep NOT include graphrag, so without these legs nothing in CI ever builds it.
+          # ~keep Same cold-cache budget class as `full` (candle + lancedb + arrow stack).
+          - os: ubuntu-latest
+            features: "hacienda-legal"
+            timeout_minutes: 240
+            debug: "0"
+          - os: macos-latest
+            features: "hacienda-legal"
+            timeout_minutes: 240
+            debug: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # ~keep The `full` build is disk-heavy; reclaim space up front on the legs that build it so the
       # ~keep debug + release target dirs and the downloaded ONNX models don't hit ENOSPC.
       - name: Free disk space (Linux)
-        if: runner.os == 'Linux' && (matrix.features == 'full' || matrix.features == 'comms documents')
+        if: runner.os == 'Linux' && (matrix.features == 'full' || matrix.features == 'hacienda-legal')
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
@@ -108,31 +115,37 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - name: Free disk space (macOS)
-        if: runner.os == 'macOS' && matrix.features == 'full'
+        if: runner.os == 'macOS' && (matrix.features == 'full' || matrix.features == 'intel-macos' || matrix.features == 'hacienda-legal')
         run: |
           sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           df -h /
 
-      # ~keep The windows-2025 image leaves C: with ~500 MB free, below the scan's pre-flight space
-      # ~keep check, so every test that scans into a tempdir failed with InsufficientSpace. The
-      # ~keep checkout and target/ already live on D:; move TMP/TEMP there too.
-      - name: Move temp to the work drive (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
-          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
-
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: rustfmt, clippy
 
       - name: Install system dependencies
-        if: matrix.features == 'full' || matrix.features == 'comms documents'
+        if: matrix.features == 'full' || matrix.features == 'intel-macos' || matrix.features == 'hacienda-legal'
         uses: ./.github/actions/install-system-deps
+
+      - name: Install Intel ONNX Runtime
+        if: matrix.features == 'intel-macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="1.23.2"
+          asset="onnxruntime-osx-x86_64-${version}.tgz"
+          sha256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
+          dir="$RUNNER_TEMP/onnxruntime"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/$asset" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${version}/${asset}"
+          echo "$sha256  $dir/$asset" | shasum -a 256 -c -
+          tar xzf "$dir/$asset" -C "$dir"
+          dylib="$dir/onnxruntime-osx-x86_64-${version}/lib/libonnxruntime.${version}.dylib"
+          test -f "$dylib"
+          echo "ORT_DYLIB_PATH=$dylib" >> "$GITHUB_ENV"
 
       - name: Install protoc (Linux, default-features)
         if: runner.os == 'Linux' && matrix.features == ''
@@ -141,26 +154,45 @@ jobs:
         if: runner.os == 'macOS' && matrix.features == ''
         run: brew install protobuf
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-${{ matrix.features }}
+      # ~keep mold and sccache were both tried here and both removed again on 2026-10-10.
+      # ~keep mold (2.30.0, via apt) installed and exported `-C link-arg=-fuse-ld=mold`, and the
+      # ~keep `full` leg then failed with `could not find native static library 'onnxruntime'` from
+      # ~keep `ort-sys`. Whatever the mechanism — `ort` resolves ONNX Runtime through its build
+      # ~keep script, and forcing the linker changed the result — a faster linker is not worth a
+      # ~keep broken `full` leg, and it was not reproducible locally to explain first.
+      # ~keep sccache: `mozilla-actions/sccache-action@v0.0.9` does not accept `rustc-wrapper` or
+      # ~keep `cache-size`; the real inputs are `version`, `token`, `disable_annotations`. The
+      # ~keep action warned and ignored both, so `RUSTC_WRAPPER` was never set and sccache served
+      # ~keep zero compilations — it was inert while appearing configured. Reinstating it means
+      # ~keep pinning the action version and verifying `RUSTC_WRAPPER` reaches the env, not just
+      # ~keep that the step is present.
 
-      # ~keep tests/upgrade_from_release.rs is compiled only with `documents`, which is these two legs
-      # ~keep on Linux and macOS. It upgrades an index built by an older release, so it needs that
-      # ~keep release's binary; under CI an absent binary fails the test rather than skipping it. 0.28.0
-      # ~keep is the newest release that still code-maps prose (the migration path), `latest` the
-      # ~keep same-shape upgrade.
-      - name: Fetch release binaries for the upgrade test
-        if: (runner.os == 'Linux' || runner.os == 'macOS') && (matrix.features == 'full' || matrix.features == 'comms documents')
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$RUNNER_OS" in
-            Linux) triple=x86_64-unknown-linux-gnu ;;
-            macOS) triple=aarch64-apple-darwin ;;
-          esac
-          list="$(scripts/fetch-release-binaries.sh "$RUNNER_TEMP/release-binaries" "$triple" 0.28.0 latest)"
-          echo "BASEMIND_UPGRADE_FROM_BIN=$list" >> "$GITHUB_ENV"
+      - name: Cache Rust and ORT (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          # ~keep v3 invalidates the pre-existing target cache, whose ort-sys build-script output
+          # points at a runtime archive that was never cached by the old, incorrect path below.
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
+          # ~keep ort-sys stores its downloaded static ONNX Runtime archive outside CARGO_HOME at
+          # ~/.cache/ort.pyke.io/dfbin/<target>/<hash> on Linux and
+          # ~/Library/Caches/ort.pyke.io/dfbin/<target>/<hash> on macOS.
+          # ~keep Caching target/ without this directory lets clippy pass (it does not link a final
+          # ~keep binary) and then makes cargo test fail when the cached build script points at the
+          # ~keep missing libonnxruntime.a.
+          cache-directories: ${{ runner.os == 'Linux' && '~/.cache/ort.pyke.io' || '~/Library/Caches/ort.pyke.io' }}
+          # ~keep Without this the leg has a doom loop. rust-cache does not save when a job fails or
+          # ~keep is cancelled, so a leg that exceeds its timeout leaves no cache behind — and the
+          # ~keep retry, being cold, is the run most likely to exceed the timeout again. Observed on
+          # ~keep 2026-10-09: `ubuntu-latest / full` cancelled at exactly 240m, then re-ran cold.
+          cache-on-failure: true
+
+      - name: Cache Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.features }}-ort-v3-${{ hashFiles('**/Cargo.lock') }}
+          cache-on-failure: true
 
       - name: cargo fmt
         run: cargo fmt --all --check
@@ -168,136 +200,68 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --tests --features "${{ matrix.features }}" -- -D warnings
 
-      # ~keep Disk use around the tests: a run of the macOS `full` leg failed its last store-opening
-      # ~keep test binaries with EIO from Fjall, and only these numbers can say whether the disk
-      # ~keep (build output plus every test binary's temp data home) was full by then.
-      - name: Disk usage before the tests
-        shell: bash
-        run: |
-          df -h . "$RUNNER_TEMP" "${TMPDIR:-/tmp}" || true
-          du -sh target "${TMPDIR:-/tmp}" 2>/dev/null || true
-
       # ~keep `--no-fail-fast`: plain `cargo test` stops at the first failing test BINARY, so a leg
       # ~keep reports one target's failures and hides every straggler behind it. A cross-cutting
       # ~keep change leaves failures in several binaries at once, and discovering them one CI
       # ~keep round-trip at a time costs an afternoon per release.
-      - name: cargo test (macOS full)
-        if: runner.os == 'macOS' && matrix.features == 'full'
-        shell: bash
-        run: |
-          cargo test --workspace --features full --quiet --no-fail-fast 2>&1 |
-            python3 -u scripts/utf8-test-log.py
-
       - name: cargo test
-        if: runner.os != 'macOS' || matrix.features != 'full'
         run: cargo test --workspace --features "${{ matrix.features }}" --quiet --no-fail-fast
 
-      - name: Disk usage after the tests
-        if: always()
-        shell: bash
+      # ~keep The debug test artifacts are dead weight once `cargo test` has passed, and with the
+      # ~keep `full` feature set they plus the release build overflow the macOS runner's disk.
+      - name: Reclaim debug artifacts (macOS full)
+        if: runner.os == 'macOS' && (matrix.features == 'full' || matrix.features == 'intel-macos' || matrix.features == 'hacienda-legal')
         run: |
-          df -h . "$RUNNER_TEMP" "${TMPDIR:-/tmp}" || true
-          du -sh target "${TMPDIR:-/tmp}" 2>/dev/null || true
+          rm -rf target/debug
+          df -h /
 
+      # ~keep 23 minutes of a 73-minute leg — 32% — and it is the largest single cost in CI.
+      # ~keep A release profile is a different fingerprint from everything above it, so this does
+      # ~keep not reuse the debug or test build: it recompiles the whole dependency graph.
+      # ~keep `publish.yaml` already builds `--release` for all six release targets, so a release
+      # ~keep that does not compile is caught there — but that is *after* the tag, which is too
+      # ~keep late to fix.
+      # ~keep So it runs on pushes to main and not on pull requests: PR latency drops by ~23m,
+      # ~keep and the release commit itself is still checked before anything is tagged. A release-only
+      # ~keep break introduced in a PR is caught on merge instead, which is a round-trip, not a
+      # ~keep release.
       - name: cargo build --release
-        if: runner.os != 'macOS' || matrix.features != 'full'
+        if: github.event_name == 'push'
         run: cargo build --release --quiet --bin basemind --features "${{ matrix.features }}"
-
-  macos-full-release:
-    name: build / macos-26 / full
-    runs-on: macos-26
-    timeout-minutes: 180
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: aarch64-apple-darwin
-
-      - name: Install system dependencies
-        uses: ./.github/actions/install-system-deps
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-26-full-release
-
-      - name: cargo build --release
-        run: cargo build --locked --release --quiet --bin basemind --features full --target aarch64-apple-darwin
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-
-  # ~keep The plugin launcher and the session-start hook are shell scripts no cargo test reaches.
-  # ~keep macOS runs them too: the launcher reads the process list and file ages with the BSD `ps`
-  # ~keep and `find` there, which the Linux run never touches.
-  plugin-scripts:
-    name: plugin scripts / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-26]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: python uv
-      # ~keep The session-start tests skip themselves without `jq`, so its absence must fail the step.
-      - name: pytest (plugin launcher and session-start hook)
-        run: |
-          set -euo pipefail
-          command -v jq
-          uv run --no-project --with pytest python -m pytest -v tests/test_mcp_launch_prune.py tests/test_session_start_hook.py
 
   hermes:
     name: hermes plugin package
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: xberg-io/actions/setup-mise@v1
-        with:
-          install-args: python uv
-      # ~keep The tests import the GENERATED package under plugin/.hermes/package (conftest.py puts it first
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # ~keep The tests import the GENERATED package under .hermes/package (conftest.py puts it first
       # ~keep on sys.path), so this also fails when the checked-in generated output is missing.
       - name: pytest
-        run: uv run --no-project --with pytest --with mcp==1.28.1 python -m pytest pip-package-hermes/tests
-      - name: Build and validate the wheel metadata
-        run: |
-          set -euo pipefail
-          wheel_dir="$(mktemp -d)"
-          trap 'rm -rf "$wheel_dir"' EXIT
-          uv build --wheel --out-dir "$wheel_dir" plugin/.hermes/package
-          wheels=("$wheel_dir"/*.whl)
-          test "${#wheels[@]}" -eq 1
-          test -f "${wheels[0]}"
-          uvx --from twine==7.0.0 --with packaging==26.3 twine check --strict "${wheels[0]}"
+        run: uv run --with pytest python -m pytest pip-package-hermes/tests
+      - name: build the wheel
+        run: uv build --wheel --out-dir /tmp/basemind-hermes-wheel .hermes/package
 
   memory-ceiling:
     name: scan under a 1 GiB cgroup (Linux)
-    # ~keep On the ubuntu-26.04 image a MemoryMax scope never kills `tail /dev/zero`; the harness probe hangs.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       # Issue #62 was reported from a daemon under a systemd `MemoryMax`, and the whole class was
       # invisible to the matrix above because no leg there ever runs under a memory cgroup. A scope
@@ -354,22 +318,20 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install system dependencies
         uses: ./.github/actions/install-system-deps
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: run harden.sh
         run: ./scripts/harden.sh
 
       - name: upload results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: harden-results
           path: /tmp/basemind-harden/results.ndjson

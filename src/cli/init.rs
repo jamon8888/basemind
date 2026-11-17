@@ -24,7 +24,6 @@ use clap::{Args, ValueEnum};
 use super::init_gitignore;
 use super::init_rules::{self, BlockSections, Capability};
 use super::init_settings;
-use super::init_verb::Verb;
 use crate::config;
 
 /// BEGIN delimiter of the managed rules block. Load-bearing: the splice matches this verbatim.
@@ -75,8 +74,9 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # max_file_bytes = 2097152
 # Skip paths under any submodule root listed in .gitmodules.
 # skip_submodules = true
-# Run L2 extraction (calls + docs) inline with L1. Powers `code_refs`. Turning off roughly halves
-# scan time on large repos but leaves reference search empty until an L2 pass.
+# Run L2 extraction (calls + docs) inline with L1. Powers the `code` tool's references / callers
+# modes. Turning off roughly halves scan time on large repos but leaves reference search empty
+# until an L2 pass.
 # eager_l2 = true
 # Absolute paths OUTSIDE the repo to also index (e.g. a Bazel external cache). Ignored unless the
 # operator sets BASEMIND_ALLOW_EXTRA_ROOTS in the environment (1 = any workspace, or a `:`-separated
@@ -100,8 +100,8 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 
 [code_intel]
 # Precise, scope- and import-aware name resolution. On by default: JS/TS resolve via oxc, Python and
-# Java via the stack-graphs engine, so `code_refs` (pinned callers and the definition relation)
-# distinguishes a shadowed local from an import instead of matching by name. Set false to fall back to fast
+# Java via the stack-graphs engine, so the `code` tool's references / callers / definition modes
+# distinguish a shadowed local from an import instead of matching by name. Set false to fall back to fast
 # tree-sitter locals binding for every language. Applies to files (re)scanned after the change.
 # precise_resolution = true
 
@@ -120,18 +120,18 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # transport = "stdio"
 
 [documents]
-# Document RAG tier (PDF / Office / HTML / email). Requires a `documents` build; images and scanned
-# PDFs also need `documents-ocr`.
+# Document RAG tier (PDF / Office / HTML / email / images). Requires a `documents` build.
 # enabled = true
 # Embed documents for semantic search. ON by default — embeddings pay off on real prose / OCR.
 # embed = true
 # Embedding model preset. Changing it forces a FULL RE-EMBED of the corpus (time + CPU): every
 # document is re-encoded at the new model's dimension.
 #   fast        — smallest / fastest, lowest quality
-#   balanced    — default; 768-dim, good quality/cost tradeoff
+#   balanced    — English-focused 768-dim, good quality/cost tradeoff
 #   quality     — larger model, best English quality, slower
-#   multilingual— multilingual model for non-English corpora
-# embedding_preset = "balanced"
+#   multilingual— default; multilingual model for 100+ languages
+# embedding_preset = "multilingual"
+# Globs for documents that are still extracted + indexed but NOT embedded (keyword-only).
 # Globs scoping which non-code files are indexed as documents. Empty include = everything that
 # passes [scan]; exclude applies to document indexing itself and beats include.
 # include = []
@@ -145,6 +145,10 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # removes the vectors of newly ineligible documents on the next scan.
 # embed_include = []
 # embed_exclude = []
+# Route archives (.zip/.tar/.jar/…) into the recursive archive extractor. Off by default so one
+# archive can't explode into thousands of embeds. True binaries are always skipped. In the shared
+# daemon this also needs BASEMIND_DAEMON_ALLOW_EXTRACT_ARCHIVES=1 in the daemon's environment.
+# extract_archives = false
 
 [code_search]
 # Semantic code-search tier. Requires a `code-search` build.
@@ -165,13 +169,27 @@ pub(crate) const INIT_SCAFFOLD_TOML: &str = r##"# basemind configuration — htt
 # ceilings: min(value here, daemon cap), with 0 / "auto" / "off" resolving to the cap. Raise a
 # daemon cap with BASEMIND_DAEMON_MAX_SCAN_THREADS / _EMBED_THREADS / _EMBED_BATCH /
 # _CONCURRENT_DOCUMENTS / _FOOTPRINT_MB / _MAP_CACHE_MB / _CANDIDATES in the daemon's environment
-# (the daemon also caps file, document and debounce settings; see the configuration docs).
+# (the daemon also caps file, document, crawl and debounce settings; see the configuration docs).
 # scan_threads = 0
 # embed_threads = 0
 # max_concurrent_documents = 0
 # embed_batch_size = 32
 # max_footprint_mb = 0
 # max_map_cache_mb = 256
+
+[crawl]
+# Web crawl / scrape limits. allow_private_network = true is ignored when it comes from this file
+# unless the operator sets BASEMIND_ALLOW_PRIVATE_HOSTS=1 in the environment.
+# respect_robots_txt = true
+# allow_private_network = false
+
+[llm]
+# Optional LLM for abstractive summaries and LLM NER. Inert while `model` is empty. In this file
+# `base_url` is ignored and api_key env references are limited to the provider's standard variable
+# (OPENAI_API_KEY for openai/..., ANTHROPIC_API_KEY for anthropic/..., or BASEMIND_LLM_API_KEY)
+# unless the operator sets BASEMIND_ALLOW_REPO_LLM=1 in the environment.
+# model = "openai/gpt-4o"
+# api_key = { env = "OPENAI_API_KEY" }
 "##;
 
 /// Where to inject the usage rules. `Auto` never writes a COMMITTED agent-instructions file
@@ -264,20 +282,15 @@ pub struct InitArgs {
 /// faithful dry-run and the real run reports the same set. `pub(crate)` so [`init_settings`] can
 /// build one for the settings-permissions step.
 pub(crate) enum Change {
-    /// A file will be created or its content changed: `verb` applied to `what`.
+    /// A file will be created or its content changed. `note` is the human summary.
     Write {
         path: PathBuf,
-        verb: Verb,
-        what: &'static str,
+        note: &'static str,
         contents: String,
     },
     /// Nothing to do for this target (already converged / opted out).
     NoOp { note: String },
 }
-
-/// Why a `.gitignore` line is added. Coverage is judged against the repository's own `.gitignore`
-/// files only: a user's global excludes file does not reach collaborators, so it does not count.
-const NOT_COVERED: &str = "not covered by the repository's .gitignore";
 
 /// Entry point. `root` is already resolved by `main`.
 pub fn run(root: &Path, args: &InitArgs) -> Result<()> {
@@ -309,10 +322,7 @@ pub fn run(root: &Path, args: &InitArgs) -> Result<()> {
             if let Some(pattern) = init_gitignore::local_pattern(root, target)
                 && !init_gitignore::is_covered(root, target)?
             {
-                println!(
-                    "would add {pattern:?} to .gitignore ({NOT_COVERED}): {}",
-                    target.display()
-                );
+                println!("would add {pattern:?} to .gitignore ({})", target.display());
             }
         }
         return Ok(());
@@ -325,27 +335,19 @@ pub fn run(root: &Path, args: &InitArgs) -> Result<()> {
         if let Some(pattern) = init_gitignore::local_pattern(root, target)
             && let Some(gitignore_path) = init_gitignore::ensure_coverage(root, target, &pattern, args.yes)?
         {
-            println!(
-                "added {pattern:?} to .gitignore ({NOT_COVERED}): {}",
-                gitignore_path.display()
-            );
+            println!("added {pattern:?} to .gitignore: {}", gitignore_path.display());
         }
     }
 
     let mut any_write = false;
     for change in &changes {
         match change {
-            Change::Write {
-                path,
-                verb,
-                what,
-                contents,
-            } => {
+            Change::Write { path, note, contents } => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
                 }
                 std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-                println!("{} {what}: {}", verb.past(), path.display());
+                println!("{note}: {}", path.display());
                 any_write = true;
             }
             Change::NoOp { note } => println!("{note}"),
@@ -514,8 +516,7 @@ fn plan_config(root: &Path, config_dir: Option<&str>) -> Result<Change> {
     }
     Ok(Change::Write {
         path,
-        verb: Verb::Write,
-        what: "basemind.toml scaffold",
+        note: "wrote basemind.toml scaffold",
         contents: INIT_SCAFFOLD_TOML.to_string(),
     })
 }
@@ -626,8 +627,7 @@ fn plan_rules_change(plan: &RulesPlan, caps: &[Capability], sections: BlockSecti
             }
             Ok(Some(Change::Write {
                 path: path.clone(),
-                verb: Verb::Write,
-                what: "ai-rulez rule (run `ai-rulez generate` to render outputs)",
+                note: "wrote ai-rulez rule (run `ai-rulez generate` to render outputs)",
                 contents,
             }))
         }
@@ -650,8 +650,7 @@ fn plan_rules_change(plan: &RulesPlan, caps: &[Capability], sections: BlockSecti
             }
             Ok(Some(Change::Write {
                 path: path.clone(),
-                verb: Verb::Inject,
-                what: "basemind rules block",
+                note: "injected basemind rules block",
                 contents: next,
             }))
         }
@@ -721,8 +720,8 @@ fn report_dry_run(changes: &[Change]) {
     let mut pending = 0;
     for change in changes {
         match change {
-            Change::Write { path, verb, what, .. } => {
-                println!("would {} {what}: {}", verb.imperative(), path.display());
+            Change::Write { path, note, .. } => {
+                println!("would {note}: {}", path.display());
                 pending += 1;
             }
             Change::NoOp { note } => println!("{note}"),

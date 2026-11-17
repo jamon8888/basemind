@@ -100,19 +100,10 @@ fn code_outline_reports_symbols() {
     let v = assert_json_fields(
         root,
         &["code", "outline", "a.rs"],
-        &["path", "language", "total", "symbols"],
+        &["path", "language", "symbols", "imports"],
     );
     let symbols = v["symbols"].as_array().expect("symbols array");
     assert_eq!(symbols.len(), 2, "expected alpha + Beta");
-    let line_of = |name: &str| {
-        symbols
-            .iter()
-            .find(|symbol| symbol["name"] == name)
-            .unwrap_or_else(|| panic!("no symbol `{name}` in {v}"))["line"]
-            .clone()
-    };
-    assert_eq!(line_of("alpha"), 1, "outline lines are 1-based");
-    assert_eq!(line_of("Beta"), 2);
     assert_human_contains(root, &["code", "outline", "a.rs"], "alpha");
 }
 
@@ -120,9 +111,8 @@ fn code_outline_reports_symbols() {
 fn code_symbols_finds_symbol() {
     let dir = build_and_scan();
     let root = dir.path();
-    let v = assert_json_fields(root, &["code", "symbols", "alpha"], &["total", "results"]);
+    let v = assert_json_fields(root, &["code", "symbols", "alpha"], &["total", "truncated", "results"]);
     assert_eq!(v["total"], 1);
-    assert!(v.get("truncated").is_none(), "a false `truncated` is left out: {v}");
     assert_human_contains(root, &["code", "symbols", "alpha"], "alpha");
 }
 
@@ -174,25 +164,25 @@ fn git_status_is_clean() {
 fn git_search_finds_commit_by_author() {
     let dir = build_and_scan();
     let root = dir.path();
-    let v = assert_json_fields(root, &["git", "log", "--author", "t"], &["commits"]);
+    let v = assert_json_fields(root, &["git", "search", "t", "--field", "author"], &["commits"]);
     let commits = v["commits"].as_array().expect("commits array");
     assert_eq!(commits.len(), 1, "author search should find the one commit");
-    assert_human_contains(root, &["git", "search", "init"], "init");
+    assert_human_contains(root, &["git", "search", "init", "--field", "message"], "init");
 }
 
 #[test]
-fn rescan_without_paths_reindexes_a_new_file() {
+fn rescan_full_reindexes_new_file() {
     let dir = build_and_scan();
     let root = dir.path();
     std::fs::write(root.join("d.rs"), b"pub fn delta() {}\n").unwrap();
 
-    let (stdout, ok) = run(root, &["rescan", "--quiet"]);
-    assert!(ok, "rescan exited non-zero; stdout: {stdout}");
+    let (stdout, ok) = run(root, &["rescan", "--full", "--quiet"]);
+    assert!(ok, "rescan --full exited non-zero; stdout: {stdout}");
 
     let search = assert_json_fields(root, &["code", "symbols", "delta"], &["total", "results"]);
-    assert_eq!(search["total"], 1, "a rescan with no path must index the new symbol");
+    assert_eq!(search["total"], 1, "rescan --full must index the new symbol");
     let status = assert_json_fields(root, &["status"], &["file_count"]);
-    assert_eq!(status["file_count"], 3, "a rescan with no path must index the new file");
+    assert_eq!(status["file_count"], 3, "rescan --full must index the new file");
 }
 
 #[test]
@@ -206,6 +196,210 @@ fn rescan_scoped_path_reindexes_only_that_path() {
 
     let search = assert_json_fields(root, &["code", "symbols", "delta"], &["total", "results"]);
     assert_eq!(search["total"], 1, "scoped rescan must index the named path");
+}
+
+/// Build a fixture repo where `a.rs` and `c.rs` co-change across several commits,
+/// giving the mining algorithm genuine signal. Returns the tempdir (kept alive by caller).
+///
+/// Commit layout (each commit touches the listed files):
+///   1. init: a.rs + c.rs (co-change)
+///   2. feat: a.rs + c.rs (co-change)
+///   3. extra: a.rs + c.rs (co-change)
+///   4. solo: a.rs only (solo change — makes freq[a.rs] > cochange count)
+///
+/// With `--min-support 1 --min-confidence 0.1`, the pair (a.rs, c.rs) qualifies:
+///   support = 3, freq[a.rs] = 4, confidence = 3/4 = 0.75 >= 0.1.
+#[cfg(feature = "memory")]
+fn build_cochange_fixture() -> TempDir {
+    basemind::store::init_isolated_cache();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+
+    std::fs::write(root.join("a.rs"), b"pub fn alpha() {}\n").unwrap();
+    std::fs::write(root.join("c.rs"), b"pub fn caller() { alpha(); }\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init: a and c"]);
+
+    std::fs::write(root.join("a.rs"), b"pub fn alpha() -> u32 { 1 }\n").unwrap();
+    std::fs::write(root.join("c.rs"), b"pub fn caller() -> u32 { alpha() }\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "feat: typed alpha"]);
+
+    std::fs::write(root.join("a.rs"), b"pub fn alpha() -> u32 { 2 }\n").unwrap();
+    std::fs::write(root.join("c.rs"), b"pub fn caller() -> u32 { alpha() + 1 }\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "feat: bump alpha return"]);
+
+    std::fs::write(root.join("a.rs"), b"pub fn alpha() -> u32 { 42 }\n").unwrap();
+    git(root, &["add", "a.rs"]);
+    git(root, &["commit", "-qm", "fix: solo alpha tweak"]);
+
+    let status = Command::new(bin())
+        .args(["--root", root.to_str().unwrap(), "scan", "--quiet"])
+        .status()
+        .expect("run basemind scan");
+    assert!(status.success(), "basemind scan failed on cochange fixture");
+    dir
+}
+
+/// Run `basemind --root <root> [extra args...]` and return (stdout, stderr, success).
+fn run_full(root: &Path, args: &[&str]) -> (String, String, bool) {
+    let mut full = vec!["--root", root.to_str().unwrap()];
+    full.extend_from_slice(args);
+    let output = Command::new(bin()).args(&full).output().expect("run basemind");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success(),
+    )
+}
+
+/// End-to-end proposal workflow under `--features memory`:
+/// mine → proposals (list) → accept → memory get → reject.
+///
+/// Requires genuine co-change history; uses `build_cochange_fixture()`.
+#[cfg(feature = "memory")]
+#[test]
+fn memory_mine_proposals_accept_get_reject_end_to_end() {
+    let dir = build_cochange_fixture();
+    let root = dir.path();
+
+    let mine_v = assert_json_fields(
+        root,
+        &["memory", "mine", "--min-support", "1", "--min-confidence", "0.1"],
+        &["mined", "window_inspected", "skipped_bulk"],
+    );
+    assert!(
+        mine_v["mined"].as_u64().unwrap() >= 1,
+        "`memory mine` must emit at least one co-change proposal; got: {mine_v}"
+    );
+
+    let list_v = assert_json_fields(root, &["memory", "proposals"], &["total", "truncated", "proposals"]);
+    let proposals = list_v["proposals"]
+        .as_array()
+        .expect("proposals field must be an array");
+    assert!(
+        !proposals.is_empty(),
+        "`memory proposals` must list at least one proposal; got: {list_v}"
+    );
+
+    let first = &proposals[0];
+    let id = first["id"]
+        .as_str()
+        .expect("each proposal must have an 'id' string field");
+    assert!(!id.is_empty(), "proposal id must not be empty");
+
+    let (accept_stdout, accept_stderr, accept_ok) = run_full(root, &["--json", "memory", "accept", id]);
+    assert!(
+        accept_ok,
+        "`memory accept` must exit 0 (no runtime-drop panic); stderr: {accept_stderr}"
+    );
+    let accept_v: Value = serde_json::from_str(accept_stdout.trim())
+        .unwrap_or_else(|e| panic!("`memory accept` did not emit JSON: {e}\nstdout: {accept_stdout}"));
+    assert_eq!(
+        accept_v["accepted"],
+        serde_json::Value::Bool(true),
+        "`memory accept` must return accepted=true in stdout; got: {accept_v}"
+    );
+    let memory_key = accept_v["memory_key"]
+        .as_str()
+        .expect("`memory accept` must return a memory_key field in stdout");
+    assert!(
+        memory_key.starts_with("skill/cochange-"),
+        "accepted memory key must start with 'skill/cochange-'; got: {memory_key:?}"
+    );
+
+    let get_v = assert_json_fields(root, &["memory", "get", memory_key], &["key", "value", "tags"]);
+    assert_eq!(
+        get_v["key"].as_str().unwrap(),
+        memory_key,
+        "memory get must return the exact key that was stored"
+    );
+    let tags = get_v["tags"]
+        .as_array()
+        .expect("memory get response must include a tags array");
+    let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+    assert!(
+        tag_strs.contains(&"skill"),
+        "accepted memory must carry the 'skill' tag; got tags: {tags:?}"
+    );
+    assert!(
+        tag_strs.contains(&"cochange"),
+        "accepted memory must carry the 'cochange' tag; got tags: {tags:?}"
+    );
+
+    let remine_v = assert_json_fields(
+        root,
+        &["memory", "mine", "--min-support", "1", "--min-confidence", "0.1"],
+        &["mined"],
+    );
+    assert!(
+        remine_v["mined"].as_u64().unwrap() >= 1,
+        "re-mine after accept must regenerate the cluster (accept does not tombstone); got: {remine_v}"
+    );
+
+    let list2_v = assert_json_fields(root, &["memory", "proposals"], &["total", "proposals"]);
+    let proposals2 = list2_v["proposals"]
+        .as_array()
+        .expect("proposals field must be an array after re-mine");
+    let reject_id = proposals2
+        .first()
+        .and_then(|p| p["id"].as_str())
+        .expect("re-mine must leave at least one proposal to reject");
+
+    let reject_v = assert_json_fields(
+        root,
+        &["memory", "reject", reject_id, "--reason", "test rejection"],
+        &["rejected"],
+    );
+    assert_eq!(
+        reject_v["rejected"],
+        serde_json::Value::Bool(true),
+        "`memory reject` must return rejected=true; got: {reject_v}"
+    );
+
+    let post_reject = assert_json_fields(
+        root,
+        &["memory", "mine", "--min-support", "1", "--min-confidence", "0.1"],
+        &["mined"],
+    );
+    let still_listed = assert_json_fields(root, &["memory", "proposals"], &["proposals"]);
+    let remaining = still_listed["proposals"].as_array().expect("array");
+    assert!(
+        !remaining.iter().any(|p| p["id"].as_str() == Some(reject_id)),
+        "rejected proposal id must not reappear after re-mine (tombstone); post_reject={post_reject}, listed={still_listed}"
+    );
+}
+
+/// Verify that governance subcommands return a graceful failure (non-zero exit,
+/// no panic) when the `memory` feature is not compiled in.
+///
+/// This test runs under both default-features and `--features memory` builds.
+/// Under `--features memory` the subcommand succeeds (the test is tolerant of
+/// that). Under default features it must NOT succeed and must NOT crash.
+#[test]
+fn memory_mine_without_the_memory_feature_does_not_panic() {
+    let dir = build_and_scan();
+    let root = dir.path();
+
+    let (stdout, stderr, ok) = run_full(
+        root,
+        &["memory", "mine", "--min-support", "1", "--min-confidence", "0.1"],
+    );
+
+    if !ok {
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            combined.to_lowercase().contains("memory") || combined.to_lowercase().contains("not enabled"),
+            "`memory mine` failure must mention 'memory' or 'not enabled'; got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            !stderr.contains("thread 'main' panicked"),
+            "governance mine must not panic when memory feature is off; stderr={stderr:?}"
+        );
+    }
 }
 
 #[test]

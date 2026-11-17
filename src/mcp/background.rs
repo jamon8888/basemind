@@ -52,7 +52,7 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
             use std::sync::atomic::Ordering;
             state.shared.initial_scan_active.store(true, Ordering::Relaxed);
             let started = std::time::Instant::now();
-            match super::daemon_forward::writer_rescan_and_refresh(&state, None, false, false, false).await {
+            match super::daemon_forward::writer_rescan_and_refresh(&state, None, false, false).await {
                 Ok(report) => tracing::info!(
                     scanned = report.scanned,
                     updated = report.updated,
@@ -70,7 +70,7 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
             tokio::spawn(async move {
                 let embed_started = std::time::Instant::now();
                 tracing::info!("background embedding pass starting (forwarded to daemon)");
-                match super::daemon_forward::writer_rescan_and_refresh(&embed_state, None, false, true, false).await {
+                match super::daemon_forward::writer_rescan_and_refresh(&embed_state, None, false, true).await {
                     Ok(report) => tracing::info!(
                         scanned = report.scanned,
                         updated = report.updated,
@@ -87,7 +87,7 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
         use std::sync::atomic::Ordering;
         state.shared.initial_scan_active.store(true, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        match helpers::scan_and_refresh(Arc::clone(&state), None, crate::scanner::EmbedMode::Deferred, false).await {
+        match helpers::scan_and_refresh(Arc::clone(&state), None, crate::scanner::EmbedMode::Deferred).await {
             Ok(report) => tracing::info!(
                 scanned = report.stats.scanned,
                 updated = report.stats.updated,
@@ -105,9 +105,7 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
         tokio::spawn(async move {
             let embed_started = std::time::Instant::now();
             tracing::info!("background embedding pass starting");
-            match helpers::scan_and_refresh(Arc::clone(&embed_state), None, crate::scanner::EmbedMode::Inline, false)
-                .await
-            {
+            match helpers::scan_and_refresh(Arc::clone(&embed_state), None, crate::scanner::EmbedMode::Inline).await {
                 Ok(report) => tracing::info!(
                     scanned = report.stats.scanned,
                     updated = report.stats.updated,
@@ -119,6 +117,122 @@ pub(super) fn spawn_initial_scan(state: Arc<ServerState>) {
             run_background_gc(embed_state).await;
         });
     });
+}
+
+/// Boot-time catch-up scan for an already-populated index, spawned once from
+/// `BasemindServer::new_with_options` on the live-watcher path.
+///
+/// The serve watcher only reports changes made after it is armed, and [`spawn_initial_scan`] runs
+/// for an empty index only, so a file added, edited or removed while no serve held the index stayed
+/// invisible until something touched it again. This runs one incremental pass over the working
+/// tree once the in-RAM map is warm: a `Deferred` pass first (keyword lane, no model load), then an
+/// `Inline` pass to embed what changed — skipped when nothing did, so an unchanged workspace never
+/// loads the embedding engine at boot. The blob GC runs after it settles.
+pub(super) fn spawn_catch_up_scan(state: Arc<ServerState>) {
+    use std::sync::atomic::Ordering;
+    // Raised before the task is even scheduled, so no caller can observe a settled lifecycle while
+    // the catch-up is still pending.
+    state.shared.catch_up_active.store(true, Ordering::Relaxed);
+    tokio::spawn(async move {
+        {
+            // Lowers the flag however this block ends (completion, early return, panic or abort),
+            // so the lifecycle can never stay stuck on `Rescanning`.
+            let _active = CatchUpActive(&state);
+            if !await_cache_warm(&state).await {
+                tracing::warn!(
+                    "in-RAM map preload still running after {} s; skipping the startup catch-up scan",
+                    CATCH_UP_WARM_WAIT_CAP.as_secs()
+                );
+                return;
+            }
+            let started = std::time::Instant::now();
+            let first = catch_up_pass(&state, false).await;
+            match &first {
+                Ok((scanned, changed)) => tracing::info!(
+                    scanned,
+                    changed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "startup catch-up scan complete (keyword lane; embeddings deferred)"
+                ),
+                Err(error) => tracing::warn!(%error, "startup catch-up scan failed"),
+            }
+            if matches!(first, Ok((_, changed)) if changed > 0) {
+                let embed_started = std::time::Instant::now();
+                match catch_up_pass(&state, true).await {
+                    Ok((scanned, changed)) => tracing::info!(
+                        scanned,
+                        changed,
+                        elapsed_ms = embed_started.elapsed().as_millis() as u64,
+                        "startup catch-up embedding pass complete"
+                    ),
+                    Err(error) => tracing::warn!(%error, "startup catch-up embedding pass failed"),
+                }
+            }
+        }
+        // The blob GC ran unflagged after boot before the catch-up existed, and still does.
+        run_background_gc(state).await;
+    });
+}
+
+/// Clears the shared `catch_up_active` flag when dropped.
+struct CatchUpActive<'a>(&'a Arc<ServerState>);
+
+impl Drop for CatchUpActive<'_> {
+    fn drop(&mut self) {
+        self.0
+            .shared
+            .catch_up_active
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How long the catch-up waits for the boot-time map preload before giving up on this boot.
+const CATCH_UP_WARM_WAIT_CAP: Duration = Duration::from_secs(600);
+
+/// Wait for the boot-time map preload to publish; `false` if it is still running after
+/// [`CATCH_UP_WARM_WAIT_CAP`]. The cap is far above [`ServerState::await_cache_ready`]'s on purpose:
+/// the catch-up's whole-tree refresh publishes a newer map, and a preload that finished after it
+/// would overwrite that map with its older snapshot, so the catch-up skips rather than race it.
+async fn await_cache_warm(state: &ServerState) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let deadline = tokio::time::Instant::now() + CATCH_UP_WARM_WAIT_CAP;
+    while state.shared.cache_warming.load(Relaxed) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let notified = state.shared.cache_ready.notified();
+        if !state.shared.cache_warming.load(Relaxed) {
+            break;
+        }
+        // Re-check on a short tick as well, in case the notification raced the registration.
+        let _ = tokio::time::timeout(Duration::from_secs(1), notified).await;
+    }
+    true
+}
+
+/// One whole-tree catch-up pass through the writer; returns `(scanned, changed)`, where `changed`
+/// counts code files written, documents (re-)extracted and files pruned. `updated` alone is
+/// code-map only: a document added while serve was down lands in `docs_indexed`, and a `Deferred`
+/// pass leaves its entry untracked, so leaving it out would skip the `Inline` pass that embeds and
+/// tracks it — the document would never get vectors and be re-extracted at every boot.
+async fn catch_up_pass(state: &Arc<ServerState>, embed: bool) -> Result<(usize, usize), String> {
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    if state.shared.daemon_writer {
+        let report = super::daemon_forward::writer_rescan_and_refresh(state, None, false, embed)
+            .await
+            .map_err(|error| error.to_string())?;
+        return Ok((report.scanned, report.updated + report.docs_indexed + report.removed));
+    }
+    let mode = if embed {
+        crate::scanner::EmbedMode::Inline
+    } else {
+        crate::scanner::EmbedMode::Deferred
+    };
+    let report = helpers::scan_and_refresh_with(Arc::clone(state), None, mode, true)
+        .await
+        .map_err(|error| error.to_string())?;
+    let stats = &report.stats;
+    Ok((stats.scanned, stats.updated + stats.docs_indexed + stats.removed))
 }
 
 /// Boot-time in-RAM code-map preload, spawned once from `BasemindServer::new_with_options` when the
@@ -139,7 +253,16 @@ pub(super) fn spawn_cache_warm(state: Arc<ServerState>) {
         let built = tokio::task::spawn_blocking(move || {
             let store = build_state.shared.store.blocking_read();
             let budget = super::l1_cache::budget_bytes_from(&build_state.shared.config.resources);
-            MapCache::build(&store, budget)
+            let mut cache = MapCache::build(&store, budget);
+            // Load persisted doc↔code links (ADR-0008) on this blocking thread — the LanceStore's own
+            // block_on must not nest inside the async reactor.
+            super::doc_links_cache::attach(
+                &mut cache,
+                &store,
+                &build_state.shared.config,
+                &build_state.shared.scope,
+            );
+            cache
         })
         .await;
         match built {
@@ -189,7 +312,6 @@ fn refresh_batch(
                 Some(paths),
                 false,
                 true,
-                false,
             ))
             .map_err(|error| error.to_string())?;
         return Ok((report.scanned, report.updated, report.removed));
@@ -199,7 +321,6 @@ fn refresh_batch(
             Arc::clone(state),
             Some(paths),
             crate::scanner::EmbedMode::Inline,
-            false,
         ))
         .map_err(|error| error.to_string())?;
     Ok((report.stats.scanned, report.stats.updated, report.stats.removed))
@@ -403,13 +524,20 @@ pub(super) fn spawn_view_watcher(state: Arc<ServerState>) -> WatcherGuard {
                     continue;
                 }
                 let budget = super::l1_cache::budget_bytes_from(&state.shared.config.resources);
-                let new_cache = Arc::new(MapCache::build(&new_store, budget));
+                let mut rebuilt = MapCache::build(&new_store, budget);
+                // Reload doc↔code links (ADR-0008) after a refreshed-index rebuild; safe here because
+                // this runs on a plain std thread with no tokio runtime entered.
+                super::doc_links_cache::attach(&mut rebuilt, &new_store, &state.shared.config, &state.shared.scope);
+                let new_cache = Arc::new(rebuilt);
                 tracing::info!(
                     files = new_cache.len(),
                     "view watcher: rebuilt MapCache from refreshed index"
                 );
                 state.shared.cache.store(new_cache);
-                state.shared.note_index_changed();
+                state
+                    .shared
+                    .cache_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             tracing::info!("view watcher: channel closed; exiting");
         })

@@ -20,9 +20,9 @@
 //!
 //! | Platform | Usage | Limit |
 //! |---|---|---|
-//! | Linux, enforced cgroup v2 limit | `memory.current` − `inactive_file` | `memory.max`, min over the hierarchy |
-//! | Linux, enforced cgroup v1 limit | `memory.usage_in_bytes` − `total_inactive_file` | `memory.limit_in_bytes` |
-//! | Linux, no enforced limit | `/proc/self/statm` resident pages | `MemTotal` from `/proc/meminfo` |
+//! | Linux, cgroup v2 | `memory.current` − `inactive_file` | `memory.max`, min over the hierarchy |
+//! | Linux, cgroup v1 | `memory.usage_in_bytes` − `total_inactive_file` | `memory.limit_in_bytes` |
+//! | Linux, neither | `/proc/self/statm` resident pages | `MemTotal` from `/proc/meminfo` |
 //! | macOS | mach `TASK_VM_INFO` `phys_footprint` | `hw.memsize` |
 //! | Windows | `K32GetProcessMemoryInfo` working set | `GlobalMemoryStatusEx` total physical |
 //! | anything else | unavailable | unavailable |
@@ -49,14 +49,16 @@ use std::time::Instant;
 const SAMPLE_CACHE_INTERVAL_MICROS: u64 = 50_000;
 
 /// Which mechanism produced a [`MemoryReading`]'s usage figure. For logs and diagnostics;
-/// what the *limit* means is [`MemoryReading::limit_is_enforced`].
+/// what the *limit* means is [`MemoryReading::limit_is_enforced`], which is a separate
+/// question — a process can read its usage from a cgroup and still be bounded only by the
+/// size of the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemorySource {
     /// Linux unified hierarchy (`/sys/fs/cgroup/…/memory.current`).
     CgroupV2,
     /// Linux legacy hierarchy (`/sys/fs/cgroup/memory/…/memory.usage_in_bytes`).
     CgroupV1,
-    /// Linux without an enforced cgroup limit: `/proc/self/statm` plus `/proc/meminfo`.
+    /// Linux with no memory cgroup: `/proc/self/statm` plus `/proc/meminfo`.
     ProcSelf,
     /// macOS mach `TASK_VM_INFO` plus `hw.memsize`.
     MachTaskInfo,
@@ -103,9 +105,9 @@ impl MemorySource {
 /// against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryReading {
-    /// Memory attributable to this process (or its container) right now, in bytes. Under an
-    /// enforced Linux cgroup limit this is the cgroup's *working set* — reclaimable page cache
-    /// has already been subtracted, so merely having read a large repository does not inflate it.
+    /// Memory attributable to this process (or its container) right now, in bytes. On Linux
+    /// this is a *working set* — reclaimable page cache has already been subtracted, so
+    /// merely having read a large repository does not inflate it.
     pub used_bytes: u64,
     /// The ceiling `used_bytes` is measured against, in bytes, or `None` when nothing on this
     /// platform imposes or reports one.
@@ -113,7 +115,9 @@ pub struct MemoryReading {
     /// Whether `limit_bytes` is a per-process or per-container ceiling the kernel actually
     /// enforces (a cgroup limit — crossing it is an OOM kill) rather than the size of the
     /// machine (shared with everything else the user is running, and merely impolite to
-    /// approach). The two deserve very different budgets.
+    /// approach). The two deserve very different budgets, which is why this is a field and
+    /// not a property of [`MemoryReading::source`]: a container with a cgroup but no
+    /// `memory.max` reads its usage from cgroup v2 and is nevertheless bounded only by RAM.
     pub limit_is_enforced: bool,
     /// Which mechanism produced `used_bytes`.
     pub source: MemorySource,
@@ -258,44 +262,27 @@ fn store_cached(reading: Option<MemoryReading>, at_micros: u64) {
 
 /// cgroup v2 wins over v1 because a hybrid host mounts both but charges the process to
 /// whichever hierarchy actually holds it, and v2 is the one systemd uses for `MemoryMax` on
-/// every current distribution.
+/// every current distribution. Only when neither controller answers does the reading fall
+/// back to whole-process RSS against whole-machine RAM, which reports the truth about the
+/// machine but says nothing about a container's ceiling.
 #[cfg(target_os = "linux")]
 fn read_memory() -> Option<MemoryReading> {
     // `or_else`, not a list: v1's files must not be read when v2 already answered.
     let charged = cgroup::read_v2()
         .map(|reading| (reading, MemorySource::CgroupV2))
         .or_else(|| cgroup::read_v1().map(|reading| (reading, MemorySource::CgroupV1)));
-    select_reading(charged, cgroup::read_mem_total(), cgroup::read_statm_rss)
-}
-
-/// Pick the usage figure that matches the ceiling.
-///
-/// The cgroup working set is the right usage only against an enforced cgroup limit, the number
-/// the kernel OOM-kills on. Without one the ceiling is a fraction of RAM, and the cgroup is
-/// usually shared (a CI runner's service, a desktop session's scope), so its working set counts
-/// other processes and active page cache that throttling this process can never release: a scan
-/// gated on it waits out every admit and crawls. The process's own RSS is used instead, which
-/// is what the no-cgroup case and the other platforms already measure.
-#[cfg(any(target_os = "linux", test))]
-fn select_reading(
-    charged: Option<(cgroup::CgroupReading, MemorySource)>,
-    mem_total: Option<u64>,
-    rss: impl FnOnce() -> Option<u64>,
-) -> Option<MemoryReading> {
     if let Some((reading, source)) = charged {
-        let (limit_bytes, limit_is_enforced) = effective_limit(reading.limit_bytes, mem_total);
-        if limit_is_enforced {
-            return Some(MemoryReading {
-                used_bytes: reading.used_bytes,
-                limit_bytes,
-                limit_is_enforced,
-                source,
-            });
-        }
+        let (limit_bytes, limit_is_enforced) = effective_limit(reading.limit_bytes, cgroup::read_mem_total());
+        return Some(MemoryReading {
+            used_bytes: reading.used_bytes,
+            limit_bytes,
+            limit_is_enforced,
+            source,
+        });
     }
     Some(MemoryReading {
-        used_bytes: rss()?,
-        limit_bytes: mem_total,
+        used_bytes: cgroup::read_statm_rss()?,
+        limit_bytes: cgroup::read_mem_total(),
         limit_is_enforced: false,
         source: MemorySource::ProcSelf,
     })
@@ -407,13 +394,39 @@ fn mac_phys_footprint() -> Option<u64> {
 /// The name is Darwin's: on macOS this is `phys_footprint`, which counts compressed and
 /// swapped-out anonymous pages and so does *not* shrink when the OS compresses idle memory
 /// under pressure. That property is why it is the right signal for a ceiling — plain RSS
-/// reads artificially low exactly when the process is heaviest — and under an enforced Linux
-/// cgroup limit the reading matches it: a cgroup working set likewise counts swapped-out
-/// anonymous memory and excludes reclaimable cache. Without an enforced limit Linux falls back
-/// to RSS (see `select_reading`). Returns `None` where nothing can be read, which
+/// reads artificially low exactly when the process is heaviest — and the Linux and Windows
+/// readings are chosen to match it: a cgroup working set likewise counts swapped-out anonymous
+/// memory and excludes reclaimable cache. Returns `None` where nothing can be read, which
 /// callers treat as "skip throttling" rather than as zero.
 pub fn phys_footprint() -> Option<u64> {
     memory_reading().map(|reading| reading.used_bytes)
+}
+
+/// The memory *this process* occupies, in bytes — the per-process counterpart of
+/// [`phys_footprint`] for callers whose budget is scoped to one process, namely
+/// [`crate::backpressure::FootprintGate`].
+///
+/// On macOS and Windows [`phys_footprint`] already reads this process; on Linux it reads the
+/// whole cgroup the process runs in, because the OOM killer strikes the cgroup. That is the
+/// right signal for a shared ceiling and the wrong one for a per-process scan budget: on a
+/// shared cgroup — a CI job running cargo and several test binaries, or a desktop user slice —
+/// the number is dominated by other processes, and the gate false-trips, throttling a healthy
+/// scan to one file per admission wait. This entry point keeps macOS's compression-aware
+/// footprint and gives Linux the process's own resident set (`/proc/self/statm`).
+///
+/// The Linux trade-off is plain RSS: it reads low when the OS swaps this process's pages out,
+/// where a working-set reading would not. Under that condition the gate admits — the same
+/// best-effort direction as an unreadable sample — rather than throttling on memory the
+/// process does not own.
+pub fn process_rss() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        current_rss()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        phys_footprint()
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -617,60 +630,6 @@ mod tests {
         assert_eq!(effective_limit(Some(16 << 30), Some(16 << 30)), (Some(16 << 30), false));
     }
 
-    fn charged(used_bytes: u64, limit_bytes: Option<u64>) -> Option<(cgroup::CgroupReading, MemorySource)> {
-        Some((
-            cgroup::CgroupReading {
-                used_bytes,
-                limit_bytes,
-            },
-            MemorySource::CgroupV2,
-        ))
-    }
-
-    #[test]
-    fn an_enforced_cgroup_limit_is_measured_against_the_cgroup_working_set() {
-        let reading = select_reading(charged(3 << 30, Some(4 << 30)), Some(64 << 30), || Some(1 << 30));
-        assert_eq!(
-            reading,
-            Some(MemoryReading {
-                used_bytes: 3 << 30,
-                limit_bytes: Some(4 << 30),
-                limit_is_enforced: true,
-                source: MemorySource::CgroupV2,
-            })
-        );
-    }
-
-    #[test]
-    fn without_an_enforced_limit_the_process_is_measured_not_its_shared_cgroup() {
-        // A CI runner or desktop session scope: the cgroup's working set is everything else in it
-        // (the runner, the build's page cache, other apps), which no amount of throttling this
-        // process can bring under a RAM-derived ceiling.
-        for limit in [None, Some(100 << 30)] {
-            let reading = select_reading(charged(12 << 30, limit), Some(16 << 30), || Some(1 << 30));
-            assert_eq!(
-                reading,
-                Some(MemoryReading {
-                    used_bytes: 1 << 30,
-                    limit_bytes: Some(16 << 30),
-                    limit_is_enforced: false,
-                    source: MemorySource::ProcSelf,
-                }),
-                "cgroup limit {limit:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn without_a_cgroup_the_process_is_measured_against_total_ram() {
-        let reading = select_reading(None, Some(16 << 30), || Some(1 << 30));
-        assert_eq!(
-            reading.map(|r| (r.used_bytes, r.source)),
-            Some((1 << 30, MemorySource::ProcSelf))
-        );
-        assert_eq!(select_reading(None, Some(16 << 30), || None), None);
-    }
-
     #[test]
     fn a_cgroup_limit_stands_alone_when_meminfo_is_unreadable() {
         assert_eq!(effective_limit(Some(2 << 30), None), (Some(2 << 30), true));
@@ -757,5 +716,12 @@ mod tests {
     fn phys_footprint_reports_positive_bytes() {
         let footprint = phys_footprint().expect("phys_footprint should be readable here");
         assert!(footprint > 0, "phys_footprint must be positive, got {footprint}");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn process_rss_reports_positive_bytes() {
+        let rss = process_rss().expect("process_rss should be readable here");
+        assert!(rss > 0, "process_rss must be positive, got {rss}");
     }
 }

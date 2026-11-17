@@ -11,10 +11,8 @@ pub mod identity;
 pub mod ids;
 
 #[cfg(all(feature = "comms", any(unix, windows)))]
-pub(crate) mod blob_gc_gate;
-#[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod client;
-/// Second `impl CommsClient` block: the daemon-forwarding rescan / memory /
+/// Second `impl CommsClient` block: the daemon-forwarding rescan / memory / governance /
 /// resolved-refs / git-history RPCs, split out of `client.rs` for the line cap.
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod client_forward;
@@ -24,7 +22,7 @@ pub mod code_search_proto;
 pub mod cursor;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod daemon;
-/// Second `impl Broker` block: the forwarded memory / resolved-refs handlers, split
+/// Second `impl Broker` block: the forwarded memory / governance / resolved-refs handlers, split
 /// out of `daemon.rs` for the line cap.
 #[cfg(all(feature = "comms", any(unix, windows)))]
 mod daemon_forward_handlers;
@@ -59,8 +57,6 @@ pub mod frontend_named_pipe;
 pub mod frontend_uds;
 /// The daemon's git-history half: the pool of open per-repo indexes + the forwarded-op handler.
 #[cfg(all(feature = "comms", any(unix, windows)))]
-pub mod generation_cleanup;
-#[cfg(all(feature = "comms", any(unix, windows)))]
 pub(crate) mod git_history_ops;
 /// The opt-in gate and bearer-token auth guarding [`http_frontend`].
 #[cfg(all(feature = "comms", any(unix, windows)))]
@@ -77,13 +73,12 @@ pub mod keys;
 pub mod memory_proto;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod model;
+#[cfg(all(feature = "comms", feature = "memory"))]
+pub mod proposals_proto;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod protocol;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod relay;
-/// The token and detail the daemon declines a relay session with.
-#[cfg(all(feature = "comms", any(unix, windows)))]
-mod relay_decline;
 pub mod resolved_proto;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod scope;
@@ -95,7 +90,6 @@ pub mod store;
 pub mod store_health;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod transport;
-pub mod v2;
 #[cfg(all(feature = "comms", any(unix, windows)))]
 pub mod workspace_pool;
 
@@ -121,7 +115,7 @@ pub fn new_idempotency_key() -> String {
 }
 
 /// Schema version for the comms store, bound to the release minor exactly like
-/// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. An older on-disk version wipes the comms store and
-/// the daemon rebuilds it from scratch — comms history is durable-but-disposable scratch, not a
-/// source of truth. A newer one is refused, so an older binary never destroys a newer daemon's store.
+/// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. A mismatch wipes the comms store and the
+/// daemon rebuilds it from scratch — comms history is durable-but-disposable scratch, not a
+/// source of truth.
 pub const COMMS_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;

@@ -101,6 +101,14 @@ impl LanceStore {
         })
     }
 
+    /// [`Self::replace_documents_many`] for the `doc_links` table (key column `doc_path`).
+    #[cfg(feature = "documents")]
+    pub fn replace_doc_links_many(&self, items: Vec<(String, String, Vec<super::DocLinkRow>)>) -> Result<()> {
+        self.replace_many(super::schema::DOC_LINKS_TABLE, "doc_path", items, |_, rows| {
+            super::doc_links::build_doc_links_batch(rows)
+        })
+    }
+
     /// [`Self::replace_documents_many`] for the `code_chunks` table.
     #[cfg(feature = "code-search")]
     pub fn replace_code_chunks_many(&self, items: Vec<(String, String, Vec<super::CodeRow>)>) -> Result<()> {
@@ -114,7 +122,7 @@ impl LanceStore {
         table_name: &str,
         key_col: &str,
         items: Vec<(String, String, Vec<R>)>,
-        build: impl Fn(u16, &[R]) -> Result<lancedb::arrow::arrow_array::RecordBatch>,
+        build: impl Fn(u16, &[R]) -> Result<arrow_array::RecordBatch>,
     ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -129,12 +137,12 @@ impl LanceStore {
                 .with_context(|| format!("open {table_name} table"))?;
             // Skip the delete (a scan plus a commit) when the table holds nothing to replace; this
             // is every batch of a first scan.
-            if table
+            let had_rows = table
                 .count_rows(None)
                 .await
                 .with_context(|| format!("count {table_name} rows"))?
-                > 0
-            {
+                > 0;
+            if had_rows {
                 table
                     .delete(&replace_predicate(key_col, &items))
                     .await
@@ -143,6 +151,9 @@ impl LanceStore {
             }
             let flat: Vec<R> = items.into_iter().flat_map(|(_, _, rows)| rows).collect();
             if flat.is_empty() {
+                if had_rows && table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
                 return anyhow::Ok(());
             }
             table
@@ -151,6 +162,9 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} {table_name} rows", flat.len()))?;
             self.after_commit(&table, table_name).await;
+            if table_name == DOCUMENTS_TABLE {
+                self.bump_document_generation()?;
+            }
             anyhow::Ok(())
         })
     }

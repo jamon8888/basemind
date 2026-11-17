@@ -1,22 +1,34 @@
-//! The `mode` vocabulary of the one domain tool that is still mode-dispatched: `agents`.
+//! The `mode` vocabulary shared by every consolidated MCP tool and CLI group.
 //!
-//! ADR-0018 replaced the mode-dispatched `code`, `git`, `memory` and `admin` domains with one tool
-//! per job (`src/mcp/types_tools.rs`). The agent-coordination surface keeps its domain shape until
-//! its own redesign lands, so this file now carries only what that tool needs: the enum macro, its
-//! vocabulary, and the per-mode field validator.
+//! basemind's surface is nine domains — `code`, `graph`, `git`, `memory`, `web`, `agents`,
+//! `workspace`, `shell`, `admin` — each a single MCP tool and a single CLI group. Which operation
+//! runs inside a domain is selected by a required `mode` enum rather than by a distinct tool name.
+//!
+//! # Why one tool per domain
+//!
+//! Hosts defer MCP tools and surface them only through keyword search, so an agent never reads a
+//! list — it searches. Every additional tool name competes for the same query, and a name whose
+//! description omits the words an agent would actually type is unreachable in practice even when it
+//! registered cleanly. Nine dense descriptions retrieve better than eighty-five thin ones.
 //!
 //! # Why the schema is hand-written
 //!
 //! The Anthropic `input_schema` subset rejects `$ref` / `$defs` / `oneOf` / `anyOf` / `allOf`, and
 //! the rejection is silent and all-or-nothing: one offending construct anywhere drops the server's
 //! ENTIRE tool registry (GH #50, guarded by `tests/mcp_schema_wire.rs`). `#[derive(JsonSchema)]` on
-//! an enum with per-variant doc comments emits exactly that: `oneOf: [{const, description}, …]`.
+//! an enum with per-variant doc comments emits exactly that — `oneOf: [{const, description}, …]`.
 //! So [`define_mode!`] emits a flat `{"type": "string", "enum": [...]}` with the variant docs folded
 //! into the description, and opts into `inline_schema()` so it never lands in `$defs`.
 //!
-//! For the same reason, per-mode parameters are optional sibling fields validated in the helper,
+//! For the same reason, per-mode parameters are **optional sibling fields validated in the helper**,
 //! never a schema-level union. [`reject_unsupported`] is the validator: it names the offending
-//! `mode`/field pair instead of ignoring the field.
+//! `mode`/field pair instead of ignoring the field, because a silently-ignored parameter reads to an
+//! agent as a successful call that did something else.
+//!
+//! # Why `mode` has no default
+//!
+//! A default would let an agent omit it and silently get a different operation than it asked for —
+//! an empty result rather than an error, which is the failure mode agents are worst at noticing.
 
 use rmcp::ErrorData as McpError;
 
@@ -27,12 +39,12 @@ use rmcp::ErrorData as McpError;
 ///
 /// ```ignore
 /// define_mode! {
-///     /// What the `agents` tool should do.
-///     pub enum AgentsMode {
-///         domain: "agents",
-///         summary: "Coordination operation to run.",
-///         Post  => "post",  "send a message to a thread";
-///         Inbox => "inbox", "unread messages across your joined threads";
+///     /// What the `web` tool should do.
+///     pub enum WebMode {
+///         domain: "web",
+///         summary: "Web operation to run.",
+///         Scrape => "scrape", "fetch one page and index it";
+///         Crawl  => "crawl",  "follow links from a seed URL";
 ///     }
 /// }
 /// ```
@@ -147,8 +159,138 @@ macro_rules! define_mode {
     };
 }
 
-// Every enum is compiled unconditionally even when its tool is gated off, so a feature build never
+// The domain vocabularies. Every enum is compiled unconditionally even when its tool is gated off,
+// so this file is the one place the whole surface can be read at once and so a feature build never
 // changes the spelling of a mode. Which domains are *advertised* is gated, in `domain_modes`. ~keep
+
+define_mode! {
+    /// Which web operation the `web` tool should run.
+    pub enum WebMode {
+        domain: "web",
+        summary: "Web operation to run.",
+        Scrape => "scrape", "fetch one URL, extract markdown, and index it into the documents store";
+        Crawl => "crawl", "follow links breadth-first from a seed URL and index every page";
+        Map => "map", "discover a site's URLs from its sitemap and link map without fetching bodies";
+    }
+}
+
+define_mode! {
+    /// Which cache / server-administration operation the `admin` tool should run.
+    pub enum AdminMode {
+        domain: "admin",
+        summary: "Administrative operation to run.",
+        Status => "status", "index health: file counts, languages, whether a scan is running";
+        Repo => "repo", "repository identity: workdir, branch, HEAD sha";
+        Rescan => "rescan", "re-index changed files, or the whole workspace when no paths are given";
+        CacheStats => "cache_stats", "on-disk bytes per cache component, blob and orphan counts, RSS, last GC outcome";
+        Gc => "gc", "report orphaned blobs no live view references; deletes nothing (`basemind cache gc` sweeps)";
+        CacheClear => "cache_clear", "delete one cache component (`component`); `blobs` needs `confirm`, `views`/`all` refused";
+        Telemetry => "telemetry", "aggregate recorded tool calls into a usage and token-savings summary";
+        Compress => "compress", "shrink an indexed file (`path`, outline) or prose (`text`) to cost less context";
+        Delta => "delta", "compact +N/-M line diff from `old` to `new`";
+        Checkpoint => "checkpoint", "distill session `text` into decisions, errors and changed files";
+        Waste => "waste", "flag redundant reads and repeated queries in a tool-call `log`";
+    }
+}
+
+define_mode! {
+    /// Which vault / rehydration-map operation the `vault` tool should run.
+    pub enum VaultMode {
+        domain: "vault",
+        summary: "Encrypted PII rehydration map operation to run.",
+        Encrypt => "encrypt", "encrypt a rehydration map (token→original) with a passphrase";
+        Decrypt => "decrypt", "decrypt a vault blob back into a rehydration map";
+        Find => "find", "search a decrypted map for token or original value (case-insensitive substring)";
+        Forget => "forget", "remove entries matching a query from the in-memory map";
+        Inspect => "inspect", "show token count, categories, and a sample from a decrypted map";
+    }
+}
+
+define_mode! {
+    /// Which workspace / worktree registry operation the `workspace` tool should run.
+    pub enum WorkspaceMode {
+        domain: "workspace",
+        summary: "Workspace registry operation to run.",
+        Workspaces => "workspaces", "every repository the machine daemon has indexed";
+        Worktrees => "worktrees", "git worktrees of this repository, with their branches and claims";
+        Branches => "branches", "branches known to this repository";
+        Claim => "claim", "take ownership of a worktree so another session does not edit it";
+        Release => "release", "give up a worktree claim this session holds";
+    }
+}
+
+define_mode! {
+    /// Which memory / document-retrieval operation the `memory` tool should run.
+    pub enum MemoryMode {
+        domain: "memory",
+        summary: "Memory operation to run.",
+        Put => "put", "write a durable note other sessions and agents will read";
+        Get => "get", "read one memory entry by key";
+        List => "list", "enumerate memory entries in key order";
+        Search => "search", "semantic search across stored memory";
+        Delete => "delete", "remove a memory entry by key";
+        Audit => "audit", "re-verify stored notes against the live code index and decay stale ones";
+        Documents => "documents", "semantic search over indexed PDFs, Office, HTML, markdown, \
+                     config and data files instead of opening them";
+        Mine => "mine", "derive co-change proposals from git history";
+        Proposals => "proposals", "list proposals awaiting review";
+        Accept => "accept", "accept a proposal into memory";
+        Reject => "reject", "reject a proposal";
+    }
+}
+
+define_mode! {
+    /// Which git-history operation the `git` tool should run.
+    pub enum GitMode {
+        domain: "git",
+        summary: "Git history operation to run.",
+        Status => "status", "uncommitted work in the tree, split into staged and unstaged";
+        Recent => "recent", "the latest commits with their touched paths and summaries";
+        Touching => "touching", "commits that modified a given path";
+        ByPath => "by_path", "path-filtered commit log";
+        Churn => "churn", "files ranked by how often they change";
+        Diff => "diff", "a file's textual diff between two revisions";
+        DiffOutline => "diff_outline", "which symbols a file gained, lost or changed between revisions";
+        Blame => "blame", "who last changed each line of a file";
+        BlameSymbol => "blame_symbol", "who last changed one symbol, resolved to its line span";
+        SymbolHistory => "symbol_history", "when a symbol's body actually changed, by structural hash";
+        Search => "search", "full-text search over commit messages and authors";
+        Show => "show", "one commit with its full, untruncated message and changed files";
+    }
+}
+
+define_mode! {
+    /// Which code-graph operation the `graph` tool should run.
+    pub enum GraphMode {
+        domain: "graph",
+        summary: "Code-graph operation to run.",
+        Calls => "calls", "walk the call chain up or down from one definition";
+        Neighbors => "neighbors", "the n-hop neighborhood around a symbol";
+        Path => "path", "the confidence-weighted shortest path between two symbols";
+        Subgraph => "subgraph", "a symbol's neighborhood cut to its most central nodes";
+        Communities => "communities", "cluster the graph into its de-facto modules";
+        Map => "map", "whole-repo architecture: hub modules by centrality, plus dependency cycles";
+        Export => "export", "render the graph as node-link JSON, DOT, Mermaid, GraphML, Cypher or HTML";
+        Display => "display", "open a rendered view in a human's desktop viewer";
+        Open => "open", "return a live browsable URL for the interactive graph page";
+        Entities => "entities", "read-only Cypher query over the entity graph (GLiNER mentions + co-occurrence)";
+        Rag => "rag", "GraphRAG: embedding seeds → entity expansion → fused retrieval";
+    }
+}
+
+define_mode! {
+    /// Which headless-terminal operation the `shell` tool should run.
+    pub enum ShellMode {
+        domain: "shell",
+        summary: "Shell session operation to run.",
+        Spawn => "spawn", "start a background terminal session running a command";
+        Send => "send", "type into a live session";
+        Capture => "capture", "read back what a session has printed";
+        Kill => "kill", "terminate a session";
+        List => "list", "every session the shell daemon currently hosts";
+        Broadcast => "broadcast", "type the same input into several sessions at once";
+    }
+}
 
 define_mode! {
     /// Which multi-agent coordination operation the `agents` tool should run.
@@ -173,6 +315,27 @@ define_mode! {
         Wait => "wait", "block until a peer posts, or until the timeout elapses";
         Cleanup => "cleanup", "preview or apply stale agent, claim, message and thread retention";
         Status => "status", "active and stale agent counts plus the last maintenance time";
+    }
+}
+
+define_mode! {
+    /// Which code-map lookup the `code` tool should run.
+    pub enum CodeMode {
+        domain: "code",
+        summary: "Code-map lookup to run.",
+        Outline => "outline", "a file's structure: symbols, lines, signatures — read this instead of the file";
+        Symbols => "symbols", "find a definition by name across every indexed file";
+        Grep => "grep", "pattern search across the workspace, filtered by language or path";
+        Files => "files", "enumerate indexed files";
+        Find => "find", "locate a file by a fuzzy fragment of its name or path";
+        Definition => "definition", "resolve a reference position to the definition it binds to";
+        References => "references", "every call site of a name";
+        Callers => "callers", "callers of one specific definition, disambiguated by path";
+        Implementations => "implementations", "types implementing or inheriting a trait, interface or base class";
+        Dependents => "dependents", "what imports a given module";
+        Expand => "expand", "one symbol's raw source body — the inverse of an outline entry";
+        Semantic => "semantic", "search code by meaning; returns pointers, fetch bodies with `chunk`";
+        Chunk => "chunk", "fetch one code chunk's source body";
     }
 }
 
@@ -203,15 +366,29 @@ pub fn reject_unsupported(domain: &str, mode: &str, present: &[(&str, bool)]) ->
     ))
 }
 
-/// Every mode-dispatched domain this build advertises, paired with the modes it accepts.
+/// Every domain this build advertises, paired with the modes it accepts.
 ///
 /// Feature-gated exactly like the router's sub-router merges, so the list can never name a domain
-/// the server does not serve. `tests/cli_parity/` walks it so every `agents` mode keeps a CLI
-/// command.
+/// the server does not serve. `tests/cli_parity/` walks it to prove the MCP and CLI surfaces stay
+/// a strict bijection at `(domain, mode)` granularity — consolidation moved the operations from
+/// tool names into modes, so parity has to be checked there or it silently stops covering them.
 pub fn domain_modes() -> Vec<(&'static str, &'static [&'static str])> {
     vec![
+        (AdminMode::DOMAIN, AdminMode::ALL_MODES),
+        (CodeMode::DOMAIN, CodeMode::ALL_MODES),
+        (GitMode::DOMAIN, GitMode::ALL_MODES),
+        (GraphMode::DOMAIN, GraphMode::ALL_MODES),
+        (MemoryMode::DOMAIN, MemoryMode::ALL_MODES),
+        #[cfg(all(feature = "shells", any(unix, windows)))]
+        (ShellMode::DOMAIN, ShellMode::ALL_MODES),
+        #[cfg(feature = "crawl")]
+        (WebMode::DOMAIN, WebMode::ALL_MODES),
         #[cfg(all(feature = "comms", any(unix, windows)))]
         (AgentsMode::DOMAIN, AgentsMode::ALL_MODES),
+        #[cfg(all(feature = "comms", any(unix, windows)))]
+        (WorkspaceMode::DOMAIN, WorkspaceMode::ALL_MODES),
+        #[cfg(feature = "documents")]
+        (VaultMode::DOMAIN, VaultMode::ALL_MODES),
     ]
 }
 
@@ -276,12 +453,12 @@ mod tests {
 
     #[test]
     fn should_reject_only_the_fields_the_caller_actually_supplied() {
-        assert!(reject_unsupported("code", "outline", &[("max_depth", false), ("limit", false)]).is_ok());
+        assert!(reject_unsupported("web", "scrape", &[("max_depth", false), ("limit", false)]).is_ok());
 
-        let error = reject_unsupported("code", "outline", &[("max_depth", true), ("limit", true)])
+        let error = reject_unsupported("web", "scrape", &[("max_depth", true), ("limit", true)])
             .expect_err("supplied inapplicable fields must fail");
         let message = error.message.to_string();
-        assert!(message.contains("`code` mode `outline` does not accept"), "{message}");
+        assert!(message.contains("`web` mode `scrape` does not accept"), "{message}");
         assert!(
             message.contains("`max_depth`") && message.contains("`limit`"),
             "{message}"

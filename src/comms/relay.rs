@@ -1,7 +1,7 @@
 //! Wire types for the stdio↔daemon MCP relay handshake.
 //!
-//! A relay client (an `rmcp` stdio front-end) forwards its JSON-RPC session to the broker
-//! daemon; `basemind serve` has no in-process server. Because a single daemon socket already carries the
+//! A relay client (an `rmcp` stdio front-end) can forward its JSON-RPC session to the broker
+//! daemon instead of serving in-process. Because a single daemon socket already carries the
 //! legacy msgpack comms protocol ([`super::protocol`]), the relay client announces itself with a
 //! fixed [`RELAY_MAGIC`] preamble so the daemon's accept loop can `MSG_PEEK` the first bytes and
 //! route a relay connection apart from a legacy comms link.
@@ -25,14 +25,10 @@ use super::ids::AgentId;
 /// length prefix, and this preamble's first four bytes (`b"BMRE"` = `0x424D5245`, ~1.1 GB)
 /// vastly exceed [`MAX_FRAME_BYTES`](super::transport::MAX_FRAME_BYTES) (16 MiB). An OLDER daemon
 /// that has never heard of the relay therefore reads the preamble as an over-long frame length,
-/// rejects it, and closes the link, which the client sees as a failed handshake. A legacy [`Hello`](super::protocol::CommsRequest::Hello) frame begins with a small
+/// rejects it, and closes the link — a clean auto-fallback signal telling the client to serve
+/// in-process. A legacy [`Hello`](super::protocol::CommsRequest::Hello) frame begins with a small
 /// length whose high byte is `0x00`, so it can never collide with the `0x42` first byte here.
 pub const RELAY_MAGIC: [u8; 8] = *b"BMRELAY1";
-
-/// How long the daemon waits for a relay link's preamble and [`RelayHello`]. A link counts as a
-/// session being set up from its accept, which makes the daemon refuse `Stop`; one that never
-/// says hello must not do that for good.
-pub const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The relay handshake's own protocol version, negotiated in [`RelayHello`] / [`RelayWelcome`].
 ///
@@ -59,8 +55,7 @@ pub struct RelayHello {
 /// The daemon's reply to a [`RelayHello`].
 ///
 /// When `accepted` is `false`, `code` carries a stable machine token (e.g. `"relay_proto_skew"`)
-/// from which the client decides whether to retry, and how soon. There is no in-process `serve`
-/// to fall back to.
+/// telling the client to fall back to in-process `serve` rather than relaying to this daemon.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayWelcome {
     /// The relay-handshake protocol version the daemon speaks.
@@ -69,35 +64,8 @@ pub struct RelayWelcome {
     pub daemon_version: String,
     /// Whether the daemon accepted the relay session.
     pub accepted: bool,
-    /// A stable rejection token when `accepted` is `false`; `None` on acceptance. One of the
-    /// [`decline`] tokens; a client treats a token it does not know as a refusal that may clear.
+    /// A stable rejection token when `accepted` is `false`; `None` on acceptance.
     pub code: Option<String>,
-    /// What the token alone cannot say, for the person reading the refusal: who holds the
-    /// workspace, or why the root was refused. Absent on acceptance and from a daemon that has
-    /// nothing to add.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-/// The tokens a daemon declines a relay session with ([`RelayWelcome::code`]).
-pub mod decline {
-    /// The client speaks another relay protocol version.
-    pub const PROTO_SKEW: &str = "relay_proto_skew";
-    /// The session asked for a view the daemon does not host. The same on every retry.
-    pub const VIEW_UNSUPPORTED: &str = "view_unsupported";
-    /// The root is not a directory basemind indexes. The same on every retry.
-    pub const ROOT_REFUSED: &str = "root_refused";
-    /// The daemon accepted a `Stop` and is on its way out; its successor accepts the session.
-    pub const DAEMON_DRAINING: &str = "daemon_draining";
-    /// Another basemind process holds the workspace's index lock. Clears when that process lets go.
-    pub const WORKSPACE_LOCKED: &str = "workspace_locked";
-    /// The daemon's own scan of the workspace holds its store. Clears within moments.
-    pub const WORKSPACE_BUSY: &str = "workspace_busy";
-    /// The workspace's index was written by a newer basemind than this daemon. The same on every
-    /// retry, until this basemind is updated.
-    pub const INDEX_NEWER: &str = "index_newer";
-    /// The daemon could not set the workspace up for a reason it has no token for.
-    pub const HOST_BUILD_FAILED: &str = "host_build_failed";
 }
 
 /// Encode a relay handshake message to msgpack, using named fields to match the rest of the wire
@@ -167,7 +135,7 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec
 /// the daemon's [`RelayWelcome`]. Leaves the stream positioned at the first post-handshake byte so
 /// the caller can immediately hand it to rmcp when `welcome.accepted`. Any I/O or decode failure
 /// (including an older daemon that rejected the preamble as an over-long frame) surfaces as an
-/// `io::Error`, which the caller retries as a failed connection.
+/// `io::Error`, on which the caller falls back to an in-process serve.
 pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     hello: &RelayHello,
@@ -183,28 +151,6 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 pub async fn read_hello<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<RelayHello> {
     let body = read_frame(reader).await?;
     decode_io(&body)
-}
-
-/// Daemon side, phase 1 — consume the [`RELAY_MAGIC`] preamble the accept loop peeked and read
-/// the [`RelayHello`], both within [`HELLO_TIMEOUT`].
-pub async fn accept_hello<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<RelayHello> {
-    let hello = async {
-        let mut magic = [0u8; RELAY_MAGIC.len()];
-        reader.read_exact(&mut magic).await?;
-        if magic != RELAY_MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "relay preamble mismatch",
-            ));
-        }
-        read_hello(reader).await
-    };
-    tokio::time::timeout(HELLO_TIMEOUT, hello).await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("no relay hello within {}s", HELLO_TIMEOUT.as_secs()),
-        )
-    })?
 }
 
 /// Daemon side, phase 1 — send the [`RelayWelcome`] reply. After this the daemon drops the frame
@@ -238,44 +184,10 @@ mod tests {
             daemon_version: "0.22.6".to_string(),
             accepted: false,
             code: Some("relay_proto_skew".to_string()),
-            detail: None,
         };
         let bytes = encode(&welcome).expect("encode");
         let back: RelayWelcome = decode(&bytes).expect("decode");
         assert_eq!(welcome, back);
-    }
-
-    /// The welcome as a build without `detail` declares it. Both directions must decode: that
-    /// build's daemon answers this client, and that build's client reads this daemon's refusal.
-    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-    struct WelcomeWithoutDetail {
-        relay_proto_ver: u32,
-        daemon_version: String,
-        accepted: bool,
-        code: Option<String>,
-    }
-
-    #[test]
-    fn a_welcome_decodes_across_builds_with_and_without_the_detail() {
-        let old = WelcomeWithoutDetail {
-            relay_proto_ver: RELAY_PROTO_VER,
-            daemon_version: "0.34.0".to_string(),
-            accepted: false,
-            code: Some(decline::HOST_BUILD_FAILED.to_string()),
-        };
-        let read: RelayWelcome = decode(&encode(&old).expect("encode")).expect("a welcome without detail");
-        assert_eq!(read.code.as_deref(), Some(decline::HOST_BUILD_FAILED));
-        assert_eq!(read.detail, None);
-
-        let new = RelayWelcome {
-            relay_proto_ver: RELAY_PROTO_VER,
-            daemon_version: "0.34.1".to_string(),
-            accepted: false,
-            code: Some(decline::WORKSPACE_LOCKED.to_string()),
-            detail: Some("pid 7".to_string()),
-        };
-        let read: WelcomeWithoutDetail = decode(&encode(&new).expect("encode")).expect("a welcome with detail");
-        assert_eq!(read.code.as_deref(), Some(decline::WORKSPACE_LOCKED));
     }
 
     #[test]
@@ -314,7 +226,6 @@ mod tests {
             daemon_version: "9.9.9".to_string(),
             accepted: true,
             code: None,
-            detail: None,
         };
 
         let server_hello = hello.clone();

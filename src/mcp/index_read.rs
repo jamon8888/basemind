@@ -14,13 +14,12 @@ use super::cursor::Cursor;
 use super::helpers::SEARCH_LIMIT_MAX;
 use super::helpers_calls_scan::{CallRef, CallScanPage, calls_in_file_fjall, scan_calls_by_name};
 use super::helpers_impls::{ImplScanPage, scan_impls_fjall};
-pub(crate) use super::helpers_refs_match::Matching;
 use super::types::ReferenceHit;
 use super::types_impls::ImplementationHit;
 use crate::comms::index_read_proto::{
     IndexReadQuery, IndexReadResult, MAX_CALLS_IN_FILES, WireCall, WireCallHit, WireCallScan, WireImplHit, WireImplScan,
 };
-use crate::index::view::IndexView;
+use crate::index::IndexDb;
 use crate::store::Store;
 
 /// Why a forwarded scan could not run: the workspace the daemon holds has no fjall index, so the
@@ -30,20 +29,13 @@ const NO_INDEX: &str = "the daemon holds this workspace without a fjall index, s
 
 /// Run a forwarded scan against an open workspace store.
 pub(crate) fn index_read_against(store: &Store, query: &IndexReadQuery) -> Result<IndexReadResult, String> {
-    let view = store.read_index_view().ok_or_else(|| NO_INDEX.to_string())?;
-    let idx: &dyn IndexView = &*view;
+    let idx = store.index_db.as_ref().ok_or_else(|| NO_INDEX.to_string())?;
     match query {
-        IndexReadQuery::CallScan {
-            name,
-            exact,
-            limit,
-            cursor,
-        } => call_scan(idx, name, Matching::from_substring(!exact), *limit, cursor.as_deref()),
+        IndexReadQuery::CallScan { name, limit, cursor } => call_scan(idx, name, *limit, cursor.as_deref()),
         IndexReadQuery::CallsInFiles { paths } => calls_in_files(idx, paths),
-        IndexReadQuery::GrepBloom { pattern, entries } => grep_skip(idx, &store.root, pattern, entries),
+        IndexReadQuery::GrepBloom { pattern, paths } => grep_skip(idx, &store.root, pattern, paths),
         IndexReadQuery::ImplScan {
             trait_name,
-            exact,
             language,
             limit,
             cursor,
@@ -51,7 +43,6 @@ pub(crate) fn index_read_against(store: &Store, query: &IndexReadQuery) -> Resul
             let page = scan_impls_fjall(
                 idx,
                 trait_name,
-                Matching::from_substring(!exact),
                 language.as_deref(),
                 clamp_limit(*limit),
                 cursor.as_deref(),
@@ -73,42 +64,39 @@ pub(crate) fn index_read_against(store: &Store, query: &IndexReadQuery) -> Resul
 /// handle instead of the workspace store lock: this scan walks the whole `calls_by_callee`
 /// partition and would otherwise block a rescan for its duration.
 pub(crate) fn call_scan(
-    idx: &dyn IndexView,
+    idx: &IndexDb,
     name: &str,
-    matching: Matching,
     limit: u32,
     cursor: Option<&[u8]>,
 ) -> Result<IndexReadResult, String> {
-    let page = scan_calls_by_name(idx, name, matching, clamp_limit(limit), cursor)
-        .map_err(|error| error.message.to_string())?;
+    let page = scan_calls_by_name(idx, name, clamp_limit(limit), cursor).map_err(|error| error.message.to_string())?;
     Ok(IndexReadResult::CallScan(call_page_to_wire(page)))
 }
 
 /// The `GrepBloom` arm on its own, so the daemon can run it holding only a cloned [`IndexDb`] handle
 /// and the workspace root instead of the store lock: it fetches a row and `stat`s a file per path.
 pub(crate) fn grep_skip(
-    idx: &dyn IndexView,
+    idx: &IndexDb,
     root: &std::path::Path,
     pattern: &str,
-    entries: &[crate::index::grep_bloom::GrepEntry],
+    paths: &[crate::path::RelPath],
 ) -> Result<IndexReadResult, String> {
     use crate::comms::index_read_proto::MAX_GREP_BLOOM_PATHS;
-    if entries.len() > MAX_GREP_BLOOM_PATHS {
+    if paths.len() > MAX_GREP_BLOOM_PATHS {
         return Err(format!(
             "grep bloom names {} files; at most {MAX_GREP_BLOOM_PATHS} per request",
-            entries.len()
+            paths.len()
         ));
     }
     // No usable literal: nothing can be skipped, and saying so is the answer, not an error.
     let Some(needle) = crate::index::grep_bloom::Needle::compile(pattern) else {
-        return Ok(IndexReadResult::GrepSkip(vec![false; entries.len()]));
+        return Ok(IndexReadResult::GrepSkip(vec![false; paths.len()]));
     };
-    Ok(IndexReadResult::GrepSkip(
-        idx.grep_skip_verdicts(root, entries, &needle),
-    ))
+    let refs: Vec<&crate::path::RelPath> = paths.iter().collect();
+    Ok(IndexReadResult::GrepSkip(idx.grep_skip_verdicts(root, &refs, &needle)))
 }
 
-fn calls_in_files(idx: &dyn IndexView, paths: &[crate::path::RelPath]) -> Result<IndexReadResult, String> {
+fn calls_in_files(idx: &IndexDb, paths: &[crate::path::RelPath]) -> Result<IndexReadResult, String> {
     if paths.len() > MAX_CALLS_IN_FILES {
         return Err(format!(
             "calls_in_files names {} files; at most {MAX_CALLS_IN_FILES} per request",
@@ -141,8 +129,7 @@ fn clamp_limit(limit: u32) -> usize {
 }
 
 fn call_page_to_wire(page: CallScanPage) -> WireCallScan {
-    let has_more = page.next_cursor.is_some() && page.stopped_after.is_none();
-    let resume_after = page.stopped_after;
+    let has_more = page.next_cursor.is_some();
     let hits = page
         .hits
         .into_iter()
@@ -161,14 +148,12 @@ fn call_page_to_wire(page: CallScanPage) -> WireCallScan {
         total: page.total,
         total_is_partial: page.total_is_partial,
         has_more,
-        resume_after,
         hits,
     }
 }
 
 /// Rebuild the scan page a writer session would have produced locally. The cursor is derived the
-/// same way the scan derives it: the last hit's key when more matches remain, else the key a
-/// capped scan stopped after.
+/// same way the scan derives it: the last hit's key, present only when more matches remain.
 pub(super) fn call_page_from_wire(wire: WireCallScan) -> CallScanPage {
     let mut hits = Vec::with_capacity(wire.hits.len());
     let mut hit_keys = Vec::with_capacity(wire.hits.len());
@@ -184,18 +169,16 @@ pub(super) fn call_page_from_wire(wire: WireCallScan) -> CallScanPage {
         hit_keys.push(hit.key);
         hit_starts.push(hit.start_byte);
     }
-    let stopped_after = if wire.has_more { None } else { wire.resume_after };
     let next_cursor = if wire.has_more {
         hit_keys.last().map(|key| Cursor::encode_fjall(key))
     } else {
-        stopped_after.as_deref().map(Cursor::encode_fjall)
+        None
     };
     CallScanPage {
         total: wire.total,
         total_is_partial: wire.total_is_partial,
         hits,
         next_cursor,
-        stopped_after,
         hit_keys,
         hit_starts,
     }
@@ -230,7 +213,6 @@ fn impl_page_to_wire(page: ImplScanPage) -> WireImplScan {
         total: page.total as u64,
         total_is_partial: page.total_is_partial,
         has_more: page.has_more,
-        resume_after: page.stopped_after,
         hits,
     }
 }
@@ -254,6 +236,5 @@ pub(super) fn impl_page_from_wire(wire: WireImplScan) -> ImplScanPage {
         hits,
         hit_keys,
         has_more: wire.has_more,
-        stopped_after: if wire.has_more { None } else { wire.resume_after },
     }
 }

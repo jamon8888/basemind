@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 /// Build the schema for the per-document-chunk `documents` table.
 ///
@@ -14,23 +14,54 @@ use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit}
 /// - `path`      UTF-8     repo-relative path of the source file
 /// - `chunk_idx` UInt32    0-based index of this chunk within the file
 /// - `mime_type` UTF-8     IANA MIME type xberg detected
+/// - `doc_type` UTF-8 nullable caller-curated document type
+/// - `section` UTF-8 nullable deterministic section role
+/// - `jurisdiction` UTF-8 nullable caller-curated jurisdiction
+/// - `doc_date` UTF-8 nullable ISO-8601 document date
+/// - `keywords` List<Utf8> nullable extracted keywords
+/// - `entities` List<Utf8> nullable `category:value` entities
+/// - `summary` UTF-8 nullable document-level summary
 /// - `text`      UTF-8     the chunk text (snippet returned by search results)
+/// - `text_phrase` UTF-8  an unstemmed copy of `text` used by the positional phrase index
+/// - `heading_path`  UTF-8  the Markdown heading breadcrumb the chunk sits under, `""` when it has
+///   none. Its own column because the keyword lane indexes it (see [`crate::lance::fts`]), and
+///   because Lance builds at most one inverted index per column. Computed unconditionally by the
+///   extractor, not behind `embed`: on a lexical-only store this is the only structural signal the
+///   keyword lane has.
 /// - `byte_start` UInt32   chunk start byte offset in the original document
 /// - `byte_end`  UInt32    chunk end byte offset
-/// - `embedding` FixedSizeList<Float32, DIM>  the embedding vector
+/// - `rehydration_ref`  UTF-8    nullable vault key for the document's encrypted rehydration map
+/// - `embedding` FixedSizeList<Float32, DIM>  the embedding vector, **nullable** — `embed = false`
+///   stores null rather than omitting the column, so a lexical-only store and a vector store share
+///   one schema and one `wipe_on_mismatch` path. The dimension still comes from the configured
+///   `embedding_preset`: `embed = false` means "do not run the embedder", not "no model configured",
+///   and the sibling `memory` / `code_chunks` tables in the same connection need a concrete dim
+///   regardless. Nothing is written into the column on a lexical-only store.
 pub fn documents_schema(dim: u16) -> SchemaRef {
+    let list_inner = Arc::new(Field::new("item", DataType::Utf8, true));
     Arc::new(Schema::new(vec![
         Field::new("scope", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("chunk_idx", DataType::UInt32, false),
         Field::new("mime_type", DataType::Utf8, false),
+        Field::new("doc_type", DataType::Utf8, true),
+        Field::new("section", DataType::Utf8, true),
+        Field::new("jurisdiction", DataType::Utf8, true),
+        Field::new("doc_date", DataType::Utf8, true),
+        Field::new("keywords", DataType::List(Arc::clone(&list_inner)), true),
+        Field::new("entities", DataType::List(list_inner), true),
+        Field::new("summary", DataType::Utf8, true),
         Field::new("text", DataType::Utf8, false),
+        Field::new("text_phrase", DataType::Utf8, false),
+        Field::new("heading_path", DataType::Utf8, false),
+        Field::new("cites", DataType::Utf8, false),
         Field::new("byte_start", DataType::UInt32, false),
         Field::new("byte_end", DataType::UInt32, false),
+        Field::new("rehydration_ref", DataType::Utf8, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), i32::from(dim)),
-            false,
+            true,
         ),
     ]))
 }
@@ -105,62 +136,119 @@ pub fn code_chunks_schema(dim: u16) -> SchemaRef {
     ]))
 }
 
+/// Build the schema for the `doc_links` table — the persisted document→code links (ADR-0008).
+///
+/// Vector-free (dim-independent): a link is a raw mention, resolution happens at graph-build time.
+/// Columns:
+/// - `scope`         UTF-8   ingestion scope (repo identity)
+/// - `doc_path`      UTF-8   repo-relative path of the source document
+/// - `chunk_idx`     UInt32  0-based chunk index within the document
+/// - `mention_kind`  UTF-8   `"name"` (identifier / keyword / entity) or `"path"` (path citation)
+/// - `mention_value` UTF-8   the raw mention text
+#[cfg(feature = "documents")]
+pub fn doc_links_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("doc_path", DataType::Utf8, false),
+        Field::new("chunk_idx", DataType::UInt32, false),
+        Field::new("mention_kind", DataType::Utf8, false),
+        Field::new("mention_value", DataType::Utf8, false),
+    ]))
+}
+
+/// Identity key source for entity nodes — mirrors spec 0016 §7.2.
+///
+/// Under `token_replace` the graph cannot join across documents by the literal
+/// (e.g. `[EMAIL_1]` appears in many documents). The key source distinguishes:
+/// - `TokenOfDocument`: (scope, label, literal, document_path) — document-scoped
+/// - `ClearLiteral`: (scope, label, normalized_literal) — global within scope
+/// - `GatewayToken`: (scope, label, gateway_token) — stable token from passerelle gaze, cross-document
+#[cfg(feature = "graphrag")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKeySource {
+    TokenOfDocument,
+    ClearLiteral,
+    GatewayToken,
+}
+
+/// Build the schema for the `graph_entities` table — entity nodes over the documents corpus.
+///
+/// One row per unique entity key (scope × label × key_source × normalized_literal/document).
+/// Columns:
+/// - `scope`            UTF-8     ingestion scope (repo identity)
+/// - `label`            UTF-8     GLiNER label (`person`, `organization`, `location`, `custom:*`)
+/// - `key_source`       UInt8     0 = TokenOfDocument, 1 = ClearLiteral, 2 = GatewayToken (EntityKeySource discriminant)
+/// - `normalized_literal` UTF-8  normalized literal (case-fold + ascii-fold + whitespace collapse) — for ClearLiteral
+/// - `document_path`    UTF-8     document path (only for TokenOfDocument; empty otherwise)
+/// - `gateway_token`    UTF-8     stable gateway token from passerelle (only for GatewayToken; empty otherwise)
+/// - `entity_id`        UTF-8     stable node id handed to lance-graph's Cypher engine (`ks<discriminant>|<label>|<key part>`);
+///   edges join on this column, so it must stay derivation-stable across rebuilds
+/// - `mention_count`    UInt32    number of mentions aggregated into this node
+/// - `first_seen_chunk` UInt32    chunk_idx of first mention (for ordering)
+/// - `last_seen_chunk`  UInt32    chunk_idx of last mention
+/// - `doc_path`         UTF-8     document path of the representative mention
+/// - `doc_chunk_idx`    UInt32    chunk index of the representative mention
+#[cfg(feature = "graphrag")]
+pub fn graph_entities_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("key_source", DataType::UInt8, false),
+        Field::new("normalized_literal", DataType::Utf8, false),
+        Field::new("document_path", DataType::Utf8, false),
+        Field::new("gateway_token", DataType::Utf8, false),
+        Field::new("entity_id", DataType::Utf8, false),
+        Field::new("mention_count", DataType::UInt32, false),
+        Field::new("first_seen_chunk", DataType::UInt32, false),
+        Field::new("last_seen_chunk", DataType::UInt32, false),
+        Field::new("doc_path", DataType::Utf8, false),
+        Field::new("doc_chunk_idx", DataType::UInt32, false),
+    ]))
+}
+
+/// Build the schema for the `graph_edges` table — co-occurrence edges within chunks.
+///
+/// One row per unique (source_entity_key, target_entity_key, chunk) triple.
+/// Columns:
+/// - `scope`           UTF-8    ingestion scope (repo identity)
+/// - `src_key_source`  UInt8    source EntityKeySource discriminant
+/// - `src_normalized_literal` UTF-8  source normalized literal
+/// - `src_document_path` UTF-8    source document path (for TokenOfDocument)
+/// - `src_label`       UTF-8    source entity label
+/// - `dst_key_source`  UInt8    target EntityKeySource discriminant
+/// - `dst_normalized_literal` UTF-8  target normalized literal
+/// - `dst_document_path` UTF-8    target document path (for TokenOfDocument)
+/// - `dst_label`       UTF-8    target entity label
+/// - `src_id`           UTF-8    source node `entity_id` (joins `graph_entities.entity_id` in Cypher)
+/// - `dst_id`           UTF-8    target node `entity_id`
+/// - `chunk_idx`       UInt32   chunk index where co-occurrence was observed
+/// - `doc_path`        UTF-8    document path of the chunk
+/// - `weight`          UInt32   number of times this edge was observed (always 1 per chunk, can accumulate across rebuilds)
+#[cfg(feature = "graphrag")]
+pub fn graph_edges_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("src_key_source", DataType::UInt8, false),
+        Field::new("src_normalized_literal", DataType::Utf8, false),
+        Field::new("src_document_path", DataType::Utf8, false),
+        Field::new("src_label", DataType::Utf8, false),
+        Field::new("dst_key_source", DataType::UInt8, false),
+        Field::new("dst_normalized_literal", DataType::Utf8, false),
+        Field::new("dst_document_path", DataType::Utf8, false),
+        Field::new("dst_label", DataType::Utf8, false),
+        Field::new("src_id", DataType::Utf8, false),
+        Field::new("dst_id", DataType::Utf8, false),
+        Field::new("chunk_idx", DataType::UInt32, false),
+        Field::new("doc_path", DataType::Utf8, false),
+        Field::new("weight", DataType::UInt32, false),
+    ]))
+}
+
 /// Table names — small constants in one place so the `LanceStore` impl and any
 /// future migration code agree on what's where.
 pub const DOCUMENTS_TABLE: &str = "documents";
 pub const MEMORY_TABLE: &str = "memory";
-#[cfg(feature = "code-search")]
 pub const CODE_CHUNKS_TABLE: &str = "code_chunks";
-
-/// Schemas for the experimental shared directory. Existing workspace tables retain their schema.
-#[doc(hidden)]
-pub fn shared_documents_schema(dim: u16) -> SchemaRef {
-    content_keyed(&documents_schema(dim), "path", false)
-}
-
-#[cfg(feature = "code-search")]
-#[doc(hidden)]
-pub fn shared_code_chunks_schema(dim: u16) -> SchemaRef {
-    content_keyed(&code_chunks_schema(dim), "path", true)
-}
-
-fn content_keyed(source: &SchemaRef, path_column: &str, add_ordinal: bool) -> SchemaRef {
-    let fields = source
-        .fields()
-        .iter()
-        .map(|field| {
-            if field.name() == path_column {
-                Arc::new(Field::new("content_hash", DataType::Utf8, false))
-            } else {
-                Arc::clone(field)
-            }
-        })
-        .chain(add_ordinal.then(|| Arc::new(Field::new("chunk_idx", DataType::UInt32, false))))
-        .collect::<Vec<_>>();
-    Arc::new(Schema::new(fields))
-}
-
-#[cfg(test)]
-mod shared_tests {
-    use super::*;
-
-    #[test]
-    fn shared_documents_replace_paths_with_content_keys() {
-        let local = documents_schema(384);
-        let shared = shared_documents_schema(384);
-        assert!(local.field_with_name("path").is_ok());
-        assert!(shared.field_with_name("path").is_err());
-        assert_eq!(
-            shared.field_with_name("content_hash").unwrap().data_type(),
-            &DataType::Utf8
-        );
-        assert_eq!(
-            shared.field_with_name("chunk_idx").unwrap().data_type(),
-            &DataType::UInt32
-        );
-        assert_eq!(
-            local.field_with_name("embedding").unwrap(),
-            shared.field_with_name("embedding").unwrap()
-        );
-    }
-}
+pub const DOC_LINKS_TABLE: &str = "doc_links";
+pub const GRAPH_ENTITIES_TABLE: &str = "graph_entities";
+pub const GRAPH_EDGES_TABLE: &str = "graph_edges";

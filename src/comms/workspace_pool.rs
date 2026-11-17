@@ -171,10 +171,6 @@ struct WorkspaceEntry {
     /// redundant. This is what stops N sessions' back-to-back full rescans (issue #44) from
     /// re-walking a monorepo N times.
     full_scan_gen: std::sync::atomic::AtomicU64,
-    /// Set at open when the fjall index was wiped or is empty over a populated file map; every
-    /// rescan runs full until one completes, which clears it. Without it the daemon would keep
-    /// serving empty reference reads for a workspace nobody asked to rescan.
-    rebuild_pending: std::sync::atomic::AtomicBool,
     /// The most recent completed full scan: (generation, embed mode, stats). Served to coalesced
     /// requests instead of re-scanning; an `Inline` result satisfies a `Deferred` request but not
     /// vice versa.
@@ -316,8 +312,6 @@ pub(crate) struct WorkspacePool {
     /// so the daemon reclaims the orphaned blobs promptly instead of waiting out the maintenance
     /// interval. A stored permit coalesces any number of passes into one wake-up.
     cleanup_signal: std::sync::Arc<tokio::sync::Notify>,
-    /// Held shared by every scan this pool runs, exclusively by the blob sweep.
-    blob_gc: std::sync::Arc<super::blob_gc_gate::BlobGcGate>,
 }
 
 impl WorkspacePool {
@@ -329,13 +323,7 @@ impl WorkspacePool {
             cap: cap.max(1),
             scan_cancel: ScanCancel::new(),
             cleanup_signal: std::sync::Arc::new(tokio::sync::Notify::new()),
-            blob_gc: std::sync::Arc::default(),
         }
-    }
-
-    /// The gate the blob sweep must hold exclusively (see [`super::blob_gc_gate`]).
-    pub(crate) fn blob_gc_gate(&self) -> std::sync::Arc<super::blob_gc_gate::BlobGcGate> {
-        std::sync::Arc::clone(&self.blob_gc)
     }
 
     /// The signal raised after a pass that displaced artifacts; the daemon's cleanup task waits on it.
@@ -380,48 +368,15 @@ impl WorkspacePool {
         embed: bool,
         cancel: &ScanCancel,
     ) -> Result<(ScanStats, bool), WorkspacePoolError> {
-        self.rescan_as(root, paths, full, embed, false, cancel)
-    }
-
-    /// [`rescan`](Self::rescan), saying whether `paths` were named by a person or an agent
-    /// (`verify`) or seen changing by a watcher: only named paths have their blobs validated.
-    pub(crate) fn rescan_as(
-        &self,
-        root: &Path,
-        paths: Option<Vec<PathBuf>>,
-        full: bool,
-        embed: bool,
-        verify: bool,
-        cancel: &ScanCancel,
-    ) -> Result<(ScanStats, bool), WorkspacePoolError> {
-        // Taken here, not by the callers: every way into a scan passes through this function.
-        let _scanning = self.blob_gc.scanning();
         let entry = self.get_or_open(root)?;
         entry.touch();
         let _busy = entry.begin_busy();
 
         let mode = if embed { EmbedMode::Inline } else { EmbedMode::Deferred };
         let config = entry.config();
-        let rebuild_pending = entry.rebuild_pending.load(std::sync::atomic::Ordering::Acquire);
+        let incremental = matches!(paths, Some(ref p) if !full && !p.is_empty());
         let gen_before = entry.full_scan_gen.load(std::sync::atomic::Ordering::Acquire);
         let mut store = entry.store.lock().unwrap_or_else(PoisonError::into_inner);
-        if store.layered_read.is_some()
-            && !cancel.is_cancelled()
-            && crate::store_base::refresh_worktree(&entry.root, &config).unwrap_or(false)
-        {
-            let mut next = Store::open_read_only_no_index(&entry.root, VIEW_WORKING)?;
-            if crate::store_base::hydrate_cold_store(&mut next, &config).is_ok() && next.layered_read.is_some() {
-                let stats = crate::store_base::layered_scan_stats(&store, &next);
-                *store = next;
-                return Ok((stats, false));
-            }
-        }
-        let from_layered = store.layered_read.is_some();
-        let full = full || rebuild_pending || from_layered || store.needs_full_scan();
-        let incremental = matches!(paths, Some(ref p) if !full && !p.is_empty());
-        if store.layered_read.is_some() {
-            *store = Store::open_with_holder(&entry.root, VIEW_WORKING, LockHolder::Rescan)?;
-        }
         if !incremental {
             let last = entry.last_full.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some((generation, last_mode, stats)) = *last
@@ -434,59 +389,25 @@ impl WorkspacePool {
         if cancel.is_cancelled() {
             return Ok((ScanStats::default(), true));
         }
-        // The daemon owns the embedding engine for forwarded and hosted passes alike: release it when
-        // the last concurrent full Inline pass ends. Incremental passes keep it warm for searches.
+        // The daemon owns the embedding engine for forwarded and hosted passes alike. Incremental
+        // batches retain it for the next edit; full passes release it unless warm models are opted in.
         #[cfg(feature = "intelligence")]
-        let _embed_pass = (matches!(mode, EmbedMode::Inline) && !incremental).then(crate::embeddings::begin_embed_pass);
-        let scanned = if incremental {
+        let _embed_pass = matches!(mode, EmbedMode::Inline)
+            .then(|| crate::embeddings::begin_embed_pass_with_policy(config.resources.keep_models_warm || incremental));
+        let report = if incremental {
             let paths = paths.as_deref().unwrap_or_default();
-            let (root, observer) = (&entry.root, &mut scanner::NullObserver);
-            if verify {
-                scanner::scan_named_paths_with_observer(root, &mut store, &config, paths, mode, cancel, observer)
-            } else {
-                scanner::scan_paths_with_observer(root, &mut store, &config, paths, mode, cancel, observer)
-            }
+            scanner::scan_paths_with_cancel(&entry.root, &mut store, &config, paths, mode, cancel)?
         } else {
-            scanner::scan_with_cancel(&entry.root, &mut store, &config, ScanSource::WorkingTree, mode, cancel)
+            scanner::scan_with_cancel(&entry.root, &mut store, &config, ScanSource::WorkingTree, mode, cancel)?
         };
-        // Before the scan's error propagates: a poisoned handle fails every later commit for the life
-        // of the daemon, so it has to be replaced whether or not this pass got to report it.
-        self.recover_poisoned_index(&entry, &mut store);
-        let report = scanned?;
-        if from_layered
-            && !report.cancelled
-            && report.stats.read_failed == 0
-            && report.stats.extract_failed == 0
-            && let Err(error) = crate::store_base::record_promotion(&entry.root, &config)
-        {
-            tracing::debug!(%error, "shared index promotion marker failed");
-        }
         if report.stats.displaced_artifacts() || std::mem::take(&mut store.reset_stale_schema) {
             self.cleanup_signal.notify_one();
         }
         if !incremental && !report.cancelled {
-            entry.rebuild_pending.store(false, std::sync::atomic::Ordering::Release);
-            store.index_rebuild_needed = false;
             let generation = entry.full_scan_gen.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
             *entry.last_full.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, mode, report.stats));
         }
         Ok((report.stats, report.cancelled))
-    }
-
-    /// Replace a poisoned code-index handle (a failed flush or commit; see
-    /// [`IndexDb::is_poisoned`](crate::index::IndexDb::is_poisoned)) by reopening the database,
-    /// which replays the journal into a fresh handle. When the reopen fails the entry is evicted so
-    /// the next request opens the workspace from scratch instead of serving a dead handle. Either
-    /// way the status sidecar already reads partial, so the next open schedules a full scan.
-    fn recover_poisoned_index(&self, entry: &WorkspaceEntry, store: &mut Store) {
-        if !store.index_db.as_ref().is_some_and(crate::index::IndexDb::is_poisoned) {
-            return;
-        }
-        tracing::warn!(root = %entry.root.display(), "index handle poisoned; reopening");
-        if let Err(error) = store.reopen_index_db() {
-            tracing::error!(root = %entry.root.display(), %error, "index reopen failed; evicting the workspace");
-            self.lock_map().remove(&entry.key);
-        }
     }
 
     /// Run `f` against a workspace's open read-write [`Store`] (immutable borrow), opening it into
@@ -742,33 +663,14 @@ impl WorkspacePool {
         }
         let pool = std::sync::Arc::clone(self);
         let root = root.to_path_buf();
-        let entry = tokio::task::spawn_blocking(move || pool.get_or_open(&root))
+        tokio::task::spawn_blocking(move || pool.get_or_open(&root))
             .await
             .map_err(|join| {
                 WorkspacePoolError::Store(store::StoreError::Io {
                     path: PathBuf::new(),
                     source: std::io::Error::other(format!("workspace open task failed: {join}")),
                 })
-            })??;
-        self.spawn_pending_rebuild(&entry);
-        Ok(entry)
-    }
-
-    /// Start the full scan a freshly opened workspace owes when its index was wiped or is empty over
-    /// a populated file map. Detached: the open must not wait on a whole-tree scan. The entry's
-    /// `rebuild_pending` flag makes a racing client rescan run full too, and the scan coalesces.
-    #[cfg(all(feature = "comms", any(unix, windows)))]
-    fn spawn_pending_rebuild(self: &std::sync::Arc<Self>, entry: &WorkspaceEntry) {
-        if !entry.rebuild_pending.load(std::sync::atomic::Ordering::Acquire) {
-            return;
-        }
-        let pool = std::sync::Arc::clone(self);
-        let root = entry.root.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = pool.rescan(&root, None, true, false, &pool.scan_cancel) {
-                tracing::warn!(root = %root.display(), %error, "index rebuild scan failed");
-            }
-        });
+            })?
     }
 
     /// Fetch the entry for `root`, opening it read-write and inserting it (evicting LRU past the
@@ -810,24 +712,9 @@ impl WorkspacePool {
                 });
             }
         };
+        let store = Store::open_with_holder(&resolved, VIEW_WORKING, LockHolder::Rescan)?;
         let config_stamp = config::daemon::ConfigStamp::of(&resolved);
         let config = config::daemon::load_daemon(&resolved)?;
-        let mut cold = None;
-        if std::env::var_os("BASEMIND_INDEX_LAYERED").is_some_and(|value| value == "1") {
-            let mut store = Store::open_read_only_no_index(&resolved, VIEW_WORKING)?;
-            if crate::store_base::hydrate_cold_store(&mut store, &config).is_ok() && store.layered_read.is_some() {
-                cold = Some(store);
-            }
-        }
-        let store = match cold {
-            Some(store) => store,
-            None => Store::open_with_holder(&resolved, VIEW_WORKING, LockHolder::Rescan)?,
-        };
-        let rebuild_pending = store.index_rebuild_needed;
-        if rebuild_pending {
-            tracing::warn!(root = %resolved.display(), "index is empty over a populated file map; scheduling a full rebuild");
-            store.mark_status_health(&crate::store::ScanHealth::partial("index rebuilding", 0, 0));
-        }
         let entry = std::sync::Arc::new(WorkspaceEntry {
             store: Mutex::new(store),
             config: std::sync::RwLock::new(std::sync::Arc::new(config)),
@@ -836,7 +723,6 @@ impl WorkspacePool {
             key: key.clone(),
             last_used: Mutex::new(Instant::now()),
             full_scan_gen: std::sync::atomic::AtomicU64::new(0),
-            rebuild_pending: std::sync::atomic::AtomicBool::new(rebuild_pending),
             last_full: Mutex::new(None),
             #[cfg(all(feature = "comms", any(unix, windows)))]
             serve_state: tokio::sync::Mutex::new(None),
@@ -907,9 +793,98 @@ impl WorkspacePool {
     }
 }
 
+/// The in-process host seam: a daemon-hosted read stack routes its writes / rescans / precise
+/// resolved-reference reads straight through the pool (the machine's sole fjall writer) instead of
+/// forwarding them over the daemon's own socket — the daemon would otherwise dial itself. Mirrors
+/// the forwarded-op handlers in [`daemon_forward_handlers`](super::daemon_forward_handlers) exactly;
+/// the pool's per-workspace store lock supplies the same serialization the socket path relied on.
+///
+/// Methods are synchronous (the pool's API is blocking); call sites run them under `spawn_blocking`.
 #[cfg(all(feature = "comms", any(unix, windows)))]
-#[path = "workspace_pool_host.rs"]
-mod host;
+impl crate::mcp::HostBackend for WorkspacePool {
+    fn host_rescan(
+        &self,
+        root: &Path,
+        paths: Option<Vec<PathBuf>>,
+        full: bool,
+        embed: bool,
+    ) -> Result<ScanStats, String> {
+        // Use the broker's shared drain token (not a throwaway `default()`), so a hosted mid-scan — ~keep
+        // e.g. a full-corpus Inline embed pass — honors `comms stop` / SIGTERM within one file ~keep
+        // instead of pinning the runtime until the 15s teardown backstop. The socket path already ~keep
+        // threads this token; the host seam must too. ~keep
+        self.rescan(root, paths, full, embed, &self.scan_cancel)
+            .map(|(stats, _cancelled)| stats)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "code-search")]
+    fn host_code_search_lanes(
+        &self,
+        root: &Path,
+        query: crate::comms::code_search_proto::CodeSearchLaneQuery,
+    ) -> Result<crate::comms::code_search_proto::CodeSearchLaneResult, String> {
+        self.with_workspace(root, |store| {
+            super::daemon_forward_handlers::code_search_lanes_against(store, &query)
+        })
+        .map_err(|error| error.to_string())?
+    }
+
+    fn host_index_read(
+        &self,
+        root: &Path,
+        query: crate::comms::index_read_proto::IndexReadQuery,
+    ) -> Result<crate::comms::index_read_proto::IndexReadResult, String> {
+        super::daemon_forward_handlers::index_read_via_pool(self, root, &query)
+    }
+
+    fn host_resolved_refs(
+        &self,
+        root: &Path,
+        query: crate::comms::resolved_proto::ResolvedRefQuery,
+    ) -> Result<crate::comms::resolved_proto::ResolvedRefResult, String> {
+        self.with_workspace(root, |store| {
+            super::daemon_forward_handlers::resolve_refs_against(store, &query)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "memory")]
+    fn host_memory(
+        &self,
+        root: &Path,
+        scope: &str,
+        op: crate::comms::memory_proto::MemoryOp,
+    ) -> Result<crate::comms::memory_proto::MemoryOutcome, String> {
+        self.with_workspace_mut(root, |store| {
+            let idx = store
+                .index_db
+                .as_ref()
+                .ok_or(crate::mcp::memory_ops::MemoryOpError::IndexUnavailable)?;
+            crate::mcp::memory_ops::run_memory_op(idx, scope, &op)
+        })
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    }
+
+    #[cfg(feature = "memory")]
+    fn host_governance(
+        &self,
+        root: &Path,
+        scope: &str,
+        op: crate::comms::proposals_proto::GovernanceOp,
+    ) -> Result<crate::comms::proposals_proto::GovernanceOutcome, String> {
+        self.with_workspace_mut(root, |store| {
+            let idx = store
+                .index_db
+                .as_ref()
+                .ok_or(crate::mcp::memory_ops::MemoryOpError::IndexUnavailable)?;
+            crate::mcp::proposals_ops::run_governance_op(idx, scope, &op)
+        })
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    }
+}
 
 #[cfg(test)]
 #[path = "workspace_pool_tests.rs"]

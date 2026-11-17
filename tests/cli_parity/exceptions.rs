@@ -13,7 +13,6 @@ const fn cli_only(cli: &'static str, param: &'static str, reason: &'static str) 
         reason,
     }
 }
-#[allow(dead_code)]
 const fn mcp_only(cli: &'static str, param: &'static str, reason: &'static str) -> Exception {
     Exception {
         cli,
@@ -85,47 +84,49 @@ pub const GLOBAL_FLAGS: &[(&str, &str)] = &[
     ),
 ];
 
-const REPEATABLE: &str = "repeatable CLI flag for the MCP list";
-const TIER: &str = "CLI switch selects the `individual` tier; MCP takes the tier name";
-const SYMBOL: &str = "the shorthand's positional `name` is the tool's `symbol`";
+const GRAPH_KNOBS: &str =
+    "TODO parity: graph traversal knob not exposed on the CLI; the command runs with the MCP default";
+const INVERTED: &str = "CLI spells the negation (`--no-X`) of the MCP boolean `X`";
+const STDIN: &str = "CLI reads this from stdin, MCP takes it as a required parameter";
+const VAULT_RUNTIME_REQUIRED: &str = "the MCP field rides the flat VaultParams object as optional and the mode validates it at runtime; the CLI declares the flag required up front";
 
 pub fn all() -> Vec<Exception> {
     vec![
-        // ---- renamed arguments ----
-        alias("memory put", "tag", "tags", REPEATABLE),
-        alias("memory put", "individual", "visibility", TIER),
-        alias("memory search", "individual", "visibility", TIER),
-        alias("memory get", "individual", "visibility", TIER),
-        alias("memory list", "individual", "visibility", TIER),
+        // ---- renamed / sense-inverted arguments ----
+        alias("code grep", "no_context", "include_context", INVERTED),
+        alias("git recent", "no_files", "include_files", INVERTED),
+        alias("admin compress", "no_preserve_code", "preserve_code", INVERTED),
+        alias("memory put", "no_embed", "embed", INVERTED),
+        alias("web scrape", "no_index", "index", INVERTED),
+        alias("shell send", "no_enter", "enter", INVERTED),
+        alias("shell broadcast", "no_enter", "enter", INVERTED),
         alias(
-            "code dependents",
-            "module",
-            "name",
-            "the shorthand's positional `module` is the tool's `name`",
+            "shell broadcast",
+            "session",
+            "session_ids",
+            "repeatable CLI flag for the MCP id list",
         ),
-        alias("git symbol-history", "name", "symbol", SYMBOL),
-        alias("git blame-symbol", "name", "symbol", SYMBOL),
+        alias("agents post", "tag", "tags", "repeatable CLI flag for the MCP list"),
         alias(
-            "git diff-outline",
-            "rev",
-            "from",
-            "the shorthand's `--rev` is the revision the working tree is compared against",
+            "agents register",
+            "skill",
+            "skills",
+            "repeatable CLI flag for the MCP list",
         ),
         alias("rescan", "path", "paths", "variadic positional for the MCP list"),
-        alias("agents post", "tag", "tags", REPEATABLE),
+        alias("graph map", "no_churn", "include_churn", INVERTED),
         alias(
-            "agents ack",
-            "message_id",
-            "message_ids",
-            "repeatable CLI flag for the MCP reference list",
+            "cache clear",
+            "yes",
+            "confirm",
+            "CLI `--yes` skips the interactive prompt; MCP has no terminal, so the caller confirms with `confirm`",
         ),
         alias(
-            "agents message",
-            "message_id",
-            "message_ref",
-            "CLI positional accepts a compact reference or legacy ID",
+            "memory *",
+            "individual",
+            "visibility",
+            "CLI switch selects the `individual` tier; MCP takes the tier name",
         ),
-        alias("agents register", "skill", "skills", REPEATABLE),
         // ---- CLI-only arguments ----
         cli_only(
             "agents cleanup",
@@ -133,36 +134,83 @@ pub fn all() -> Vec<Exception> {
             "no-op flag (preview is the default); MCP expresses intent through `apply`",
         ),
         cli_only(
+            "cache gc",
+            "dry_run",
+            "the CLI deletes by default and `--dry-run` selects the report; the MCP `gc` mode is always the read-only report",
+        ),
+        cli_only(
             "rescan",
             "no_git_history",
-            "TODO parity: `index_rescan` cannot skip the git-history index build",
+            "TODO parity: the MCP `rescan` cannot skip the git-history index build",
         ),
         cli_only(
             "rescan",
             "rebuild_git_history",
-            "TODO parity: `index_rescan` cannot wipe and rebuild the git-history index",
+            "TODO parity: the MCP `rescan` cannot wipe and rebuild the git-history index",
         ),
         // ---- MCP-only parameters ----
+        mcp_only("checkpoint", "text", STDIN),
+        mcp_only("graph communities", "max_communities", GRAPH_KNOBS),
+        mcp_only("graph communities", "members_per_community", GRAPH_KNOBS),
+        mcp_only("graph export", "algorithm", GRAPH_KNOBS),
+        mcp_only("graph export", "edges", GRAPH_KNOBS),
+        mcp_only("graph export", "max_edges", GRAPH_KNOBS),
+        mcp_only("graph export", "max_nodes", GRAPH_KNOBS),
+        mcp_only("graph export", "min_confidence", GRAPH_KNOBS),
         mcp_only(
-            "memory search",
-            "key",
-            "the `key` shape of `memory_search` is `basemind memory get`",
+            "graph export",
+            "write",
+            "TODO parity: MCP can write the export to a file; the CLI prints it",
         ),
-        mcp_only(
-            "memory search",
-            "prefix",
-            "the `prefix` shape of `memory_search` is `basemind memory list`",
+        mcp_only("graph neighbors", "depth", GRAPH_KNOBS),
+        mcp_only("graph neighbors", "direction", GRAPH_KNOBS),
+        mcp_only("graph neighbors", "edges", GRAPH_KNOBS),
+        mcp_only("graph neighbors", "max_nodes", GRAPH_KNOBS),
+        mcp_only("graph neighbors", "min_confidence", GRAPH_KNOBS),
+        mcp_only("graph path", "edges", GRAPH_KNOBS),
+        mcp_only("graph path", "include_contains", GRAPH_KNOBS),
+        mcp_only("graph path", "min_confidence", GRAPH_KNOBS),
+        mcp_only("graph path", "to_path", GRAPH_KNOBS),
+        mcp_only("graph subgraph", "depth", GRAPH_KNOBS),
+        mcp_only("graph subgraph", "edges", GRAPH_KNOBS),
+        mcp_only("graph subgraph", "max_nodes", GRAPH_KNOBS),
+        mcp_only("graph subgraph", "min_confidence", GRAPH_KNOBS),
+        // ---- allowed values ----
+        values(
+            "graph calls",
+            "direction",
+            "the MCP `direction` field is shared with `neighbors` (`both|out|in`) and also accepts `callers`/`callees` synonyms there, so no single enum fits",
         ),
-        mcp_only(
-            "memory search",
-            "cursor",
-            "only a listing pages; `basemind memory list` takes `--cursor`",
+        values(
+            "graph display",
+            "format",
+            "the MCP `format` enum is the `export` set; `display` accepts only the visual subset `html|svg`",
+        ),
+        values(
+            "graph open",
+            "format",
+            "the MCP `format` enum is the `export` set; `open` accepts only the visual subset `html|svg`",
         ),
         // ---- required-ness ----
         required(
-            "memory search",
-            "query",
-            "`basemind memory search` is the query shape of `memory_search`, whose selector is optional",
+            "cache clear",
+            "component",
+            "TODO parity: MCP requires `component`; the CLI defaults to `git-cache`",
         ),
+        required("delta", "new", STDIN),
+        required("detect-waste", "log", STDIN),
+        // ---- vault: one flat MCP parameter object vs per-mode CLI flags ----
+        mcp_only(
+            "vault decrypt",
+            "map",
+            "one flat VaultParams object serves all five modes; decrypt reads encrypted_blob and passphrase only, so the CLI has no inert --map flag",
+        ),
+        required("vault encrypt", "map", STDIN),
+        required("vault encrypt", "passphrase", VAULT_RUNTIME_REQUIRED),
+        required("vault find", "map", STDIN),
+        required("vault find", "query", VAULT_RUNTIME_REQUIRED),
+        required("vault forget", "map", STDIN),
+        required("vault forget", "query", VAULT_RUNTIME_REQUIRED),
+        required("vault inspect", "map", STDIN),
     ]
 }

@@ -39,15 +39,6 @@ pub(crate) trait HostBackend: Send + Sync {
         embed: bool,
     ) -> Result<crate::scanner::ScanStats, String>;
 
-    /// [`host_rescan`](Self::host_rescan) of paths a person or an agent named: a named file that
-    /// reads as unchanged has its blob validated.
-    fn host_rescan_named(
-        &self,
-        root: &Path,
-        paths: Vec<PathBuf>,
-        embed: bool,
-    ) -> Result<crate::scanner::ScanStats, String>;
-
     /// Answer a precise resolved-reference query against the workspace's read-write fjall index (the
     /// pool holds it as the sole writer, so the cross-file `refs_by_def` / `refs_by_path` edges a
     /// read-only serve cannot see are present).
@@ -87,4 +78,14 @@ pub(crate) trait HostBackend: Send + Sync {
         scope: &str,
         op: crate::comms::memory_proto::MemoryOp,
     ) -> Result<crate::comms::memory_proto::MemoryOutcome, String>;
+
+    /// Run a PROPOSAL governance operation against the workspace's read-write index. Same locking
+    /// contract as [`host_memory`](Self::host_memory).
+    #[cfg(feature = "memory")]
+    fn host_governance(
+        &self,
+        root: &Path,
+        scope: &str,
+        op: crate::comms::proposals_proto::GovernanceOp,
+    ) -> Result<crate::comms::proposals_proto::GovernanceOutcome, String>;
 }

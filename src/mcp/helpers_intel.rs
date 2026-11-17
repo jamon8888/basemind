@@ -20,134 +20,65 @@ use super::types::{DefinitionLocation, GotoDefinitionParams, GotoDefinitionRespo
 use crate::intel::model::ResolvedEdge;
 use crate::path::RelPath;
 
-/// Body of `code_refs` relation `definition`. Resolves the reference at `path`:`line`:`column` to
-/// its definition, following a cross-file hop when the in-file binding is an import. Returns
+/// Body of the `code` tool's `definition` mode. Resolves the reference at `path`:`line`:`column` to its
+/// definition, following a cross-file hop when the in-file binding is an import. Returns
 /// `definition: None` (not an error) when the position holds no resolved binding.
-///
-/// Resolution edges are byte offsets into the content that was indexed, so the file is read once,
-/// bounded, and must still be that content; the same holds for the file a cross-file edge lands in.
-///
-/// The store is read-locked for the whole call, file reads included: the stamp each file is judged
-/// against, the resolution blob and a locally read cross-file edge then come from one scan, never
-/// from either side of a rescan that landed in between. A rescan waits for the reads, which are
-/// bounded by `scan.max_file_bytes`. A cross-file edge the daemon answers (a `daemon_writer` serve, or
-/// a session the daemon hosts) comes from the daemon's index, outside this guard. The file it lands in
-/// is still read against this store's stamp, which catches a file changed since that stamp, but not an
-/// edge the daemon's resolve pass has yet to rewrite after a rescan this store already reflects.
 pub(super) async fn run_goto_definition(
     state: &ServerState,
     params: GotoDefinitionParams,
 ) -> Result<CallToolResult, McpError> {
     let started = std::time::Instant::now();
-    let max_bytes = state.shared.config.scan.max_file_bytes;
-    // The index is consulted before the file is read, so a path that is not indexed cannot be
-    // probed for existence or contents through the errors below.
-    let store = state.shared.store.read().await;
-    let Some(entry) = store.lookup(&params.path) else {
-        return Err(super::tool_contract::not_indexed_in(
-            &store,
-            &state.shared.root,
-            "code_refs",
-            &params.path,
-        ));
-    };
-    let file = super::tool_contract::indexed_file(state, &store, "code_refs", &params.path)?;
-    let source = super::index_route::blocking(|| {
-        super::freshness::load_fresh("code_refs", &params.path, &file, entry.into(), max_bytes)
-    })?;
-    let column = match params.column {
-        Some(column) => column,
-        None => column_of(&source, &params.path, params.line, &params.name)?,
-    };
+    let abs = state.shared.root.join(params.path.to_path_buf());
+    let source = std::fs::read(&abs)
+        .map_err(|e| McpError::invalid_params(format!("goto_definition: read {}: {e}", params.path), None))?;
 
-    let pos = line_col_to_offset(&source, params.line, column).ok_or_else(|| {
+    let pos = line_col_to_offset(&source, params.line, params.column).ok_or_else(|| {
         McpError::invalid_params(
             format!(
-                "`code_refs`: position {}:{} is out of range in `{}`",
-                params.line,
-                column + 1,
-                params.path
+                "goto_definition: position {}:{} is out of range in {}",
+                params.line, params.column, params.path
             ),
             None,
         )
     })?;
 
-    let refs = store.read_resolved_by_hex(&entry.hash_hex).unwrap_or_else(|error| {
-        tracing::debug!(path = %params.path, %error, "goto_definition: resolution blob unreadable — treating as no in-file edge");
-        None
-    });
-    let resolution_ran = refs.is_some();
-    let pass_complete = resolution_ran || resolve_pass_complete(&store);
-    let intra_def = refs
-        .as_ref()
-        .and_then(|r| containing_edge(&r.intra, pos))
-        .map(|e| e.def_start);
-    let resolved: Option<(RelPath, u32)> = match intra_def {
-        Some(def_start) => Some(
-            resolve_definition(state, &store, &params.path, def_start)
-                .await
-                .unwrap_or((params.path.clone(), def_start)),
-        ),
-        None => resolve_definition(state, &store, &params.path, pos).await,
+    let resolved: Option<(RelPath, u32)> = {
+        let store = state.shared.store.read().await;
+        let Some(entry) = store.lookup(&params.path) else {
+            return Err(McpError::invalid_params(
+                format!("goto_definition: {} is not indexed", params.path),
+                None,
+            ));
+        };
+        let refs = store.read_resolved_by_hex(&entry.hash_hex).unwrap_or_else(|error| {
+            tracing::debug!(path = %params.path, %error, "goto_definition: resolution blob unreadable — treating as no in-file edge");
+            None
+        });
+        let intra_def = refs
+            .as_ref()
+            .and_then(|r| containing_edge(&r.intra, pos))
+            .map(|e| e.def_start);
+        match intra_def {
+            Some(def_start) => Some(
+                resolve_definition(state, &store, &params.path, def_start)
+                    .await
+                    .unwrap_or((params.path.clone(), def_start)),
+            ),
+            None => resolve_definition(state, &store, &params.path, pos).await,
+        }
     };
 
-    let definition = match resolved {
-        Some((def_path, def_start)) => definition_location(state, &store, &params.path, &source, def_path, def_start)?,
-        None => None,
-    };
+    let definition = resolved
+        .and_then(|(def_path, def_start)| definition_location(state, &params.path, &source, def_path, def_start));
 
     let (line, column) = offset_to_line_col(&source, pos);
-    let resolution = if definition.is_none() && !resolution_ran {
-        resolution_gap(Some(&entry.language), pass_complete)
-    } else {
-        None
-    };
     json_result(&GotoDefinitionResponse {
         path: params.path,
         line,
-        column: column + 1,
+        column,
         definition,
-        resolution,
         elapsed_us: super::helpers::elapsed_us(started),
     })
-}
-
-/// What to report when a file has no resolution blob. The scan writes one only for a file that
-/// produced facts, so its absence means one of three things, each a different answer: the language
-/// has no resolution engine, the resolve pass has not finished for this index (`pass_complete` is
-/// false: every file lacks facts then), or the pass ran and this file bound nothing.
-pub(super) fn resolution_gap(language: Option<&str>, pass_complete: bool) -> Option<String> {
-    match language {
-        Some(language) if crate::intel::resolve::supports(language) => Some(
-            if pass_complete {
-                NO_RESOLUTION_FACTS
-            } else {
-                RESOLUTION_NOT_RUN
-            }
-            .to_string(),
-        ),
-        Some(language) => Some(format!("unsupported for {language}")),
-        None => Some("unsupported for this language".to_string()),
-    }
-}
-
-/// `resolution` value for a file of a supported language that produced no resolution facts.
-pub(super) const NO_RESOLUTION_FACTS: &str = "no resolution facts for this file";
-
-/// `resolution` value when the file has resolution facts and none of them names the pinned
-/// definition (nothing in the file refers to it and it is not exported).
-pub(super) const NO_DEFINITION_FACTS: &str = "no resolution facts for this definition";
-
-/// `resolution` value when the index's resolve pass did not run to completion.
-pub(super) const RESOLUTION_NOT_RUN: &str =
-    "resolution has not finished for this index; a running scan will complete it, otherwise run `index_rescan`";
-
-/// Whether the last scan's resolve pass committed. The scan stamps `status.json` as resolving when
-/// it flushes the code map and as complete once the pass has committed every edge; a cancelled or
-/// aborted scan leaves it partial. A missing sidecar vouches for nothing either way and reads as
-/// complete, as it does for the boot-time rescan decision.
-pub(super) fn resolve_pass_complete(store: &crate::store::Store) -> bool {
-    crate::store::read_status_sidecar(&store.basemind_dir).is_none_or(|status| !status.is_degraded())
 }
 
 /// The definition the use at `(use_path, use_start)` binds to. A `daemon_writer` serve has no open
@@ -219,67 +150,38 @@ async fn resolve_definition(
     crate::query::definition_of(store, use_path, use_start)
 }
 
-/// The 0-based byte column where `name` first occurs as a whole identifier on `line` of `source`
-/// (`get` in `budget.pop(get)` is the argument, not the tail of `budget`).
-fn column_of(source: &[u8], path: &RelPath, line: u32, name: &str) -> Result<u32, McpError> {
-    let text = source
-        .split(|byte| *byte == b'\n')
-        .nth(line.saturating_sub(1) as usize)
-        .ok_or_else(|| McpError::invalid_params(format!("`code_refs`: `{path}` has no line {line}"), None))?;
-    let finder = memchr::memmem::Finder::new(name.as_bytes());
-    crate::textmatch::find_whole(text, &finder)
-        .map(|column| column as u32)
-        .ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "`code_refs`: `{name}` does not occur on line {line} of `{path}`. Pass the 1-based `column` \
-                     of the reference, or the line it is on."
-                ),
-                None,
-            )
-        })
-}
-
 /// Build a [`DefinitionLocation`] for a resolved `(def_path, def_start)`. Reuses the already-read
 /// `query_source` when the definition is in the queried file; otherwise reads the target file (a
 /// cross-file definition). The identifier text is recovered from `def_start` since only the start
-/// byte is indexed for cross-file / `locals` edges.
-///
-/// `None` when a cross-file target is not an indexed file of this repository. A target that was
-/// edited or deleted since the scan is an error: `def_start` is an offset into the indexed bytes.
-/// `store` is the guard the edge was resolved under, so the target's stamp is of the same scan.
+/// byte is indexed for cross-file / `locals` edges. Returns `None` if a cross-file target can't be
+/// read (e.g. removed between scan and query).
 fn definition_location(
     state: &ServerState,
-    store: &crate::store::Store,
     query_path: &RelPath,
     query_source: &[u8],
     def_path: RelPath,
     def_start: u32,
-) -> Result<Option<DefinitionLocation>, McpError> {
-    let located = |source: &[u8], path: RelPath| {
-        let (line, column) = offset_to_line_col(source, def_start);
-        DefinitionLocation {
-            name: identifier_at(source, def_start),
-            path,
-            line,
-            column: column + 1,
-        }
-    };
+) -> Option<DefinitionLocation> {
     if &def_path == query_path {
-        return Ok(Some(located(query_source, def_path)));
+        let (line, column) = offset_to_line_col(query_source, def_start);
+        let name = identifier_at(query_source, def_start);
+        return Some(DefinitionLocation {
+            path: def_path,
+            line,
+            column,
+            name,
+        });
     }
-    let target = store.lookup(&def_path).and_then(|entry| {
-        let file = super::tool_contract::IndexedFiles::of(state).indexed_path(&def_path)?;
-        Some((file, entry))
-    });
-    let Some((file, entry)) = target else {
-        return Ok(None);
-    };
-    let max_bytes = state.shared.config.scan.max_file_bytes;
-    let def_source = super::index_route::blocking(|| {
-        super::freshness::load_fresh("code_refs", &def_path, &file, entry.into(), max_bytes)
-    })?;
-    Ok(Some(located(&def_source, def_path)))
+    let abs = state.shared.root.join(def_path.to_path_buf());
+    let def_source = std::fs::read(&abs).ok()?;
+    let (line, column) = offset_to_line_col(&def_source, def_start);
+    let name = identifier_at(&def_source, def_start);
+    Some(DefinitionLocation {
+        path: def_path,
+        line,
+        column,
+        name,
+    })
 }
 
 /// The intra-file edge whose use span contains `pos`. A zero-width span (`use_end == use_start`,

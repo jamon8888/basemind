@@ -14,8 +14,6 @@
 //! sibling's scope, so copying would leak foreign rows; the seeded index records a sentinel embed
 //! policy so the first `Inline` full scan re-flushes every eligible file into a fresh lance store),
 //! `workspace.json` (keyed to the new root by `ensure_workspace_marker`), `status.json`, `.lock`.
-//! User memory is not in the view at all: it lives in the per-repo-group `memory.fjall`, and rows a
-//! pre-group sibling still carries are merged there (and dropped from the clone) on the first open.
 //!
 //! Consistency: the clone is taken only while the sibling's exclusive workspace lock is held by US. A
 //! directory copy of a live fjall database is not a snapshot, and `index.msgpack` and `index.fjall`
@@ -144,25 +142,18 @@ pub(crate) fn seed_working_view(root: &Path, basemind_dir: &Path, view_dir: &Pat
         .write(true)
         .open(source_ws.join(LOCK_FILE))
         .ok()
-        .and_then(|f| fs2::FileExt::try_lock_exclusive(&f).ok().map(|()| f))
-        .map(crate::store_lock::LockGuard::held);
+        .and_then(|f| fs2::FileExt::try_lock_exclusive(&f).ok().map(|()| f));
     let Some(sibling_lock) = sibling_lock else {
         tracing::info!(source = %source_ws.display(), "view seed skipped: source is being written; cold scan");
         return None;
     };
     let cloned = clone_dir(&source_view, &tmp);
-    // Read under the sibling's lock, so it speaks for the map just cloned. A scan breadcrumb found
-    // while we hold that lock is a dead scan's, which becomes `verify-blobs` only when the sibling
-    // next scans. ~keep
-    let blobs_unverified = crate::scan_evidence::blobs_need_verifying(&source_ws)
-        || crate::scan_evidence::inflight_path(&source_ws).exists();
     drop(sibling_lock);
 
     let result = cloned
         .map_err(|e| e.to_string())
         .and_then(|()| vet_clone(&tmp))
         .and_then(|index| mark_lance_stale(&tmp, index))
-        .and_then(|()| inherit_blob_verification(blobs_unverified, basemind_dir))
         .and_then(|()| promote(&tmp, view_dir));
     match result {
         Ok(()) => {
@@ -207,18 +198,6 @@ fn mark_lance_stale(tmp: &Path, mut index: crate::store::Index) -> Result<(), St
     std::fs::rename(&staging, tmp.join(INDEX_FILE)).map_err(|e| format!("replace seeded index: {e}"))
 }
 
-/// Ask this workspace's next scan to verify its blobs when the sibling's had to: the clone names
-/// the same blobs, which a power loss may have torn, and this workspace did not exist when the
-/// request was made. Without the request the seed is not used.
-fn inherit_blob_verification(blobs_unverified: bool, basemind_dir: &Path) -> Result<(), String> {
-    if !blobs_unverified {
-        return Ok(());
-    }
-    std::fs::create_dir_all(basemind_dir)
-        .and_then(|()| std::fs::write(basemind_dir.join(crate::scan_evidence::VERIFY_BLOBS_FILE), b""))
-        .map_err(|e| format!("request blob verification: {e}"))
-}
-
 /// Atomically move the vetted clone into place. `view_dir` may exist as an empty directory.
 fn promote(tmp: &Path, view_dir: &Path) -> Result<(), String> {
     if view_dir.exists() {
@@ -237,20 +216,11 @@ fn clone_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (s, d) = (c(src)?, c(dst)?);
     // SAFETY: both pointers are valid NUL-terminated strings for the duration of the call.
     let rc = unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    // `clonefile` takes the directory whole, including an index an interrupted discard set aside.
-    crate::index::durability::sweep_discarded(dst);
-    Ok(())
-}
-
-/// An index set aside by an interrupted discard: dead weight a clone must not carry.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn is_discarded_index(entry: &std::fs::DirEntry) -> bool {
-    let name = entry.file_name();
-    name.to_string_lossy()
-        .starts_with(crate::index::durability::DISCARD_PREFIX)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -278,9 +248,6 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     let mut total = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if is_discarded_index(&entry) {
-            continue;
-        }
         let meta = entry.metadata()?;
         total += if meta.is_dir() {
             dir_size(&entry.path())?
@@ -297,9 +264,6 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        if is_discarded_index(&entry) {
-            continue;
-        }
         let (from, to) = (entry.path(), dst.join(entry.file_name()));
         if entry.file_type()?.is_dir() {
             copy_tree(&from, &to)?;
@@ -326,6 +290,10 @@ mod tests {
     use crate::scanner::{EmbedMode, ScanSource, scan};
     use crate::store::{Store, init_isolated_cache};
     use std::process::Command;
+    use std::sync::Mutex;
+
+    // `init_isolated_cache` redirects process-global state, so fixture tests must not overlap.
+    static STORE_SEED_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -372,6 +340,9 @@ mod tests {
 
     #[test]
     fn seeded_view_reflushes_identical_files_from_cache_and_reextracts_modified() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         std::fs::write(wt.join("b.rs"), "pub fn b() { let _x = 1; }\n").expect("modify");
 
@@ -417,78 +388,11 @@ mod tests {
         assert_eq!(m.index.files.len(), 3);
     }
 
-    /// The sibling's blobs may be torn (a scan of it died, or the machine went down under a
-    /// daemon), and its next scan is to verify them. A worktree seeded from it names the same
-    /// blobs, did not exist when that was asked, and must verify them too: otherwise its first scan
-    /// takes a torn blob for an unchanged file's because the blob exists.
-    #[test]
-    fn a_seed_from_a_sibling_that_must_verify_its_blobs_verifies_them_too() {
-        seeds_verify_blobs_the_sibling_may_have_torn("request", |main_dir| {
-            std::fs::write(main_dir.join(crate::scan_evidence::VERIFY_BLOBS_FILE), b"").expect("request");
-        });
-    }
-
-    /// A CLI scan of the sibling died with the machine: its breadcrumb is the only trace, and it
-    /// becomes `verify-blobs` only when something next begins or clears a scan of the sibling.
-    #[test]
-    fn a_seed_from_a_sibling_whose_scan_died_verifies_its_blobs() {
-        seeds_verify_blobs_the_sibling_may_have_torn("breadcrumb", |main_dir| {
-            std::fs::write(crate::scan_evidence::inflight_path(main_dir), b"{}").expect("breadcrumb");
-        });
-    }
-
-    /// Tear a blob of the sibling, leave `evidence` of it in the sibling's cache directory, and
-    /// check that the worktree seeded from it rebuilds the blob on its first scan. The blob store
-    /// is shared by every test of the process, so the torn file's content is the caller's own
-    /// (`tag`): no other test reads the blob while it is torn.
-    fn seeds_verify_blobs_the_sibling_may_have_torn(tag: &str, evidence: impl FnOnce(&Path)) {
-        let (_tmp, main, wt) = fixture();
-        let own = format!("pub fn a() {{}} // {tag}\n");
-        std::fs::write(main.join("a.rs"), &own).expect("write main");
-        std::fs::write(wt.join("a.rs"), &own).expect("write wt");
-        let mut store = Store::open(&main, VIEW_WORKING).expect("open main");
-        scan(
-            &main,
-            &mut store,
-            &ConfigV1::with_defaults(),
-            ScanSource::WorkingTree,
-            EmbedMode::Inline,
-        )
-        .expect("rescan main");
-        drop(store);
-        let main_dir = workspace_cache_dir(&main);
-        let torn = {
-            let m = Store::open(&main, VIEW_WORKING).expect("open main");
-            let hash = m.index.files[&crate::path::RelPath::from("a.rs")].hash_hex.clone();
-            let path = m.blob_path_fm_hex(&hash);
-            std::fs::write(&path, b"torn").expect("tear the blob");
-            (path, hash)
-        };
-        evidence(&main_dir);
-
-        let mut store = Store::open(&wt, VIEW_WORKING).expect("open wt");
-        assert_eq!(store.index.files.len(), 3, "the view was seeded");
-        assert!(
-            crate::scan_evidence::blobs_need_verifying(&workspace_cache_dir(&wt)),
-            "the seeded worktree inherits the request"
-        );
-        scan(
-            &wt,
-            &mut store,
-            &ConfigV1::with_defaults(),
-            ScanSource::WorkingTree,
-            EmbedMode::Inline,
-        )
-        .expect("scan wt");
-        assert!(
-            store.filemap_blob_is_intact(&torn.1),
-            "{} was rebuilt",
-            torn.0.display()
-        );
-    }
-
     #[test]
     fn schema_mismatched_source_falls_back_to_cold_view() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let view = workspace_cache_dir(&main).join(VIEWS_DIR).join(VIEW_WORKING);
         let path = view.join(INDEX_FILE);
@@ -506,6 +410,9 @@ mod tests {
 
     #[test]
     fn source_held_by_a_writer_is_not_cloned() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -524,6 +431,9 @@ mod tests {
 
     #[test]
     fn seeded_index_records_sentinel_policy_so_lance_is_rebuilt() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, wt) = fixture();
         let main_policy = {
             let m = Store::open(&main, VIEW_WORKING).expect("open main");
@@ -550,6 +460,9 @@ mod tests {
 
     #[test]
     fn stale_seed_tmp_is_swept_even_when_view_is_populated() {
+        let _serial = STORE_SEED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_tmp, main, _wt) = fixture();
         let dir = workspace_cache_dir(&main);
         std::fs::create_dir_all(dir.join(SEED_TMP_DIR).join("junk")).unwrap();
@@ -560,23 +473,6 @@ mod tests {
             !dir.join(SEED_TMP_DIR).exists(),
             "debris from a crashed clone is removed"
         );
-    }
-
-    /// An index set aside by an interrupted discard is dead weight; the clone must not carry it.
-    #[test]
-    fn an_index_set_aside_in_the_source_is_not_cloned() {
-        let (_tmp, main, _wt) = fixture();
-        let view = workspace_cache_dir(&main).join(VIEWS_DIR).join(VIEW_WORKING);
-        let aside = format!("{}4242-0", crate::index::durability::DISCARD_PREFIX);
-        std::fs::create_dir(view.join(&aside)).unwrap();
-        std::fs::write(view.join(&aside).join("0.jnl"), b"leftover").unwrap();
-
-        let clone = workspace_cache_dir(&main).join(SEED_TMP_DIR);
-        clone_dir(&view, &clone).expect("clone");
-        assert!(clone.join(INDEX_DB_DIR).is_dir(), "the live index is cloned");
-        assert!(clone.join(INDEX_FILE).is_file());
-        assert!(!clone.join(&aside).exists(), "the index set aside is left behind");
-        assert!(view.join(&aside).exists(), "the source is untouched");
     }
 
     #[test]

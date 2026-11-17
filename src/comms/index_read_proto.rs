@@ -34,10 +34,6 @@ pub enum IndexReadQuery {
     CallScan {
         /// Case-sensitive substring of the callee identifier.
         name: String,
-        /// Keep only callees whose identifier IS `name` (bare or as the last path segments).
-        /// Defaulted so a client that predates it still decodes; the frames are named maps.
-        #[serde(default)]
-        exact: bool,
         /// Page size, already clamped by the caller; clamped again daemon-side.
         limit: u32,
         /// Raw key of the last hit of the previous page (exclusive lower bound).
@@ -54,17 +50,13 @@ pub enum IndexReadQuery {
     GrepBloom {
         /// The grep regex source.
         pattern: String,
-        /// Files to test with the hash and stamp they were indexed under, at most
-        /// [`MAX_GREP_BLOOM_PATHS`].
-        entries: Vec<crate::index::grep_bloom::GrepEntry>,
+        /// Files to test, at most [`MAX_GREP_BLOOM_PATHS`].
+        paths: Vec<RelPath>,
     },
     /// The `implementations_by_trait` scan behind `implementations`.
     ImplScan {
         /// Case-sensitive substring of the trait name.
         trait_name: String,
-        /// Keep only implementations of the trait named exactly `trait_name`.
-        #[serde(default)]
-        exact: bool,
         /// Only implementations in files of this language.
         language: Option<String>,
         /// Page size, already clamped by the caller; clamped again daemon-side.
@@ -97,10 +89,6 @@ pub struct WireCallScan {
     pub total_is_partial: bool,
     /// Whether matches remain past this page. The cursor is the last hit's key.
     pub has_more: bool,
-    /// The last key examined, when the scan stopped at its examined-keys cap before filling the
-    /// page: the cursor to continue from. Absent from a daemon that predates the cap.
-    #[serde(default)]
-    pub resume_after: Option<Vec<u8>>,
     /// The page's hits, in key order.
     pub hits: Vec<WireCallHit>,
 }
@@ -144,9 +132,6 @@ pub struct WireImplScan {
     pub total_is_partial: bool,
     /// Whether matches remain past this page. The cursor is the last hit's key.
     pub has_more: bool,
-    /// [`WireCallScan::resume_after`] for the implementation scan.
-    #[serde(default)]
-    pub resume_after: Option<Vec<u8>>,
     /// The page's hits, in key order.
     pub hits: Vec<WireImplHit>,
 }

@@ -11,11 +11,10 @@ use super::MapCache;
 use super::cursor::Cursor;
 use super::helpers::{SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, json_result, kind_to_str, parse_kind};
 pub(crate) use super::helpers_calls_scan::InRamCallIndex;
-use super::helpers_calls_scan::{CallRef, CallScanPage, budget_call_page};
-use super::helpers_refs_match::Matching;
+use super::helpers_calls_scan::{CallRef, CallScanPage, budget_call_page, calls_in_file_fjall};
 use super::index_route::IndexRoute;
 use super::types::ReferenceHit;
-use crate::index::view::Part;
+use crate::index::IndexDb;
 use crate::path::RelPath;
 
 /// How `find_callers` fetches the cross-file resolved uses of a definition. The precise
@@ -98,16 +97,48 @@ impl RefsSource<'_> {
     }
 }
 
+/// Invoke `f(callee, start_byte)` for every call site in `path`, from whichever backend
+/// is live (Fjall index when open, in-RAM call projection for read-only sessions). Returning
+/// `false` from `f` stops iteration early — used to enforce per-file scan caps.
+///
+/// Shared by `helpers_archmap::RepoGraph::build`, `helpers_archmap::run_tier_symbol`,
+/// and `codegraph::build` (which backs `call_graph`). Keeping the dual-backend dispatch
+/// here removes the duplicate scan loops those callers previously maintained inline. These are
+/// whole-corpus walks, so a read-only session serves them from the (byte-budgeted) projection
+/// rather than one daemon round trip per file; `references` / `callers` / `implementations` are the
+/// point queries that forward instead.
+pub(super) fn for_each_call_in_file<F: FnMut(&str, u32) -> bool>(
+    idx: Option<&IndexDb>,
+    cache: &MapCache,
+    path: &RelPath,
+    mut f: F,
+) -> Result<(), McpError> {
+    let owned: Vec<CallRef>;
+    let refs: &[CallRef] = match idx {
+        Some(idx) => {
+            owned = calls_in_file_fjall(idx, path)?;
+            &owned
+        }
+        None => cache.calls_projection().calls_in_file(path),
+    };
+    for cref in refs {
+        if !f(&cref.callee, cref.start_byte) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// Point-lookup a `Call` value in the index by `(path, start_byte)` and return its
 /// `(line, column)` as 1-based / 0-based respectively. Falls back to `(0, 0)` when the
 /// row/col fields aren't populated (older L2 blobs predating the field's introduction).
 pub(super) fn resolve_call_line_col(
-    idx: &dyn crate::index::view::IndexView,
+    idx: &crate::index::IndexDb,
     rel: &crate::path::RelPath,
     start_byte: u32,
 ) -> (u32, u32) {
     let key = crate::index::keys::call_by_path(rel, start_byte);
-    let value = match idx.get(Part::CallsByPath, &key) {
+    let value = match idx.calls_by_path.get(key) {
         Ok(Some(v)) => v,
         _ => return (0, 0),
     };
@@ -131,9 +162,8 @@ pub(super) async fn run_find_references(
     let format = super::toon::ResponseFormat::parse(params.format.as_deref());
     let limit = params.limit.unwrap_or(SEARCH_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
     let cursor_bytes = params.cursor.as_ref().map(|c| c.decode_fjall()).transpose()?;
-    let matching = Matching::from_substring(params.substring);
     let scan = route
-        .scan_calls(cache, &params.name, matching, limit, cursor_bytes.as_deref())
+        .scan_calls(cache, &params.name, limit, cursor_bytes.as_deref())
         .await?;
     let total = scan.total;
     let total_is_partial = scan.total_is_partial;
@@ -141,10 +171,8 @@ pub(super) async fn run_find_references(
     super::toon::format_result(
         &FindReferencesResponse {
             name: params.name,
-            matching: matching.as_str(),
             total,
-            truncated: total_is_partial,
-            truncated_reason: total_is_partial.then_some(super::types::SCAN_CAP),
+            total_is_partial,
             budgeted: budgeted.budgeted,
             hits: budgeted.hits,
             next_cursor: budgeted.next_cursor,
@@ -186,7 +214,7 @@ pub(super) async fn run_find_callers(
     store: &crate::store::Store,
     refs: RefsSource<'_>,
     route: &IndexRoute,
-    files: super::tool_contract::IndexedFiles<'_>,
+    root: &std::path::Path,
     cache: &super::MapCache,
     params: super::types::FindCallersParams,
     notice: impl FnOnce() -> Option<super::types::LifecycleNotice>,
@@ -195,78 +223,30 @@ pub(super) async fn run_find_callers(
     use super::types::{DefinitionView, FindCallersResponse};
     let limit = params.limit.unwrap_or(SEARCH_LIMIT_DEFAULT).min(SEARCH_LIMIT_MAX) as usize;
     let kind_filter = params.kind.as_deref().map(parse_kind).transpose()?;
-    // A pinned call that cannot be pinned is an error: answering with the unpinned name scan would
-    // read as "these are the callers of the definition in that file".
-    let not_indexed = || super::tool_contract::not_indexed_in(store, files.root, "code_refs", &params.path);
-    // One snapshot for the stamp, the outline and the resolution facts: all three follow the
-    // store's entry, which this call holds a read guard on.
-    let (entry, l1) = super::freshness::indexed_outline(store, cache, &params.path).ok_or_else(not_indexed)?;
-    let file = files.file(store, &params.path).map_err(|refusal| match refusal {
-        super::tool_contract::Unreadable::NotIndexed => not_indexed(),
-        super::tool_contract::Unreadable::Outside => {
-            super::tool_contract::outside_repository("code_refs", &params.path)
-        }
-    })?;
-    // The outline's spans and the resolution facts below are offsets into the indexed bytes.
-    let source = super::index_route::blocking(|| {
-        super::freshness::load_fresh("code_refs", &params.path, &file, (&entry).into(), files.max_file_bytes)
-    })?;
-    let symbol = super::helpers_pick::pick_symbol(
-        "code_refs",
-        &params.path,
-        None,
-        &l1.symbols,
-        Some(&source),
-        &params.name,
-        kind_filter,
-        params.line,
-    )?
-    .symbol;
-    let definition = DefinitionView {
+    let symbol = cache.get(&params.path).and_then(|l1| {
+        l1.symbols
+            .iter()
+            .find(|s| s.name == params.name && kind_filter.is_none_or(|k| s.kind == k))
+            .cloned()
+    });
+    let definition: Option<DefinitionView> = symbol.as_ref().map(|sym| DefinitionView {
         path: params.path.clone(),
-        name: symbol.name.clone(),
-        kind: kind_to_str(symbol.kind),
-        line: symbol.start_row + 1,
-        column: symbol.start_col + 1,
-    };
+        name: sym.name.clone(),
+        kind: kind_to_str(sym.kind),
+        start_row: sym.start_row,
+        start_col: sym.start_col,
+    });
 
     let cursor_bytes = params.cursor.as_ref().map(|c| c.decode_fjall()).transpose()?;
-    let matching = Matching::from_substring(params.substring);
     let scan = route
-        .scan_calls(cache, &params.name, matching, limit, cursor_bytes.as_deref())
+        .scan_calls(cache, &params.name, limit, cursor_bytes.as_deref())
         .await?;
 
-    // Resolution facts are a per-file blob the scan writes only for a file that produced some. No
-    // blob is not `resolved_total: 0`: the language has no resolution engine, the resolve pass did
-    // not finish, or this file bound nothing; `resolution` says which (`helpers_intel::resolution_gap`).
-    let resolution_ran = store.read_resolved_by_hex(&entry.hash_hex).ok().flatten().is_some();
-    let resolved = if resolution_ran {
-        resolved_callers(
-            store,
-            &refs,
-            route,
-            cache,
-            &params.path,
-            &source,
-            symbol,
-            &params.name,
-            limit,
-        )
-        .await
-    } else {
-        None
+    let resolved = match symbol.as_ref() {
+        Some(sym) => resolved_callers(store, &refs, route, root, cache, &params.path, sym, &params.name, limit).await,
+        None => None,
     };
-    let resolved_total = resolved.as_ref().map(|r| r.total);
-    let resolution = if resolved.is_some() {
-        None
-    } else if resolution_ran {
-        Some(super::helpers_intel::NO_DEFINITION_FACTS.to_string())
-    } else {
-        super::helpers_intel::resolution_gap(
-            cache.language_of(&params.path),
-            super::helpers_intel::resolve_pass_complete(store),
-        )
-    };
+    let resolved_total = resolved.as_ref().map_or(0, |r| r.total);
 
     let page = merge_resolved(scan, resolved, limit, cursor_bytes.as_deref());
     let total = page.total;
@@ -274,12 +254,9 @@ pub(super) async fn run_find_callers(
     let budgeted = budget_call_page(page, params.max_tokens);
     json_result(&FindCallersResponse {
         definition,
-        matching: matching.as_str(),
-        resolution,
         resolved_total,
         total,
-        truncated: total_is_partial,
-        truncated_reason: total_is_partial.then_some(super::types::SCAN_CAP),
+        total_is_partial,
         budgeted: budgeted.budgeted,
         hits: budgeted.hits,
         next_cursor: budgeted.next_cursor,
@@ -292,15 +269,11 @@ pub(super) async fn run_find_callers(
 ///
 /// Deliberately NOT a complete caller set: it is everything resolution can *prove*, which is a
 /// subset of the truth whose gap resolution cannot measure. See [`run_find_callers`].
-#[derive(Default)]
-pub(super) struct ResolvedCallers {
+struct ResolvedCallers {
     /// `path` → proven call-site start bytes. Probed per name-scan hit to set `resolved`.
     /// A map-of-sets rather than a set of `(RelPath, u32)` so probing borrows the hit's path
     /// instead of cloning it per hit on the scan's inner loop.
-    pub(super) sites: ahash::AHashMap<crate::path::RelPath, ahash::AHashSet<u32>>,
-    /// Files holding resolved uses that were past the probe cap: nothing is known about their call
-    /// sites, so hits there stay unannotated.
-    pub(super) unprobed: ahash::AHashSet<crate::path::RelPath>,
+    sites: ahash::AHashMap<crate::path::RelPath, ahash::AHashSet<u32>>,
     /// Proven call sites the name scan structurally cannot reach: the callee identifier does not
     /// contain `name`, because the local binding was renamed at the import (`import { f as g }` →
     /// callee `g`). Carried with their `calls_by_callee` key so they merge into the scan's
@@ -340,12 +313,9 @@ fn index_by_start(calls: Vec<CallRef>) -> ahash::AHashMap<u32, CallSite> {
 /// live at once, and the size of each forwarded `CallsInFiles` request.
 const CALL_SITE_BATCH: usize = 128;
 
-/// Build the resolved refinement for the definition `symbol` in `def_path`, whose indexed bytes
-/// are `def_source`. `None` when resolution has nothing to say about that definition (its facts do
-/// not name it, or the call sites could not be fetched): no hit is then marked either way. A
-/// definition resolution knows and found no use of yields an empty refinement, which marks every
-/// hit unproven. Cross-file uses come from the index via [`RefsSource`]: read locally when it is
-/// open, else forwarded to the machine daemon on a `daemon_writer` serve.
+/// Build the resolved refinement for the definition `symbol` in `def_path`, or `None` when nothing
+/// resolves. Cross-file uses come from the index via [`RefsSource`]: read locally when it is open,
+/// else forwarded to the machine daemon on a `daemon_writer` serve.
 ///
 /// Offset alignment (verified empirically, see the unit test): the resolver records `def_start` as
 /// the definition *identifier* byte, which is NOT the L1 `Symbol.start_byte` (the definition *node*
@@ -363,21 +333,22 @@ async fn resolved_callers(
     store: &crate::store::Store,
     ref_source: &RefsSource<'_>,
     route: &IndexRoute,
+    root: &std::path::Path,
     cache: &MapCache,
     def_path: &crate::path::RelPath,
-    def_source: &[u8],
     symbol: &crate::extract::Symbol,
     name: &str,
     limit: usize,
 ) -> Option<ResolvedCallers> {
     let entry = store.lookup(def_path)?;
     let refs = store.read_resolved_by_hex(&entry.hash_hex).ok().flatten()?;
+    let def_source = std::fs::read(root.join(def_path.to_path_buf())).ok()?;
 
     let mut def_starts: Vec<u32> = Vec::new();
     let push_candidate = |byte: u32, def_starts: &mut Vec<u32>| {
         if byte >= symbol.start_byte
             && byte < symbol.end_byte
-            && super::helpers_intel::identifier_at(def_source, byte) == symbol.name.as_str()
+            && super::helpers_intel::identifier_at(&def_source, byte) == symbol.name.as_str()
             && !def_starts.contains(&byte)
         {
             def_starts.push(byte);
@@ -403,7 +374,7 @@ async fn resolved_callers(
         }
     }
     if uses.is_empty() {
-        return Some(ResolvedCallers::default());
+        return None;
     }
 
     let probe_cap = limit.saturating_mul(8).max(2_000);
@@ -419,12 +390,6 @@ async fn resolved_callers(
     for group in uses.chunk_by(|a, b| a.0 == b.0) {
         runs.push((&group[0].0, group));
     }
-    let unprobed = runs
-        .get(probe_cap..)
-        .unwrap_or_default()
-        .iter()
-        .map(|(path, _)| (*path).clone())
-        .collect();
     runs.truncate(probe_cap);
     for batch in runs.chunks(CALL_SITE_BATCH) {
         let paths: Vec<crate::path::RelPath> = batch.iter().map(|(path, _)| (*path).clone()).collect();
@@ -454,12 +419,10 @@ async fn resolved_callers(
             }
         }
     }
-    Some(ResolvedCallers {
-        sites,
-        unprobed,
-        aliased,
-        total,
-    })
+    if total == 0 {
+        return None;
+    }
+    Some(ResolvedCallers { sites, aliased, total })
 }
 
 /// Fold the resolved refinement into the name-scan page: annotate each scan hit with whether
@@ -469,7 +432,7 @@ async fn resolved_callers(
 /// page stays a contiguous prefix of one key-ordered stream and the cursor contract is unchanged:
 /// `next_cursor` is the last key emitted, and the next call resumes strictly after it. Aliased hits
 /// already emitted (key <= cursor) are filtered out, so paging never duplicates them.
-pub(super) fn merge_resolved(
+fn merge_resolved(
     mut page: CallScanPage,
     resolved: Option<ResolvedCallers>,
     limit: usize,
@@ -480,9 +443,6 @@ pub(super) fn merge_resolved(
     };
 
     for (hit, start) in page.hits.iter_mut().zip(page.hit_starts.iter()) {
-        if resolved.unprobed.contains(&hit.path) {
-            continue;
-        }
         let proven = resolved.sites.get(&hit.path).is_some_and(|s| s.contains(start));
         hit.resolved = Some(proven);
     }
@@ -491,11 +451,7 @@ pub(super) fn merge_resolved(
         return page;
     }
     let total = page.total.saturating_add(resolved.aliased.len() as u32);
-    // A scan that stopped at its examined-keys cap has looked at nothing past `stop`: an aliased
-    // hit beyond it belongs to a later page, and the cursor must stay at `stop` for that page to
-    // continue the scan from there.
-    let stop = page.stopped_after.take();
-    let scan_had_more = page.next_cursor.is_some() && stop.is_none();
+    let scan_had_more = page.next_cursor.is_some();
 
     let mut merged: Vec<(Vec<u8>, ReferenceHit, u32)> = Vec::with_capacity(page.hits.len() + resolved.aliased.len());
     for ((key, hit), start) in page
@@ -507,9 +463,7 @@ pub(super) fn merge_resolved(
         merged.push((key, hit, start));
     }
     for (key, hit) in resolved.aliased {
-        if cursor_after.is_some_and(|cursor| key.as_slice() <= cursor)
-            || stop.as_deref().is_some_and(|stop| key.as_slice() > stop)
-        {
+        if cursor_after.is_some_and(|cursor| key.as_slice() <= cursor) {
             continue;
         }
         merged.push((key, hit, 0));
@@ -518,11 +472,10 @@ pub(super) fn merge_resolved(
 
     let has_more = merged.len() > limit || scan_had_more;
     merged.truncate(limit);
-    let stopped_after = if has_more { None } else { stop };
     let next_cursor = if has_more {
         merged.last().map(|(key, _, _)| Cursor::encode_fjall(key))
     } else {
-        stopped_after.as_deref().map(Cursor::encode_fjall)
+        None
     };
     let (hit_keys, hits, hit_starts) = merged.into_iter().fold(
         (Vec::new(), Vec::new(), Vec::new()),
@@ -538,12 +491,382 @@ pub(super) fn merge_resolved(
         total_is_partial: page.total_is_partial,
         hits,
         next_cursor,
-        stopped_after,
         hit_keys,
         hit_starts,
     }
 }
 
 #[cfg(test)]
-#[path = "helpers_calls_tests.rs"]
-mod tests;
+mod tests {
+    use super::super::helpers_calls_scan::scan_calls_in_ram;
+    use crate::config::ConfigV1;
+    use crate::scanner::{ScanSource, scan};
+    use crate::store::{Store, VIEW_WORKING};
+
+    /// Decode a `CallToolResult` back into JSON — the exact bytes an MCP client sees.
+    fn decode(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        use rmcp::model::ContentBlock;
+        let text = result
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        serde_json::from_str(&text).expect("tool response is JSON")
+    }
+
+    /// The route a writer session takes: its own open fjall index.
+    fn local_route(store: &Store) -> super::IndexRoute {
+        super::IndexRoute::Local(store.index_db.clone().expect("a writer store opens the fjall index"))
+    }
+
+    /// Scan `root` and return the store plus its map cache.
+    fn scan_fixture(root: &std::path::Path) -> (Store, crate::mcp::MapCache) {
+        let mut store = Store::open(root, VIEW_WORKING).expect("open");
+        scan(
+            root,
+            &mut store,
+            &ConfigV1::with_defaults(),
+            ScanSource::WorkingTree,
+            crate::scanner::EmbedMode::Inline,
+        )
+        .expect("scan");
+        let cache = crate::mcp::MapCache::build(&store, 0);
+        (store, cache)
+    }
+
+    /// **P0 regression pin.** `find_callers` MUST report the cross-file callers that scope
+    /// resolution cannot see, and MUST NOT present a resolution-limited subset as the complete
+    /// answer.
+    ///
+    /// The fixture is the exact real-world shape that broke: Python's `from pkg import mod`
+    /// followed by `mod.target()` binds a *module*, not the function, so the cross-file join
+    /// (`src/intel/xfile.rs`) has no named export to bind and skips the importer entirely — every
+    /// such caller is invisible to resolution. Meanwhile the definition file's own self-call DOES
+    /// resolve intra-file (tree-sitter `locals`, no feature flag), so resolution "succeeds" with a
+    /// single hit. A resolution-first `find_callers` therefore returned `total: 1`, no truncation
+    /// flag, and an agent concluded almost nothing called `target`.
+    ///
+    /// The name scan is the sound floor: `find_callers` must agree with `find_references` on the
+    /// count for an unambiguous name, and merely *annotate* which hits resolution could prove.
+    #[test]
+    fn find_callers_reports_cross_file_callers_resolution_cannot_see() {
+        use crate::mcp::types::{FindCallersParams, FindReferencesParams};
+        use crate::path::RelPath;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir(root.join("pkg")).expect("pkg dir");
+        std::fs::write(root.join("pkg/__init__.py"), b"").expect("__init__.py");
+        std::fs::write(
+            root.join("pkg/mod.py"),
+            b"def target():\n    return 1\n\n\ndef seed():\n    return target()\n",
+        )
+        .expect("mod.py");
+        std::fs::write(
+            root.join("caller_a.py"),
+            b"from pkg import mod\n\n\ndef go():\n    return mod.target()\n",
+        )
+        .expect("caller_a.py");
+        std::fs::write(
+            root.join("caller_b.py"),
+            b"from pkg import mod\n\n\ndef go2():\n    return mod.target() + mod.target()\n",
+        )
+        .expect("caller_b.py");
+
+        let (store, cache) = scan_fixture(root);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let references = decode(
+            &runtime
+                .block_on(super::run_find_references(
+                    &local_route(&store),
+                    FindReferencesParams {
+                        name: "target".to_string(),
+                        limit: Some(500),
+                        max_tokens: None,
+                        format: None,
+                        cursor: None,
+                    },
+                    &cache,
+                    || None,
+                    std::time::Instant::now(),
+                ))
+                .expect("find_references"),
+        );
+        assert_eq!(
+            references.get("total").and_then(serde_json::Value::as_u64),
+            Some(4),
+            "ground truth: find_references sees all 4 target() call sites: {references}"
+        );
+
+        let callers = decode(
+            &runtime
+                .block_on(super::run_find_callers(
+                    &store,
+                    super::RefsSource::Local(&store),
+                    &local_route(&store),
+                    root,
+                    &cache,
+                    FindCallersParams {
+                        path: RelPath::from("pkg/mod.py".as_bytes()),
+                        name: "target".to_string(),
+                        kind: None,
+                        limit: Some(500),
+                        max_tokens: None,
+                        cursor: None,
+                    },
+                    || None,
+                    std::time::Instant::now(),
+                ))
+                .expect("find_callers"),
+        );
+
+        assert_eq!(
+            callers.get("total").and_then(serde_json::Value::as_u64),
+            Some(4),
+            "find_callers must NOT shrink to the resolution-visible subset: {callers}"
+        );
+        let hits = callers.get("hits").and_then(serde_json::Value::as_array).expect("hits");
+        let paths: Vec<&str> = hits
+            .iter()
+            .filter_map(|h| h.get("path").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(
+            paths.contains(&"caller_a.py") && paths.contains(&"caller_b.py"),
+            "the module-import callers resolution cannot see must still be reported: {paths:?}"
+        );
+        assert_eq!(
+            callers.get("total").and_then(serde_json::Value::as_u64),
+            references.get("total").and_then(serde_json::Value::as_u64),
+            "find_callers and find_references must agree on an unambiguous name"
+        );
+
+        let resolved_total = callers
+            .get("resolved_total")
+            .and_then(serde_json::Value::as_u64)
+            .expect("resolved_total is always reported");
+        assert!(
+            resolved_total <= 4,
+            "resolved_total is a lower bound on the truth, never above total: {callers}"
+        );
+    }
+
+    /// **P0 regression pin, JS/TS engine.** The reported production case: a TS hook whose
+    /// `find_callers` returned `total: 2` (both in its own file) while `find_references` returned
+    /// 172 across 159 files.
+    ///
+    /// Reproduced exactly: `util.ts` calls `target()` itself, so oxc resolves that intra edge and
+    /// resolution "succeeds". `consumer.ts` reaches it through a NAMESPACE import
+    /// (`import * as util`), which binds a module object, not `target` — `intel::xfile` finds no
+    /// named export to bind and skips the importer, so its two call sites are invisible to
+    /// resolution. The old resolution-first code therefore returned `total: 1`, no truncation flag,
+    /// and an agent concluded nothing external called the hook.
+    #[cfg(feature = "code-intel-js")]
+    #[test]
+    fn find_callers_reports_namespace_import_callers_the_js_resolver_cannot_bind() {
+        use crate::mcp::types::FindCallersParams;
+        use crate::path::RelPath;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("util.ts"),
+            b"export function target() { return 1; }\ntarget();\n",
+        )
+        .expect("util.ts");
+        std::fs::write(
+            root.join("consumer.ts"),
+            b"import * as util from './util';\nutil.target();\nutil.target();\n",
+        )
+        .expect("consumer.ts");
+        let (store, cache) = scan_fixture(root);
+
+        let body = decode(
+            &tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(super::run_find_callers(
+                    &store,
+                    super::RefsSource::Local(&store),
+                    &local_route(&store),
+                    root,
+                    &cache,
+                    FindCallersParams {
+                        path: RelPath::from("util.ts".as_bytes()),
+                        name: "target".to_string(),
+                        kind: None,
+                        limit: Some(500),
+                        max_tokens: None,
+                        cursor: None,
+                    },
+                    || None,
+                    std::time::Instant::now(),
+                ))
+                .expect("find_callers"),
+        );
+
+        assert_eq!(
+            body.get("total").and_then(serde_json::Value::as_u64),
+            Some(3),
+            "all 3 call sites — the resolvable self-call AND the 2 namespace-import callers: {body}"
+        );
+        assert_eq!(
+            body.get("resolved_total").and_then(serde_json::Value::as_u64),
+            Some(1),
+            "resolution can only PROVE the intra-file self-call — it must not pass that off as the total"
+        );
+        let hits = body.get("hits").and_then(serde_json::Value::as_array).expect("hits");
+        let consumer_hits = hits
+            .iter()
+            .filter(|h| h.get("path").and_then(serde_json::Value::as_str) == Some("consumer.ts"))
+            .count();
+        assert_eq!(
+            consumer_hits, 2,
+            "the namespace-import callers resolution cannot see must still be reported: {body}"
+        );
+        assert!(
+            hits.iter().all(|h| h.get("resolved").is_some()),
+            "every hit is annotated so the agent can tell proven from unproven: {body}"
+        );
+    }
+
+    /// The in-RAM index (built from blobs, used by read-only sessions) must return
+    /// the same references the Fjall path would — this is what keeps `find_references`
+    /// working for the 2nd+ concurrent session that can't open the Fjall lock.
+    #[test]
+    fn in_ram_call_index_resolves_references() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), b"pub fn alpha() {}\n").expect("a.rs");
+        std::fs::write(root.join("b.rs"), b"fn beta() { alpha(); alpha(); }\n").expect("b.rs");
+        let mut store = Store::open(root, VIEW_WORKING).expect("open");
+        scan(
+            root,
+            &mut store,
+            &ConfigV1::with_defaults(),
+            ScanSource::WorkingTree,
+            crate::scanner::EmbedMode::Inline,
+        )
+        .expect("scan");
+
+        let cache = crate::mcp::MapCache::build(&store, 0);
+        let page = scan_calls_in_ram(cache.calls_projection(), "alpha", 100, None);
+        assert_eq!(page.total, 2, "two alpha() call sites in b.rs");
+        assert_eq!(page.hits.len(), 2);
+        assert!(page.hits.iter().all(|h| h.callee == "alpha"));
+        assert!(
+            page.hits.iter().all(|h| h.path.as_str() == Some("b.rs")),
+            "both references live in b.rs"
+        );
+    }
+
+    /// Precision is preserved, but as an ANNOTATION rather than a silent filter: resolution proves
+    /// only the callers that bind to *this* definition (never a same-named function in another
+    /// file), yet the same-named site is still REPORTED — flagged `resolved: false` — instead of
+    /// being dropped from the answer. Dropping is what made `find_callers` under-report; a caller
+    /// that wants precision filters on the flag.
+    ///
+    /// Also pins the offset-alignment finding: the L1 node `start_byte` differs from the resolver's
+    /// `def_start` identifier byte, so the proven set can only be built by recovering the true
+    /// `def_start` from the blob. Feature-gated — only oxc (JS/TS) resolves top-level function calls
+    /// to their definition today.
+    #[cfg(feature = "code-intel-js")]
+    #[test]
+    fn find_callers_annotates_resolved_edges_without_dropping_same_name_sites() {
+        use crate::mcp::types::FindCallersParams;
+        use crate::path::RelPath;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("util.ts"),
+            b"export function target() { return 1; }\ntarget();\ntarget();\n",
+        )
+        .expect("util.ts");
+        std::fs::write(root.join("other.ts"), b"function target() { return 3; }\ntarget();\n").expect("other.ts");
+        let (store, cache) = scan_fixture(root);
+
+        let def_path = RelPath::from("util.ts".as_bytes());
+        let l1 = crate::query::file_outline(&store, &def_path).expect("outline");
+        let sym = l1
+            .symbols
+            .iter()
+            .find(|s| s.name == "target" && s.kind == crate::extract::SymbolKind::Function)
+            .cloned()
+            .expect("util.ts target function symbol");
+
+        let entry = store.lookup(&def_path).expect("indexed");
+        let refs = store
+            .read_resolved_by_hex(&entry.hash_hex)
+            .expect("read blob")
+            .expect("resolution facts present");
+        assert!(
+            !refs.intra.iter().any(|e| e.def_start == sym.start_byte),
+            "L1 node start_byte must differ from the resolver's def identifier byte"
+        );
+
+        let body = decode(
+            &tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(super::run_find_callers(
+                    &store,
+                    super::RefsSource::Local(&store),
+                    &local_route(&store),
+                    root,
+                    &cache,
+                    FindCallersParams {
+                        path: def_path.clone(),
+                        name: "target".to_string(),
+                        kind: None,
+                        limit: Some(100),
+                        max_tokens: None,
+                        cursor: None,
+                    },
+                    || None,
+                    std::time::Instant::now(),
+                ))
+                .expect("find_callers"),
+        );
+
+        assert_eq!(
+            body.get("resolved_total").and_then(serde_json::Value::as_u64),
+            Some(2),
+            "exactly the two util.ts callers are PROVEN to bind to util.ts target: {body}"
+        );
+        assert_eq!(
+            body.get("total").and_then(serde_json::Value::as_u64),
+            Some(3),
+            "the other.ts same-name call site is still reported, not dropped: {body}"
+        );
+        let hits = body.get("hits").and_then(serde_json::Value::as_array).expect("hits");
+        let proven: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.get("resolved").and_then(serde_json::Value::as_bool) == Some(true))
+            .filter_map(|h| h.get("path").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            proven,
+            vec!["util.ts", "util.ts"],
+            "only the util.ts sites are proven — other.ts is never conflated INTO the proven set"
+        );
+        let unproven: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.get("resolved").and_then(serde_json::Value::as_bool) == Some(false))
+            .filter_map(|h| h.get("path").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            unproven,
+            vec!["other.ts"],
+            "the same-name site is surfaced as unproven, so a precision-seeking caller can filter it"
+        );
+    }
+}

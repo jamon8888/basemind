@@ -12,178 +12,165 @@
 //! runtime context.
 
 mod batch;
-mod memory;
+#[cfg(feature = "documents")]
+mod doc_links;
+/// Documents-tier row/schema tests, likewise out of line.
+#[cfg(test)]
+mod documents_unit_tests;
+/// Lexical index build and query, out of line by the line cap.
+#[cfg(feature = "documents")]
+pub mod fts;
+mod generation;
+/// GraphRAG entity graph over GLiNER entities (spec 0016 / ADR-0016).
+#[cfg(feature = "graphrag")]
+pub mod graph_api;
+mod predicates;
+
+#[cfg(feature = "graphrag")]
+pub mod graphrag;
 pub mod schema;
-#[doc(hidden)]
-pub mod shared;
-#[cfg(any(feature = "documents", feature = "code-search"))]
-pub(crate) mod shared_snapshot;
-#[doc(hidden)]
-pub mod shared_store;
+/// Unit tests; out of line by the line cap (`tests/max_lines.rs`).
+#[cfg(test)]
+mod store_tests;
+/// Test-only inherent methods on [`LanceStore`], kept out of this module by the 1000-line cap
+/// (`tests/max_lines.rs`).
+#[cfg(any(test, feature = "test-support"))]
+mod test_support;
 
 pub use batch::{BATCH_MAX_DOCS, BATCH_MAX_ROWS, PendingBatch, SCAN_RETENTION};
-pub use memory::MemoryStamps;
 
+#[cfg(feature = "documents")]
+pub use doc_links::DocLinkRow;
+
+#[cfg(feature = "graphrag")]
+pub use graphrag::{
+    CypherResult, DocEntitySidecar, GraphEdgeRow, GraphEntityRow, GraphRagHit, GraphragConfig,
+    build_graph_from_entities, delete_graph_for_scope, execute_cypher, normalize_literal, upsert_graph_edges,
+    upsert_graph_entities,
+};
+
+use generation::{bump_generation_file, generation_path, read_generation, wipe_on_mismatch};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
+use arrow_array::builder::{
+    FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
+};
+use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use lancedb::Connection;
-use lancedb::arrow::arrow_array::builder::{FixedSizeListBuilder, Float32Builder, StringBuilder, UInt32Builder};
-use lancedb::arrow::arrow_array::{Array, RecordBatch, StringArray};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 
 use schema::{DOCUMENTS_TABLE, MEMORY_TABLE, documents_schema, memory_schema};
+#[cfg(feature = "graphrag")]
+use schema::{GRAPH_EDGES_TABLE, GRAPH_ENTITIES_TABLE, graph_edges_schema, graph_entities_schema};
 
-/// On-disk metadata for the lance store. Tracks the vector dim, the
-/// embedding-model identifier, and the Arrow table schema version; a mismatch on
-/// any field wipes the store.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct LanceMeta {
     dim: u16,
     embedding_model: String,
-    /// Arrow schema version of the `memory` / `documents` tables (see
-    /// [`MEMORY_SCHEMA_VER`]). `#[serde(default)]` makes a pre-0.5 `meta.json` (which
-    /// lacks this field) deserialize as `0`, forcing a wipe on upgrade rather than a
-    /// parse error — the table column set changed, and a stale-arity table would fault
-    /// at batch-build time, not at open.
     #[serde(default)]
     schema_ver: u32,
+    #[serde(default)]
+    tokenizer_config: String,
 }
 
+const TOKENIZER_CONFIG: &str = "simple-v1";
 const META_FILE: &str = "meta.json";
+const GENERATION_SUFFIX: &str = ".generation";
 
-/// File beside `meta.json` naming this store: written when the store is created, gone with it when
-/// it is wiped or removed. A scan records the id of the store it wrote a view's rows to, so a
-/// store that was wiped or deleted since is told from the one that holds those rows.
-const STORE_ID_FILE: &str = "store-id";
-
-/// Lock file inside the store directory, held while an open decides whether to wipe the store and
-/// creates what is missing. Without it one process can remove, as "tables beside no meta.json",
-/// the tables another process created a moment after writing its own.
-const OPEN_LOCK_FILE: &str = ".open.lock";
-
-/// The id of the store at `dir`, or `None` when there is no store there or it carries none.
-pub fn store_id(dir: &Path) -> Option<String> {
-    let id = std::fs::read_to_string(dir.join(STORE_ID_FILE)).ok()?;
-    let id = id.trim();
-    (!id.is_empty()).then(|| id.to_string())
+pub fn bump_document_generation_for_dir(dir: &Path) -> Result<u64> {
+    let path = generation_path(dir);
+    let current = read_generation(&path)?;
+    bump_generation_file(&path, current)
 }
 
-/// Give the store at `dir` an id when it has none: a new store, or one an earlier build created.
-fn ensure_store_id(dir: &Path) -> Result<()> {
-    if store_id(dir).is_some() {
-        return Ok(());
-    }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let path = dir.join(STORE_ID_FILE);
-    std::fs::write(&path, format!("{nanos:x}-{:x}", std::process::id()))
-        .with_context(|| format!("write {}", path.display()))
-}
-
-/// How long an open waits for another open of the same store to finish. An open holds the lock
-/// only while it creates the store's files, so a holder past this is stuck, not busy.
-const OPEN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Hold the open lock of the store at `dir`, waiting at most `wait` for it. `Ok(None)` when the lock
-/// file cannot be created: the open goes on unserialised, as it would on a directory it cannot
-/// write. An error when another open holds the lock past `wait`: that open may be wiping the
-/// store, and opening beside it would race the wipe, so this open fails and the next search or
-/// scan tries again.
-fn lock_open(dir: &Path, wait: std::time::Duration) -> Result<Option<crate::store_lock::LockGuard>> {
-    const RETRY: std::time::Duration = std::time::Duration::from_millis(20);
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(OPEN_LOCK_FILE))
-    else {
+#[cfg(feature = "intelligence")]
+pub fn open_existing(dir: &Path) -> Result<Option<LanceStore>> {
+    let meta_path = dir.join(META_FILE);
+    if !meta_path.exists() {
         return Ok(None);
-    };
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        if fs2::FileExt::try_lock_exclusive(&file).is_ok() {
-            return Ok(Some(crate::store_lock::LockGuard::held(file)));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow!(
-                "another open of the vector store at {} held its lock for over {} s; not opening beside it",
-                dir.display(),
-                wait.as_secs_f32()
-            ));
-        }
-        std::thread::sleep(RETRY);
     }
+    let body = std::fs::read(&meta_path).with_context(|| format!("read {}", meta_path.display()))?;
+    let meta: LanceMeta = serde_json::from_slice(&body).with_context(|| format!("parse {}", meta_path.display()))?;
+    LanceStore::open(dir, meta.dim, &meta.embedding_model).map(Some)
 }
 
-/// Schema version of the lance Arrow tables, bound to the release minor exactly like
-/// `INDEX_SCHEMA_VER` and the blob `SCHEMA_VER`. Bump `RELEASE_MINOR` whenever the
-/// `memory` or `documents` table column set changes; the resulting `LanceMeta` mismatch
-/// wipes and rebuilds the lance dir.
 pub const MEMORY_SCHEMA_VER: u32 = crate::version::RELEASE_MINOR as u32;
 
-/// One row in the `documents` table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentFacets {
+    pub doc_type: Option<String>,
+    pub section: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub doc_date: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub entities: Option<Vec<String>>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFacetFilter {
+    pub doc_type: Option<String>,
+    pub section: Option<String>,
+    pub jurisdiction: Option<String>,
+    pub doc_date: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DocumentRow {
     pub scope: String,
     pub path: String,
     pub chunk_idx: u32,
     pub mime_type: String,
+    pub facets: DocumentFacets,
     pub text: String,
+    pub text_phrase: String,
+    pub heading_path: String,
+    pub cites: String,
     pub byte_start: u32,
     pub byte_end: u32,
+    pub rehydration_ref: Option<String>,
     pub embedding: Vec<f32>,
 }
 
-/// One row in the `memory` table. It carries the note's vector and tags, never its text: a row
-/// can outlive its note, and the text of a deleted note must not.
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     pub scope: String,
     pub key: String,
+    pub value: String,
     pub tags: Vec<String>,
-    /// Memory tier: `"group"` (shared) or `"individual"` (per-agent).
     pub visibility: String,
-    /// Owner of an individual-tier row; empty string for the group tier.
     pub agent_id: String,
     pub embedding: Vec<f32>,
-    /// Microseconds since unix epoch.
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-/// A search hit from the `documents` table.
 #[derive(Debug, Clone)]
 pub struct DocumentHit {
     pub path: String,
     pub chunk_idx: u32,
     pub text: String,
     pub mime_type: String,
+    pub facets: DocumentFacets,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer). LanceDB returns this
-    /// in the `_distance` column.
     pub distance: f32,
 }
 
-/// A search hit from the `memory` table: which note, and which write of it. The note's text and
-/// tags are read from the note itself.
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub key: String,
-    /// The `updated_at` of the note this row was embedded from. A row whose stamp differs from the
-    /// note's own was left behind by a newer write and must not be served.
-    pub updated_at: i64,
+    pub value: String,
+    pub tags: Vec<String>,
     pub distance: f32,
 }
 
-/// One row in the `code_chunks` table.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeRow {
@@ -201,7 +188,6 @@ pub struct CodeRow {
     pub embedding: Vec<f32>,
 }
 
-/// A search hit from the `code_chunks` table — a pointer, not a body.
 #[cfg(feature = "code-search")]
 #[derive(Debug, Clone)]
 pub struct CodeChunkHit {
@@ -214,7 +200,6 @@ pub struct CodeChunkHit {
     pub line_end: u32,
     pub byte_start: u32,
     pub byte_end: u32,
-    /// L2 distance from the query vector (lower = closer).
     pub distance: f32,
 }
 
@@ -232,8 +217,10 @@ struct LanceStoreInner {
     dim: u16,
     embedding_model: String,
     dir: PathBuf,
+    generation_path: PathBuf,
+    document_generation: Mutex<u64>,
     /// Commits per table since the last maintenance pass; drives bounded version retention.
-    commits: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    commits: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl LanceStoreInner {
@@ -254,32 +241,24 @@ impl Drop for LanceStoreInner {
 impl LanceStore {
     /// Open (or initialise) the lance store rooted at `dir`. If a pre-existing
     /// meta.json reports a different `(dim, embedding_model, schema_ver)` triple, the
-    /// entire dir is wiped and rebuilt before the connection opens — unless its `schema_ver`
-    /// is newer than this binary's, which fails the open and leaves the dir untouched. A dir
-    /// with tables and no meta.json is emptied too.
+    /// entire dir is wiped and rebuilt before the connection opens.
     pub fn open(dir: &Path, dim: u16, embedding_model: &str) -> Result<Self> {
-        Self::open_waiting(dir, dim, embedding_model, OPEN_LOCK_WAIT)
-    }
-
-    /// [`Self::open`] waiting at most `wait` for another open of the store.
-    fn open_waiting(dir: &Path, dim: u16, embedding_model: &str, wait: std::time::Duration) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let meta_path = dir.join(META_FILE);
+        let generation_path = generation_path(dir);
+        let generation = read_generation(&generation_path)?;
         let expected = LanceMeta {
             dim,
             embedding_model: embedding_model.to_string(),
             schema_ver: MEMORY_SCHEMA_VER,
+            tokenizer_config: TOKENIZER_CONFIG.to_string(),
         };
-        // Released when this function returns, tables created.
-        let _opening = lock_open(dir, wait)?;
-        wipe_on_mismatch(dir, &meta_path, &expected)?;
-        // meta.json goes in before any table. Tables beside no meta.json have no known model: they
-        // are what an open that died before its meta write left, and are removed, not adopted.
-        if !meta_path.exists() {
-            remove_entries(dir, &meta_path, &remove_entry)?;
-            write_meta(&meta_path, &expected)?;
-        }
-        ensure_store_id(dir)?;
+        let wiped = wipe_on_mismatch(dir, &meta_path, &expected)?;
+        let generation = if wiped {
+            bump_generation_file(&generation_path, generation)?
+        } else {
+            generation
+        };
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -295,8 +274,20 @@ impl LanceStore {
             ensure_table(&connection, MEMORY_TABLE, memory_schema(dim)).await?;
             #[cfg(feature = "code-search")]
             ensure_table(&connection, schema::CODE_CHUNKS_TABLE, schema::code_chunks_schema(dim)).await?;
+            #[cfg(feature = "documents")]
+            ensure_table(&connection, schema::DOC_LINKS_TABLE, schema::doc_links_schema()).await?;
+            #[cfg(feature = "graphrag")]
+            {
+                ensure_table(&connection, GRAPH_ENTITIES_TABLE, graph_entities_schema()).await?;
+                ensure_table(&connection, GRAPH_EDGES_TABLE, graph_edges_schema()).await?;
+            }
             anyhow::Ok(())
         })?;
+
+        if !meta_path.exists() {
+            let body = serde_json::to_vec_pretty(&expected).context("serialize lance meta.json")?;
+            std::fs::write(&meta_path, body).with_context(|| format!("write {}", meta_path.display()))?;
+        }
 
         Ok(Self {
             inner: Arc::new(LanceStoreInner {
@@ -305,13 +296,30 @@ impl LanceStore {
                 dim,
                 embedding_model: embedding_model.to_string(),
                 dir: dir.to_path_buf(),
-                commits: std::sync::Mutex::new(std::collections::HashMap::new()),
+                generation_path,
+                document_generation: Mutex::new(generation),
+                commits: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
 
     pub fn dim(&self) -> u16 {
         self.inner.dim
+    }
+
+    /// Shared LanceDB connection — read surface for the graphrag module (spec 0016):
+    /// the `graph entities` / `graph rag` tools run Cypher over the same connection
+    /// the store owns, instead of reaching into the private `inner`.
+    #[cfg(feature = "graphrag")]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.inner.connection
+    }
+
+    /// The store's tokio runtime, for `block_on` around lance-graph's async Cypher
+    /// execution from sync call sites (same contract as [`LanceStoreInner::rt`]).
+    #[cfg(feature = "graphrag")]
+    pub(crate) fn runtime(&self) -> &Runtime {
+        self.inner.rt()
     }
 
     pub fn embedding_model(&self) -> &str {
@@ -322,8 +330,24 @@ impl LanceStore {
         &self.inner.dir
     }
 
-    /// Replace all documents rows for the given `(scope, path)` pair and insert
-    /// the supplied rows. Used by the scanner during incremental re-extract.
+    pub fn document_generation(&self) -> u64 {
+        *self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn bump_document_generation(&self) -> Result<u64> {
+        let mut generation = self
+            .inner
+            .document_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = bump_generation_file(&self.inner.generation_path, *generation)?;
+        Ok(*generation)
+    }
+
     pub fn replace_document(&self, scope: &str, path: &str, rows: Vec<DocumentRow>) -> Result<()> {
         self.inner.rt().block_on(async {
             let table = self
@@ -344,6 +368,7 @@ impl LanceStore {
                 .with_context(|| format!("delete existing rows for {scope}/{path}"))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
             if rows.is_empty() {
+                self.bump_document_generation()?;
                 return Ok(());
             }
             let batch = build_documents_batch(self.inner.dim, &rows)?;
@@ -353,17 +378,61 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("insert {} documents rows", rows.len()))?;
             self.after_commit(&table, DOCUMENTS_TABLE).await;
+            self.bump_document_generation()?;
             anyhow::Ok(())
         })
     }
 
-    /// KNN over the documents table for one scope.
+    pub fn upsert_memory(&self, row: MemoryRow) -> Result<()> {
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(MEMORY_TABLE)
+                .execute()
+                .await
+                .with_context(|| format!("open {MEMORY_TABLE} table"))?;
+            let predicate = memory_row_predicate(&row.scope, &row.visibility, &row.agent_id, &row.key);
+            table.delete(&predicate).await.context("delete previous memory entry")?;
+            let batch = build_memory_batch(self.inner.dim, std::slice::from_ref(&row))?;
+            table.add(batch).execute().await.context("insert memory row")?;
+            self.after_commit(&table, MEMORY_TABLE).await;
+            anyhow::Ok(())
+        })
+    }
+
+    pub fn delete_memory(&self, scope: &str, visibility: &str, agent_id: &str, key: &str) -> Result<u64> {
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(MEMORY_TABLE)
+                .execute()
+                .await
+                .with_context(|| format!("open {MEMORY_TABLE} table"))?;
+            let predicate = memory_row_predicate(scope, visibility, agent_id, key);
+            let result = table.delete(&predicate).await.context("delete memory entry")?;
+            anyhow::Ok(result.num_deleted_rows)
+        })
+    }
+
     pub fn search_documents(
         &self,
         scope: &str,
         query: Vec<f32>,
         limit: usize,
         mime_type_filter: Option<&str>,
+    ) -> Result<Vec<DocumentHit>> {
+        self.search_documents_filtered(scope, query, limit, mime_type_filter, None)
+    }
+
+    pub fn search_documents_filtered(
+        &self,
+        scope: &str,
+        query: Vec<f32>,
+        limit: usize,
+        mime_type_filter: Option<&str>,
+        facet_filter: Option<&DocumentFacetFilter>,
     ) -> Result<Vec<DocumentHit>> {
         if query.len() != usize::from(self.inner.dim) {
             return Err(anyhow!(
@@ -381,11 +450,26 @@ impl LanceStore {
                 .await
                 .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
             let mut q = table.vector_search(query).context("build vector search")?.limit(limit);
-            let scope_clause = format!("scope = '{}'", escape_sql_literal(scope));
-            q = match mime_type_filter {
-                Some(m) => q.only_if(format!("{scope_clause} AND mime_type = '{}'", escape_sql_literal(m))),
-                None => q.only_if(scope_clause),
-            };
+            let mut predicates = vec![format!("scope = '{}'", escape_sql_literal(scope))];
+            if let Some(m) = mime_type_filter {
+                predicates.push(format!("mime_type = '{}'", escape_sql_literal(m)));
+            }
+            if let Some(facets) = facet_filter {
+                for (column, value) in [
+                    ("doc_type", facets.doc_type.as_deref()),
+                    ("section", facets.section.as_deref()),
+                    ("jurisdiction", facets.jurisdiction.as_deref()),
+                    ("doc_date", facets.doc_date.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        predicates.push(format!(
+                            "({column} IS NULL OR {column} = '{}')",
+                            escape_sql_literal(value)
+                        ));
+                    }
+                }
+            }
+            q = q.only_if(predicates.join(" AND "));
             let mut stream = q.execute().await.context("run document search")?;
             let mut hits = Vec::new();
             while let Some(batch) = stream.try_next().await.context("stream next batch")? {
@@ -395,9 +479,82 @@ impl LanceStore {
         })
     }
 
-    /// Replace all `code_chunks` rows for a `(scope, path)` pair and insert the supplied rows.
-    /// Delete-then-insert mirrors [`Self::replace_document`] so a re-scan never leaves stale
-    /// chunks behind.
+    pub fn document_chunks_for_paths(&self, scope: &str, paths: &[String], limit: usize) -> Result<Vec<DocumentHit>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(DOCUMENTS_TABLE)
+                .execute()
+                .await
+                .with_context(|| format!("open {DOCUMENTS_TABLE} table"))?;
+            let path_list = paths
+                .iter()
+                .map(|p| format!("'{}'", escape_sql_literal(p)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let predicate = format!("scope = '{}' AND path IN ({path_list})", escape_sql_literal(scope));
+            let mut stream = table
+                .query()
+                .only_if(predicate)
+                .limit(limit)
+                .execute()
+                .await
+                .context("fetch document chunks")?;
+            let mut hits = Vec::new();
+            while let Some(batch) = stream.try_next().await.context("stream next batch")? {
+                decode_document_hits(&batch, &mut hits)?;
+            }
+            anyhow::Ok(hits)
+        })
+    }
+
+    pub fn search_memory(
+        &self,
+        scope: &str,
+        visibility: &str,
+        agent_id: &str,
+        query: Vec<f32>,
+        limit: usize,
+        tag_filter: Option<&str>,
+    ) -> Result<Vec<MemoryHit>> {
+        if query.len() != usize::from(self.inner.dim) {
+            return Err(anyhow!(
+                "query vector dim {} does not match store dim {}",
+                query.len(),
+                self.inner.dim
+            ));
+        }
+        self.inner.rt().block_on(async {
+            let table = self
+                .inner
+                .connection
+                .open_table(MEMORY_TABLE)
+                .execute()
+                .await
+                .with_context(|| format!("open {MEMORY_TABLE} table"))?;
+            let mut q = table
+                .vector_search(query)
+                .context("build memory vector search")?
+                .limit(limit);
+            let namespace_clause = memory_namespace_predicate(scope, visibility, agent_id);
+            let _ = tag_filter;
+            q = q.only_if(namespace_clause);
+            let mut stream = q.execute().await.context("run memory search")?;
+            let mut hits = Vec::new();
+            while let Some(batch) = stream.try_next().await.context("stream next batch")? {
+                decode_memory_hits(&batch, &mut hits)?;
+            }
+            if let Some(tag) = tag_filter {
+                hits.retain(|h| h.tags.iter().any(|t| t == tag));
+            }
+            anyhow::Ok(hits)
+        })
+    }
+
     #[cfg(feature = "code-search")]
     pub fn replace_code_chunks(&self, scope: &str, path: &str, rows: Vec<CodeRow>) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -432,9 +589,6 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row for a `(scope, path)` pair without inserting replacements.
-    /// The scanner's stale-file pass calls this when a file is removed, so a deleted path leaves no
-    /// dangling `search_code` hits. Idempotent — deleting a path with no rows is a no-op.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks(&self, scope: &str, path: &str) -> Result<()> {
         self.inner.rt().block_on(async {
@@ -458,22 +612,26 @@ impl LanceStore {
         })
     }
 
-    /// Delete every `code_chunks` row of `paths` in `scope`, batching the paths into `IN (...)`
-    /// predicates so a purge of N files is a handful of deletes rather than N table versions.
     #[cfg(feature = "code-search")]
     pub fn delete_code_chunks_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(schema::CODE_CHUNKS_TABLE, "path", scope, paths)
     }
 
-    /// Delete every `documents` row of `paths` in `scope`; the batched counterpart of
-    /// [`Self::replace_document`] with no replacement rows.
     pub fn delete_documents_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
         self.delete_paths_in(DOCUMENTS_TABLE, "path", scope, paths)
     }
 
+    #[cfg(feature = "documents")]
+    pub fn delete_doc_links_for_paths(&self, scope: &str, paths: &[String]) -> Result<()> {
+        self.delete_paths_in(schema::DOC_LINKS_TABLE, "doc_path", scope, paths)
+    }
+
+    #[cfg(feature = "graphrag")]
+    pub fn delete_graph_for_scope(&self, scope: &str) -> Result<()> {
+        graphrag::delete_graph_for_scope(&self.inner.connection, self.inner.rt(), scope)
+    }
+
     pub(super) fn delete_paths_in(&self, table_name: &str, key_col: &str, scope: &str, paths: &[String]) -> Result<()> {
-        // Each batch is one delete transaction (a new table version plus a scan of `path`), so a
-        // large purge is dominated by the batch COUNT; 2000 literals keep the predicate small.
         const BATCH: usize = 2_000;
         if paths.is_empty() {
             return Ok(());
@@ -486,9 +644,6 @@ impl LanceStore {
                 .execute()
                 .await
                 .with_context(|| format!("open {table_name} table"))?;
-            // Nothing stored for this scope (the common case on the first scan after an upgrade, or
-            // with embeddings off): skip the N/200 deletes, each of which scans the table and may
-            // commit a table version.
             let in_scope = table
                 .count_rows(Some(format!("scope = '{}'", escape_sql_literal(scope))))
                 .await
@@ -508,13 +663,14 @@ impl LanceStore {
                     .await
                     .with_context(|| format!("delete {} paths from {table_name} in {scope}", batch.len()))?;
                 self.after_commit(&table, table_name).await;
+                if table_name == DOCUMENTS_TABLE {
+                    self.bump_document_generation()?;
+                }
             }
             anyhow::Ok(())
         })
     }
 
-    /// KNN over the `code_chunks` table for one scope. Returns pointer hits (path + span +
-    /// symbol + distance), best-first.
     #[cfg(feature = "code-search")]
     pub fn search_code_chunks(&self, scope: &str, query: Vec<f32>, limit: usize) -> Result<Vec<CodeChunkHit>> {
         if query.len() != usize::from(self.inner.dim) {
@@ -547,90 +703,7 @@ impl LanceStore {
     }
 }
 
-/// Write `meta.json` through a sibling temp file and a rename, so a crash leaves the previous file
-/// or the whole new one, never a truncated file that fails every later open.
-fn write_meta(meta_path: &Path, meta: &LanceMeta) -> Result<()> {
-    use std::io::Write;
-
-    let body = serde_json::to_vec_pretty(meta).context("serialize lance meta.json")?;
-    // Named by pid: two processes opening a new store at once must not write one temp file.
-    let tmp = meta_path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut file = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-    file.write_all(&body)
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, meta_path).with_context(|| format!("write {}", meta_path.display()))
-}
-
-/// The one field of `meta.json` every layout of it has had. Read on its own, so a file whose other
-/// fields this binary cannot parse still says which basemind wrote it.
-#[derive(Deserialize)]
-struct MetaVersion {
-    schema_ver: u32,
-}
-
-fn wipe_on_mismatch(dir: &Path, meta_path: &Path, expected: &LanceMeta) -> Result<()> {
-    if !meta_path.exists() {
-        return Ok(());
-    }
-    let bytes = std::fs::read(meta_path).with_context(|| format!("read {}", meta_path.display()))?;
-    // A newer store is refused before anything else is asked of its meta.json: a newer layout
-    // need not parse as this one, and a parse failure must not read as leave to wipe it.
-    if let Ok(MetaVersion { schema_ver }) = serde_json::from_slice(&bytes)
-        && schema_ver > expected.schema_ver
-    {
-        return Err(anyhow!(
-            "lance store at {} written by a newer basemind (schema {schema_ver}); this binary understands {} — upgrade basemind",
-            dir.display(),
-            expected.schema_ver
-        ));
-    }
-    // A meta.json with no readable version says nothing about the tables beside it, which is a
-    // mismatch, not a reason to fail every open of a store that is only a cache.
-    match serde_json::from_slice::<LanceMeta>(&bytes) {
-        Ok(actual) if actual == *expected => return Ok(()),
-        Ok(actual) => tracing::warn!(
-            old_dim = actual.dim,
-            new_dim = expected.dim,
-            old_model = %actual.embedding_model,
-            new_model = %expected.embedding_model,
-            old_schema_ver = actual.schema_ver,
-            new_schema_ver = expected.schema_ver,
-            "lance store dim/model/schema mismatch — wiping {}",
-            dir.display()
-        ),
-        Err(error) => tracing::warn!(%error, "lance meta.json is unreadable — wiping {}", dir.display()),
-    }
-    // meta.json goes last: while it is there a wipe that was cut short is seen and finished by the
-    // next open.
-    remove_entries(dir, meta_path, &remove_entry)?;
-    std::fs::remove_file(meta_path).with_context(|| format!("remove {}", meta_path.display()))
-}
-
-/// Remove every entry of `dir` but `keep` and the open lock, through `remove`.
-fn remove_entries(dir: &Path, keep: &Path, remove: &dyn Fn(&Path) -> std::io::Result<()>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let path = entry.context("entry")?.path();
-        if path != keep && path.file_name().is_none_or(|name| name != OPEN_LOCK_FILE) {
-            remove(&path).with_context(|| format!("remove {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_entry(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
-}
-
-async fn ensure_table(
-    connection: &Connection,
-    name: &str,
-    schema: lancedb::arrow::arrow_schema::SchemaRef,
-) -> Result<()> {
+async fn ensure_table(connection: &Connection, name: &str, schema: arrow_schema::SchemaRef) -> Result<()> {
     let existing: Vec<String> = connection.table_names().execute().await.context("list lance tables")?;
     if existing.iter().any(|t| t == name) {
         return Ok(());
@@ -643,18 +716,48 @@ async fn ensure_table(
     Ok(())
 }
 
+fn append_optional(builder: &mut StringBuilder, value: Option<&str>) {
+    match value {
+        Some(value) => builder.append_value(value),
+        None => builder.append_null(),
+    }
+}
+
+fn append_optional_list(builder: &mut ListBuilder<StringBuilder>, value: Option<&[String]>) {
+    match value {
+        Some(values) => {
+            for value in values {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+        None => builder.append(false),
+    }
+}
+
 fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> {
     let mut scope = StringBuilder::new();
     let mut path = StringBuilder::new();
     let mut chunk_idx = UInt32Builder::new();
     let mut mime = StringBuilder::new();
+    let mut doc_type = StringBuilder::new();
+    let mut section = StringBuilder::new();
+    let mut jurisdiction = StringBuilder::new();
+    let mut doc_date = StringBuilder::new();
+    let mut keywords = ListBuilder::new(StringBuilder::new());
+    let mut entities = ListBuilder::new(StringBuilder::new());
+    let mut summary = StringBuilder::new();
     let mut text = StringBuilder::new();
+    let mut text_phrase = StringBuilder::new();
+    let mut heading_path = StringBuilder::new();
+    let mut cites = StringBuilder::new();
     let mut byte_start = UInt32Builder::new();
     let mut byte_end = UInt32Builder::new();
+    let mut rehydration_ref = StringBuilder::new();
     let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
 
     for r in rows {
-        if r.embedding.len() != usize::from(dim) {
+        if !r.embedding.is_empty() && r.embedding.len() != usize::from(dim) {
             return Err(anyhow!(
                 "documents row embedding dim {} does not match store dim {}",
                 r.embedding.len(),
@@ -665,13 +768,32 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
         path.append_value(&r.path);
         chunk_idx.append_value(r.chunk_idx);
         mime.append_value(&r.mime_type);
+        append_optional(&mut doc_type, r.facets.doc_type.as_deref());
+        append_optional(&mut section, r.facets.section.as_deref());
+        append_optional(&mut jurisdiction, r.facets.jurisdiction.as_deref());
+        append_optional(&mut doc_date, r.facets.doc_date.as_deref());
+        append_optional_list(&mut keywords, r.facets.keywords.as_deref());
+        append_optional_list(&mut entities, r.facets.entities.as_deref());
+        append_optional(&mut summary, r.facets.summary.as_deref());
         text.append_value(&r.text);
+        text_phrase.append_value(&r.text_phrase);
+        heading_path.append_value(&r.heading_path);
+        cites.append_value(&r.cites);
         byte_start.append_value(r.byte_start);
         byte_end.append_value(r.byte_end);
-        for v in &r.embedding {
-            embedding.values().append_value(*v);
+        match &r.rehydration_ref {
+            Some(value) => rehydration_ref.append_value(value),
+            None => rehydration_ref.append_null(),
         }
-        embedding.append(true);
+        if r.embedding.is_empty() {
+            embedding.values().append_nulls(dim as usize);
+            embedding.append(false);
+        } else {
+            for v in &r.embedding {
+                embedding.values().append_value(*v);
+            }
+            embedding.append(true);
+        }
     }
 
     let schema = documents_schema(dim);
@@ -682,9 +804,20 @@ fn build_documents_batch(dim: u16, rows: &[DocumentRow]) -> Result<RecordBatch> 
             Arc::new(path.finish()),
             Arc::new(chunk_idx.finish()),
             Arc::new(mime.finish()),
+            Arc::new(doc_type.finish()),
+            Arc::new(section.finish()),
+            Arc::new(jurisdiction.finish()),
+            Arc::new(doc_date.finish()),
+            Arc::new(keywords.finish()),
+            Arc::new(entities.finish()),
+            Arc::new(summary.finish()),
             Arc::new(text.finish()),
+            Arc::new(text_phrase.finish()),
+            Arc::new(heading_path.finish()),
+            Arc::new(cites.finish()),
             Arc::new(byte_start.finish()),
             Arc::new(byte_end.finish()),
+            Arc::new(rehydration_ref.finish()),
             Arc::new(embedding.finish()),
         ],
     )
@@ -754,16 +887,7 @@ fn build_code_chunks_batch(dim: u16, rows: &[CodeRow]) -> Result<RecordBatch> {
 
 #[cfg(feature = "code-search")]
 fn decode_code_chunk_hits(batch: &RecordBatch, out: &mut Vec<CodeChunkHit>) -> Result<()> {
-    decode_code_chunk_hits_with_path_column(batch, "path", out)
-}
-
-#[cfg(feature = "code-search")]
-fn decode_code_chunk_hits_with_path_column(
-    batch: &RecordBatch,
-    path_column: &str,
-    out: &mut Vec<CodeChunkHit>,
-) -> Result<()> {
-    use lancedb::arrow::arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float32Array, UInt32Array};
     let str_col = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
@@ -776,7 +900,7 @@ fn decode_code_chunk_hits_with_path_column(
             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
             .ok_or_else(|| anyhow!("`{name}` column missing"))
     };
-    let path = str_col(path_column)?;
+    let path = str_col("path")?;
     let chunk_id = str_col("chunk_id")?;
     let symbol = str_col("symbol")?;
     let kind = str_col("kind")?;
@@ -806,20 +930,66 @@ fn decode_code_chunk_hits_with_path_column(
     Ok(())
 }
 
-fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Result<()> {
-    decode_document_hits_with_path_column(batch, "path", out)
+fn build_memory_batch(dim: u16, rows: &[MemoryRow]) -> Result<RecordBatch> {
+    let mut scope = StringBuilder::new();
+    let mut key = StringBuilder::new();
+    let mut value = StringBuilder::new();
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    let mut visibility = StringBuilder::new();
+    let mut agent_id = StringBuilder::new();
+    let mut embedding = FixedSizeListBuilder::new(Float32Builder::new(), i32::from(dim));
+    let mut created = TimestampMicrosecondBuilder::new();
+    let mut updated = TimestampMicrosecondBuilder::new();
+
+    for r in rows {
+        if r.embedding.len() != usize::from(dim) {
+            return Err(anyhow!(
+                "memory row embedding dim {} does not match store dim {}",
+                r.embedding.len(),
+                dim
+            ));
+        }
+        scope.append_value(&r.scope);
+        key.append_value(&r.key);
+        value.append_value(&r.value);
+        for t in &r.tags {
+            tags.values().append_value(t);
+        }
+        tags.append(true);
+        visibility.append_value(&r.visibility);
+        agent_id.append_value(&r.agent_id);
+        for v in &r.embedding {
+            embedding.values().append_value(*v);
+        }
+        embedding.append(true);
+        created.append_value(r.created_at);
+        updated.append_value(r.updated_at);
+    }
+
+    let schema = memory_schema(dim);
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(scope.finish()),
+            Arc::new(key.finish()),
+            Arc::new(value.finish()),
+            Arc::new(tags.finish()),
+            Arc::new(visibility.finish()),
+            Arc::new(agent_id.finish()),
+            Arc::new(embedding.finish()),
+            Arc::new(created.finish()),
+            Arc::new(updated.finish()),
+        ],
+    )
+    .context("assemble memory batch")
 }
 
-fn decode_document_hits_with_path_column(
-    batch: &RecordBatch,
-    path_column: &str,
-    out: &mut Vec<DocumentHit>,
-) -> Result<()> {
-    use lancedb::arrow::arrow_array::{Float32Array, UInt32Array};
+fn decode_document_hits(batch: &RecordBatch, out: &mut Vec<DocumentHit>) -> Result<()> {
+    use arrow_array::{Float32Array, ListArray, UInt32Array};
     let path = batch
-        .column_by_name(path_column)
+        .column_by_name("path")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| anyhow!("`{path_column}` column missing"))?;
+        .ok_or_else(|| anyhow!("`path` column missing"))?;
     let mime = batch
         .column_by_name("mime_type")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -843,6 +1013,36 @@ fn decode_document_hits_with_path_column(
     let distance = batch
         .column_by_name("_distance")
         .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+    let optional_string = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+    };
+    let optional_list = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+    };
+    let doc_type = optional_string("doc_type");
+    let section = optional_string("section");
+    let jurisdiction = optional_string("jurisdiction");
+    let doc_date = optional_string("doc_date");
+    let keywords = optional_list("keywords");
+    let entities = optional_list("entities");
+    let summary = optional_string("summary");
+    let optional_value = |array: Option<&StringArray>, i: usize| {
+        array.and_then(|values| (!values.is_null(i)).then(|| values.value(i).to_string()))
+    };
+    let optional_values = |array: Option<&ListArray>, i: usize| {
+        array.and_then(|values| {
+            if values.is_null(i) {
+                return None;
+            }
+            let values = values.value(i);
+            let values = values.as_any().downcast_ref::<StringArray>()?;
+            Some((0..values.len()).map(|index| values.value(index).to_string()).collect())
+        })
+    };
 
     for i in 0..batch.num_rows() {
         out.push(DocumentHit {
@@ -850,6 +1050,15 @@ fn decode_document_hits_with_path_column(
             chunk_idx: chunk_idx.value(i),
             text: text.value(i).to_string(),
             mime_type: mime.value(i).to_string(),
+            facets: DocumentFacets {
+                doc_type: optional_value(doc_type, i),
+                section: optional_value(section, i),
+                jurisdiction: optional_value(jurisdiction, i),
+                doc_date: optional_value(doc_date, i),
+                keywords: optional_values(keywords, i),
+                entities: optional_values(entities, i),
+                summary: optional_value(summary, i),
+            },
             byte_start: byte_start.value(i),
             byte_end: byte_end.value(i),
             distance: distance.map(|d| d.value(i)).unwrap_or(0.0),
@@ -858,30 +1067,47 @@ fn decode_document_hits_with_path_column(
     Ok(())
 }
 
-/// Single-quote escape for the simple SQL-literal predicates we use.
-fn escape_sql_literal(s: &str) -> String {
-    s.replace('\'', "''")
+fn decode_memory_hits(batch: &RecordBatch, out: &mut Vec<MemoryHit>) -> Result<()> {
+    use arrow_array::{Float32Array, ListArray};
+    let key = batch
+        .column_by_name("key")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`key` column missing"))?;
+    let value = batch
+        .column_by_name("value")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow!("`value` column missing"))?;
+    let tags = batch
+        .column_by_name("tags")
+        .and_then(|c| c.as_any().downcast_ref::<ListArray>());
+    let distance = batch
+        .column_by_name("_distance")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+    for i in 0..batch.num_rows() {
+        let tag_list: Vec<String> = match tags {
+            Some(list) if list.is_valid(i) => {
+                let inner = list.value(i);
+                let s = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| anyhow!("tags inner type unexpected"))?;
+                (0..s.len()).map(|j| s.value(j).to_string()).collect()
+            }
+            _ => Vec::new(),
+        };
+        out.push(MemoryHit {
+            key: key.value(i).to_string(),
+            value: value.value(i).to_string(),
+            tags: tag_list,
+            distance: distance.map(|d| d.value(i)).unwrap_or(0.0),
+        });
+    }
+    Ok(())
 }
 
-/// Predicate selecting a whole `(scope, visibility, agent_id)` memory namespace.
-///
-/// Used by [`LanceStore::search_memory`] so an individual search can never surface another
-/// agent's rows and a group search only sees group rows.
-fn memory_namespace_predicate(scope: &str, visibility: &str, agent_id: &str) -> String {
-    format!(
-        "scope = '{}' AND visibility = '{}' AND agent_id = '{}'",
-        escape_sql_literal(scope),
-        escape_sql_literal(visibility),
-        escape_sql_literal(agent_id),
-    )
-}
-
-/// Convenience: current time as microseconds since unix epoch, saturating on
-/// the (effectively impossible) clock-before-epoch case.
-pub fn now_micros() -> i64 {
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    i64::try_from(dur.as_micros()).unwrap_or(i64::MAX)
-}
+#[allow(unused_imports)]
+pub(crate) use predicates::{escape_sql_literal, memory_namespace_predicate, memory_row_predicate, now_micros};
 
 #[cfg(test)]
 #[path = "tests.rs"]

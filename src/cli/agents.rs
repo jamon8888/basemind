@@ -222,9 +222,6 @@ pub enum AgentsCmd {
         /// Resume token from a previous page's `next_cursor`.
         #[arg(long)]
         cursor: Option<String>,
-        /// Return messages after this per-thread sequence number.
-        #[arg(long, conflicts_with = "cursor")]
-        after_seq: Option<u64>,
         /// Maximum messages to return (default 100, max 1000).
         #[arg(long)]
         limit: Option<u32>,
@@ -648,18 +645,19 @@ async fn dispatch(root: &Path, json: bool, cmd: AgentsCmd, out: &mut impl Write)
         AgentsCmd::History {
             thread,
             cursor,
-            after_seq,
             limit,
             since_hours,
             as_agent,
         } => {
             let mut client = connect_as(root, as_agent).await?;
             let thread_id = ThreadId::parse(thread).context("thread id")?;
-            let cursor = cursor
-                .map(Cursor)
-                .or_else(|| after_seq.map(|seq| Cursor::encode(thread_id.as_str(), seq)));
             let (messages, next_cursor) = client
-                .read_history(thread_id, cursor, clamp_limit(limit), since_cutoff(since_hours))
+                .read_history(
+                    thread_id,
+                    cursor.map(Cursor),
+                    clamp_limit(limit),
+                    since_cutoff(since_hours),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("history: {e}"))?;
             render_front_matter(&messages, next_cursor.as_ref(), None, json, out)?;
@@ -760,8 +758,8 @@ async fn dispatch(root: &Path, json: bool, cmd: AgentsCmd, out: &mut impl Write)
             let timeout = std::time::Duration::from_secs(u64::from(
                 timeout_secs.unwrap_or(DEFAULT_WAIT_SECS).clamp(1, MAX_WAIT_SECS),
             ));
-            let outcome = client
-                .wait_inbox_unseen(
+            let (timed_out, messages, unread, next_cursor) = client
+                .wait_inbox(
                     remote,
                     cwd,
                     thread_id,
@@ -769,41 +767,28 @@ async fn dispatch(root: &Path, json: bool, cmd: AgentsCmd, out: &mut impl Write)
                     cursor.map(Cursor),
                     DEFAULT_LIMIT,
                     timeout,
-                    &tokio_util::sync::CancellationToken::new(),
-                    |_| false,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("wait: {e}"))?;
-            let timed_out = outcome.timed_out();
-            let reason = outcome.reason.as_str();
             if json {
                 let now = crate::comms::model::now_micros();
-                let messages: Vec<MessageFrontMatter> = outcome
-                    .messages
+                let messages: Vec<MessageFrontMatter> = messages
                     .iter()
                     .map(|sm| MessageFrontMatter::from_seq_meta(sm, now))
                     .collect();
                 render_response(
                     &InboxWaitResponse {
                         timed_out,
-                        reason: reason.to_string(),
                         total: messages.len(),
-                        unread: outcome.unread,
+                        unread,
                         messages,
-                        next_cursor: outcome.next_cursor,
+                        next_cursor,
                     },
                     out,
                 )?;
             } else {
                 writeln!(out, "timed_out: {timed_out}")?;
-                writeln!(out, "reason: {reason}")?;
-                render_front_matter(
-                    &outcome.messages,
-                    outcome.next_cursor.as_ref(),
-                    Some(outcome.unread),
-                    json,
-                    out,
-                )?;
+                render_front_matter(&messages, next_cursor.as_ref(), Some(unread), json, out)?;
             }
         }
     }

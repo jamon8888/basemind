@@ -10,81 +10,19 @@ use rmcp::ErrorData as McpError;
 
 use super::cursor::Cursor;
 use super::helpers_calls::resolve_call_line_col;
-use super::helpers_refs_match::Matching;
 use super::types::ReferenceHit;
-use crate::index::view::Part;
-
-/// Keys one name scan examines before it stops, whether or not they matched. `scan_cap` counts only
-/// accepted hits, so without this an exact scan for a name that is also a common fragment (`get`)
-/// walks every key containing the fragment before it returns. A scan that stops here reports
-/// `total_is_partial` and resumes from the last key it examined.
-pub(crate) const SCAN_KEYS_EXAMINED_MAX: usize = 200_000;
 
 pub(crate) struct CallScanPage {
     pub total: u32,
     pub total_is_partial: bool,
     pub hits: Vec<ReferenceHit>,
     pub next_cursor: Option<Cursor>,
-    /// The last key examined, when the scan stopped at its examined-keys cap with room left on the
-    /// page. `next_cursor` then encodes this key instead of the last hit's, so the next page
-    /// continues the scan where it stopped.
-    pub stopped_after: Option<Vec<u8>>,
     /// Parallel to `hits`: the Fjall key for each emitted hit. Retained so a token budget can
     /// re-anchor `next_cursor` to the last KEPT hit, not the last scanned one.
     pub hit_keys: Vec<Vec<u8>>,
     /// Parallel to `hits`: each hit's call-site start byte. `find_callers` probes it against the
     /// resolved call-site set to annotate `ReferenceHit::resolved` without re-deriving the offset.
     pub hit_starts: Vec<u32>,
-}
-
-impl CallScanPage {
-    /// Assemble a scan's page. The cursor is the last hit's key when matches remain past the page
-    /// (`has_more`), and otherwise the key the scan stopped after, if it stopped early.
-    fn finish(
-        total: u32,
-        total_is_partial: bool,
-        hits: Vec<ReferenceHit>,
-        hit_keys: Vec<Vec<u8>>,
-        hit_starts: Vec<u32>,
-        has_more: bool,
-        stopped_after: Option<Vec<u8>>,
-    ) -> Self {
-        let stopped_after = if has_more { None } else { stopped_after };
-        let next_cursor = if has_more {
-            hit_keys.last().map(|k| Cursor::encode_fjall(k))
-        } else {
-            stopped_after.as_deref().map(Cursor::encode_fjall)
-        };
-        Self {
-            total,
-            total_is_partial,
-            hits,
-            next_cursor,
-            stopped_after,
-            hit_keys,
-            hit_starts,
-        }
-    }
-
-    /// Drop the hits `keep` rejects, with their parallel entries. `total` shrinks by the same count:
-    /// it counted every hit the sender matched, of which only this page's share could be tested, so
-    /// what is left is an upper bound on the hits `keep` accepts. No scan cap was hit, so
-    /// `total_is_partial`, which the response reports as `truncated_reason: "scan_cap"`, is left as the
-    /// sender set it.
-    #[cfg(any(test, all(feature = "comms", any(unix, windows))))]
-    pub(super) fn retain(&mut self, keep: impl Fn(&ReferenceHit) -> bool) {
-        let mut index = 0;
-        while index < self.hits.len() {
-            if keep(&self.hits[index]) {
-                index += 1;
-                continue;
-            }
-            self.hits.remove(index);
-            self.hit_keys.remove(index);
-            self.hit_starts.remove(index);
-            self.total = self.total.saturating_sub(1);
-        }
-    }
 }
 
 /// Result of applying a `max_tokens` budget to a call-scan page.
@@ -129,38 +67,15 @@ pub(super) fn budget_call_page(page: CallScanPage, max_tokens: Option<u32>) -> B
 /// Materializes up to `limit` hits and caps at `scan_cap = limit * 8` matching entries
 /// to bound work on extremely common names.
 ///
-/// `matching` is applied here, on the key, before a hit's position is resolved and before it counts
-/// toward `scan_cap`: under [`Matching::Exact`] a callee that merely contains `name` costs one
-/// suffix test, so a common fragment (`get` inside `get_or_insert`) cannot use up the cap and hide
-/// the exact call sites that sort after it.
-///
-/// Rejected keys still cost a parse and a test each, so the scan also stops once it has examined
-/// [`SCAN_KEYS_EXAMINED_MAX`] keys with more to go; see [`CallScanPage::stopped_after`].
-///
 /// When `cursor_after` is `Some`, the scan resumes from the key immediately following
 /// the cursor (exclusive). The cursor returned in [`CallScanPage::next_cursor`] is the
 /// last key emitted on this page — pass it back on the next call to advance.
 pub(crate) fn scan_calls_by_name(
-    idx: &dyn crate::index::view::IndexView,
+    idx: &crate::index::IndexDb,
     name: &str,
-    matching: Matching,
     limit: usize,
     cursor_after: Option<&[u8]>,
 ) -> Result<CallScanPage, McpError> {
-    scan_calls_examining(idx, name, matching, limit, cursor_after, SCAN_KEYS_EXAMINED_MAX)
-}
-
-/// [`scan_calls_by_name`] with the examined-keys cap as an argument, so a test can reach it.
-pub(super) fn scan_calls_examining(
-    idx: &dyn crate::index::view::IndexView,
-    name: &str,
-    matching: Matching,
-    limit: usize,
-    cursor_after: Option<&[u8]>,
-    examine_cap: usize,
-) -> Result<CallScanPage, McpError> {
-    // A page that examined nothing has no key to resume from.
-    let examine_cap = examine_cap.max(1);
     let finder = memchr::memmem::Finder::new(name.as_bytes());
 
     let lower: Bound<Vec<u8>> = match cursor_after {
@@ -175,22 +90,16 @@ pub(super) fn scan_calls_examining(
     let scan_cap = limit.saturating_mul(8).max(2_000);
     let mut has_more = false;
     let mut matched: usize = 0;
-    let mut last_examined: Option<crate::index::view::IndexBytes> = None;
-    let mut stopped_after: Option<Vec<u8>> = None;
-    for (examined, guard) in idx.callee_keys_matching(name, cursor_after, lower).enumerate() {
-        let (k, _) = guard.map_err(|e| McpError::internal_error(format!("index iter: {e}"), None))?;
-        // Checked on the key that follows the cap, so a scan that ends exactly there is complete.
-        if examined >= examine_cap {
-            total_is_partial = true;
-            stopped_after = last_examined.take().map(|key| key.to_vec());
-            break;
-        }
+    for guard in
+        crate::index::name_dict::name_ordered_keys(&idx.calls_by_callee, &idx.callee_names, name, cursor_after, lower)
+    {
+        let (k, _) = guard
+            .into_inner()
+            .map_err(|e| McpError::internal_error(format!("index iter: {e}"), None))?;
         let Some((callee, rel, start)) = crate::index::keys::parse_call_by_callee(&k) else {
-            last_examined = Some(k);
             continue;
         };
-        if finder.find(callee.as_bytes()).is_none() || !matching.accepts_callee(&callee, name) {
-            last_examined = Some(k);
+        if finder.find(callee.as_bytes()).is_none() {
             continue;
         }
         total += 1;
@@ -213,32 +122,39 @@ pub(super) fn scan_calls_examining(
             total_is_partial = true;
             break;
         }
-        last_examined = Some(k);
     }
-    Ok(CallScanPage::finish(
+    let next_cursor = if has_more {
+        hit_keys.last().map(|k| Cursor::encode_fjall(k))
+    } else {
+        None
+    };
+    Ok(CallScanPage {
         total,
         total_is_partial,
         hits,
+        next_cursor,
         hit_keys,
         hit_starts,
-        has_more,
-        stopped_after,
-    ))
+    })
 }
 
 /// Every call site in `path` from the Fjall `calls_by_path` keyspace, in start-byte order. The one
 /// reader behind the writer session's per-file lookups and the daemon's forwarded
 /// `CallsInFiles`, so the two cannot drift.
 pub(crate) fn calls_in_file_fjall(
-    idx: &dyn crate::index::view::IndexView,
+    idx: &crate::index::IndexDb,
     path: &crate::path::RelPath,
 ) -> Result<Vec<CallRef>, McpError> {
     let prefix = crate::index::keys::calls_by_path_prefix(path);
-    let upper = super::cursor::prefix_upper_bound(&prefix);
-    let upper = upper.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+    let upper: Bound<Vec<u8>> = match super::cursor::prefix_upper_bound(&prefix) {
+        Some(b) => Bound::Excluded(b),
+        None => Bound::Unbounded,
+    };
     let mut out = Vec::new();
-    for guard in idx.range(Part::CallsByPath, Bound::Included(&prefix), upper) {
-        let (_, v) = guard.map_err(|e| McpError::internal_error(format!("index iter: {e}"), None))?;
+    for guard in idx.calls_by_path.range::<Vec<u8>, _>((Bound::Included(prefix), upper)) {
+        let (_, v) = guard
+            .into_inner()
+            .map_err(|e| McpError::internal_error(format!("index iter: {e}"), None))?;
         let call: crate::extract::Call = match rmp_serde::from_slice(&v) {
             Ok(c) => c,
             Err(_) => continue,
@@ -254,29 +170,15 @@ pub(crate) fn calls_in_file_fjall(
 }
 
 /// In-RAM `scan_calls_by_name` twin over [`InRamCallIndex`]. Same case-sensitive
-/// `memmem` substring filter, same `matching` / `limit` / `scan_cap` / cursor semantics — the
+/// `memmem` substring filter, same `limit` / `scan_cap` / cursor semantics — the
 /// entries carry the exact Fjall key the writer would persist, so cursors and
 /// scan order round-trip identically between the two paths.
 pub(super) fn scan_calls_in_ram(
     index: &InRamCallIndex,
     name: &str,
-    matching: Matching,
     limit: usize,
     cursor_after: Option<&[u8]>,
 ) -> CallScanPage {
-    scan_calls_in_ram_examining(index, name, matching, limit, cursor_after, SCAN_KEYS_EXAMINED_MAX)
-}
-
-/// [`scan_calls_in_ram`] with the examined-keys cap as an argument, so a test can reach it.
-pub(super) fn scan_calls_in_ram_examining(
-    index: &InRamCallIndex,
-    name: &str,
-    matching: Matching,
-    limit: usize,
-    cursor_after: Option<&[u8]>,
-    examine_cap: usize,
-) -> CallScanPage {
-    let examine_cap = examine_cap.max(1);
     let finder = memchr::memmem::Finder::new(name.as_bytes());
     let start = match cursor_after {
         Some(cursor) => index.entries.partition_point(|e| e.key.as_slice() <= cursor),
@@ -290,14 +192,8 @@ pub(super) fn scan_calls_in_ram_examining(
     let scan_cap = limit.saturating_mul(8).max(2_000);
     let mut has_more = false;
     let mut matched: usize = 0;
-    let mut stopped_after: Option<Vec<u8>> = None;
-    for (examined, entry) in index.entries[start..].iter().enumerate() {
-        if examined >= examine_cap {
-            total_is_partial = true;
-            stopped_after = Some(index.entries[start + examined - 1].key.clone());
-            break;
-        }
-        if finder.find(entry.callee.as_bytes()).is_none() || !matching.accepts_callee(&entry.callee, name) {
+    for entry in &index.entries[start..] {
+        if finder.find(entry.callee.as_bytes()).is_none() {
             continue;
         }
         total += 1;
@@ -320,15 +216,19 @@ pub(super) fn scan_calls_in_ram_examining(
             break;
         }
     }
-    CallScanPage::finish(
+    let next_cursor = if has_more {
+        hit_keys.last().map(|k| Cursor::encode_fjall(k))
+    } else {
+        None
+    };
+    CallScanPage {
         total,
         total_is_partial,
         hits,
+        next_cursor,
         hit_keys,
         hit_starts,
-        has_more,
-        stopped_after,
-    )
+    }
 }
 
 /// How many files one projection pass decodes before folding them into the views. Bounds the
@@ -338,13 +238,14 @@ const L2_PROJECTION_CHUNK: usize = 256;
 /// In-RAM mirror of the Fjall `calls_by_callee` + `calls_by_path` keyspaces, built
 /// from the L2 call blobs for read-only `serve` sessions that can't open the
 /// single-holder Fjall index. Lets unlimited concurrent sessions answer
-/// `find_references` / `find_callers` from the shared, immutable,
+/// `find_references` / `find_callers` / `call_graph` from the shared, immutable,
 /// concurrently-readable blobs.
 pub(crate) struct InRamCallIndex {
     /// Sorted ascending by `key` to match Fjall's `range` iteration order
     /// (drives `find_references` / `find_callers`).
     entries: Vec<InRamCall>,
-    /// path → its call sites (the `calls_by_path` keyspace).
+    /// path → its call sites (the `calls_by_path` keyspace), for the call-graph
+    /// "callees" direction.
     by_path: ahash::AHashMap<crate::path::RelPath, Vec<CallRef>>,
     /// True when the byte budget cut the projection short, so its answers are incomplete.
     capped: bool,
@@ -452,22 +353,13 @@ impl InRamCallIndex {
         }
     }
 
-    /// A projection of no files.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self {
-            entries: Vec::new(),
-            by_path: ahash::AHashMap::new(),
-            capped: false,
-        }
-    }
-
     /// Whether the byte budget truncated this projection.
     pub(crate) fn capped(&self) -> bool {
         self.capped
     }
 
-    /// All call sites in `rel` (the `calls_by_path` keyspace).
+    /// All call sites in `rel`, for the call-graph "callees" direction (the
+    /// `calls_by_path` keyspace).
     pub(crate) fn calls_in_file(&self, rel: &crate::path::RelPath) -> &[CallRef] {
         self.by_path.get(rel).map_or(&[], Vec::as_slice)
     }

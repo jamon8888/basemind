@@ -56,9 +56,6 @@ pub(crate) struct FileMeta {
     pub(crate) hash_hex: Box<str>,
     pub(crate) language: Box<str>,
     pub(crate) size_bytes: u64,
-    /// File mtime in nanoseconds as indexed (0 = unknown); with `size_bytes` the stamp grep holds the
-    /// live file to before trusting the content's bloom.
-    pub(crate) mtime_ns: i64,
 }
 
 /// Sorted view of every indexed file that has a readable L1 blob.
@@ -85,13 +82,10 @@ impl FileIndexView {
             .files
             .par_iter()
             .filter_map(|(path, entry)| {
-                let blob = store.blob_path_fm_hex(&entry.hash_hex);
-                let exists = blob.is_file()
-                    || store
-                        .fallback_blobs_dir
-                        .as_ref()
-                        .is_some_and(|fallback| blob.file_name().is_some_and(|name| fallback.join(name).is_file()));
-                exists.then(|| (path.clone(), FileMeta::from(entry)))
+                store
+                    .blob_path_fm_hex(&entry.hash_hex)
+                    .is_file()
+                    .then(|| (path.clone(), FileMeta::from(entry)))
             })
             .collect();
         Self { files }
@@ -105,7 +99,9 @@ impl FileIndexView {
         self.files.get(path)
     }
 
-    #[cfg(test)]
+    // Membership is asked only by the governance audit (`memory`) and the codegraph document lane
+    // (`documents`); gated rather than blanket-allowed so a build that drops both keeps no dead code.
+    #[cfg(any(test, feature = "documents", feature = "memory"))]
     pub(crate) fn contains(&self, path: &RelPath) -> bool {
         self.files.contains_key(path)
     }
@@ -158,7 +154,6 @@ impl From<&crate::store::FileEntry> for FileMeta {
             hash_hex: entry.hash_hex.as_str().into(),
             language: entry.language.as_str().into(),
             size_bytes: entry.size_bytes,
-            mtime_ns: entry.mtime,
         }
     }
 }
@@ -169,7 +164,6 @@ impl Clone for FileMeta {
             hash_hex: self.hash_hex.clone(),
             language: self.language.clone(),
             size_bytes: self.size_bytes,
-            mtime_ns: self.mtime_ns,
         }
     }
 }
@@ -189,8 +183,6 @@ pub(crate) struct L1Cache {
     /// Global content-addressed blob directory. Reading a blob needs nothing but this path, which
     /// is why a miss can be served without ever taking the store lock.
     blobs_dir: PathBuf,
-    fallback: Option<PathBuf>,
-    _layered_lease: Option<std::sync::Arc<dyn crate::index::view::IndexView>>,
     /// Byte ceiling for decoded values; `0` means unbounded (the pre-split behaviour).
     budget_bytes: u64,
     inner: Mutex<Charged>,
@@ -203,8 +195,6 @@ impl L1Cache {
     pub(crate) fn new(blobs_dir: PathBuf, budget_bytes: u64) -> Self {
         Self {
             blobs_dir,
-            fallback: None,
-            _layered_lease: None,
             budget_bytes,
             inner: Mutex::new(Charged {
                 lru: LruCache::unbounded(),
@@ -220,13 +210,6 @@ impl L1Cache {
     }
 
     /// The global content-addressed blob directory this cache reads from.
-    pub(crate) fn from_store(store: &crate::store::Store, budget_bytes: u64) -> Self {
-        let mut cache = Self::new(store.blobs_dir.clone(), budget_bytes);
-        cache.fallback = store.fallback_blobs_dir.clone();
-        cache._layered_lease = store.layered_read.clone();
-        cache
-    }
-
     pub(crate) fn blobs_dir(&self) -> &std::path::Path {
         &self.blobs_dir
     }
@@ -296,56 +279,9 @@ impl L1Cache {
 
     fn read_blob(&self, hash_hex: &str) -> Option<FileMapL1> {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        match crate::store_blob::read_l1_blob_in(&self.blobs_dir, hash_hex) {
-            Ok(Some(map)) => Some(map),
-            Ok(None) => self
-                .fallback
-                .as_ref()
-                .and_then(|dir| crate::store_blob::read_l1_blob_in(dir, hash_hex).ok().flatten()),
-            Err(error) => self.recover_unreadable(hash_hex, &error),
-        }
-    }
-
-    /// Log why a blob the file map names could not be served, and remove a damaged one. The
-    /// caller's refusal says the same to the agent (see `tool_contract::not_indexed`). Returns the
-    /// blob when a writer replaced the damaged file with a good one in the meantime.
-    fn recover_unreadable(&self, hash_hex: &str, error: &crate::store::StoreError) -> Option<FileMapL1> {
-        if is_damage(error) && self.blobs_dir == crate::store::global_blobs_dir() {
-            // A damaged blob (torn by a power loss: blobs are not fsynced) would be trusted for
-            // existing by every later scan. With the blob gone the next scan of the file finds
-            // nothing for its hash and extracts it again. Only the global store is repaired this
-            // way; a published base generation is immutable.
-            //
-            // A scan may rename a good blob over the damaged one at any moment, and an unlink by
-            // path would take that one. So the file is identified, read once more, and removed
-            // only if that read finds damage too and it is still the file that was read.
-            let path = self.blobs_dir.join(format!("{hash_hex}.fm.msgpack"));
-            let failed = BlobIdentity::of(&path);
-            match crate::store_blob::read_l1_blob_in(&self.blobs_dir, hash_hex) {
-                Ok(replaced) => return replaced,
-                Err(again) if is_damage(&again) => {
-                    let dropped = remove_if_still(&path, failed);
-                    self.forget(hash_hex);
-                    tracing::warn!(hash = hash_hex, %error, dropped, "damaged blob for an indexed file; rescan to rebuild it");
-                }
-                // The file identified may be a good one a scan has just put there, and a read
-                // that failed for another reason says nothing against it.
-                Err(again) => {
-                    tracing::warn!(hash = hash_hex, error = %again, "blob for an indexed file could not be read");
-                }
-            }
-        } else {
-            tracing::warn!(hash = hash_hex, %error, "blob for an indexed file could not be read");
-        }
-        None
-    }
-
-    /// Drop the cached value of `hash_hex`, if any.
-    fn forget(&self, hash_hex: &str) {
-        let mut guard = self.lock();
-        if let Some(previous) = guard.lru.pop(hash_hex) {
-            guard.charged = guard.charged.saturating_sub(l1_heap_bytes(&previous));
-        }
+        crate::store_blob::read_l1_blob_in(&self.blobs_dir, hash_hex)
+            .ok()
+            .flatten()
     }
 
     /// Insert `value` and evict least-recently-used entries until the charge fits the budget.
@@ -383,36 +319,6 @@ impl L1Cache {
         // A poisoned cache costs at most a re-read: every value is reconstructible from its blob.
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// What tells one file at a path from another renamed over it: its inode where there is one, and
-/// its length and modification time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BlobIdentity {
-    inode: u64,
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-impl BlobIdentity {
-    fn of(path: &std::path::Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
-        #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
-        #[cfg(not(unix))]
-        let inode = 0;
-        Some(Self {
-            inode,
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        })
-    }
-}
-
-/// Remove the file at `path` if it is still the file `expected` identified. Returns whether it
-/// was removed.
-fn remove_if_still(path: &std::path::Path, expected: Option<BlobIdentity>) -> bool {
-    expected.is_some() && BlobIdentity::of(path) == expected && std::fs::remove_file(path).is_ok()
 }
 
 /// Stream `(path, l1)` for every file in `view`, in path order, calling `f` until it returns
@@ -497,21 +403,6 @@ pub(crate) fn budget_bytes_from(resources: &crate::config::ResourcesConfig) -> u
     (resources.max_map_cache_mb as u64).saturating_mul(1024 * 1024)
 }
 
-/// Whether `error` says the blob's bytes are bad, as opposed to the read having failed. The
-/// global store's directory is this binary's own schema namespace, so a blob there that claims
-/// another schema is not one any basemind wrote: it is damaged like a torn one.
-fn is_damage(error: &crate::store::StoreError) -> bool {
-    use crate::store::StoreError;
-    matches!(
-        error,
-        StoreError::CorruptBlob { .. }
-            | StoreError::Decode(_)
-            | StoreError::Decompression { .. }
-            | StoreError::SchemaMismatch { .. }
-            | StoreError::NewerSchema { .. }
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,49 +456,6 @@ mod tests {
         assert!(cache.load("ff").is_some(), "the newest entry is never evicted");
     }
 
-    /// A damaged blob must not stay where every later scan would trust it for existing.
-    #[test]
-    fn a_damaged_blob_is_dropped_so_the_next_scan_rebuilds_it() {
-        crate::store::init_isolated_cache();
-        let blobs = crate::store::global_blobs_dir();
-        std::fs::create_dir_all(&blobs).unwrap();
-        let hash = "d".repeat(64);
-        let path = blobs.join(format!("{hash}.fm.msgpack"));
-        let mut torn = crate::store_blob::frame_filemap(&l1_with("a", 64), None).unwrap();
-        torn.truncate(torn.len() / 2);
-        std::fs::write(&path, torn).unwrap();
-        let cache = L1Cache::new(blobs, 0);
-
-        assert!(cache.load(&hash).is_none());
-        assert!(!path.exists(), "the damaged blob must be removed");
-    }
-
-    /// A scan can rename a good blob over the damaged one between the failed read and the unlink.
-    /// The unlink is for the file that failed, not for whatever is at its path by then.
-    #[test]
-    fn a_blob_renamed_into_place_after_the_failed_read_is_not_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("blob.fm.msgpack");
-        std::fs::write(&path, b"torn").unwrap();
-        let failed = BlobIdentity::of(&path);
-        let fresh = dir.path().join("blob.fm.msgpack.tmp");
-        std::fs::write(&fresh, b"a good blob").unwrap();
-        std::fs::rename(&fresh, &path).unwrap();
-
-        assert!(!remove_if_still(&path, failed), "another file is at the path now");
-        assert_eq!(std::fs::read(&path).unwrap(), b"a good blob");
-
-        assert!(
-            remove_if_still(&path, BlobIdentity::of(&path)),
-            "the same file is removed"
-        );
-        assert!(!path.exists());
-        assert!(
-            !remove_if_still(&path, None),
-            "a file that could not be identified is left alone"
-        );
-    }
-
     /// `0` disables eviction entirely — the documented "unbounded" sentinel the equivalence test
     /// compares against.
     #[test]
@@ -618,20 +466,5 @@ mod tests {
             cache.admit(&format!("{i:064x}"), &value);
         }
         assert!(cache.charged_bytes() > 32 * 4096);
-    }
-
-    /// Only bad bytes condemn a blob. A read that failed for another reason (the disk, a
-    /// permission) says nothing about the file, which may be a good one a scan has just written.
-    #[test]
-    fn a_read_that_failed_is_not_a_damaged_blob() {
-        use crate::store::StoreError;
-
-        let path = std::path::PathBuf::from("blob.fm.msgpack");
-        assert!(is_damage(&StoreError::CorruptBlob { path: path.clone() }));
-        assert!(is_damage(&StoreError::SchemaMismatch { found: 1, expected: 2 }));
-        assert!(!is_damage(&StoreError::Io {
-            path,
-            source: std::io::Error::from(std::io::ErrorKind::Interrupted),
-        }));
     }
 }

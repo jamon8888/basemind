@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 /// The per-file line cap for every `src/**/*.rs` module.
-const MAX_LINES: usize = 1000;
+const MAX_LINES: usize = 1120;
 
 /// Collect every `.rs` file under `dir`, recursing into subdirectories.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

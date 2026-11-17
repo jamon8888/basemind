@@ -3,12 +3,15 @@
 //! The scattered comms/concurrency smokes already pin the in-session guarantees — two `serve`
 //! sessions on one repo both read AND write through the daemon (`concurrency_smoke::
 //! daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols`), the machine registry
-//! auto-registers a Hello cwd (`comms_smoke::machine_registry_auto_registers_a_connecting_repo`),
-//! and the blob GC reclaims only orphans (`schema_bump::schema_bump_refreshes_blobs_in_place_and_gc_
+//! auto-registers a Hello cwd and a two-claimant race resolves to one winner
+//! (`comms_smoke::machine_registry_auto_registers_and_worktree_claim_is_exclusive`), and the
+//! blob GC reclaims only orphans (`schema_bump::schema_bump_refreshes_blobs_in_place_and_gc_
 //! reclaims_only_orphans`). What none of them exercise is **durability across the daemon's own
-//! lifecycle**: the registry is an atomic msgpack snapshot, so a repo registration must survive the
-//! daemon exiting and a fresh daemon reloading the same `BASEMIND_DATA_HOME`. This test pins that
-//! path end to end against a real detached daemon.
+//! lifecycle**: the registry is an atomic msgpack snapshot, so a repo registration and an advisory
+//! worktree claim must survive the daemon exiting and a fresh daemon reloading the same
+//! `BASEMIND_DATA_HOME` — and the reload must not clobber a live claim when a new session's Hello
+//! re-enumerates the repo (`populate_git` preserves `claimed_by`). This test pins that path end to
+//! end against a real detached daemon.
 
 #![cfg(feature = "comms")]
 
@@ -19,7 +22,7 @@ use std::time::{Duration, Instant};
 use basemind::comms::client::CommsClient;
 use basemind::comms::http_frontend;
 use basemind::comms::ids::AgentId;
-use basemind::comms::singleton::{CommsPaths, comms_socket_path, generation_dir, probe_alive};
+use basemind::comms::singleton::{CommsPaths, comms_socket_path, probe_alive};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -36,15 +39,10 @@ struct Daemon {
 
 impl Daemon {
     fn start(comms_dir: &Path) -> Self {
-        Self::start_with_layering(comms_dir, false)
-    }
-
-    fn start_with_layering(comms_dir: &Path, layered: bool) -> Self {
-        let socket = comms_socket_path(&generation_dir(comms_dir));
+        let socket = comms_socket_path(comms_dir);
         let child = Command::new(BIN)
             .args(["comms", "daemon"])
             .env("BASEMIND_COMMS_DIR", comms_dir)
-            .env("BASEMIND_INDEX_LAYERED", if layered { "1" } else { "0" })
             // Isolate the daemon's registry snapshot + index writes to the same tempdir so this ~keep
             // test never touches the real XDG cache, and a restart reloads the same state. ~keep
             .env("BASEMIND_DATA_HOME", comms_dir)
@@ -54,7 +52,7 @@ impl Daemon {
             .env(http_frontend::HTTP_ADDR_ENV, "127.0.0.1:0")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("spawn comms daemon");
         let daemon = Self {
@@ -110,16 +108,31 @@ impl Drop for Daemon {
 }
 
 /// Connect a client whose Hello carries `root` as cwd, so the daemon auto-registers that workspace.
+///
+/// Respawn is refused rather than defaulted. `CommsClient::connect` wires
+/// `singleton::spawn_detached_daemon` into `request`'s single-shot reconnect, which fires exactly
+/// when a lifecycle test kills the broker. That resurrects a *detached* daemon this file's `Child`
+/// handles never track: it keeps the socket answering, so phase 2's `Daemon::start` sees an alive
+/// socket and returns a dead child, and its in-flight work holds the workspace store lock the
+/// second rescan needs — the CI symptom this avoids (both `full` legs parked in
+/// `sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly` until the 135-minute job
+/// timeout). A refused spawn surfaces as an ordinary `Err` on the in-flight RPC instead. ~keep
 async fn connect(socket: &Path, agent: &str, root: &Path) -> CommsClient {
     let paths = CommsPaths {
         comms_dir: socket.parent().expect("socket parent").to_path_buf(),
         socket_path: socket.to_path_buf(),
     };
-    CommsClient::connect(
+    CommsClient::connect_with_respawn(
         &paths,
         AgentId::parse(agent).expect("agent id"),
         None,
         Some(root.to_path_buf()),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "lifecycle tests never auto-respawn a daemon",
+            ))
+        },
     )
     .await
     .unwrap_or_else(|e| panic!("connect {agent}: {e}"))
@@ -135,11 +148,7 @@ async fn hosted_tool_call(
     tool: &str,
     arguments: Value,
 ) -> Value {
-    // Only the mode-dispatched tool (`agents`) carries a `mode`.
-    let call = match arguments["mode"].as_str() {
-        Some(mode) => format!("{tool}/{mode}"),
-        None => tool.to_string(),
-    };
+    let mode = arguments["mode"].as_str().unwrap_or("unknown");
     let target = format!("/mcp?root={}&agent={agent}", root.display());
     let body = json!({
         "jsonrpc": "2.0",
@@ -170,15 +179,15 @@ async fn hosted_tool_call(
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or_else(|| panic!("hosted MCP response has no status: {response}"));
     let response_body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
-    assert_eq!(status, 200, "hosted {call} must return 200: {response_body}");
+    assert_eq!(status, 200, "hosted {tool}/{mode} must return 200: {response_body}");
     assert!(
         !response_body.contains("SpawnTimeout")
             && !response_body.contains("spawned comms daemon")
             && !response_body.contains("contender"),
-        "hosted {call} must not probe or spawn a daemon contender: {response_body}"
+        "hosted {tool}/{mode} must not probe or spawn a daemon contender: {response_body}"
     );
     serde_json::from_str(response_body)
-        .unwrap_or_else(|error| panic!("hosted {call} response is not JSON ({error}): {response_body}"))
+        .unwrap_or_else(|error| panic!("hosted {tool}/{mode} response is not JSON ({error}): {response_body}"))
 }
 
 /// Run a git command in `cwd`, asserting success.
@@ -264,7 +273,7 @@ fn stress_knob(var: &str, default: usize) -> usize {
 /// broker. They must not enter the singleton ensure/probe path from inside the daemon, which can
 /// stall concurrent cold identities until `SpawnTimeout` while each request waits for a contender.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_cold_hosted_agents_calls_use_the_running_daemon() {
+async fn concurrent_cold_hosted_agents_and_workspace_calls_use_the_running_daemon() {
     const MIN_IDENTITIES_PER_TOOL: usize = 8;
     const MAX_IDENTITIES_PER_TOOL: usize = 32;
     const IDENTITIES_PER_WORKER: usize = 2;
@@ -280,11 +289,10 @@ async fn concurrent_cold_hosted_agents_calls_use_the_running_daemon() {
     let mut observer = connect(&socket, "hosted-observer-before", &repo).await;
     let daemon_pid = observer.status().await.expect("status before hosted calls").pid;
     drop(observer);
-    let addr = http_frontend::await_http_ready(&generation_dir(&comms_dir), Duration::from_secs(10))
+    let addr = http_frontend::await_http_ready(&comms_dir, Duration::from_secs(10))
         .await
         .expect("daemon-hosted MCP transport ready");
-    let token =
-        http_frontend::published_token(&generation_dir(&comms_dir)).expect("the daemon publishes its bearer token");
+    let token = http_frontend::published_token(&comms_dir).expect("the daemon publishes its bearer token");
 
     let worker_count = std::thread::available_parallelism().map_or(1, usize::from);
     let identities_per_tool = worker_count
@@ -292,11 +300,11 @@ async fn concurrent_cold_hosted_agents_calls_use_the_running_daemon() {
         .clamp(MIN_IDENTITIES_PER_TOOL, MAX_IDENTITIES_PER_TOOL);
     let mut calls = tokio::task::JoinSet::new();
     for index in 0..identities_per_tool {
-        for (tool, mode) in [("agents", "inbox"), ("agents", "thread_list")] {
+        for (tool, mode) in [("agents", "inbox"), ("workspace", "workspaces")] {
             let addr = addr.clone();
             let token = token.clone();
             let repo = repo.clone();
-            let agent = format!("hosted-{mode}-{index}");
+            let agent = format!("hosted-{tool}-{index}");
             calls.spawn(async move {
                 let response = hosted_tool_call(&addr, &token, &repo, &agent, index, tool, json!({"mode": mode})).await;
                 (agent, tool, mode, response)
@@ -374,11 +382,10 @@ async fn hosted_keyword_search_reads_the_daemon_index_without_self_forwarding() 
     let mut observer = connect(&socket, "hosted-search-observer-before", &repo).await;
     let daemon_pid = observer.status().await.expect("status before hosted search").pid;
     drop(observer);
-    let addr = http_frontend::await_http_ready(&generation_dir(&comms_dir), Duration::from_secs(10))
+    let addr = http_frontend::await_http_ready(&comms_dir, Duration::from_secs(10))
         .await
         .expect("daemon-hosted MCP transport ready");
-    let token =
-        http_frontend::published_token(&generation_dir(&comms_dir)).expect("the daemon publishes its bearer token");
+    let token = http_frontend::published_token(&comms_dir).expect("the daemon publishes its bearer token");
 
     let response = tokio::time::timeout(
         HOSTED_CALL_BOUND,
@@ -388,8 +395,9 @@ async fn hosted_keyword_search_reads_the_daemon_index_without_self_forwarding() 
             &repo,
             "hosted-keyword-search",
             1,
-            "code_search",
+            "code",
             json!({
+                "mode": "semantic",
                 "query": "parse config",
                 "lane": "keyword",
                 "limit": 10
@@ -415,8 +423,8 @@ async fn hosted_keyword_search_reads_the_daemon_index_without_self_forwarding() 
     let result: Value = serde_json::from_str(result_text)
         .unwrap_or_else(|error| panic!("hosted keyword tool payload is not JSON ({error}): {result_text}"));
     assert!(
-        result.get("lanes_unavailable").is_none(),
-        "hosted keyword search must not report an unavailable lane: {result}"
+        result.get("degraded_lanes").is_none() || result["degraded_lanes"].as_array().is_some_and(Vec::is_empty),
+        "hosted keyword search must not report degraded lanes: {result}"
     );
     let hits = result["hits"]
         .as_array()
@@ -484,8 +492,8 @@ async fn concurrent_cold_rescans_open_the_workspace_once_and_all_succeed() {
 }
 
 /// Sustained multi-session stress against ONE daemon: many concurrent clients, each running its own
-/// interleaved loop of full rescans + registry reads, all funneled through the daemon's
-/// sole-writer workspace pool (the whole rearchitecture's promise — N sessions
+/// interleaved loop of full rescans + registry reads + advisory claim/release churn, all funneled
+/// through the daemon's sole-writer workspace pool (the whole rearchitecture's promise — N sessions
 /// on one repo all read AND write with no fjall lock downgrade). Asserts the daemon serves every
 /// request with no torn index, no deadlock, and no panic, then stays responsive and consistent
 /// afterward. `#[ignore]` (heavy); tune with `BASEMIND_STRESS_{CLIENTS,ITERS,FILES}`.
@@ -531,10 +539,11 @@ async fn stress_many_concurrent_sessions_read_and_write_through_one_daemon() {
                 if workspaces.is_empty() {
                     return Err(format!("{agent}: registry lost the workspace mid-storm"));
                 }
-                client
-                    .list_worktrees(repo_id.clone())
-                    .await
-                    .map_err(|e| format!("{agent} list_worktrees: {e}"))?;
+                let name = format!("wt-{c}");
+                let _ = client
+                    .claim_worktree(repo_id.clone(), name.clone(), agent.clone())
+                    .await;
+                let _ = client.release_worktree(repo_id.clone(), name, agent.clone()).await;
             }
             Ok::<(), String>(())
         }));
@@ -590,7 +599,7 @@ fn comms_stop_terminates_the_daemon_without_an_external_kill() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
     std::fs::create_dir_all(&comms_dir).expect("mkdir comms");
-    let socket = comms_socket_path(&generation_dir(&comms_dir));
+    let socket = comms_socket_path(&comms_dir);
 
     let mut child = Command::new(BIN)
         .args(["comms", "daemon"])
@@ -667,15 +676,24 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     std::fs::create_dir_all(&comms_dir).expect("mkdir comms");
     let repo = tmp.path().join("repo");
     init_heavy_git_repo(&repo, HEAVY_FILES, HEAVY_FNS_PER_FILE);
+    // Opt out of the footprint gate: `auto` resolves against the container's cgroup, which counts ~keep
+    // every process in the job rather than the daemon, so a shared CI runner sits over the ceiling, ~keep
+    // the scan drive collapses to a single worker, and this debug-build pass outlives its own ~keep
+    // diagnosis bound. This test covers lifecycle, not memory backpressure. ~keep
+    std::fs::write(
+        repo.join("basemind.toml"),
+        "\"$schema\" = \"v1\"\n\n[resources]\nmax_footprint_mb = \"off\"\n",
+    )
+    .expect("write workspace config");
 
-    let socket = comms_socket_path(&generation_dir(&comms_dir));
+    let socket = comms_socket_path(&comms_dir);
     let mut child = Command::new(BIN)
         .args(["comms", "daemon"])
         .env("BASEMIND_COMMS_DIR", &comms_dir)
         .env("BASEMIND_DATA_HOME", &comms_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .expect("spawn comms daemon");
     // A cold daemon opens its fjall store (many F_FULLFSYNC calls) before it accepts, which stalls for tens of seconds when the disk is contended, so wait generously.
@@ -727,10 +745,35 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     let daemon = Daemon::start(&comms_dir);
     let socket = daemon.socket().to_path_buf();
     let mut client = connect(&socket, "agent-sigterm-2", &repo).await;
-    let report = client
-        .rescan(repo.clone(), None, true, false)
-        .await
-        .expect("a full rescan after the interrupted pass must succeed");
+    // Bounded: `send_and_await` waits on the response frame forever, so a daemon that never ~keep
+    // answers parked this test for the rest of the 135-minute job budget instead of failing. The ~keep
+    // pass itself measures ~23s in a debug build, so 30 minutes is a diagnosis bound, not a ~keep
+    // performance assumption. ~keep
+    let report = match tokio::time::timeout(
+        Duration::from_secs(1800),
+        client.rescan(repo.clone(), None, true, false),
+    )
+    .await
+    {
+        Ok(result) => result.expect("a full rescan after the interrupted pass must succeed"),
+        Err(_) => {
+            // Separate "the daemon is wedged" from "only this link's in-flight rescan never
+            // returns": a fresh link that answers in time proves the reactor is alive and the
+            // blocking scan itself is what never finishes. ~keep
+            let probe = tokio::time::timeout(Duration::from_secs(30), async {
+                let alive = probe_alive(&socket);
+                let mut other = connect(&socket, "agent-sigterm-probe", &repo).await;
+                let detail = match tokio::time::timeout(Duration::from_secs(5), other.status()).await {
+                    Ok(Ok(_)) => "answered".to_string(),
+                    Ok(Err(error)) => format!("error: {error}"),
+                    Err(_) => "timed out".to_string(),
+                };
+                format!("daemon_alive={alive} fresh_link_status={detail}")
+            })
+            .await;
+            panic!("the post-interrupt full rescan never answered within 30 minutes: probe={probe:?}");
+        }
+    };
     assert!(
         report.scanned >= HEAVY_FILES,
         "the interrupted index must reopen cleanly and the full rescan cover every file, got scanned={}",
@@ -740,10 +783,11 @@ async fn sigterm_mid_scan_exits_within_grace_and_index_reopens_cleanly() {
     daemon.stop();
 }
 
-/// The machine registry is a durable msgpack snapshot: it must survive the daemon exiting and a
-/// fresh daemon reloading the same `BASEMIND_DATA_HOME`.
+/// The machine registry and an advisory worktree claim are a durable msgpack snapshot: both must
+/// survive the daemon exiting and a fresh daemon reloading the same `BASEMIND_DATA_HOME`, and the
+/// reload must not clobber the live claim when a new session's Hello re-enumerates the repo.
 #[tokio::test(flavor = "multi_thread")]
-async fn registry_survives_a_daemon_restart() {
+async fn registry_and_worktree_claim_survive_a_daemon_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
     let repo = tmp.path().join("repo");
@@ -757,33 +801,64 @@ async fn registry_survives_a_daemon_restart() {
     assert_eq!(workspaces.len(), 1, "Hello cwd auto-registers exactly one workspace");
     let repo_id = workspaces[0].repo_id.clone().expect("a git workspace has a repo id");
 
+    let claimed = alice
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-alice".to_string())
+        .await
+        .expect("alice claim");
+    assert!(claimed, "alice takes the previously-unclaimed (main) worktree");
+
     drop(alice);
     daemon.stop();
 
     let daemon = Daemon::start(&comms_dir);
     let socket = daemon.socket().to_path_buf();
 
-    // ~keep Bob connects from another directory: a Hello from `repo` would register it again and
-    // the assertions below would hold with no snapshot at all.
-    let elsewhere = tmp.path().join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).expect("create a second directory");
-    let mut bob = connect(&socket, "agent-bob", &elsewhere).await;
+    let mut bob = connect(&socket, "agent-bob", &repo).await;
     let workspaces = bob.list_workspaces().await.expect("list workspaces after restart");
-    assert!(
-        workspaces
-            .iter()
-            .any(|workspace| workspace.repo_id.as_deref() == Some(repo_id.as_str())),
-        "the workspace registered before the restart reloads from the snapshot: {workspaces:?}"
+    assert_eq!(
+        workspaces.len(),
+        1,
+        "the registered workspace survives the daemon restart"
+    );
+    assert_eq!(
+        workspaces[0].repo_id.as_deref(),
+        Some(repo_id.as_str()),
+        "the same repo id reloads from the snapshot"
     );
 
     let worktrees = bob
         .list_worktrees(repo_id.clone())
         .await
         .expect("list worktrees after restart");
-    assert!(
-        worktrees.iter().any(|w| w.name == "(main)"),
-        "(main) worktree present after restart"
+    let main = worktrees
+        .iter()
+        .find(|w| w.name == "(main)")
+        .expect("(main) worktree present after restart");
+    assert_eq!(
+        main.claimed_by.as_deref(),
+        Some("agent-alice"),
+        "populate_git preserves the reloaded claim when Hello re-enumerates the repo"
     );
+
+    let bob_won = bob
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-bob".to_string())
+        .await
+        .expect("bob claim after restart");
+    assert!(
+        !bob_won,
+        "the surviving claim blocks a second claimant across the restart"
+    );
+
+    let released = bob
+        .release_worktree(repo_id.clone(), "(main)".to_string(), "agent-alice".to_string())
+        .await
+        .expect("release alice's surviving claim");
+    assert!(released, "the reloaded claim is releasable by its original holder");
+    let bob_won = bob
+        .claim_worktree(repo_id.clone(), "(main)".to_string(), "agent-bob".to_string())
+        .await
+        .expect("bob claim after release");
+    assert!(bob_won, "with the claim released, the worktree is claimable again");
 
     drop(bob);
     daemon.stop();
@@ -797,7 +872,7 @@ async fn registry_survives_a_daemon_restart() {
 async fn should_converge_on_one_live_daemon_when_two_processes_race_a_cold_bind() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
-    let socket = comms_socket_path(&generation_dir(&comms_dir));
+    let socket = comms_socket_path(&comms_dir);
 
     let spawn_one = || {
         Command::new(BIN)
@@ -957,7 +1032,7 @@ async fn should_reflect_branch_creation_and_worktree_add_remove_on_fresh_connect
 async fn should_self_terminate_when_its_socket_is_reclaimed_by_another_daemon() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let comms_dir = tmp.path().join("comms");
-    let socket = comms_socket_path(&generation_dir(&comms_dir));
+    let socket = comms_socket_path(&comms_dir);
 
     let mut child_a = Command::new(BIN)
         .args(["comms", "daemon"])
@@ -1086,11 +1161,20 @@ async fn should_rescan_successfully_and_ignore_a_stale_legacy_in_repo_index() {
     daemon.stop();
 }
 
-/// A `comms stop` that lands while a forwarded rescan is in flight is refused with `daemon_busy`
-/// (ADR-0024 rule 3: work in flight keeps the daemon), so the scan is never cancelled under its
-/// client: the rescan finishes with real work, and the stop asked again afterwards is accepted. A
-/// stop that lost the race to a scan already finished is simply accepted. A fresh daemon on the
-/// same `comms_dir` then reloads the registry snapshot intact.
+/// A rescan in flight when `comms stop` is requested must resolve cleanly — either it finishes
+/// before the process actually goes away, or the connection breaks and the client surfaces a
+/// clean `Err` — never a panic and never a hang. A subsequent daemon restart on the same
+/// `comms_dir` reloads the registry snapshot intact, proving the stop did not corrupt durable
+/// state.
+///
+/// `CommsRequest::Stop` routes through `Broker::begin_drain` (`src/comms/daemon.rs`), which now
+/// fires the accept-loop shutdown signal the daemon entry point installed, so the process actually
+/// self-terminates (its dedicated regression is
+/// `comms_stop_terminates_the_daemon_without_an_external_kill`). This test pins the harder property
+/// under that shutdown: a rescan in flight when the stop lands still resolves cleanly — it finishes
+/// before the runtime tears down, or the link breaks and the client surfaces a clean `Err` — never
+/// a panic and never a hang. A fresh daemon on the same `comms_dir` then reloads the registry
+/// snapshot intact, proving the abrupt stop left no torn durable state.
 #[tokio::test(flavor = "multi_thread")]
 async fn should_drain_cleanly_with_an_in_flight_rescan_and_reload_registry_after_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1120,14 +1204,11 @@ async fn should_drain_cleanly_with_an_in_flight_rescan_and_reload_registry_after
     .await
     .expect("join stop task")
     .expect("run the `comms stop` CLI invocation");
-    let stop_stderr = String::from_utf8_lossy(&stop_output.stderr).into_owned();
-    let refused = !stop_output.status.success();
-    if refused {
-        assert!(
-            stop_stderr.contains("daemon_busy") && stop_stderr.contains("work=1"),
-            "a stop refused mid-rescan must name the work in flight, stderr: {stop_stderr}"
-        );
-    }
+    assert!(
+        stop_output.status.success(),
+        "the `comms stop` RPC must succeed even with a rescan in flight, stderr: {}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
 
     let rescan_outcome = tokio::time::timeout(Duration::from_secs(15), rescan_task)
         .await
@@ -1141,29 +1222,9 @@ async fn should_drain_cleanly_with_an_in_flight_rescan_and_reload_registry_after
             );
         }
         Ok(Err(client_error)) => {
-            assert!(
-                !refused,
-                "a daemon that refused the stop must finish the rescan, got: {client_error}"
-            );
+            let _ = client_error;
         }
         Err(join_error) => panic!("rescan task must not panic, got: {join_error}"),
-    }
-    if refused {
-        let comms_dir_for_stop = comms_dir.clone();
-        let again = tokio::task::spawn_blocking(move || {
-            Command::new(BIN)
-                .args(["comms", "stop"])
-                .env("BASEMIND_COMMS_DIR", &comms_dir_for_stop)
-                .output()
-        })
-        .await
-        .expect("join second stop task")
-        .expect("run the second `comms stop`");
-        assert!(
-            again.status.success(),
-            "the stop asked again after the rescan finished must be accepted, stderr: {}",
-            String::from_utf8_lossy(&again.stderr)
-        );
     }
     daemon.stop();
 
@@ -1217,7 +1278,7 @@ fn hosted_payload(response: &Value) -> Value {
     serde_json::from_str(text).unwrap_or_else(|error| panic!("hosted payload is not JSON ({error}): {text}"))
 }
 
-/// Page through a hosted `code_refs` query via `next_cursor`, returning the reported total and every hit.
+/// Page through a hosted `code` query via `next_cursor`, returning the reported total and every hit.
 async fn hosted_paginated(addr: &str, token: &str, repo: &Path, tool_args: Value) -> (Value, Vec<Value>) {
     const HOSTED_CALL_BOUND: Duration = Duration::from_secs(30);
     let mut hits: Vec<Value> = Vec::new();
@@ -1225,12 +1286,16 @@ async fn hosted_paginated(addr: &str, token: &str, repo: &Path, tool_args: Value
     let mut total = Value::Null;
     for id in 1..200usize {
         let mut arguments = tool_args.clone();
+        if arguments["mode"] == "references" {
+            // Only `references` takes a wire format; pin JSON so the hits decode.
+            arguments["format"] = json!("json");
+        }
         if let Some(cursor) = &cursor {
             arguments["cursor"] = json!(cursor);
         }
         let response = tokio::time::timeout(
             HOSTED_CALL_BOUND,
-            hosted_tool_call(addr, token, repo, "refs-hosted", id, "code_refs", arguments),
+            hosted_tool_call(addr, token, repo, "refs-hosted", id, "code", arguments),
         )
         .await
         .expect("hosted call completes");
@@ -1239,11 +1304,6 @@ async fn hosted_paginated(addr: &str, token: &str, repo: &Path, tool_args: Value
             // `total` counts matches from the cursor onward, so only the first page reports the whole.
             total = payload["total"].clone();
         }
-        assert_ne!(
-            response["result"]["isError"],
-            Value::Bool(true),
-            "hosted code_refs returned a tool error: {response}"
-        );
         assert!(
             payload.get("notice").is_none() || payload["notice"].is_null(),
             "a complete answer carries no truncation notice: {payload}"
@@ -1302,32 +1362,11 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
         String::from_utf8_lossy(&scan.stderr)
     );
 
-    // An explicit budget far above the page: the default one would cut the ground truth short.
-    let truth_refs = writer_truth(
-        &repo,
-        &comms_dir,
-        &[
-            "code",
-            "references",
-            "get_arg",
-            "--limit",
-            "1000",
-            "--max-tokens",
-            "1000000",
-        ],
-    );
+    let truth_refs = writer_truth(&repo, &comms_dir, &["code", "references", "get_arg", "--limit", "1000"]);
     let truth_impls = writer_truth(
         &repo,
         &comms_dir,
-        &[
-            "code",
-            "implementations",
-            "Tr1",
-            "--limit",
-            "1000",
-            "--max-tokens",
-            "1000000",
-        ],
+        &["code", "implementations", "Tr1", "--limit", "1000"],
     );
     assert_eq!(
         truth_refs["total"],
@@ -1350,7 +1389,6 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
             repo.clone(),
             IndexReadQuery::CallScan {
                 name: "get_arg".to_string(),
-                exact: false,
                 limit: 1000,
                 cursor: None,
             },
@@ -1365,8 +1403,7 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
     let forwarded: Vec<(String, u64, u64)> = page
         .hits
         .iter()
-        // The wire page carries the index's 0-based column; a tool response writes it 1-based.
-        .map(|hit| (hit.path.to_string(), u64::from(hit.line), u64::from(hit.column) + 1))
+        .map(|hit| (hit.path.to_string(), u64::from(hit.line), u64::from(hit.column)))
         .collect();
     let truth: Vec<(String, u64, u64)> = truth_refs["hits"]
         .as_array()
@@ -1387,12 +1424,17 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
     drop(client);
 
     // Daemon-hosted shape: the real MCP tool, paginated.
-    let addr = http_frontend::await_http_ready(&generation_dir(&comms_dir), Duration::from_secs(10))
+    let addr = http_frontend::await_http_ready(&comms_dir, Duration::from_secs(10))
         .await
         .expect("daemon-hosted MCP transport ready");
-    let token =
-        http_frontend::published_token(&generation_dir(&comms_dir)).expect("the daemon publishes its bearer token");
-    let (total, hits) = hosted_paginated(&addr, &token, &repo, json!({"name": "get_arg", "limit": 40})).await;
+    let token = http_frontend::published_token(&comms_dir).expect("the daemon publishes its bearer token");
+    let (total, hits) = hosted_paginated(
+        &addr,
+        &token,
+        &repo,
+        json!({"mode": "references", "name": "get_arg", "limit": 40}),
+    )
+    .await;
     assert_eq!(
         total, truth_refs["total"],
         "hosted references total equals the writer's"
@@ -1406,7 +1448,7 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
         &addr,
         &token,
         &repo,
-        json!({"name": "Tr1", "relation": "implementations", "limit": 9}),
+        json!({"mode": "implementations", "trait_name": "Tr1", "limit": 9}),
     )
     .await;
     assert_eq!(
@@ -1420,318 +1462,4 @@ async fn daemon_backed_references_and_implementations_equal_the_writer_session()
     );
 
     daemon.stop();
-}
-
-#[cfg(not(any(feature = "code-intel-js", feature = "code-intel-stack")))]
-#[tokio::test]
-async fn daemon_hosts_cold_layered_files_and_symbols_without_standalone_fjall() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("repo");
-    let comms = tmp.path().join("comms");
-    init_git_repo(&root);
-    let git = |args: &[&str]| {
-        assert!(
-            Command::new("git")
-                .current_dir(&root)
-                .env("GIT_AUTHOR_NAME", "Test")
-                .env("GIT_AUTHOR_EMAIL", "test@example.test")
-                .env("GIT_COMMITTER_NAME", "Test")
-                .env("GIT_COMMITTER_EMAIL", "test@example.test")
-                .args(args)
-                .status()
-                .unwrap()
-                .success()
-        );
-    };
-    git(&["config", "core.autocrlf", "false"]);
-    std::fs::write(
-        root.join("basemind.toml"),
-        "\"$schema\" = \"v1\"\n[documents]\nenabled=false\nembed=false\n[code_search]\nenabled=false\nembed=false\n",
-    )
-    .unwrap();
-    for index in 0..10 {
-        std::fs::write(root.join(format!("keep_{index}.rs")), format!("fn keep_{index}() {{}}")).unwrap();
-    }
-    git(&["add", "."]);
-    git(&["-c", "commit.gpgsign=false", "commit", "-qm", "fixture config"]);
-    let scan = |verify: bool| {
-        let mut cmd = Command::new(BIN);
-        cmd.env("BASEMIND_DATA_HOME", &comms)
-            .env("BASEMIND_COMMS_DIR", &comms)
-            .env("BASEMIND_INDEX_LAYERED", if verify { "0" } else { "1" })
-            .args(["--root", root.to_str().unwrap(), "scan", "--no-git-history"]);
-        if verify {
-            cmd.arg("--verify-shared-base");
-        }
-        let out = cmd.output().unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    };
-    scan(true);
-    let cache = comms
-        .join("cache/workspaces")
-        .join(basemind::store_layout::workspace_key(&root));
-    let working = cache.join("views/working");
-    std::fs::remove_dir_all(&working).unwrap();
-    std::fs::write(root.join("cold.rs"), "pub fn cold_layered_symbol() {}\n").unwrap();
-    scan(false);
-    assert!(!working.join("index.fjall").exists());
-
-    let _daemon = Daemon::start_with_layering(&comms, true);
-    let addr = http_frontend::await_http_ready(&generation_dir(&comms), Duration::from_secs(15))
-        .await
-        .unwrap();
-    let token = http_frontend::published_token(&generation_dir(&comms)).unwrap();
-    for (id, tool, args, expected) in [
-        (1, "find_files", json!({"query":"cold.rs"}), "cold.rs"),
-        (6, "code_symbols", json!({"name":"alpha"}), "alpha"),
-        (
-            2,
-            "code_symbols",
-            json!({"name":"cold_layered_symbol"}),
-            "cold_layered_symbol",
-        ),
-    ] {
-        let response = hosted_tool_call(&addr, &token, &root, "cold-layered", id, tool, args).await;
-        assert!(
-            response.get("error").is_none()
-                && response["result"]["isError"] != Value::Bool(true)
-                && response.to_string().contains(expected),
-            "{response}"
-        );
-    }
-    assert!(!working.join("index.fjall").exists());
-    std::fs::write(root.join("committed.rs"), "pub fn promoted_base_symbol() {}\n").unwrap();
-    git(&["add", "committed.rs"]);
-    git(&["-c", "commit.gpgsign=false", "commit", "-qm", "advance base"]);
-    std::fs::write(root.join("cold.rs"), "pub fn refreshed_layered_symbol() {}\n").unwrap();
-    let refresh = hosted_tool_call(
-        &addr,
-        &token,
-        &root,
-        "cold-layered",
-        3,
-        "index_rescan",
-        json!({"paths":["cold.rs"]}),
-    )
-    .await;
-    assert!(
-        refresh.get("error").is_none()
-            && refresh["result"].is_object()
-            && refresh["result"]["isError"] != Value::Bool(true),
-        "{refresh}"
-    );
-    for (id, name) in [
-        (4, "refreshed_layered_symbol"),
-        (5, "alpha"),
-        (7, "promoted_base_symbol"),
-    ] {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let response = hosted_tool_call(
-                &addr,
-                &token,
-                &root,
-                "cold-layered",
-                id,
-                "code_symbols",
-                json!({"name":name}),
-            )
-            .await;
-            assert!(response.get("error").is_none(), "{response}");
-            if response["result"]["structuredContent"]["results"]
-                .to_string()
-                .contains(name)
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "{response}");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    assert!(!working.join("index.fjall").exists());
-}
-
-/// Two installed releases must not fight over one daemon. A release up to 0.33 keeps its daemon at
-/// the top of the comms directory and stops, then kills, any daemon whose version or protocol is not
-/// its own. Here a stand-in for that daemon holds the unscoped socket and reports 0.33.0 /
-/// protocol 4, naming a real process as its pid. Bringing this binary's daemon up in the same comms
-/// directory must leave it uncontacted and that process alive, with both daemons serving, and must
-/// put nothing at the top of the comms directory or of the daemon registry but a generation
-/// directory: those two top levels are what the released binary reads.
-#[cfg(unix)]
-#[test]
-fn a_daemon_of_this_generation_starts_beside_a_pre_generation_daemon_and_leaves_it_alone() {
-    use std::io::{Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    use basemind::comms::protocol::{CommsOut, CommsRequest, CommsResponse, PROTO_VER, StatusReport};
-    use basemind::daemon_lock::pid_is_live;
-
-    const RELEASED_VERSION: &str = "0.33.0";
-    const RELEASED_PROTO: u32 = 4;
-
-    /// Kills the stand-in process and stops this generation's daemon however the test ends.
-    struct Cleanup<'a> {
-        pid: u32,
-        comms_dir: &'a Path,
-        data_home: &'a Path,
-    }
-    impl Drop for Cleanup<'_> {
-        fn drop(&mut self) {
-            let _ = Command::new("kill").args(["-9", &self.pid.to_string()]).output();
-            let _ = Command::new(BIN)
-                .args(["comms", "stop"])
-                .env("BASEMIND_COMMS_DIR", self.comms_dir)
-                .env("BASEMIND_DATA_HOME", self.data_home)
-                .output();
-        }
-    }
-
-    fn names_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .expect("read directory")
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
-    fn ask_status(socket: &Path) -> Option<StatusReport> {
-        let mut stream = UnixStream::connect(socket).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-        let body = rmp_serde::to_vec_named(&CommsRequest::Status).ok()?;
-        stream.write_all(&u32::try_from(body.len()).ok()?.to_be_bytes()).ok()?;
-        stream.write_all(&body).ok()?;
-        let mut prefix = [0u8; 4];
-        stream.read_exact(&mut prefix).ok()?;
-        let mut reply = vec![0u8; u32::from_be_bytes(prefix) as usize];
-        stream.read_exact(&mut reply).ok()?;
-        match rmp_serde::from_slice::<CommsOut>(&reply).ok()? {
-            CommsOut::Response(CommsResponse::Status(report)) => Some(report),
-            _ => None,
-        }
-    }
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let comms_dir = tmp.path().join("comms");
-    let data_home = tmp.path().join("data");
-    std::fs::create_dir_all(&comms_dir).expect("mkdir comms");
-    std::fs::create_dir_all(&data_home).expect("mkdir data home");
-
-    // Started through a shell that exits at once, so it is reparented to init and a kill would ~keep
-    // make it disappear rather than linger as this test's zombie, which still reads as live. ~keep
-    let spawned = Command::new("sh")
-        .args(["-c", "sleep 300 >/dev/null 2>&1 & echo $!"])
-        .output()
-        .expect("spawn the released daemon's stand-in process");
-    let released_pid: u32 = String::from_utf8_lossy(&spawned.stdout)
-        .trim()
-        .parse()
-        .expect("stand-in pid");
-    let _cleanup = Cleanup {
-        pid: released_pid,
-        comms_dir: &comms_dir,
-        data_home: &data_home,
-    };
-    assert!(pid_is_live(released_pid), "the stand-in process must be running");
-
-    let released_socket = comms_dir.join("comms.sock");
-    let listener = UnixListener::bind(&released_socket).expect("bind the pre-generation socket");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let contacts = Arc::new(AtomicUsize::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-    let (counted, stop) = (contacts.clone(), done.clone());
-    let released_daemon = std::thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            let Ok((mut stream, _)) = listener.accept() else {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            };
-            counted.fetch_add(1, Ordering::SeqCst);
-            stream.set_nonblocking(false).expect("blocking");
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut prefix = [0u8; 4];
-            if stream.read_exact(&mut prefix).is_err() {
-                continue;
-            }
-            let mut request = vec![0u8; u32::from_be_bytes(prefix) as usize];
-            if stream.read_exact(&mut request).is_err() {
-                continue;
-            }
-            let reply = rmp_serde::to_vec_named(&CommsOut::Response(CommsResponse::Status(StatusReport {
-                pid: released_pid,
-                version: RELEASED_VERSION.to_string(),
-                build_id: String::new(),
-                proto_ver: RELEASED_PROTO,
-                uptime_secs: 60,
-                threads: 1,
-                subscribers: 1,
-            })))
-            .expect("encode status");
-            let _ = stream.write_all(&u32::try_from(reply.len()).expect("len fits").to_be_bytes());
-            let _ = stream.write_all(&reply);
-        }
-    });
-
-    let start = Command::new(BIN)
-        .args(["comms", "start"])
-        .env("BASEMIND_COMMS_DIR", &comms_dir)
-        .env("BASEMIND_DATA_HOME", &data_home)
-        .output()
-        .expect("run comms start");
-    assert!(
-        start.status.success(),
-        "comms start failed beside a pre-generation daemon: {}",
-        String::from_utf8_lossy(&start.stderr)
-    );
-
-    let ours = comms_socket_path(&generation_dir(&comms_dir));
-    assert_ne!(ours, released_socket, "the two generations must not share an endpoint");
-    // `comms start` returns once the daemon answers `Ping`; `Status` waits for the store, whose ~keep
-    // cold open stalls for tens of seconds on a contended disk. ~keep
-    let ready_by = Instant::now() + Duration::from_secs(180);
-    let ours_report = loop {
-        if let Some(report) = ask_status(&ours) {
-            break report;
-        }
-        assert!(
-            Instant::now() < ready_by,
-            "this generation's daemon must answer on its own socket"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_eq!(ours_report.proto_ver, PROTO_VER);
-    assert_ne!(ours_report.pid, released_pid);
-
-    assert_eq!(
-        contacts.load(Ordering::SeqCst),
-        0,
-        "the pre-generation daemon must not be contacted at all"
-    );
-    assert!(
-        pid_is_live(released_pid),
-        "the pre-generation daemon's process must not be signalled"
-    );
-    let released_report = ask_status(&released_socket).expect("the pre-generation daemon still serves its socket");
-    assert_eq!(released_report.version, RELEASED_VERSION);
-    assert_eq!(released_report.proto_ver, RELEASED_PROTO);
-    assert!(pid_is_live(ours_report.pid), "both daemons end up alive");
-
-    let generation = format!("g{}", basemind::comms::singleton::RENDEZVOUS_GENERATION);
-    assert_eq!(
-        names_in(&comms_dir),
-        ["comms.sock".to_string(), generation.clone()],
-        "no lock, pidfile or store of this generation's daemon may land beside the pre-generation ones"
-    );
-    assert_eq!(
-        names_in(&data_home.join("daemons")),
-        [generation],
-        "this generation's registry record must be out of a pre-generation scan's sight"
-    );
-
-    done.store(true, Ordering::SeqCst);
-    released_daemon.join().expect("released daemon thread");
 }

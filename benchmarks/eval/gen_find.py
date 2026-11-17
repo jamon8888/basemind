@@ -1,18 +1,13 @@
 """Gold for `find`: a mutated file name -> the file it was derived from.
 
-`find_files` (CLI `code find`) is fuzzy file lookup (fzf/fd-style). Each task samples a real tracked file whose stem is
+`code find` is fuzzy file lookup (fzf/fd-style). Each task samples a real tracked file whose stem is
 unique in the repo and queries it in one of three mutated forms:
 
-  basename  the exact file name (`widget.py`)
-  typo      the stem with one adjacent-character swap or one deleted character (`widgte`)
-  abbrev    the consonant skeleton of the stem, keeping its first letter (`wdgt`)
+  basename  the exact file name (`manifest.py`)
+  typo      the stem with one adjacent-character swap or one deleted character (`amnifest`)
+  abbrev    the consonant skeleton of the stem, keeping its first letter (`mnfst`)
 
 Gold is the single source path; scoring is `ranked` (hit@1/@5, MRR, nDCG).
-
-Baseline (`fd` is not installed here and not pinned, so `git ls-files` stands in for it): the
-basename is a fixed-string filter, `git ls-files | grep -i -F NAME`; a typo or skeleton is what fzf
-would do with it, a case-insensitive subsequence regex over the listing. Both are scored against the
-same gold by their output order (`git ls-files` is sorted), so a match buried past `k` is a miss.
 
 `find` covers every path basemind indexes (code map plus document tier), and what is indexed depends
 on the repo's `[scan]` / `[documents]` config: a tracked `.yaml` that no tier accepts is unreachable,
@@ -21,14 +16,15 @@ not a miss. Pass `--indexed FILE` (one repo-relative path per line, e.g. the pat
 """
 
 import argparse
-import re
+import random
+from pathlib import Path
 
 import _common as c
 
 VOWELS = set("aeiouAEIOU")
 
 
-def mutate(stem: str, kind: str, rng) -> str | None:
+def mutate(stem: str, kind: str, rng: random.Random) -> str | None:
     if kind == "typo":
         if len(stem) < 5:
             return None
@@ -56,7 +52,7 @@ def main() -> None:
     repo = c.Repo(a.repo, a.exclude, a.ext, a.max_bytes)
     files = repo.files()
     if a.indexed:
-        with open(a.indexed, encoding="utf-8") as fh:
+        with Path(a.indexed).open(encoding="utf-8") as fh:
             indexed = {line.rstrip("\n") for line in fh}
         files = [f for f in files if f in indexed]
     stems: dict[str, int] = {}
@@ -85,11 +81,7 @@ def main() -> None:
             "k": a.k,
         }
         if kind == "basename":
-            cmd = "git ls-files | grep -i -F " + c.shell_quote(query)
-        else:
-            cmd = "git ls-files | grep -i -E " + c.shell_quote(".*".join(re.escape(ch) for ch in query))
-        task["meta"] = {"variant": kind}
-        task["baseline"] = {"grep": cmd, "items": "paths"}
+            task["baseline"] = {"grep": "git ls-files | grep -i -F " + c.shell_quote(query)}
         tasks.append(task)
     c.emit(tasks, a.out)
 

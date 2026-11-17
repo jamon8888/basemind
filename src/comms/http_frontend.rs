@@ -18,19 +18,16 @@
 //!
 //! ## Opt-in + authentication
 //!
-//! This front-end does not exist unless an operator grants it, and every request must
+//! This front-end does not exist unless an operator grants it, and every request on both routes must
 //! present the daemon's bearer token. Both live in [`http_auth`](super::http_auth), which documents
 //! why loopback alone was never an authentication boundary.
 //!
-//! ## Address + portfile
+//! ## Bind-as-lock + portfile
 //!
-//! The listener binds a loopback address: [`HTTP_ADDR_ENV`] when set, else `127.0.0.1:51786`. The
-//! default is a preference, not a lock. Daemons of two protocol generations run side by side, and
-//! the second one to start finds the default port taken; it binds a port the OS assigns instead.
-//! An address set through [`HTTP_ADDR_ENV`] is binding: if it is in use, the front-end does not
-//! start. The actually-bound `host:port` and the process's bearer token are written to
-//! `<comms_dir>/http.addr` (mode 0600 on Unix), in the daemon's own generation directory, so
-//! tooling — `basemind daemon ensure` and any launcher — discovers both without guessing the port.
+//! The listener binds a fixed loopback address (default `127.0.0.1:51786`, override
+//! [`HTTP_ADDR_ENV`]). Binding IS the lock: only one daemon holds it. The actually-bound `host:port`
+//! and the process's bearer token are written to `<comms_dir>/http.addr` (mode 0600 on Unix) so
+//! tooling — `basemind daemon ensure` and any launcher — can discover both without guessing.
 //!
 //! ## Idle lifecycle
 //!
@@ -73,12 +70,19 @@ pub use super::http_auth::{ALLOW_HTTP_ENV, http_enabled, portfile_path};
 
 /// Env var overriding the bound loopback address. `host:port`, e.g. `127.0.0.1:0` to let the OS pick
 /// a free port (the actual port is discoverable via the portfile). Empty/unset uses
-/// [`DEFAULT_HTTP_ADDR`], or an OS-assigned port when that is in use.
+/// [`DEFAULT_HTTP_ADDR`].
 pub const HTTP_ADDR_ENV: &str = "BASEMIND_HTTP_ADDR";
-/// Preferred loopback address for the streamable-HTTP MCP transport.
+/// Default fixed loopback address for the streamable-HTTP MCP transport.
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:51786";
-/// The MCP JSON-RPC transport path. Anything else is a 404.
+/// The MCP JSON-RPC transport path. Anything other than this or [`UI_PATH`] is a 404.
 const MCP_PATH: &str = "/mcp";
+/// The interactive-UI path (ADR-0006): `GET /ui?root=<abs>&…` serves the self-contained graph page
+/// for a workspace, so a browser (or the Tauri shell) can drive the same view the `ui` tool resolves.
+const UI_PATH: &str = "/ui";
+/// How long [`served_ui_url`] waits for the daemon port to answer before deciding it is not serving.
+/// A live loopback daemon answers in well under this; a stale portfile (crashed daemon) fails fast so
+/// the `ui` tool degrades to the file export instead of handing back a dead link.
+const UI_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 /// Poll cadence while [`await_http_ready`] waits for the listener to answer.
 const HTTP_READY_POLL: Duration = Duration::from_millis(50);
 
@@ -86,45 +90,14 @@ const HTTP_READY_POLL: Duration = Duration::from_millis(50);
 /// returns, so the router and the service agree.
 type HttpBody = BoxBody<Bytes, Infallible>;
 
-/// The address to bind and where it came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BindAddr {
-    addr: SocketAddr,
-    /// Set through [`HTTP_ADDR_ENV`], so it must be bound as given or not at all.
-    configured: bool,
-}
-
 /// Resolve the address to bind: [`HTTP_ADDR_ENV`] when set and non-blank, else [`DEFAULT_HTTP_ADDR`].
-fn resolve_addr() -> Result<BindAddr> {
-    let configured = std::env::var(HTTP_ADDR_ENV)
+fn resolve_addr() -> Result<SocketAddr> {
+    let raw = std::env::var(HTTP_ADDR_ENV)
         .ok()
-        .filter(|value| !value.trim().is_empty());
-    let raw = configured.as_deref().unwrap_or(DEFAULT_HTTP_ADDR);
-    let addr = raw
-        .parse::<SocketAddr>()
-        .with_context(|| format!("parse {HTTP_ADDR_ENV}={raw:?} as a host:port socket address"))?;
-    Ok(BindAddr {
-        addr,
-        configured: configured.is_some(),
-    })
-}
-
-/// Bind the HTTP listener. When the default address is in use — by the daemon of another protocol
-/// generation, or by anything else — bind a port the OS assigns on the same interface instead; the
-/// portfile carries the result. A configured address is never substituted.
-async fn bind_http_listener(bind: BindAddr) -> std::io::Result<TcpListener> {
-    match TcpListener::bind(bind.addr).await {
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && !bind.configured => {
-            let any_port = SocketAddr::new(bind.addr.ip(), 0);
-            tracing::warn!(
-                addr = %bind.addr,
-                "comms: the default streamable-HTTP address is in use (another basemind daemon?); \
-                 binding an OS-assigned port instead, published in http.addr"
-            );
-            TcpListener::bind(any_port).await
-        }
-        bound => bound,
-    }
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string());
+    raw.parse::<SocketAddr>()
+        .with_context(|| format!("parse {HTTP_ADDR_ENV}={raw:?} as a host:port socket address"))
 }
 
 /// Parse `root` (required) and `agent` (optional) from the request query. A blank `agent` is treated
@@ -178,10 +151,10 @@ type RootRefusal = (StatusCode, std::borrow::Cow<'static, str>);
 
 /// Resolve a `?root=` query value into a usable workspace root, or the parts of the refusal.
 ///
-/// A relative path is rejected
+/// Shared by `/mcp` and `/ui` so the two cannot drift apart. Both must reject a relative path
 /// *before* `canonicalize`, which would otherwise resolve it against the DAEMON's cwd — wherever
-/// the daemon happened to be spawned — rather than anywhere the caller named. A non-project root
-/// is refused here, upstream of the workspace pool, so that no cache directory is minted
+/// the daemon happened to be spawned — rather than anywhere the caller named. And both must refuse
+/// a non-project root here, upstream of the workspace pool, so that no cache directory is minted
 /// for `/` and the caller is told what to do instead of getting a generic "could not be hosted"
 /// (issue #62).
 ///
@@ -278,12 +251,71 @@ fn unauthorized_response() -> Response<HttpBody> {
         // ~keep A response built from constant parts is infallible; mirrors rmcp's own handlers.
         .body(
             Full::new(Bytes::from_static(
-                b"unauthorized: present the daemon's bearer token as `Authorization: Bearer <token>`; \
-                  it is the second line of <comms_dir>/http.addr",
+                b"unauthorized: present the daemon's bearer token as `Authorization: Bearer <token>` \
+                  or `?token=<token>`; it is the second line of <comms_dir>/http.addr",
             ))
             .boxed(),
         )
         .expect("unauthorized response builds from constant parts")
+}
+
+/// Build an HTML/SVG HTTP response with a boxed body matching [`HttpBody`]. `content_type` is one of
+/// the two constants the UI renderer returns, so the header is always valid.
+fn html_response(status: StatusCode, body: String, content_type: &str) -> Response<HttpBody> {
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(Full::new(Bytes::from(body)).boxed())
+        .expect("html response builds from a valid header + body")
+}
+
+/// The `/ui` route's parsed query: the required workspace `root` plus the same graph-shaping knobs the
+/// `ui` tool exposes, each defaulted exactly as the tool defaults them so the served page matches.
+struct UiRenderArgs {
+    root: PathBuf,
+    format: String,
+    edges: String,
+    algorithm: String,
+    min_confidence: Option<f32>,
+    max_nodes: Option<u32>,
+    max_edges: Option<u32>,
+    focus: Option<String>,
+}
+
+/// Parse `root` (required) and the optional graph knobs from a `/ui` request query. Returns `None`
+/// only when `root` is missing/blank; unknown keys and unparseable numbers are ignored (best-effort,
+/// like the tool's own defaulting).
+fn parse_ui_args(query: Option<&str>) -> Option<UiRenderArgs> {
+    let query = query?;
+    let (mut root, mut format, mut edges, mut algorithm, mut focus) = (None, None, None, None, None);
+    let (mut min_confidence, mut max_nodes, mut max_edges) = (None, None, None);
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "root" => root = Some(value.into_owned()),
+            "format" => format = Some(value.into_owned()),
+            "edges" => edges = Some(value.into_owned()),
+            "algorithm" | "algo" => algorithm = Some(value.into_owned()),
+            "min_confidence" => min_confidence = value.parse::<f32>().ok(),
+            "max_nodes" => max_nodes = value.parse::<u32>().ok(),
+            "max_edges" => max_edges = value.parse::<u32>().ok(),
+            "focus" => focus = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let non_blank = |value: String| Some(value).filter(|v| !v.trim().is_empty());
+    let root = root.and_then(non_blank)?;
+    Some(UiRenderArgs {
+        root: PathBuf::from(root),
+        format: format.and_then(non_blank).unwrap_or_else(|| "html".to_string()),
+        edges: edges.and_then(non_blank).unwrap_or_else(|| "all".to_string()),
+        algorithm: algorithm
+            .and_then(non_blank)
+            .unwrap_or_else(|| "label_propagation".to_string()),
+        min_confidence,
+        max_nodes,
+        max_edges,
+        focus: focus.and_then(non_blank),
+    })
 }
 
 /// The per-request router: shared across every accepted connection, cheap to clone.
@@ -360,6 +392,7 @@ impl HttpRouter {
                 .headers()
                 .get(http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok()),
+            request.uri().query(),
         );
         if !presented.is_some_and(|token| self.token.matches(&token)) {
             drain_request_body(&mut request).await;
@@ -382,8 +415,17 @@ impl HttpRouter {
         // tear the process down mid-request. See `Broker::begin_http_request`.
         let _activity = self.broker.begin_http_request();
 
+        // The interactive-UI route (ADR-0006) serves an HTML/SVG page for a browser; it precedes the
+        // MCP JSON-RPC branch and is the only other path this server answers.
+        if request.uri().path() == UI_PATH {
+            return self.handle_ui(&request).await;
+        }
+
         if request.uri().path() != MCP_PATH {
-            return text_response(StatusCode::NOT_FOUND, "not found: this server serves POST /mcp only");
+            return text_response(
+                StatusCode::NOT_FOUND,
+                "not found: this server serves POST /mcp and GET /ui only",
+            );
         }
         let Some((raw_root, agent)) = parse_target(request.uri().query()) else {
             return text_response(StatusCode::NOT_FOUND, "not found: missing ?root=<abs-repo-path>");
@@ -444,6 +486,52 @@ impl HttpRouter {
         let service = StreamableHttpService::new(factory, self.session_manager.clone(), config);
         service.handle(request).await
     }
+
+    /// Serve `GET /ui?root=<abs>&…`: render the interactive graph page for a workspace and return it
+    /// as HTML/SVG. Mirrors [`handle`]'s workspace resolution (canonicalize → host the read stack →
+    /// pin the workspace against eviction), then renders through the shared `render_ui_http` path the
+    /// `ui` tool also uses. Never bricks the connection — every failure is an HTTP status.
+    async fn handle_ui(&self, request: &Request<Incoming>) -> Response<HttpBody> {
+        let Some(args) = parse_ui_args(request.uri().query()) else {
+            return text_response(StatusCode::BAD_REQUEST, "bad request: missing ?root=<abs-repo-path>");
+        };
+        let root = match resolve_request_root(&args.root) {
+            Ok(root) => root,
+            Err((status, message)) => return text_response(status, &message),
+        };
+        let shared = match self.broker.host_read_stack(&root).await {
+            Ok(shared) => shared,
+            Err(error) => {
+                tracing::warn!(%error, root = %root.display(), "http /ui: hosting read stack failed");
+                return text_response(StatusCode::NOT_FOUND, "not found: workspace could not be hosted");
+            }
+        };
+        // Pin the workspace against eviction for the render's lifetime, mirroring the MCP branch.
+        let _conn = match self.broker.begin_workspace_conn(&root) {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, root = %root.display(), "http /ui: workspace connection accounting failed");
+                return text_response(StatusCode::NOT_FOUND, "not found: workspace could not be hosted");
+            }
+        };
+        let agent_id = identity::cli_agent_id(&root).into_string();
+        let server = BasemindServer::from_shared(shared, agent_id, Arc::clone(&self.broker.heavy_admission));
+        match server
+            .render_ui_http(
+                &args.format,
+                &args.edges,
+                &args.algorithm,
+                args.min_confidence,
+                args.max_nodes,
+                args.max_edges,
+                args.focus,
+            )
+            .await
+        {
+            Ok((body, content_type)) => html_response(StatusCode::OK, body, content_type),
+            Err(error) => text_response(StatusCode::BAD_REQUEST, &format!("bad request: {}", error.message)),
+        }
+    }
 }
 
 /// A [`hyper::service::Service`] wrapper over the shared router. A newtype is required because the
@@ -466,26 +554,26 @@ impl Service<Request<Incoming>> for HyperSvc {
 ///
 /// Returns `Ok(())` immediately, binding nothing, unless the operator granted the front-end via
 /// [`ALLOW_HTTP_ENV`] — see [`http_auth`](super::http_auth) for why it is off by default. When it is
-/// granted, this mints the process's bearer token, binds the loopback listener
-/// ([`bind_http_listener`]), publishes address + token to the portfile, and serves each connection with a hyper auto (h1/h2)
+/// granted, this mints the process's bearer token, binds the loopback listener (bind-as-lock),
+/// publishes address + token to the portfile, and serves each connection with a hyper auto (h1/h2)
 /// server over the shared router. A bind failure is returned to the caller, which logs it and leaves
 /// the rest of the daemon (the UDS relay) running — HTTP is additive, never a precondition for comms.
 pub async fn serve_http(broker: Arc<Broker>, comms_dir: PathBuf, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     if !http_auth::http_enabled() {
         // A portfile from a previously-granted daemon would otherwise keep advertising an address
-        // nothing is serving.
+        // nothing is serving, so `served_ui_url` would hand out dead links.
         http_auth::remove_portfile(&comms_dir);
         tracing::info!(
             grant = ALLOW_HTTP_ENV,
-            "comms: streamable-HTTP MCP front-end not started (opt-in). The /mcp route is \
+            "comms: streamable-HTTP MCP front-end not started (opt-in). The /mcp and /ui routes, and \
+             with them the served interactive graph page the `display` and `ui` tools open, are \
              unavailable; set {ALLOW_HTTP_ENV}=1 in the daemon's environment and restart it to enable \
-             it.",
+             them.",
         );
         return Ok(());
     }
     let token = HttpToken::generate()?;
-    let bind = resolve_addr()?;
-    let addr = bind.addr;
+    let addr = resolve_addr()?;
     if !addr.ip().is_loopback() {
         tracing::warn!(
             %addr,
@@ -494,13 +582,14 @@ pub async fn serve_http(broker: Arc<Broker>, comms_dir: PathBuf, mut shutdown: w
              remote access you must configure allowed_hosts/origins for the real hostnames."
         );
     }
-    let listener = match bind_http_listener(bind).await {
+    let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
-            // A portfile left by an earlier daemon of this generation would otherwise misdirect
-            // `await_http_ready` / launchers / hard-coded manifests to whatever now holds that
-            // address. Clear it before bailing so discovery fails cleanly. The portfile is in this
-            // generation's directory, which only this generation's one daemon writes.
+            // A stale portfile from a prior crashed daemon would otherwise misdirect
+            // `await_http_ready` / launchers / hard-coded manifests to whatever now holds the port.
+            // Clear it before bailing so discovery fails cleanly instead of pointing at a foreign
+            // process. (The portfile lives in this user's comms dir, so it can only be our own stale
+            // write — the per-user singleton lock means we never race another basemind daemon here.)
             http_auth::remove_portfile(&comms_dir);
             return Err(anyhow::Error::new(error)).with_context(|| {
                 format!("bind streamable-HTTP MCP listener on {addr} (is another process holding it?)")
@@ -603,6 +692,113 @@ pub fn base_url(addr: &str) -> String {
     format!("http://{addr}{MCP_PATH}")
 }
 
+/// Assemble the `/ui` URL for a served workspace: `http://<addr>/ui?root=…&…` with every value
+/// percent-encoded. Pure (no I/O) so the URL assembly is unit-testable.
+///
+/// The bearer token rides in the query because the consumer of this URL is a *browser*: the `ui` and
+/// `display` tools hand it to the system opener, and a navigation cannot set an `Authorization`
+/// header. Loopback-only and readable solely by the daemon's own user (the portfile it comes from is
+/// `0600`), so the exposure is the URL landing in that user's own browser history.
+#[allow(clippy::too_many_arguments)]
+fn build_ui_url(
+    addr: &SocketAddr,
+    token: &str,
+    root: &Path,
+    format: &str,
+    edges: &str,
+    algorithm: &str,
+    min_confidence: Option<f32>,
+    max_nodes: Option<u32>,
+    max_edges: Option<u32>,
+    focus: Option<&str>,
+) -> String {
+    let mut ser = form_urlencoded::Serializer::new(String::new());
+    ser.append_pair(http_auth::TOKEN_QUERY_KEY, token);
+    ser.append_pair("root", &root.to_string_lossy());
+    ser.append_pair("format", format);
+    ser.append_pair("edges", edges);
+    ser.append_pair("algorithm", algorithm);
+    if let Some(confidence) = min_confidence {
+        ser.append_pair("min_confidence", &confidence.to_string());
+    }
+    if let Some(max) = max_nodes {
+        ser.append_pair("max_nodes", &max.to_string());
+    }
+    if let Some(max) = max_edges {
+        ser.append_pair("max_edges", &max.to_string());
+    }
+    if let Some(prefix) = focus {
+        ser.append_pair("focus", prefix);
+    }
+    format!("http://{addr}/ui?{}", ser.finish())
+}
+
+/// Resolve the live `/ui` URL for `root` when a basemind daemon is serving HTTP on this machine, else
+/// `None` (portfile absent/unreadable, or the port is not answering). Called by the `ui` tool
+/// (`crate::mcp`) to prefer a live served page over the static file export.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn served_ui_url(
+    root: &Path,
+    format: &str,
+    edges: &str,
+    algorithm: &str,
+    min_confidence: Option<f32>,
+    max_nodes: Option<u32>,
+    max_edges: Option<u32>,
+    focus: Option<&str>,
+) -> Option<String> {
+    let paths = super::singleton::resolve_paths().ok()?;
+    served_ui_url_from_comms_dir(
+        &paths.comms_dir,
+        root,
+        format,
+        edges,
+        algorithm,
+        min_confidence,
+        max_nodes,
+        max_edges,
+        focus,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn served_ui_url_from_comms_dir(
+    comms_dir: &Path,
+    root: &Path,
+    format: &str,
+    edges: &str,
+    algorithm: &str,
+    min_confidence: Option<f32>,
+    max_nodes: Option<u32>,
+    max_edges: Option<u32>,
+    focus: Option<&str>,
+) -> Option<String> {
+    let portfile = http_auth::read_portfile(comms_dir)?;
+    // A portfile with no token line was written by a pre-token daemon; a URL built without one would
+    // 401. Degrading to the file export beats handing the browser a page it cannot open.
+    let token = portfile.token?;
+    // Confirm a daemon is actually answering before advertising the URL — a stale portfile (crashed
+    // daemon) must degrade to the file export, not hand back a dead link. Async connect + timeout so
+    // the probe never blocks the calling tokio worker (`run_ui` awaits this on a hot path).
+    tokio::time::timeout(UI_PROBE_TIMEOUT, tokio::net::TcpStream::connect(portfile.addr))
+        .await
+        .ok()?
+        .ok()?;
+    Some(build_ui_url(
+        &portfile.addr,
+        &token,
+        root,
+        format,
+        edges,
+        algorithm,
+        min_confidence,
+        max_nodes,
+        max_edges,
+        focus,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,48 +829,163 @@ mod tests {
         // Default when unset.
         // SAFETY: single-threaded test; no other thread reads the env concurrently.
         unsafe { std::env::remove_var(HTTP_ADDR_ENV) };
-        let default = resolve_addr().expect("default parses");
-        assert_eq!(default.addr.to_string(), DEFAULT_HTTP_ADDR);
-        assert!(!default.configured);
+        assert_eq!(resolve_addr().expect("default parses").to_string(), DEFAULT_HTTP_ADDR);
         unsafe { std::env::set_var(HTTP_ADDR_ENV, "127.0.0.1:0") };
         assert_eq!(
             resolve_addr().expect("env parses"),
-            BindAddr {
-                addr: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-                configured: true,
-            }
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap()
         );
         unsafe { std::env::remove_var(HTTP_ADDR_ENV) };
-    }
-
-    /// Two generations' daemons both prefer the default port. The second must still get a
-    /// listener, on a port of its own, while an address the operator chose is never swapped.
-    #[tokio::test]
-    async fn a_default_address_in_use_falls_back_to_a_free_port_and_a_configured_one_does_not() {
-        let holder = TcpListener::bind("127.0.0.1:0").await.expect("hold a port");
-        let taken = holder.local_addr().expect("held address");
-
-        let fallback = bind_http_listener(BindAddr {
-            addr: taken,
-            configured: false,
-        })
-        .await
-        .expect("the default address being in use must not cost the front-end");
-        let bound = fallback.local_addr().expect("fallback address");
-        assert_ne!(bound.port(), taken.port());
-        assert_eq!(bound.ip(), taken.ip(), "the fallback stays on the same interface");
-
-        let refused = bind_http_listener(BindAddr {
-            addr: taken,
-            configured: true,
-        })
-        .await
-        .expect_err("a configured address is bound as given or not at all");
-        assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     #[test]
     fn base_url_appends_mcp_path() {
         assert_eq!(base_url("127.0.0.1:51786"), "http://127.0.0.1:51786/mcp");
+    }
+
+    #[test]
+    fn build_ui_url_encodes_root_and_all_knobs() {
+        let addr: SocketAddr = "127.0.0.1:51786".parse().unwrap();
+        let url = build_ui_url(
+            &addr,
+            "deadbeef",
+            Path::new("/tmp/my repo"),
+            "html",
+            "all",
+            "label_propagation",
+            Some(0.5),
+            Some(200),
+            Some(700),
+            Some("src/mcp"),
+        );
+        assert!(url.starts_with("http://127.0.0.1:51786/ui?"), "got {url}");
+        // The bearer token rides in the query: a browser navigation cannot send an Authorization header.
+        assert!(url.contains("token=deadbeef"), "token carried: {url}");
+        // A space and `/` in the root are percent/plus-encoded — the query survives the round-trip.
+        assert!(url.contains("root=%2Ftmp%2Fmy+repo"), "root encoded: {url}");
+        assert!(url.contains("format=html"), "{url}");
+        assert!(url.contains("edges=all"), "{url}");
+        assert!(url.contains("algorithm=label_propagation"), "{url}");
+        assert!(url.contains("min_confidence=0.5"), "{url}");
+        assert!(url.contains("max_nodes=200"), "{url}");
+        assert!(url.contains("max_edges=700"), "{url}");
+        assert!(url.contains("focus=src%2Fmcp"), "{url}");
+        // Round-trips back through the route parser to the same knobs.
+        let query = url.split_once('?').unwrap().1;
+        let args = parse_ui_args(Some(query)).expect("route parses its own URL");
+        assert_eq!(args.root, PathBuf::from("/tmp/my repo"));
+        assert_eq!(args.format, "html");
+        assert_eq!(args.min_confidence, Some(0.5));
+        assert_eq!(args.max_nodes, Some(200));
+        assert_eq!(args.max_edges, Some(700));
+        assert_eq!(args.focus.as_deref(), Some("src/mcp"));
+    }
+
+    #[test]
+    fn build_ui_url_omits_absent_optionals() {
+        let addr: SocketAddr = "127.0.0.1:51786".parse().unwrap();
+        let url = build_ui_url(
+            &addr,
+            "deadbeef",
+            Path::new("/repo"),
+            "svg",
+            "calls",
+            "louvain",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(url.contains("format=svg"), "{url}");
+        assert!(!url.contains("min_confidence"), "{url}");
+        assert!(!url.contains("max_nodes"), "{url}");
+        assert!(!url.contains("max_edges"), "{url}");
+        assert!(!url.contains("focus"), "{url}");
+    }
+
+    #[test]
+    fn parse_ui_args_requires_root_and_defaults_knobs() {
+        assert!(parse_ui_args(Some("format=html")).is_none(), "root is required");
+        assert!(parse_ui_args(Some("root=%20%20")).is_none(), "blank root rejected");
+        assert!(parse_ui_args(None).is_none());
+        let args = parse_ui_args(Some("root=%2Frepo")).expect("root-only parses");
+        assert_eq!(args.root, PathBuf::from("/repo"));
+        assert_eq!(args.format, "html");
+        assert_eq!(args.edges, "all");
+        assert_eq!(args.algorithm, "label_propagation");
+        assert_eq!(args.min_confidence, None);
+        assert_eq!(args.max_nodes, None);
+        assert_eq!(args.max_edges, None);
+        assert_eq!(args.focus, None);
+    }
+
+    /// The served-path selection the `ui` tool depends on: with a daemon answering, `served_ui_url`
+    /// hands back a live `http://<addr>/ui?…` URL; with only a stale portfile (crashed daemon) it
+    /// degrades to `None` so the tool falls back to the `file://` export rather than a dead link.
+    /// This is the one end-to-end check of the `served:true` path — every other `ui` test exercises
+    /// only the no-daemon fallback.
+    #[tokio::test]
+    async fn served_ui_url_resolves_live_daemon_and_degrades_when_dead() {
+        use std::net::TcpListener;
+
+        let comms_dir = tempfile::tempdir().expect("comms tempdir");
+        // `root` only needs to be an existing path (it is percent-encoded into the URL, not hosted).
+        let root = comms_dir.path();
+
+        // the backlog), so a URL targeting that address is returned.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let token = HttpToken::generate().expect("generate token");
+        http_auth::write_portfile(comms_dir.path(), &addr, &token).expect("write portfile");
+        let live = served_ui_url_from_comms_dir(
+            comms_dir.path(),
+            root,
+            "html",
+            "all",
+            "label_propagation",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a daemon answering the probe yields a served URL");
+        assert!(
+            live.starts_with(&format!("http://{addr}/ui?")),
+            "served URL targets the live daemon address: {live}"
+        );
+        assert!(
+            live.contains("format=html") && live.contains("edges=all"),
+            "served URL carries the requested knobs: {live}"
+        );
+        assert!(
+            live.contains(&format!("token={}", token.as_str())),
+            "served URL carries the daemon's bearer token, or the browser gets a 401: {live}"
+        );
+        drop(listener);
+
+        // Dead: rewrite the portfile to an address nothing is listening on (bind + drop to grab an
+        // almost-certainly-free port). The probe's connect fails, so the tool degrades to the export.
+        let dead_addr = {
+            let ephemeral = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+            ephemeral.local_addr().expect("listener addr")
+        };
+        http_auth::write_portfile(comms_dir.path(), &dead_addr, &token).expect("rewrite portfile");
+        let dead = served_ui_url_from_comms_dir(
+            comms_dir.path(),
+            root,
+            "html",
+            "all",
+            "label_propagation",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            dead.is_none(),
+            "a stale portfile with no daemon answering degrades to None, got {dead:?}"
+        );
     }
 }

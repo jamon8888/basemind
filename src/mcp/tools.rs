@@ -1,40 +1,93 @@
-//! The code verb tools of `BasemindServer`: `code_outline`, `code_symbols`, `code_read`,
-//! `code_grep`, `code_search`, `code_refs` and `find_files` (ADR-0018).
+//! The `code` domain tool shim for `BasemindServer`.
 //!
-//! Each `#[tool]` is a thin shim: [`BasemindServer::answer`] rejects inexact arguments and reports
-//! failures as `isError` results, and the `*_call` method beside it (also what `basemind code …`
-//! runs) records telemetry around the body in `helpers_code.rs` / `helpers_expand.rs`.
+//! One tool, one required `mode` — `outline` / `symbols` / `grep` / `files` / `find` /
+//! `definition` / `references` / `callers` / `implementations` / `dependents` / `expand` /
+//! `semantic` / `chunk` — dispatched to `helpers_code::run_code`. Thin wrapper: the bodies live in
+//! `helpers_code.rs` (`outline`, `symbols`, `dependents`), `helpers_files.rs`, `helpers_grep.rs`,
+//! `helpers_calls.rs`, `helpers_impls.rs`, `helpers_intel.rs`, `helpers_compress.rs` and
+//! `helpers_code_search.rs`.
 //!
-//! No tool declares an `output_schema`: the response structs nest, schemars emits nested structs
-//! as `$ref` into `$defs` (the construct that dropped the whole registry in GH #50), and inlining
-//! them would put `tools/list` over its byte ceiling.
-//!
-//! The pagination / cap helpers the code-map bodies share stay at the bottom of the file.
+//! The pagination / cap helpers the code-map bodies share stay here at the bottom of the file.
 
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::tool;
+use serde_json::Value;
 
 use super::BasemindServer;
-use super::cursor_bind::bound;
-use super::helpers::{LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX};
-use super::strict::Strict;
-use super::types_tools::{
-    CodeGrepParams, CodeOutlineParams, CodeReadParams, CodeRefsParams, CodeSearchParams, CodeSymbolsParams,
-    FindFilesToolParams,
-};
-use super::{helpers_code, helpers_expand};
+use super::helpers::{LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX, record_call};
+use super::lenient::Lenient;
+use super::types_code::CodeParams;
 
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_core")]
 impl BasemindServer {
+    // No `output_schema`: the thirteen modes return thirteen different response shapes, and
+    // SEP-2106 allows exactly one per tool. Declaring a union would mean nested structs, which
+    // schemars emits as `$ref` into `$defs` — the construct that silently dropped the whole
+    // registry in GH #50. The per-mode shapes are documented in the description instead. ~keep
     #[tool(
-        title = "Outline a file",
-        description = "Use to see what a file contains before, or instead of, reading it: every \
-        symbol with its kind, signature and 1-based `line`/`end_line`, plus the file's imports. \
-        Feed a span to `code_read`. Code files only. `stale` means the file changed since it was \
-        indexed and is outlined as it is now. \
-        Example: {\"path\":\"src/store.rs\"}",
+        title = "Code map",
+        description = "Read this repository's code map instead of opening files: grep it, find \
+        where something is defined, see who calls this, locate a file by name, and pull one \
+        symbol's body. Everything is served from the index — paths, lines, columns and \
+        signatures — at a fraction of the tokens a Read or a shell `rg` costs. The map holds \
+        CODE only: markdown, JSON, YAML, TOML, XML, CSV and other prose/config/data files are \
+        documents, invisible to every mode here (`outline` errors \"not indexed\"); search them \
+        with `memory` mode `documents`. `mode` is required. `outline` returns one file's structure (symbols with kind + row/col + \
+        signature, plus imports) — read this INSTEAD of opening the file, then fetch only the \
+        span you need; `l2: true` adds call sites and doc comments when an L2 blob exists for \
+        the file's current content. `symbols` searches every indexed symbol NAME for `name` as \
+        a case-sensitive SUBSTRING (optional `kind` filter) — the definition finder, and the \
+        right answer to \"where is X defined\"; `total` counts matches up to a per-call cap \
+        (`limit*64`, min 2000) and sets `total_is_partial` when it stops there. `grep` is regex \
+        content search (Rust `regex` syntax) over EVERY indexed code file — use it for a \
+        pattern, a string literal or a comment, and prefer `symbols` for a plain identifier; \
+        `limit` caps hits, never files, so `total_matches` is exact, and `language` / \
+        `path_contains` narrow the sweep. A per-file trigram filter skips files that cannot \
+        match, so patterns with a literal of 3+ bytes are fast; `.*` or `(?i)k` sweep all. \
+        `files` enumerates indexed paths, documents included (`path_contains` / `language` \
+        filters). `find` is fuzzy filename search over code AND document files (fzf/fd-style \
+        subsequence, case-insensitive, ranked by score, weak matches cut) — reach for it instead \
+        of `find` / `fd` / `ls -R`. `definition` \
+        resolves the reference at `path`:`line`:`column` to the definition it BINDS to — \
+        scope-resolved, not name-matched, so it never conflates same-named symbols, and it \
+        follows cross-file imports for JS/TS; `line` is 1-based, `column` 0-based bytes; a \
+        position with no resolved binding returns no `definition` rather than an error. \
+        `references` finds every call site whose callee identifier contains `name` — NAME-ONLY, \
+        no scope resolution, so `Foo::bar()` and `bar()` both match `name=\"bar\"`; that is the \
+        fast, complete floor for \"what calls this\" (only with no daemon reachable can a \
+        last-resort in-RAM fallback truncate, flagged by a `projections_capped` notice). `callers` answers the same question for \
+        ONE specific definition: it resolves `path` + `name` (+ optional `kind`) first, echoes \
+        it as `definition`, then runs that same name scan — so `total` agrees with `references` \
+        on an unambiguous name — and additionally marks each hit `resolved` when scope/import \
+        resolution PROVED it binds to that definition (`resolved_total`). `resolved: false` is \
+        not evidence a hit isn't a caller; trust `total` for completeness before a refactor and \
+        filter on `resolved` when you want precision. `implementations` finds the types that \
+        implement / extend / inherit `trait_name` (case-sensitive substring; Rust, Python, \
+        TS/TSX, JS class + interface extends/implements — Go structural satisfaction is not \
+        detected). `dependents` is the reverse import lookup: indexed files whose imports \
+        mention `module` (heuristic substring against each recorded module path; all matches, \
+        no `limit` or `cursor`). `expand` \
+        returns one symbol's RAW SOURCE BODY resolved by `path` + `name` (+ `kind` to \
+        disambiguate an overload) — the inverse of an outline entry, and the second half of the \
+        outline-then-expand pattern. `semantic` searches code by MEANING rather than spelling: \
+        `lane` picks `hybrid` (default; RRF fusion of vector, BM25 and exact-symbol lanes, \
+        degrading gracefully when a lane is unavailable), `semantic` (vector only) or `keyword` \
+        (BM25 only); it returns POINTERS (path + line/byte range + symbol), never bodies — \
+        fetch one with `chunk`. `chunk` returns a single chunk's source by `path`, \
+        disambiguated with `chunk_id` or `byte_start`. Caps: `symbols` / `grep` / `references` \
+        / `callers` / `implementations` default `limit` 100, max 1000; `files` / `find` default \
+        200, max 5000; `semantic` default 10, max 100. The index scanners bound their work at \
+        `scan_cap = limit * 8` (min 2000) and flag a cut result with `total_is_partial`. `cursor` pages \
+        (`references` / `callers` / `implementations` cursors are stable across rescans; \
+        `symbols` / `grep` / `files` / `find` cursors are not and set `cursor_invalidated` \
+        after one), `max_tokens` budgets the returned list and \
+        sets `budgeted`, and `format: \"toon\"` returns compact tabular rows. Parameters that \
+        belong to another mode are rejected, not ignored.",
+        // Every mode is a read over the local index or working tree — nothing is written and
+        // nothing outside this repository is contacted, so the union of the thirteen keeps the
+        // fully-pure hints a client may auto-approve on. ~keep
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -42,232 +95,16 @@ impl BasemindServer {
             open_world_hint = false
         )
     )]
-    pub(crate) async fn code_outline(
+    pub(crate) async fn code(
         &self,
-        Parameters(args): Parameters<Strict<CodeOutlineParams>>,
+        Parameters(Lenient(p)): Parameters<Lenient<CodeParams>>,
     ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_outline_call(p)).await
-    }
-
-    #[tool(
-        title = "Find a definition",
-        description = "Use for \"where is X defined\" when you know (part of) the name: finds \
-        functions, types, constants and other symbols by name across the repository and returns \
-        path, line and signature. Ranked: the exact name first, then prefix, then substring, then \
-        (with `fuzzy`) fuzzy matches. Definitions only: for any text use `code_grep`. \
-        Example: {\"name\":\"parse_config\",\"kind\":\"function\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn code_symbols(
-        &self,
-        Parameters(args): Parameters<Strict<CodeSymbolsParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_symbols_call(p)).await
-    }
-
-    #[tool(
-        title = "Read a symbol or line span",
-        description = "Use to read the source of one function or type, or an exact line span, \
-        instead of the whole file. Pass `symbol` (plus `line` when several share the name), or a \
-        `line`..`end_line` span. A body over 128 KiB is cut after a whole line and flagged \
-        `truncated`: read on from `end_line` + 1. `stale` means the file changed since it was \
-        indexed and the symbol was found by parsing it as it is now. \
-        Example: {\"path\":\"src/store.rs\",\"symbol\":\"open\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn code_read(
-        &self,
-        Parameters(args): Parameters<Strict<CodeReadParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_read_call(p)).await
-    }
-
-    #[tool(
-        title = "Search code text",
-        description = "Use instead of `rg`/`grep` to find exact text (a string, identifier or \
-        comment) anywhere in the indexed code. `pattern` is literal unless `regex` is true. Each \
-        hit is its line plus the symbol it sits in; a hit in a file edited since it was indexed \
-        has `stale` and no symbol. `skipped_files` counts files that could not be searched. A \
-        `path` or `language` no indexed file has is an error. Code files only: search documents \
-        with `docs_search`. \
-        Example: {\"pattern\":\"cache_root(\",\"path\":\"src/\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn code_grep(
-        &self,
-        Parameters(args): Parameters<Strict<CodeGrepParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_grep_call(p)).await
-    }
-
-    #[tool(
-        title = "Search code by meaning",
-        description = "Use when you know what the code does but not a name or string in it: \
-        searches code chunks by meaning and returns pointers (path, `line`/`end_line`, symbol), \
-        not bodies. `lanes_unavailable` says when a lane could not run; `truncated` that the \
-        ranking was cut: past the 100 hits that can be paged (`depth`) or by the reranker's \
-        `top_k` (`rerank_top_k`). Read a hit with `code_read`. \
-        Example: {\"query\":\"retry a failed upload with backoff\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn code_search(
-        &self,
-        Parameters(args): Parameters<Strict<CodeSearchParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_search_call(p)).await
-    }
-
-    #[tool(
-        title = "Find usages",
-        description = "Use for \"what calls X\", \"what implements X\", \"what imports X\" and \
-        \"which definition does this reference bind to\". `relation` picks the question; the name \
-        is matched exactly. `path` pins the definition in that file; a hit then has `resolved` \
-        true (proven to bind to it), false (checked, not proven) or absent (not checked: \
-        `resolution` says why). A pinned file edited since it was indexed is an error naming \
-        `index_rescan`. \
-        Example: {\"name\":\"open_store\",\"path\":\"src/store.rs\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn code_refs(
-        &self,
-        Parameters(args): Parameters<Strict<CodeRefsParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.code_refs_call(p)).await
-    }
-
-    #[tool(
-        title = "Find files",
-        description = "Use instead of `find`/`fd`/`ls -R` to locate a file by a fuzzy fragment of \
-        its name or path, or to list indexed files when `query` is omitted. Covers code and \
-        documents (markdown, config, PDFs). A `path_prefix` or `language` no indexed file has is \
-        an error. \
-        Example: {\"query\":\"readme\"}",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub(crate) async fn find_files(
-        &self,
-        Parameters(args): Parameters<Strict<FindFilesToolParams>>,
-    ) -> Result<CallToolResult, McpError> {
-        self.answer(args, |p| self.find_files_call(p)).await
-    }
-}
-
-impl BasemindServer {
-    /// Body of `code_outline`, shared with `basemind code outline`.
-    pub(crate) async fn code_outline_call(&self, p: CodeOutlineParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_outline",
-            p,
-            bound(p, |p| helpers_code::code_outline(&self.state, p)).await
-        )
-    }
-
-    /// Body of `code_symbols`, shared with `basemind code symbols`.
-    pub(crate) async fn code_symbols_call(&self, p: CodeSymbolsParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_symbols",
-            p,
-            bound(p, |p| helpers_code::code_symbols(&self.state, p)).await
-        )
-    }
-
-    /// Body of `code_read`, shared with `basemind code read`.
-    pub(crate) async fn code_read_call(&self, p: CodeReadParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_read",
-            p,
-            helpers_expand::code_read(&self.state, p).await
-        )
-    }
-
-    /// Body of `code_grep`, shared with `basemind code grep`.
-    pub(crate) async fn code_grep_call(&self, p: CodeGrepParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_grep",
-            p,
-            bound(p, |p| helpers_code::code_grep(&self.state, p)).await
-        )
-    }
-
-    /// Body of `code_search`, shared with `basemind code search`.
-    pub(crate) async fn code_search_call(&self, p: CodeSearchParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_search",
-            p,
-            bound(p, |p| helpers_code::code_search(&self.state, p)).await
-        )
-    }
-
-    /// Body of `code_refs`, shared with `basemind code refs`.
-    pub(crate) async fn code_refs_call(&self, p: CodeRefsParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "code_refs",
-            p,
-            bound(p, |p| helpers_code::code_refs(&self.state, p)).await
-        )
-    }
-
-    /// Body of `find_files`, shared with `basemind code find`.
-    pub(crate) async fn find_files_call(&self, p: FindFilesToolParams) -> Result<CallToolResult, McpError> {
-        crate::instrument_tool!(
-            &self.state,
-            "find_files",
-            p,
-            bound(p, |p| helpers_code::find_files(&self.state, p)).await
-        )
-    }
-
-    /// Fetch one semantic-search chunk body. No MCP tool (`code_read` reads a hit's span):
-    /// `basemind code chunk`.
-    pub(crate) async fn code_chunk_call(
-        &self,
-        p: super::types_code::GetChunkParams,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(feature = "code-search")]
-        {
-            super::helpers_code_search::run_get_chunk(&self.state, p).await
-        }
-        #[cfg(not(feature = "code-search"))]
-        {
-            let _ = p;
-            Err(super::tool_contract::feature_missing("code chunk", "code-search"))
-        }
+        let __started = std::time::Instant::now();
+        let __key = p.mode.telemetry_key();
+        let __params_json = serde_json::to_value(&p).unwrap_or(Value::Null);
+        let __result: Result<CallToolResult, McpError> = super::helpers_code::run_code(&self.state, p).await;
+        record_call(&self.state, __key, &__params_json, __started, &__result);
+        __result
     }
 }
 
@@ -281,6 +118,14 @@ pub(super) fn effective_list_limit(requested: Option<u32>) -> (usize, bool) {
     let asked = requested.unwrap_or(LIST_LIMIT_DEFAULT);
     let clamped = asked > LIST_LIMIT_MAX;
     (asked.min(LIST_LIMIT_MAX) as usize, clamped)
+}
+
+/// The `code` mode `symbols` scan cap: matches walked are bounded by this so a common needle
+/// never scans the whole corpus. When the cap is reached, `total` is a lower bound, not the
+/// global match count — the response sets `total_is_partial` so callers don't mistake it for
+/// a true total (bug #16).
+pub(super) fn search_max_total(limit: usize) -> usize {
+    limit.saturating_mul(64).max(2_000)
 }
 
 /// Count content-addressed blobs in the GLOBAL blob store by tallying `.fm.msgpack` files
@@ -298,21 +143,11 @@ pub(super) fn count_fm_blobs() -> usize {
     crate::store::count_fm_blobs(&crate::store::global_blobs_dir())
 }
 
-/// The `status` note: that a rescan is owed (see [`crate::store::Store::rescan_owed`]), else the
-/// divergence note below.
-///
-/// The divergence note (bug #10): when the current view's index is empty
+/// Build the `status` divergence note (bug #10): when the current view's index is empty
 /// but content-addressed blobs are present on disk, the index was lost/wiped over live
 /// blobs and a rescan would rebuild it. A legitimately unscanned repo (no blobs either)
 /// gets no note.
-pub(super) fn index_note(rescan_owed: bool, file_count: usize, blob_count: usize) -> Option<String> {
-    if rescan_owed {
-        return Some(crate::store::RESCAN_OWED.to_string());
-    }
-    blob_divergence_note(file_count, blob_count)
-}
-
-fn blob_divergence_note(file_count: usize, blob_count: usize) -> Option<String> {
+pub(super) fn blob_divergence_note(file_count: usize, blob_count: usize) -> Option<String> {
     if file_count == 0 && blob_count > 0 {
         Some(format!(
             "index for this view is empty but {blob_count} blob file(s) exist on disk; \
@@ -357,6 +192,42 @@ mod tests {
     }
 
     #[test]
+    fn search_total_partial_when_cap_reached() {
+        let limit = 10usize;
+        let cap = search_max_total(limit);
+        let matches_available = cap + 500;
+        let mut total = 0usize;
+        let mut partial = false;
+        for _ in 0..matches_available {
+            total += 1;
+            if total >= cap {
+                partial = true;
+                break;
+            }
+        }
+        assert_eq!(total, cap, "total saturates at the scan cap, not the true match count");
+        assert!(partial, "hitting the cap must mark total as partial (bug #16)");
+    }
+
+    #[test]
+    fn search_total_exact_when_under_cap() {
+        let limit = 10usize;
+        let cap = search_max_total(limit);
+        let matches_available = 5usize;
+        let mut total = 0usize;
+        let mut partial = false;
+        for _ in 0..matches_available {
+            total += 1;
+            if total >= cap {
+                partial = true;
+                break;
+            }
+        }
+        assert_eq!(total, matches_available, "total is exact below the cap");
+        assert!(!partial, "a query under the cap reports an exact, complete total");
+    }
+
+    #[test]
     fn status_note_absent_when_index_and_blobs_agree() {
         assert_eq!(blob_divergence_note(42, 100), None, "populated index: no note");
     }
@@ -368,17 +239,6 @@ mod tests {
             None,
             "empty index with no blobs is a legitimately unscanned repo, not a lost index"
         );
-    }
-
-    #[test]
-    fn status_note_says_a_rescan_is_owed_before_anything_else() {
-        let note = index_note(true, 0, 7).expect("an owed rescan always has a note");
-        assert!(
-            note.contains("basemind scan") && note.contains("index_rescan"),
-            "{note}"
-        );
-        assert_eq!(index_note(false, 42, 100), None);
-        assert!(index_note(false, 0, 7).is_some_and(|note| note.contains("7 blob file")));
     }
 
     #[test]

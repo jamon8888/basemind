@@ -7,39 +7,30 @@ use super::*;
 impl Broker {
     /// Scan/rescan a workspace on the sole-writer pool. The scan is CPU-bound, so it runs on a
     /// blocking thread while the reactor keeps serving other links. A scan/store error becomes a
-    /// `CommsResponse::Error` (never a torn link). Held under a [`WorkGuard`] throughout: the
-    /// caller is attached by a plain link only, which does not make the daemon refuse `Stop`.
+    /// `CommsResponse::Error` (never a torn link).
     pub(super) async fn on_rescan(
         &self,
         root: std::path::PathBuf,
         paths: Option<Vec<std::path::PathBuf>>,
         full: bool,
         embed: bool,
-        verify: bool,
     ) -> CommsResponse {
         self.mark_active().await;
         // A tripped scan token means the daemon is draining (every drain route cancels first, ~keep
         // and the token never un-trips). Launching a scan now would only produce a doomed ~keep
         // partial pass that defeats coalescing — refuse instead; the client retries against ~keep
         // the next daemon. ~keep
-        // The scan counts as work from here to its end, so a `Stop` is refused instead of ~keep
-        // cancelling it. Taken under the registry lock, where `on_stop` reads the count and ~keep
-        // starts the drain: a rescan either is counted before that read or sees the drain. ~keep
-        let _working = {
-            let registry = self.registry.lock().await;
-            let draining = matches!(registry.state, LifecycleState::Draining | LifecycleState::Stopped);
-            if draining || self.scan_cancel.is_cancelled() {
-                return CommsResponse::Error {
-                    code: "rescan_draining".to_string(),
-                    message: "daemon draining; rescan refused (retry against the next daemon)".to_string(),
-                };
-            }
-            self.begin_work()
-        };
+        if self.scan_cancel.is_cancelled() {
+            return CommsResponse::Error {
+                code: "rescan_draining".to_string(),
+                message: "daemon draining; rescan refused (retry against the next daemon)".to_string(),
+            };
+        }
+        let _rescan_guard = self.blob_gc_lock.read().await;
         let pool = Arc::clone(&self.workspaces);
         let cancel = self.scan_cancel.clone();
         let started = Instant::now();
-        match tokio::task::spawn_blocking(move || pool.rescan_as(&root, paths, full, embed, verify, &cancel)).await {
+        match tokio::task::spawn_blocking(move || pool.rescan(&root, paths, full, embed, &cancel)).await {
             // A cancelled pass committed only part of the tree — surface it as an error so no ~keep
             // client mistakes the partial index for a completed rescan. ~keep
             Ok(Ok((_, true))) => CommsResponse::Error {
@@ -98,6 +89,17 @@ impl Broker {
         }
     }
 
+    /// Advisory-claim a worktree. An unknown `(repo_id, name)` returns `held = false`.
+    pub(super) async fn on_worktree_claim(&self, repo_id: String, name: String, claimant: String) -> CommsResponse {
+        match self
+            .registry_blocking(move |registry| registry.claim_worktree(&repo_id, &name, &claimant))
+            .await
+        {
+            Ok(held) => CommsResponse::ClaimOutcome { held },
+            Err(error) => registry_error(error),
+        }
+    }
+
     /// Drop machine-registry rows whose on-disk path is gone, returning how many were removed.
     ///
     /// The registry is append-only by construction: a row is written when a workspace registers and
@@ -112,6 +114,17 @@ impl Broker {
                 tracing::warn!(%error, "comms: machine registry prune failed");
                 0
             }
+        }
+    }
+
+    /// Release an advisory worktree claim held by `claimant`.
+    pub(super) async fn on_worktree_release(&self, repo_id: String, name: String, claimant: String) -> CommsResponse {
+        match self
+            .registry_blocking(move |registry| registry.release_worktree(&repo_id, &name, &claimant))
+            .await
+        {
+            Ok(held) => CommsResponse::ClaimOutcome { held },
+            Err(error) => registry_error(error),
         }
     }
 }
