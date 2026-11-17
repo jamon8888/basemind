@@ -5,14 +5,9 @@
 //! without rewriting half of the codebase.
 
 mod commit;
-#[cfg(test)]
-pub(crate) use commit::FILE_LISTINGS;
-mod diff;
-mod export;
 mod remote;
 mod worktree;
-use commit::{build_commit_info, commit_files, commit_touches_path, decode_path};
-pub use diff::FileDiff;
+use commit::{build_commit_info, commit_files, commit_touches_path, compute_hunks, decode_path};
 pub use remote::{normalize_remote_url, scope_key};
 pub use worktree::{BranchInfo, WorktreeInfo};
 
@@ -38,9 +33,6 @@ pub enum GitError {
         bytes: u64,
         lines: u64,
     },
-    /// A working-tree read was asked for a path that leaves the repository.
-    #[error("{0} is outside this repository")]
-    OutsideRepo(crate::path::RelPath),
     #[error("git error: {0}")]
     Other(String),
 }
@@ -74,18 +66,6 @@ pub struct WorkingTreeStatus {
     pub staged_deleted: Vec<crate::path::RelPath>,
     pub modified: Vec<crate::path::RelPath>,
     pub untracked: Vec<crate::path::RelPath>,
-}
-
-impl WorkingTreeStatus {
-    pub(crate) fn overlay_candidates(self) -> std::collections::BTreeSet<crate::path::RelPath> {
-        self.staged_added
-            .into_iter()
-            .chain(self.staged_modified)
-            .chain(self.staged_deleted)
-            .chain(self.modified)
-            .chain(self.untracked)
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -375,34 +355,6 @@ impl Repo {
         Ok(id.to_string())
     }
 
-    pub(crate) fn checkout_transforms_possible(&self) -> Result<bool, GitError> {
-        let local = self.local();
-        let config = local.config_snapshot();
-        if config.string("core.autocrlf").is_some_and(|value| {
-            ![b"false".as_slice(), b"no", b"off", b"0", b"input"]
-                .iter()
-                .any(|allowed| value.as_slice().eq_ignore_ascii_case(allowed))
-        }) || config.string("core.attributesFile").is_some()
-        {
-            return Ok(true);
-        }
-        let has_attributes = |path: &std::path::Path| match std::fs::metadata(path) {
-            Ok(metadata) => Ok(metadata.len() > 0),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(GitError::Read {
-                what: path.display().to_string(),
-                msg: error.to_string(),
-            }),
-        };
-        if has_attributes(&local.common_dir().join("info/attributes"))? {
-            return Ok(true);
-        }
-        Ok(self
-            .list_paths_staged()?
-            .iter()
-            .any(|path| path.rsplit('/').next() == Some(".gitattributes")))
-    }
-
     /// List forward-slash relative paths of every blob recorded in the staging index.
     pub fn list_paths_staged(&self) -> Result<Vec<String>, GitError> {
         let local = self.local();
@@ -521,19 +473,7 @@ impl Repo {
     }
 
     /// Porcelain-style status: bucketed by stage vs working tree, including untracked files.
-    /// An untracked directory is one entry or one per file, as `status.showUntrackedFiles` says.
     pub fn status_porcelain(&self) -> Result<WorkingTreeStatus, GitError> {
-        self.status_listing(None)
-    }
-
-    /// [`status_porcelain`](Self::status_porcelain) with every untracked file listed on its own,
-    /// whatever the configuration collapses: the form a status narrowed to a directory needs, since
-    /// a collapsed entry for an ancestor says nothing about the paths under it.
-    pub fn status_per_file(&self) -> Result<WorkingTreeStatus, GitError> {
-        self.status_listing(Some(gix::status::UntrackedFiles::Files))
-    }
-
-    fn status_listing(&self, untracked: Option<gix::status::UntrackedFiles>) -> Result<WorkingTreeStatus, GitError> {
         let local = self.local();
         let mut out = WorkingTreeStatus::default();
 
@@ -541,10 +481,6 @@ impl Repo {
             what: "status".to_string(),
             msg: e.to_string(),
         })?;
-        let platform = match untracked {
-            Some(untracked) => platform.untracked_files(untracked),
-            None => platform,
-        };
         let iter = platform.into_iter(None).map_err(|e| GitError::Read {
             what: "status".to_string(),
             msg: e.to_string(),
@@ -557,66 +493,6 @@ impl Repo {
             classify_status_item(&item, &mut out);
         }
         Ok(out)
-    }
-
-    /// Enumerate staged and live changes relative to a selected base tree.
-    pub(crate) fn status_against(&self, base: &str) -> Result<WorkingTreeStatus, GitError> {
-        use gix::status::{UntrackedFiles, tree_index::TrackRenames};
-
-        let local = self.local();
-        let read_error = |msg: String| GitError::Read {
-            what: format!("status against {base}"),
-            msg,
-        };
-        let tree = local
-            .rev_parse_single(format!("{base}^{{tree}}").as_str())
-            .map_err(|error| read_error(error.to_string()))?;
-        let platform = local
-            .status(gix::progress::Discard)
-            .map_err(|error| read_error(error.to_string()))?
-            .head_tree(tree.detach())
-            .untracked_files(UntrackedFiles::Files)
-            .tree_index_track_renames(TrackRenames::Disabled)
-            .index_worktree_rewrites(None);
-        let mut out = WorkingTreeStatus::default();
-        for item in platform
-            .into_iter(None)
-            .map_err(|error| read_error(error.to_string()))?
-        {
-            classify_status_item(&item.map_err(|error| read_error(error.to_string()))?, &mut out);
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn changed_tree_files(&self, from: &str, to: &str) -> Result<usize, GitError> {
-        let local = self.local();
-        let read_error = |msg| GitError::Read {
-            what: format!("tree diff {from}..{to}"),
-            msg,
-        };
-        let tree = |rev: &str| {
-            local
-                .rev_parse_single(rev)
-                .map_err(|error| read_error(error.to_string()))?
-                .object()
-                .map_err(|error| read_error(error.to_string()))?
-                .peel_to_tree()
-                .map_err(|error| read_error(error.to_string()))
-        };
-        let from_tree = tree(from)?;
-        let to_tree = tree(to)?;
-        let mut count = 0usize;
-        from_tree
-            .changes()
-            .map_err(|error| read_error(error.to_string()))?
-            .for_each_to_obtain_tree(&to_tree, |change| {
-                if commit::classify_tree_change(&change).is_some() {
-                    count += 1;
-                }
-                Ok(gix::object::tree::diff::Action::Continue(()))
-            })
-            .map_err(|error| read_error(error.to_string()))?;
-        Ok(count)
     }
 
     /// Recent commits across the repo, newest first.
@@ -638,7 +514,7 @@ impl Repo {
             })?;
         let mut out = Vec::with_capacity(max_commits.min(1024));
         for info in walk.take(max_commits) {
-            let info = commit::walk_step(info)?;
+            let Ok(info) = info else { continue };
             if let Some(ci) = build_commit_info(&local, info.id, include_files) {
                 out.push(ci);
             }
@@ -675,7 +551,7 @@ impl Repo {
             if out.len() >= max_commits {
                 break;
             }
-            let info = commit::walk_step(info)?;
+            let Ok(info) = info else { continue };
             if !commit_touches_path(&local, info.id, rel) {
                 continue;
             }
@@ -803,6 +679,30 @@ impl Repo {
             hunks,
             truncated_reason: None,
         })
+    }
+
+    /// Content-level hunks for `path` between `rev_old` and `rev_new`. Returns the bytes for
+    /// either side and the unified-diff hunks. The output is empty (an empty Vec, not an
+    /// error) when the file exists at both revs but the bytes are identical, and `None` when
+    /// the path is absent at both sides.
+    pub fn diff_file(
+        &self,
+        rev_old: &str,
+        rev_new: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<Option<(Vec<Hunk>, bool, bool)>, GitError> {
+        let path_ref = path.as_ref();
+        let old_bytes = self.read_blob_at_rev(rev_old, path_ref)?;
+        let new_bytes = self.read_blob_at_rev(rev_new, path_ref)?;
+        if old_bytes.is_none() && new_bytes.is_none() {
+            return Ok(None);
+        }
+        let old_exists = old_bytes.is_some();
+        let new_exists = new_bytes.is_some();
+        let old_buf = old_bytes.unwrap_or_default();
+        let new_buf = new_bytes.unwrap_or_default();
+        let hunks = compute_hunks(&old_buf, &new_buf);
+        Ok(Some((hunks, old_exists, new_exists)))
     }
 
     /// Diff the commit at `commit_sha` against its first parent. Returns the per-file
@@ -973,6 +873,3 @@ fn classify_tree_index(change: &gix::diff::index::Change, out: &mut WorkingTreeS
         }
     }
 }
-
-#[cfg(test)]
-mod status_against_tests;

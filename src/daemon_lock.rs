@@ -1,8 +1,8 @@
 //! Single-owner daemon lock, pidfile, and the machine-wide live-daemon registry + ceiling.
 //!
-//! Shared by every daemon family basemind spawns (see [`DaemonKind`]), so one lock discipline, one
-//! registry and one ceiling cover all of them. The registry itself is feature-independent; its
-//! consumers stay feature-gated.
+//! Shared by every daemon family basemind spawns — the comms broker and the
+//! shells/rmux daemon (see [`DaemonKind`]) — so one lock discipline, one registry and one ceiling
+//! cover all of them. The registry itself is feature-independent; its consumers stay feature-gated.
 //!
 //! Two safeguards against the process/memory leak class, layered on top of the per-daemon-dir
 //! guards a family may already have (for comms: the UDS bind and the store flock):
@@ -13,19 +13,14 @@
 //!    removed on `Drop`. This is the authoritative "one daemon per dir" gate, uniform across Unix
 //!    and Windows (a real lock, not the Unix-only socket-inode watchdog).
 //!
-//! 2. **The machine ceiling** — every live daemon registers a pidfile under
-//!    `<data_home>/daemons/g<N>/`, `N` being its [`RENDEZVOUS_GENERATION`]. [`live_daemons`] and
-//!    [`live_daemons_of`] list this generation's holders only, pruning dead ones via
-//!    [`crate::boot_identity::PidState::may_be_live`]; they are what `comms doctor` and `comms stop --all` act on, so neither can
-//!    reach another generation's daemon. [`count_live_daemons_of`] tallies one kind's holders
-//!    across every generation — this one's directory, the other `g<M>/` directories and the
-//!    unscoped `daemons/` that releases up to 0.33 register in — by reading the records, never by
-//!    contacting a daemon, and a spawner (e.g. `ensure_daemon` in `comms::singleton`) refuses to
-//!    spawn past [`max_live_daemons`]. The ceiling is applied per kind so one runaway family
-//!    cannot starve another. It is keyed on the resolved data home (`BASEMIND_DATA_HOME`), so it
-//!    is a **production** ceiling on a shared cache — NOT the test guard. Tests isolate the data
-//!    home per process, so a suite's daemons never accumulate here; their leak safety comes from
-//!    the bootstrap reaper and the kill-and-wait test harness, not this count.
+//! 2. **The machine ceiling** — every live daemon registers a pidfile under `<data_home>/daemons/`.
+//!    [`count_live_daemons_of`] tallies one kind's holders, pruning dead ones via [`pid_is_live`],
+//!    and a spawner (e.g. `ensure_daemon` in `comms::singleton`) refuses to spawn past
+//!    [`max_live_daemons`]. The ceiling is applied per kind so one runaway family cannot starve
+//!    another. It is keyed on the resolved data home (`BASEMIND_DATA_HOME`), so it is a
+//!    **production** ceiling on a shared cache — NOT the test guard. Tests isolate the data home
+//!    per process, so a suite's daemons never accumulate here; their leak safety comes from the
+//!    bootstrap reaper and the kill-and-wait test harness, not this count.
 
 #![cfg(any(unix, windows))]
 
@@ -45,38 +40,6 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 const DAEMON_PID_FILE: &str = "daemon.pid";
 /// The machine-wide directory of live-daemon pidfiles under the data home.
 const DAEMONS_SUBDIR: &str = "daemons";
-
-/// The protocol generation: which subdirectory of the comms directory
-/// (`comms::singleton::generation_dir`) this binary's daemon and clients meet in, and which
-/// subdirectory of the machine registry its daemons are listed in. Binaries of different
-/// generations never contact each other, so each keeps its own daemon alive for as long as its own
-/// sessions need it.
-///
-/// Deliberately not `PROTO_VER`. A protocol bump is survivable inside a generation: mismatched
-/// peers refuse each other by the takeover table without anyone being signalled. A generation bump
-/// is not free — the new generation starts with an empty comms store (threads, messages and the
-/// agent roster do not carry over) and one more daemon runs until the old sessions end.
-///
-/// Unrelated to the scan generation and to the index's base generations: this one only names where
-/// a daemon and its clients meet.
-///
-/// Bump it, by one, only when a release must stay invisible to binaries ALREADY RELEASED into the
-/// current generation, because they would mishandle its daemon or its files and cannot be patched:
-///
-/// - a released binary's takeover rule would stop or signal this release's daemon (the reason
-///   generation 1 exists: every release up to 0.33 kills any daemon whose version or protocol
-///   differs from its own);
-/// - the bring-up exchange they rely on changes shape: the length-prefixed msgpack framing, the
-///   `Ping` / `Status` / `Stop` requests, or the `pid` / `version` / `proto_ver` fields of
-///   `StatusReport`;
-/// - the meaning of `daemon.lock` / `daemon.pid`, of a registry record, or of the socket bind as a
-///   lock, changes;
-/// - the store changes on disk in a way its schema version does not announce, so an older binary
-///   would open it instead of failing with `NewerSchema`.
-///
-/// Do not bump it for a `PROTO_VER` bump, a new request or response variant, or a store schema
-/// bump: the first two are refused at the handshake and the third is versioned in the store.
-pub const RENDEZVOUS_GENERATION: u32 = 1;
 
 /// Default machine-wide ceiling, per kind, on concurrently live daemons before a spawn is refused.
 /// Well above any legitimate need (one per user is the norm; a handful covers isolated
@@ -107,8 +70,7 @@ pub enum DaemonKind {
     // field at all — still deserializes instead of being pruned as corrupt. See `read_record`. ~keep
     #[default]
     Comms,
-    /// The agent-shells daemon of an older release. Never written by this version; kept readable
-    /// so a record of that kind still parses instead of being reaped as corrupt. See `read_record`.
+    /// The shells / rmux daemon.
     Shells,
 }
 
@@ -148,43 +110,13 @@ pub struct DaemonRecord {
     pub version: String,
     /// Unix seconds when the daemon acquired the lock.
     pub started_unix: i64,
-    /// The daemon's own [`crate::boot_identity::process_start`]: the process at `pid` is the daemon
-    /// exactly when its start is this one. `None` in a record an older release wrote, or where the
-    /// platform gives no start; [`crate::process_start::can_have_written`] then falls back to
-    /// comparing wall-clock times.
-    #[serde(default)]
-    pub process_start: Option<u64>,
-    /// The boot the daemon ran in ([`crate::boot_identity::current`]), without which a Linux
-    /// `process_start` (ticks since boot) could match a process of a later boot.
-    #[serde(default)]
-    pub boot: Option<String>,
 }
 
-/// The registry root (`<data_home>/daemons/`), holding one subdirectory per generation. Releases
-/// up to 0.33 keep their records directly in it; their scan reads only `*.pid` files there, so a
-/// generation subdirectory is invisible to them.
-fn daemons_root() -> PathBuf {
-    cache_root().join(DAEMONS_SUBDIR)
-}
-
-/// This generation's registry directory (`<data_home>/daemons/g<N>/`): where this binary's daemons
-/// register and the only place its listings look. Keyed on the resolved data home; the `_in`/`_at`
-/// helpers take a directory explicitly so unit tests inject a temp dir without mutating the
-/// process-global `BASEMIND_DATA_HOME`.
+/// The machine-wide daemons directory (`<data_home>/daemons/`). The registry lives here so it is
+/// keyed on the resolved data home; the `_in`/`_at` helpers take it explicitly so unit tests inject
+/// a temp dir without mutating the process-global `BASEMIND_DATA_HOME`.
 fn daemons_dir() -> PathBuf {
-    generation_registry_in(&daemons_root())
-}
-
-/// This generation's registry directory under an explicit registry root.
-fn generation_registry_in(root: &Path) -> PathBuf {
-    root.join(format!("g{RENDEZVOUS_GENERATION}"))
-}
-
-/// Whether `name` names a generation's directory, in the registry or in a comms directory: `g`
-/// followed by decimal digits.
-pub(crate) fn is_generation_name(name: &str) -> bool {
-    name.strip_prefix('g')
-        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+    cache_root().join(DAEMONS_SUBDIR)
 }
 
 /// The registry pidfile for a daemon dir within a given machine dir: `<machine_dir>/<kind>-<hash>.pid`.
@@ -194,7 +126,41 @@ fn machine_registry_path_in(machine_dir: &Path, kind: DaemonKind, dir: &Path) ->
     machine_dir.join(format!("{}-{}.pid", kind.as_str(), workspace_key(dir)))
 }
 
-pub use crate::boot_identity::pid_is_live;
+/// Whether a process id is still live. Unix: `kill(pid, 0)` — `0` (signalable) or `EPERM` (exists,
+/// not ours) both mean alive; `ESRCH` means gone. Windows: `OpenProcess` succeeds for a live pid.
+#[cfg(unix)]
+pub fn pid_is_live(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 performs only an existence/permission check and sends no signal.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn pid_is_live(pid: u32) -> bool {
+    /// `OpenProcess` access mask: query basic info only.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // SAFETY: `OpenProcess`/`CloseHandle` take only primitive arguments and read no caller memory.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Win32 `OpenProcess` — returns a process handle (0 on failure).
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+    /// Win32 `CloseHandle`.
+    fn CloseHandle(handle: isize) -> i32;
+}
 
 /// Read a daemon record from a pidfile, or `None` when absent/corrupt. A `None` here deregisters the
 /// holder (the caller reaps the file), which is why [`DaemonRecord`]'s shape only ever grows in
@@ -203,19 +169,9 @@ fn read_record(path: &Path) -> Option<DaemonRecord> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-/// The live process `<dir>/daemon.pid` names, if any. Only the lock holder writes that file, but
-/// it outlives a daemon that was killed, so the process may be an unrelated one that was given
-/// the pid since. A caller about to signal it must also find `daemon.lock` held, the process the
-/// one the record names ([`crate::process_start::can_have_written`]), and the pid equal to the
-/// one the daemon reported, when it reported one.
-pub fn recorded_holder(dir: &Path) -> Option<DaemonRecord> {
-    read_record(&dir.join(DAEMON_PID_FILE)).filter(|record| pid_is_live(record.pid))
-}
-
-/// Every live daemon of this generation registered on this machine (under the resolved data home),
-/// of any kind, with the pidfiles of any that have died pruned as a side effect. Best-effort: an
-/// unreadable registry dir yields empty. Powers `comms doctor`. Daemons of other generations are
-/// never listed: the caller would address them over a protocol they may not speak.
+/// Every live daemon registered on this machine (under the resolved data home), of any kind, with
+/// the pidfiles of any that have died pruned as a side effect. Best-effort: an unreadable registry
+/// dir yields empty. Powers `comms doctor`.
 pub fn live_daemons() -> Vec<DaemonRecord> {
     live_daemons_in(&daemons_dir())
 }
@@ -236,17 +192,6 @@ fn live_daemons_of_in(machine_dir: &Path, kind: DaemonKind) -> Vec<DaemonRecord>
 
 /// [`live_daemons`] over an explicit machine dir. Injected so unit tests use a temp registry.
 fn live_daemons_in(machine_dir: &Path) -> Vec<DaemonRecord> {
-    live_daemons_judged_by(machine_dir, crate::boot_identity::pid_state)
-}
-
-/// [`live_daemons_in`] with what runs at a pid read by `state`. A record is pruned only when its
-/// process is surely gone ([`crate::boot_identity::PidState::may_be_live`]): one Windows refuses to
-/// open may be a daemon of another account or sandbox sharing the data home, and losing its record
-/// would hide it from `comms doctor` and `stop --all` and from the ceiling for good. It is listed.
-fn live_daemons_judged_by(
-    machine_dir: &Path,
-    state: impl Fn(u32) -> crate::boot_identity::PidState,
-) -> Vec<DaemonRecord> {
     let Ok(entries) = std::fs::read_dir(machine_dir) else {
         return Vec::new();
     };
@@ -257,7 +202,7 @@ fn live_daemons_judged_by(
             continue;
         }
         match read_record(&path) {
-            Some(record) if state(record.pid).may_be_live() => live.push(record),
+            Some(record) if pid_is_live(record.pid) => live.push(record),
             // Missing/corrupt record or a dead holder: reap the stale pidfile so the count is honest.
             _ => {
                 let _ = std::fs::remove_file(&path);
@@ -267,168 +212,21 @@ fn live_daemons_judged_by(
     live
 }
 
-/// Count the live daemons of one kind on this machine across every generation, for the ceiling.
-/// This generation's dead pidfiles are pruned; the others' records are only read.
+/// Count the live daemons of one kind on this machine, pruning dead pidfiles. See [`live_daemons`].
 pub fn count_live_daemons_of(kind: DaemonKind) -> usize {
-    count_all_generations_in(&daemons_root(), kind)
-}
-
-/// [`count_live_daemons_of`] over an explicit registry root.
-fn count_all_generations_in(root: &Path, kind: DaemonKind) -> usize {
-    live_daemons_of_in(&generation_registry_in(root), kind).len() + count_other_generations_in(root, kind)
-}
-
-/// How many live daemons of one kind other generations have registered: the releases up to 0.33,
-/// whose records sit directly in the registry root, and every `g<M>/` but this binary's. They count
-/// toward the ceiling and are otherwise out of this binary's reach.
-pub fn count_live_daemons_of_other_generations(kind: DaemonKind) -> usize {
-    count_other_generations_in(&daemons_root(), kind)
-}
-
-/// [`count_live_daemons_of_other_generations`] over an explicit registry root.
-fn count_other_generations_in(root: &Path, kind: DaemonKind) -> usize {
-    let own = generation_registry_in(root);
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    let mut count = count_recorded_in(root, kind);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let named_generation = entry.file_name().to_str().is_some_and(is_generation_name);
-        if named_generation && path != own && path.is_dir() {
-            count += count_recorded_in(&path, kind);
-        }
-    }
-    count
-}
-
-/// The live `kind` daemons recorded directly in `dir`. Read-only, unlike [`live_daemons_in`]: a
-/// record another generation wrote is that generation's to prune, and one this binary cannot parse
-/// may be a shape a later release introduced.
-fn count_recorded_in(dir: &Path, kind: DaemonKind) -> usize {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("pid"))
-        .filter_map(|path| read_record(&path))
-        .filter(|record| record.kind == kind && pid_is_live(record.pid))
-        .count()
-}
-
-/// The registry record of the live daemon running as `pid`, whatever its generation or kind: the
-/// releases up to 0.33 record directly in the registry root, later ones in a `g<N>/` below it.
-/// Read-only. For naming the process that holds something this daemon wants; a pid alone does not
-/// say which basemind version it is. A record that does not name the process now under its pid
-/// ([`crate::process_start::can_have_written`]) is passed over: a daemon that was killed left it,
-/// and the number now belongs to something else.
-pub fn registered_daemon(pid: u32) -> Option<DaemonRecord> {
-    registered_daemon_in(&daemons_root(), pid)
-}
-
-/// [`registered_daemon`] over an explicit registry root.
-fn registered_daemon_in(root: &Path, pid: u32) -> Option<DaemonRecord> {
-    let recorded_in = |dir: &Path| {
-        std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("pid"))
-            .filter_map(|path| read_record(&path))
-            .find(|record| record.pid == pid && pid_is_live(pid) && crate::process_start::can_have_written(record))
-    };
-    recorded_in(root).or_else(|| {
-        std::fs::read_dir(root)
-            .ok()?
-            .flatten()
-            .filter(|entry| entry.file_name().to_str().is_some_and(is_generation_name))
-            .find_map(|entry| recorded_in(&entry.path()))
-    })
-}
-
-/// What `<dir>/daemon.lock` says about a daemon in `dir`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LockState {
-    /// There is no lock file: no daemon of this lock scheme has run here, or the directory is gone.
-    Absent,
-    /// The lock was taken, and released again at once: no daemon is running here.
-    Free,
-    /// Another process holds the lock, or the file cannot be opened, so that cannot be ruled out.
-    Held,
-}
-
-/// Test `<dir>/daemon.lock` by taking it for an instant. A contender starting at that instant
-/// reads the lock as held with no live holder recorded, which it waits out (see
-/// `contend_for_lock`).
-pub fn lock_state(dir: &Path) -> LockState {
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(dir.join(DAEMON_LOCK_FILE))
-    {
-        Ok(file) if file.try_lock_exclusive().is_ok() => {
-            let _ = FileExt::unlock(&file);
-            LockState::Free
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LockState::Absent,
-        Ok(_) | Err(_) => LockState::Held,
-    }
-}
-
-/// Remove the registry records of other generations whose daemon is provably gone: the directory
-/// it owned no longer exists, or its `daemon.lock` is there and free. Such a record still counts
-/// toward the ceiling whenever its pid has been reused by a live process, and the generation that
-/// wrote it may never run again to prune it. A record this binary cannot parse stays, and so does
-/// one whose directory has no `daemon.lock`: a later release may lock another way. With `dry_run`
-/// nothing is removed. Returns how many records were (or would be) removed.
-pub fn prune_other_generations_records(dry_run: bool) -> usize {
-    prune_other_generations_in(&daemons_root(), dry_run)
-}
-
-/// [`prune_other_generations_records`] over an explicit registry root.
-fn prune_other_generations_in(root: &Path, dry_run: bool) -> usize {
-    let own = generation_registry_in(root);
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    let mut registries = vec![root.to_path_buf()];
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let named_generation = entry.file_name().to_str().is_some_and(is_generation_name);
-        if named_generation && path != own && path.is_dir() {
-            registries.push(path);
-        }
-    }
-    let mut pruned = 0;
-    for registry in registries {
-        for entry in std::fs::read_dir(&registry).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("pid") {
-                continue;
-            }
-            let Some(record) = read_record(&path) else {
-                continue;
-            };
-            let gone = !record.dir.exists() || lock_state(&record.dir) == LockState::Free;
-            if gone && (dry_run || std::fs::remove_file(&path).is_ok()) {
-                pruned += 1;
-            }
-        }
-    }
-    pruned
+    live_daemons_of(kind).len()
 }
 
 /// The single-owner daemon lock: an exclusive flock plus the two pidfiles, released and removed on
 /// `Drop`. Acquire it at the very top of the daemon entry point, before binding the socket.
 #[derive(Debug)]
 pub struct DaemonLock {
-    /// Held for the daemon's lifetime and explicitly unlocked after deregistration.
-    lock: File,
+    /// Held for the daemon's lifetime; the flock releases when this `File` drops (or the process
+    /// dies — the OS releases advisory locks on exit, so a crashed daemon never wedges the lock).
+    _lock: File,
     /// `<dir>/daemon.pid`, removed on drop.
     pid_path: PathBuf,
-    /// `<data_home>/daemons/g<N>/<kind>-<hash>.pid`, removed on drop.
+    /// `<data_home>/daemons/<kind>-<hash>.pid`, removed on drop.
     machine_path: PathBuf,
 }
 
@@ -510,8 +308,6 @@ impl DaemonLock {
             dir: dir.to_path_buf(),
             version: version.to_string(),
             started_unix: now_unix(),
-            process_start: crate::boot_identity::process_start(std::process::id()),
-            boot: crate::boot_identity::current(),
         };
         let pid_path = dir.join(DAEMON_PID_FILE);
         let machine_path = machine_registry_path_in(machine_dir, kind, dir);
@@ -520,7 +316,7 @@ impl DaemonLock {
         write_record(&machine_path, &record);
 
         Ok(DaemonLockOutcome::Acquired(DaemonLock {
-            lock: file,
+            _lock: file,
             pid_path,
             machine_path,
         }))
@@ -532,8 +328,6 @@ impl Drop for DaemonLock {
         // removing the pidfiles just keeps the registry tidy so a later count needs no liveness prune.
         let _ = std::fs::remove_file(&self.pid_path);
         let _ = std::fs::remove_file(&self.machine_path);
-        // A forked child may still hold a copy of the open file description until it execs. ~keep
-        let _ = FileExt::unlock(&self.lock);
     }
 }
 
@@ -558,5 +352,178 @@ fn now_unix() -> i64 {
 }
 
 #[cfg(test)]
-#[path = "daemon_lock_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_pid_is_live_and_a_bogus_pid_is_not() {
+        assert!(pid_is_live(std::process::id()), "our own pid is live");
+        // A pid well above any real one on a fresh machine reads as dead.
+        assert!(!pid_is_live(0x7FFF_FFFE), "an absent pid is not live");
+    }
+
+    #[test]
+    fn a_record_written_by_an_older_binary_still_parses_as_a_comms_daemon() {
+        let old_shape = br#"{"pid":4242,"comms_dir":"/tmp/old-comms","version":"0.22.0","started_unix":17}"#;
+        let record: DaemonRecord = serde_json::from_slice(old_shape).expect("an old-shape record must still parse");
+        assert_eq!(record.kind, DaemonKind::Comms, "an untagged record is a comms daemon");
+        assert_eq!(
+            record.dir,
+            PathBuf::from("/tmp/old-comms"),
+            "the directory survives the rename"
+        );
+        assert_eq!(record.pid, 4242);
+    }
+
+    #[test]
+    fn acquire_admits_one_owner_then_reports_already_held() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        let first =
+            DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("first acquire");
+        assert!(
+            matches!(first, DaemonLockOutcome::Acquired(_)),
+            "the first daemon wins the lock"
+        );
+        match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("second acquire")
+        {
+            DaemonLockOutcome::AlreadyHeld(Some(record)) => {
+                assert_eq!(record.pid, std::process::id(), "the holder record names us");
+            }
+            other => panic!("a second acquire must report AlreadyHeld with the holder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_prunes_dead_holders_and_counts_live_ones() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        let held = DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("acquire");
+        assert!(matches!(held, DaemonLockOutcome::Acquired(_)));
+        assert_eq!(
+            live_daemons_in(machine.path()).len(),
+            1,
+            "our live daemon is counted once"
+        );
+
+        // Plant a registry entry for a dead pid; the scan must prune it.
+        let dead = DaemonRecord {
+            pid: 0x7FFF_FFFE,
+            kind: DaemonKind::Comms,
+            dir: PathBuf::from("/nonexistent"),
+            version: "9.9.9".to_string(),
+            started_unix: now_unix(),
+        };
+        let dead_path = machine.path().join("dead.pid");
+        write_record(&dead_path, &dead);
+        assert_eq!(
+            live_daemons_in(machine.path()).len(),
+            1,
+            "the dead holder is pruned, only the live one counts"
+        );
+        assert!(!dead_path.exists(), "the dead pidfile was reaped");
+    }
+
+    #[test]
+    fn the_ceiling_counts_each_kind_separately() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        let shells = tempfile::tempdir().expect("shells tempdir");
+        let _comms_lock =
+            DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("comms acquire");
+        let _shells_lock =
+            DaemonLock::acquire_at(DaemonKind::Shells, shells.path(), "9.9.9", machine.path()).expect("shells acquire");
+
+        assert_eq!(live_daemons_in(machine.path()).len(), 2, "both families are registered");
+        let comms_only = live_daemons_of_in(machine.path(), DaemonKind::Comms);
+        assert_eq!(comms_only.len(), 1, "a shells daemon does not count against comms");
+        assert_eq!(comms_only[0].dir, comms.path(), "the comms entry names the comms dir");
+        assert_eq!(
+            live_daemons_of_in(machine.path(), DaemonKind::Shells).len(),
+            1,
+            "the shells daemon is counted under its own kind"
+        );
+    }
+
+    #[test]
+    fn a_record_naming_the_removed_agent_kind_is_reaped_without_crashing() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let path = machine.path().join("legacy.pid");
+        let record = |kind: &str| {
+            format!(
+                r#"{{"pid":{},"kind":"{kind}","dir":"/tmp/x","version":"1","started_unix":1}}"#,
+                std::process::id()
+            )
+        };
+        // Control: the same record with a live kind parses, so only the kind can explain the reap.
+        std::fs::write(&path, record("comms")).expect("write control record");
+        assert!(read_record(&path).is_some(), "fixture is otherwise valid");
+        std::fs::write(&path, record("agent")).expect("write legacy record");
+        assert!(read_record(&path).is_none(), "the removed kind no longer parses");
+        assert!(live_daemons_in(machine.path()).is_empty());
+        assert!(!path.exists(), "the unreadable record is reaped like any corrupt one");
+    }
+
+    #[test]
+    fn drop_releases_the_lock_and_removes_the_registry_entry() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        {
+            let held =
+                DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("acquire");
+            assert!(matches!(held, DaemonLockOutcome::Acquired(_)));
+            assert_eq!(live_daemons_in(machine.path()).len(), 1);
+        }
+        assert_eq!(
+            live_daemons_in(machine.path()).len(),
+            0,
+            "dropping the lock deregisters the daemon"
+        );
+        // flock belongs to the open file description, so a sibling test thread that forks (any
+        // `Command::spawn`) inherits it until its exec closes the CLOEXEC fd. That window is a few
+        // milliseconds, so the lock can read as held right after our drop; wait it out rather than
+        // asserting on a race the production code cannot and need not prevent. ~keep
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path())
+                .expect("re-acquire after drop")
+            {
+                DaemonLockOutcome::Acquired(_) => break,
+                other if std::time::Instant::now() >= deadline => panic!("the lock is free after drop, got {other:?}"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// A concurrent fork/exec carries a copy of a just-dropped lock's fd until it execs, so the lock
+    /// reads as held for a few ms with no record behind it. Re-acquiring right after a drop must
+    /// still win rather than report a phantom peer.
+    #[test]
+    fn reacquire_after_drop_wins_despite_concurrent_fork_exec() {
+        let machine = tempfile::tempdir().expect("machine tempdir");
+        let comms = tempfile::tempdir().expect("comms tempdir");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let mut phantom_holders = 0;
+        for _ in 0..200 {
+            match DaemonLock::acquire_at(DaemonKind::Comms, comms.path(), "9.9.9", machine.path()).expect("acquire") {
+                DaemonLockOutcome::Acquired(lock) => drop(lock),
+                DaemonLockOutcome::AlreadyHeld(_) => phantom_holders += 1,
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().expect("spawner thread");
+        }
+        assert_eq!(phantom_holders, 0, "a released lock was reported as held by a peer");
+    }
+}

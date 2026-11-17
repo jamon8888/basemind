@@ -48,11 +48,6 @@ pub const STATUS_SIDECAR_FILE: &str = "status.json";
 /// Schema version of [`StatusSidecar`]. Bump on any incompatible field change; [`read_status_sidecar`]
 /// ignores a sidecar whose `schema_ver` it does not recognize (forward-compat, like a schema wipe).
 pub const STATUS_SIDECAR_SCHEMA_VER: u32 = 1;
-/// File holding the generated-and-persisted per-workspace agent id, in the workspace's cache dir
-/// beside [`WORKSPACE_MARKER_FILE`]. Named here, with the rest of the layout, because the store's
-/// orphan reaper ([`crate::store_gc_workspace`]) must recognize it; the identity resolver in
-/// `crate::comms::identity` reads and writes it.
-pub const AGENT_ID_FILE: &str = "agent-id";
 pub const VIEWS_DIR: &str = "views";
 /// Lazy-opened LanceDB store directory under `.basemind/`. Created on first use.
 #[cfg(feature = "intelligence")]
@@ -110,69 +105,10 @@ pub fn workspace_cache_dir(root: &Path) -> PathBuf {
         .join(workspace_key(root))
 }
 
-/// Sub-directory of the cache holding per-repo-group state shared by every worktree of one clone,
-/// keyed by [`repo_group_key`]. Today that is the user-authored memory store; nothing under it is
-/// rebuildable, so no garbage collector may list it.
-pub const REPOS_DIR: &str = "repos";
-/// Fjall database under a repo-group dir holding `memory_by_key`.
-pub const MEMORY_STORE_DIR: &str = "memory.fjall";
-
-/// Group key for the worktree at `root`: the blake3 of the canonical main worktree root (the parent
-/// of the shared git common dir), so every linked worktree of one clone maps to the same group. A
-/// root outside any git repository (or in a bare one) falls back to its own [`workspace_key`].
-pub fn repo_group_key(root: &Path) -> String {
-    match crate::git::Repo::discover(root) {
-        Ok(repo) => {
-            let main = repo.main_worktree_root();
-            let canonical = main.canonicalize().unwrap_or(main);
-            hashing::hex(&hashing::hash_bytes(canonical.as_os_str().as_encoded_bytes()))
-        }
-        Err(_) => workspace_key(root),
-    }
-}
-
-/// Per-repo-group directory for `root`: `cache_root()/cache/repos/<repo_group_key>/`.
-pub fn repo_group_dir(root: &Path) -> PathBuf {
-    cache_root().join(CACHE_DIR).join(REPOS_DIR).join(repo_group_key(root))
-}
-
-/// The group's user-memory Fjall database: `<repo_group_dir>/memory.fjall`. Outlives every
-/// workspace in the group, so budget eviction and the orphan reaper never touch it.
-pub fn memory_store_dir(root: &Path) -> PathBuf {
-    repo_group_dir(root).join(MEMORY_STORE_DIR)
-}
-
-/// Directory, beside [`MEMORY_STORE_DIR`], that holds the vector stores of the memory notes: one
-/// subdirectory per embedding model and dimension.
-pub const MEMORY_VECTORS_DIR: &str = "memory.lance";
-
-/// `<repo_group_dir>/memory.lance/`: the memory notes' vector stores of every embedding model.
-pub fn memory_vectors_dir(root: &Path) -> PathBuf {
-    repo_group_dir(root).join(MEMORY_VECTORS_DIR)
-}
-
-/// The layout of the blob store, recorded in every file map ([`crate::store::Index::blob_layout`]).
-/// `0`: blobs flat in `cache/blobs/`. `1`: one namespace directory per blob schema. A file map of
-/// an earlier layout names blobs that are not where this binary looks, so it is discarded and the
-/// workspace scanned again, without waiting for a release to change the schema as well.
-pub const BLOB_LAYOUT: u8 = 1;
-
-/// Root of the global blob store: `cache_root()/cache/blobs/`. Holds one namespace directory per
-/// blob schema; only [`global_blobs_dir`] is read or written by this binary.
-pub fn global_blobs_root() -> PathBuf {
-    cache_root().join(CACHE_DIR).join(BLOBS_DIR)
-}
-
-/// The GLOBAL content-addressed blob store: `cache_root()/cache/blobs/v<SCHEMA_VER>/`. Shared
-/// across every workspace on the machine, so byte-identical files are extracted + embedded exactly
-/// once.
-///
-/// Namespaced by blob schema because two installed basemind minors share the cache: in one flat
-/// directory each would overwrite the other's blobs as "not current", and the other side's file map
-/// would go on calling those files unchanged. Other namespaces are never read, written or deleted
-/// here; [`crate::store_gc`] reaps the superseded ones.
+/// The GLOBAL content-addressed blob store: `cache_root()/cache/blobs/`. Shared across every
+/// workspace on the machine, so byte-identical files are extracted + embedded exactly once.
 pub fn global_blobs_dir() -> PathBuf {
-    global_blobs_root().join(format!("v{}", crate::extract::SCHEMA_VER))
+    cache_root().join(CACHE_DIR).join(BLOBS_DIR)
 }
 
 /// The `workspace.json` sidecar: the canonical worktree root a workspace cache dir was keyed from.
@@ -239,112 +175,6 @@ pub struct StatusSidecar {
     pub blob_count: usize,
     /// Unix-epoch seconds when the sidecar was written (i.e. when the scan that produced it finished).
     pub scanned_unix: i64,
-    /// False from the moment the code map is flushed until the resolve pass has committed every
-    /// edge. A scan that dies or aborts in between leaves it false, which readers report as
-    /// degraded. Absent in a pre-marker sidecar, which reads as complete.
-    #[serde(default = "default_true")]
-    pub resolve_complete: bool,
-    /// True when the last full scan was cancelled or aborted before covering the workspace, so the
-    /// file map holds only the files completed so far. Absent reads as false.
-    #[serde(default)]
-    pub partial: bool,
-    /// Why the scan stopped short; set together with [`Self::partial`].
-    #[serde(default)]
-    pub partial_reason: Option<String>,
-    /// Files the partial scan had completed.
-    #[serde(default)]
-    pub progress_done: Option<usize>,
-    /// Candidate files the partial scan had enumerated.
-    #[serde(default)]
-    pub progress_total: Option<usize>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Why a full scan stopped before covering the workspace, and how far it got.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PartialScan {
-    pub reason: String,
-    pub done: usize,
-    pub total: usize,
-}
-
-/// The completeness half of the sidecar: what a reader needs to tell a finished index from a
-/// degraded one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScanHealth {
-    pub resolve_complete: bool,
-    pub partial: Option<PartialScan>,
-}
-
-impl ScanHealth {
-    /// A finished scan whose resolve pass committed (or has nothing to resolve).
-    pub fn complete() -> Self {
-        Self {
-            resolve_complete: true,
-            partial: None,
-        }
-    }
-
-    /// The code map is flushed but the resolve pass has not finished yet.
-    pub fn resolving() -> Self {
-        Self {
-            resolve_complete: false,
-            partial: None,
-        }
-    }
-
-    /// The scan stopped short: the resolve pass did not run either.
-    pub fn partial(reason: impl Into<String>, done: usize, total: usize) -> Self {
-        Self {
-            resolve_complete: false,
-            partial: Some(PartialScan {
-                reason: reason.into(),
-                done,
-                total,
-            }),
-        }
-    }
-}
-
-impl Default for ScanHealth {
-    fn default() -> Self {
-        Self::complete()
-    }
-}
-
-impl StatusSidecar {
-    /// The health recorded in this sidecar.
-    pub fn health(&self) -> ScanHealth {
-        ScanHealth {
-            resolve_complete: self.resolve_complete,
-            partial: self.partial.then(|| PartialScan {
-                reason: self.partial_reason.clone().unwrap_or_default(),
-                done: self.progress_done.unwrap_or(0),
-                total: self.progress_total.unwrap_or(0),
-            }),
-        }
-    }
-
-    /// Whether the index is anything less than a finished scan with a committed resolve pass.
-    pub fn is_degraded(&self) -> bool {
-        self.partial || !self.resolve_complete
-    }
-
-    /// One-line operator description of the degradation, or `None` for a healthy index.
-    pub fn degraded_summary(&self) -> Option<String> {
-        if self.partial {
-            let reason = self.partial_reason.as_deref().unwrap_or("unknown");
-            let (done, total) = (self.progress_done.unwrap_or(0), self.progress_total.unwrap_or(0));
-            return Some(format!(
-                "partial scan ({reason}; {done}/{total} files); a full rescan is needed"
-            ));
-        }
-        (!self.resolve_complete)
-            .then(|| "resolve pass incomplete; resolved references and callers may be stale".to_string())
-    }
 }
 
 /// Path of the `status.json` sidecar inside a workspace cache dir.
@@ -368,7 +198,7 @@ pub fn count_fm_blobs(blobs_dir: &Path) -> usize {
 /// Best-effort atomic write of the `status.json` sidecar into `basemind_dir`. `scanned_unix` is set
 /// to now. Errors are swallowed deliberately, mirroring [`ensure_workspace_marker`] — a failed
 /// sidecar write must never fail a scan, and a stale/absent sidecar only degrades the statusline.
-pub fn write_status_sidecar(basemind_dir: &Path, file_count: usize, blob_count: usize, health: &ScanHealth) {
+pub fn write_status_sidecar(basemind_dir: &Path, file_count: usize, blob_count: usize) {
     let scanned_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -378,11 +208,6 @@ pub fn write_status_sidecar(basemind_dir: &Path, file_count: usize, blob_count: 
         file_count,
         blob_count,
         scanned_unix,
-        resolve_complete: health.resolve_complete,
-        partial: health.partial.is_some(),
-        partial_reason: health.partial.as_ref().map(|p| p.reason.clone()),
-        progress_done: health.partial.as_ref().map(|p| p.done),
-        progress_total: health.partial.as_ref().map(|p| p.total),
     };
     let Ok(bytes) = serde_json::to_vec(&sidecar) else {
         return;
@@ -396,14 +221,6 @@ pub fn read_status_sidecar(basemind_dir: &Path) -> Option<StatusSidecar> {
     let bytes = std::fs::read(status_sidecar_path(basemind_dir)).ok()?;
     let sidecar: StatusSidecar = serde_json::from_slice(&bytes).ok()?;
     (sidecar.schema_ver == STATUS_SIDECAR_SCHEMA_VER).then_some(sidecar)
-}
-
-/// Replace only the health fields of the sidecar, keeping its counts and timestamp. With no usable
-/// sidecar there is nothing to keep, so a zero-count one is written: the point is that a reader sees
-/// the degradation. Best-effort, like [`write_status_sidecar`].
-pub fn update_status_health(basemind_dir: &Path, health: &ScanHealth) {
-    let (file_count, blob_count) = read_status_sidecar(basemind_dir).map_or((0, 0), |s| (s.file_count, s.blob_count));
-    write_status_sidecar(basemind_dir, file_count, blob_count, health);
 }
 
 /// Redirect [`cache_root`] at a per-process temp dir for the whole test binary.
@@ -427,88 +244,23 @@ fn marked_isolated_root(path: PathBuf) -> Option<PathBuf> {
     path.join(ISOLATION_MARKER).is_file().then_some(path)
 }
 
-/// Name prefix of a cache dir created by [`init_isolated_cache`], so the stale sweep only stats
-/// directories it could have created.
-#[cfg(any(feature = "test-support", test))]
-const ISOLATED_CACHE_PREFIX: &str = "basemind-test-";
-
-/// The `tempfile` default prefix, which isolated caches carried before they were named.
-#[cfg(any(feature = "test-support", test))]
-const LEGACY_ISOLATED_CACHE_PREFIX: &str = ".tmp";
-
-/// A marked cache this old belongs to a test process that was killed before its exit handler ran.
-#[cfg(any(feature = "test-support", test))]
-const STALE_ISOLATED_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-
-/// Removals per sweep, so a backlog costs a test binary's start-up a bounded amount of work.
-#[cfg(any(feature = "test-support", test))]
-const MAX_STALE_REMOVALS: usize = 64;
-
-/// The isolated cache this process created (never one it adopted), removed at process exit.
-#[cfg(any(feature = "test-support", test))]
-static CREATED_ISOLATED_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// `atexit` handler: best-effort removal of [`CREATED_ISOLATED_ROOT`]. A daemon still holding files
-/// there (or Windows refusing to delete an open file) only leaves debris for the stale sweep.
-#[cfg(any(feature = "test-support", test))]
-extern "C" fn remove_created_isolated_cache() {
-    if let Some(root) = CREATED_ISOLATED_ROOT.get() {
-        // Unwinding out of an `extern "C"` fn aborts the exiting process. ~keep
-        let _ = std::panic::catch_unwind(|| std::fs::remove_dir_all(root));
-    }
-}
-
-/// Remove marked isolated caches directly under `temp_root` whose marker is at least `max_age`
-/// old, returning how many were removed. Only entries named with [`ISOLATED_CACHE_PREFIX`] or
-/// [`LEGACY_ISOLATED_CACHE_PREFIX`] are inspected, nothing is descended into, and a directory
-/// without [`ISOLATION_MARKER`] is never touched. Errors are ignored.
-#[cfg(any(feature = "test-support", test))]
-fn sweep_stale_isolated_caches(temp_root: &Path, max_age: std::time::Duration) -> usize {
-    let Ok(entries) = std::fs::read_dir(temp_root) else {
-        return 0;
-    };
-    let now = std::time::SystemTime::now();
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        if removed >= MAX_STALE_REMOVALS {
-            break;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !(name.starts_with(ISOLATED_CACHE_PREFIX) || name.starts_with(LEGACY_ISOLATED_CACHE_PREFIX)) {
-            continue;
-        }
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let dir = entry.path();
-        let Ok(marker) = std::fs::symlink_metadata(dir.join(ISOLATION_MARKER)) else {
-            continue;
-        };
-        let stale = marker.is_file()
-            && marker
-                .modified()
-                .ok()
-                .and_then(|written| now.duration_since(written).ok())
-                .is_some_and(|age| age >= max_age);
-        if stale && std::fs::remove_dir_all(&dir).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-/// Sets `$BASEMIND_DATA_HOME` exactly once (via [`std::sync::Once`]) to a temp dir that outlives
-/// every test in the binary, and is idempotent across the many fixture constructors that call it.
-/// The process that created the dir removes it at exit; ones left by killed processes are swept
-/// when the next one is created. Workspace-keying + content-addressed blobs keep tests mutually
-/// isolated even though they share this one cache root, so all tests in a binary can safely share
-/// it — no per-test env churn, no races on `set_var`.
+/// Sets `$BASEMIND_DATA_HOME` exactly once (via [`std::sync::Once`]) to a leaked [`tempfile::TempDir`]
+/// so it outlives every test in the binary, and is idempotent across the many fixture constructors
+/// that call it. Workspace-keying + content-addressed blobs keep tests mutually isolated even
+/// though they share this one cache root, so all tests in a binary can safely share it — no
+/// per-test env churn, no races on `set_var`.
 ///
 /// Also pins `$BASEMIND_COMMS_DIR` under the same tempdir. On a `comms` build the real `basemind
 /// serve` binary is a `daemon_writer` that forwards every write to the machine daemon (auto-spawned
 /// on first use); a test that spawns `serve` inherits this env, so its daemon binds an ISOLATED
 /// socket under the tempdir instead of touching the user's real machine daemon.
+///
+/// The same treatment covers every other daemon family basemind can auto-spawn, because a daemon
+/// that survives the suite keeps an exclusive Fjall directory lock and blocks the next
+/// `basemind scan`:
+/// * **shells/rmux** resolves its endpoint from `directories::ProjectDirs`, i.e. the user's REAL
+///   data dir, unless `$BASEMIND_SHELLS_SOCKET` overrides it — so that override is pinned into the
+///   tempdir, which is the only thing keeping a test off the developer's live rmux daemon.
 ///
 /// A cache created here is stamped with [`ISOLATION_MARKER`] and re-adopted by any child process,
 /// so the machine-wide daemon ceiling counts one registry across the whole tree.
@@ -526,35 +278,24 @@ pub fn init_isolated_cache() {
         //
         // The marker is what makes adoption safe: an unmarked `$BASEMIND_DATA_HOME` is a developer's
         // REAL cache, and a test must never be pointed at that. ~keep
-        let root: PathBuf = match inherited_isolated_root() {
-            Some(path) => path,
+        let root: &Path = match inherited_isolated_root() {
+            Some(path) => Box::leak(Box::new(path)).as_path(),
             None => {
-                let temp_root = std::env::temp_dir();
-                sweep_stale_isolated_caches(&temp_root, STALE_ISOLATED_CACHE_AGE);
-                let dir = tempfile::Builder::new()
-                    .prefix(ISOLATED_CACHE_PREFIX)
-                    .tempdir_in(&temp_root)
-                    .expect("create isolated cache tempdir")
-                    .keep();
-                std::fs::write(dir.join(ISOLATION_MARKER), b"basemind test cache\n")
+                let dir = Box::leak(Box::new(tempfile::tempdir().expect("create isolated cache tempdir")));
+                std::fs::write(dir.path().join(ISOLATION_MARKER), b"basemind test cache\n")
                     .expect("write the isolated-cache marker");
-                if CREATED_ISOLATED_ROOT.set(dir.clone()).is_ok() {
-                    // SAFETY: registers a plain `extern "C" fn()` with no captured state; it reads
-                    // only the `OnceLock` set just above. ~keep
-                    unsafe {
-                        libc::atexit(remove_created_isolated_cache);
-                    }
-                }
-                dir
+                dir.path()
             }
         };
         let comms_dir = root.join("comms");
+        let shells_endpoint = isolated_shells_endpoint(root);
         // SAFETY: set exactly once, inside `Once::call_once`, before any test thread reads
         unsafe {
             std::env::set_var(DATA_HOME_ENV, root);
-            // A literal key, not the `comms::singleton::COMMS_DIR_ENV` constant: that module is
-            // feature-gated, this helper is not. ~keep
+            // Literal keys, not the `comms::singleton::COMMS_DIR_ENV` / `shells::SHELLS_SOCKET_ENV`
+            // constants: both modules are feature-gated, this helper is not. ~keep
             std::env::set_var("BASEMIND_COMMS_DIR", comms_dir);
+            std::env::set_var("BASEMIND_SHELLS_SOCKET", shells_endpoint);
             // A test binary spawns its own isolated daemons (per the dirs above). Pin a fast idle
             // reap so they self-terminate within seconds of the suite going quiet instead of lingering
             // the shipped window — otherwise a parallel `cargo test` accumulates one daemon per binary,
@@ -573,6 +314,24 @@ pub fn init_isolated_cache() {
             }
         }
     });
+}
+
+/// Endpoint the embedded shells (rmux) daemon binds under an isolated cache: `<dir>/shells/rmux.sock`.
+/// The parent is created eagerly because the daemon binds the socket without creating it, and a bind
+/// failure would silently fall the runtime back to the user's real per-user socket.
+#[cfg(all(any(feature = "test-support", test), not(windows)))]
+fn isolated_shells_endpoint(dir: &Path) -> std::ffi::OsString {
+    let shells_dir = dir.join("shells");
+    let _ = std::fs::create_dir_all(&shells_dir);
+    shells_dir.join("rmux.sock").into_os_string()
+}
+
+/// Windows has no filesystem socket to place under the tempdir — rmux binds a named pipe, and
+/// `shells::daemon::validate_socket_path` accepts nothing but a `\\.\pipe\` name. Namespacing it by
+/// pid is what isolates one test binary from another and from the user's live daemon.
+#[cfg(all(any(feature = "test-support", test), windows))]
+fn isolated_shells_endpoint(_dir: &Path) -> std::ffi::OsString {
+    std::ffi::OsString::from(format!(r"\\.\pipe\basemind-shells-test-{}", std::process::id()))
 }
 
 #[cfg(test)]
@@ -620,6 +379,32 @@ mod daemon_isolation_tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn shells_socket_override_points_at_a_bindable_path_in_the_temp_cache() {
+        init_isolated_cache();
+        let temp_root = PathBuf::from(std::env::var_os(DATA_HOME_ENV).expect("BASEMIND_DATA_HOME is set"));
+        let socket = PathBuf::from(std::env::var_os("BASEMIND_SHELLS_SOCKET").expect("BASEMIND_SHELLS_SOCKET is set"));
+
+        assert!(
+            socket.starts_with(&temp_root),
+            "shells/rmux daemon escaped isolation: {}",
+            socket.display()
+        );
+        assert!(
+            socket.parent().is_some_and(Path::is_dir),
+            "the socket parent must exist or the bind falls back to the real per-user socket"
+        );
+        // The platform `sockaddr_un` ceiling is ~104 bytes; a too-long tempdir path would make the
+        // bind fail and silently hand the test the developer's live daemon. ~keep
+        assert!(
+            socket.as_os_str().len() < 104,
+            "isolated socket path must stay bindable: {} ({} bytes)",
+            socket.display(),
+            socket.as_os_str().len()
+        );
+    }
+
     /// The isolated cache must carry its marker, or a child process cannot tell it apart from a
     /// developer's real `$BASEMIND_DATA_HOME` and will mint a fresh one — which is what detaches the
     /// daemon ceiling from the process tree it is supposed to bound.
@@ -653,42 +438,19 @@ mod daemon_isolation_tests {
         );
     }
 
-    /// A killed test process never runs its exit handler, so its cache is reclaimed by the next
-    /// one's sweep: stale marked dirs (new and legacy names) go, while an unmarked dir and a fresh
-    /// marked dir stay.
+    /// The env override only isolates if the real resolver accepts it — `ShellRuntime::new` runs the
+    /// value through `validate_socket_path` and silently falls back to the user's per-user socket on
+    /// rejection, which is exactly the leak this test exists to catch.
+    #[cfg(all(feature = "shells", any(unix, windows)))]
     #[test]
-    fn the_sweep_removes_only_stale_marked_caches() {
-        let temp_root = tempfile::tempdir().expect("tempdir");
-        let age = STALE_ISOLATED_CACHE_AGE;
-        let long_ago = std::time::SystemTime::now() - age - std::time::Duration::from_secs(60);
-        let make = |name: &str, marker_written: Option<std::time::SystemTime>| {
-            let dir = temp_root.path().join(name);
-            std::fs::create_dir_all(dir.join("cache")).expect("create candidate");
-            if let Some(written) = marker_written {
-                let marker = dir.join(ISOLATION_MARKER);
-                std::fs::write(&marker, b"basemind test cache\n").expect("write marker");
-                std::fs::File::options()
-                    .write(true)
-                    .open(&marker)
-                    .and_then(|file| file.set_modified(written))
-                    .expect("backdate marker");
-            }
-            dir
-        };
-        let stale = make("basemind-test-stale", Some(long_ago));
-        let legacy = make(".tmpLegacy", Some(long_ago));
-        let unmarked = make("basemind-test-unmarked", None);
-        let fresh = make("basemind-test-fresh", Some(std::time::SystemTime::now()));
-
-        let removed = sweep_stale_isolated_caches(temp_root.path(), age);
-
-        assert_eq!(removed, 2, "exactly the stale and the legacy marked caches are removed");
-        assert!(!stale.exists(), "a stale marked cache must be removed");
-        assert!(!legacy.exists(), "a stale legacy `.tmp*` marked cache must be removed");
-        assert!(unmarked.exists(), "an unmarked dir must never be touched");
-        assert!(
-            fresh.exists(),
-            "a fresh marked cache belongs to a live process and must stay"
+    fn shell_runtime_resolves_the_isolated_endpoint() {
+        init_isolated_cache();
+        let expected =
+            PathBuf::from(std::env::var_os("BASEMIND_SHELLS_SOCKET").expect("BASEMIND_SHELLS_SOCKET is set"));
+        assert_eq!(
+            crate::shells::ShellRuntime::new().socket_path(),
+            expected.as_path(),
+            "the shells runtime must bind the isolated endpoint, not the per-user default"
         );
     }
 }
@@ -700,7 +462,7 @@ mod status_sidecar_tests {
     #[test]
     fn write_then_read_round_trips_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_status_sidecar(dir.path(), 42, 7, &ScanHealth::complete());
+        write_status_sidecar(dir.path(), 42, 7);
         let sidecar = read_status_sidecar(dir.path()).expect("sidecar present after write");
         assert_eq!(sidecar.schema_ver, STATUS_SIDECAR_SCHEMA_VER);
         assert_eq!(sidecar.file_count, 42);
@@ -710,42 +472,6 @@ mod status_sidecar_tests {
             "scanned_unix should be a real epoch, got {}",
             sidecar.scanned_unix
         );
-    }
-
-    #[test]
-    fn a_pre_marker_sidecar_reads_as_complete() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let legacy =
-            format!(r#"{{"schema_ver":{STATUS_SIDECAR_SCHEMA_VER},"file_count":3,"blob_count":3,"scanned_unix":9}}"#);
-        std::fs::write(status_sidecar_path(dir.path()), legacy).expect("write");
-        let sidecar = read_status_sidecar(dir.path()).expect("legacy sidecar still parses");
-        assert!(!sidecar.is_degraded());
-        assert_eq!(sidecar.degraded_summary(), None);
-    }
-
-    #[test]
-    fn health_round_trips_and_summarizes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_status_sidecar(dir.path(), 5, 5, &ScanHealth::partial("cancelled", 2, 5));
-        let sidecar = read_status_sidecar(dir.path()).expect("sidecar");
-        assert!(sidecar.is_degraded());
-        assert_eq!(sidecar.health(), ScanHealth::partial("cancelled", 2, 5));
-        let summary = sidecar.degraded_summary().expect("summary");
-        assert!(summary.contains("cancelled") && summary.contains("2/5"), "{summary}");
-
-        write_status_sidecar(dir.path(), 5, 5, &ScanHealth::resolving());
-        let sidecar = read_status_sidecar(dir.path()).expect("sidecar");
-        assert!(sidecar.is_degraded() && !sidecar.partial);
-    }
-
-    #[test]
-    fn update_health_keeps_counts() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_status_sidecar(dir.path(), 42, 7, &ScanHealth::complete());
-        update_status_health(dir.path(), &ScanHealth::partial("disk full", 1, 9));
-        let sidecar = read_status_sidecar(dir.path()).expect("sidecar");
-        assert_eq!((sidecar.file_count, sidecar.blob_count), (42, 7));
-        assert!(sidecar.partial);
     }
 
     #[test]
@@ -762,11 +488,6 @@ mod status_sidecar_tests {
             file_count: 1,
             blob_count: 1,
             scanned_unix: 1,
-            resolve_complete: true,
-            partial: false,
-            partial_reason: None,
-            progress_done: None,
-            progress_total: None,
         })
         .expect("serialize");
         std::fs::write(status_sidecar_path(dir.path()), bytes).expect("write");

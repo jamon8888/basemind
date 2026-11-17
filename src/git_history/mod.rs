@@ -55,33 +55,21 @@ pub mod remote;
 
 use std::path::{Path, PathBuf};
 
-use fjall::config::CompressionPolicy;
-use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
 use thiserror::Error;
 
 use crate::path::RelPath;
 
 /// On-disk schema for the git-history store. Offset from [`crate::version::RELEASE_MINOR`] (the
 /// code index owns `+2`, git_cache `+1`), so it moves with each minor release but is independent of
-/// the code-map index schema. An older on-disk schema wipes `git-history.fjall/` on open and the next
-/// scan rebuilds; a newer one is refused ([`GitHistoryError::NewerSchema`]).
+/// the code-map index schema. Mismatch on open wipes `git-history.fjall/` and the next scan rebuilds.
 ///
 /// The offset is `+5`: bumped from `+4` when the stored commit-meta head gained an `author_email`
 /// field (`sha ‖ time ‖ author ‖ email ‖ summary ‖ files`) for git-history full-text search. The
 /// prior `+4` bump switched the posting-list byte format from ascending (full-scan tail) to
 /// **newest-first** delta-varints (O(n) head decode). The format is part of this still-unreleased
 /// feature, so the bump only forces in-flight dev indexes to rebuild.
-///
-/// `+6` switched every keyspace to LZ4 at all levels (fjall's default leaves L0/L1 raw and persists the
-/// policy at keyspace creation, so existing stores must be recreated to pick it up).
-pub const GIT_HISTORY_SCHEMA: u32 = crate::version::RELEASE_MINOR as u32 + 6;
-
-/// LZ4 on data and index blocks at every level; see [`crate::index`]'s `index_keyspace_options`.
-fn keyspace_options() -> KeyspaceCreateOptions {
-    KeyspaceCreateOptions::default()
-        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-        .index_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-}
+pub const GIT_HISTORY_SCHEMA: u32 = crate::version::RELEASE_MINOR as u32 + 5;
 
 /// On-disk directory name of the git-history index under `.basemind/`. `pub(crate)` so the cache
 /// accounting in [`crate::store_gc::cache_stats`] can size it (it is a sibling of `views/`).
@@ -172,13 +160,6 @@ pub enum GitHistoryError {
     /// daemon's in-process runner so both the forwarded and the hosted path report it uniformly.
     #[error("git-history index disabled (BASEMIND_GH_INDEX=0)")]
     Disabled,
-    /// The on-disk index carries a schema newer than [`GIT_HISTORY_SCHEMA`]. Never wiped: it belongs
-    /// to a newer basemind sharing this cache.
-    #[error(
-        "git-history index written by a newer basemind (schema {stored}); this binary understands \
-         {current} — upgrade basemind"
-    )]
-    NewerSchema { stored: u32, current: u32 },
     /// The workspace root a client asked history for is not one basemind will index (issue #62).
     /// The payload is the full operator-facing guidance from
     /// [`refusal_message`](crate::config::root_guard::refusal_message).
@@ -216,27 +197,9 @@ pub struct CommitMeta {
 enum Backend {
     /// This process holds the fjall database.
     Local(LocalDb),
-    /// Another process holds it; every read is forwarded to it.
-    Remote(std::sync::Arc<dyn HistoryForwarder>),
-}
-
-/// The read side of a daemon-backed index: forwards each query to the process that holds the
-/// database. Implemented outside the core by the transport (`remote::RemoteHistory`), so this module
-/// names no transport, runtime or caller identity; the implementor carries its own. Synchronous: an
-/// implementor that waits on IO blocks inside the call. `Any` lets the transport recover its own type
-/// from a handle.
-pub trait HistoryForwarder: Send + Sync + std::any::Any {
-    /// The HEAD the holder's index is synced to, or `None` when unbuilt or unreachable. `None` makes
-    /// the caller's freshness check fail closed: it live-walks.
-    fn indexed_head(&self) -> Option<String>;
-
-    /// Run one commit-returning op against the holder's index. Unreachable or a reply of another
-    /// shape yields an empty page.
-    fn commits(&self, op: proto::GitHistoryOp) -> Vec<crate::git::CommitInfo>;
-
-    /// Whether the holder is this process. Such a handle must never be asked to sync over the
-    /// holder's socket, which would dial itself; required so no implementor can leave it out.
-    fn hosts_in_process(&self) -> bool;
+    /// The daemon holds it; every read is a forwarded RPC.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    Remote(remote::RemoteHistory),
 }
 
 /// Handle to every git-history partition. Cloned cheaply (each `Keyspace` is `Arc`'d by Fjall).
@@ -268,9 +231,8 @@ pub struct GitHistoryIndex {
 impl GitHistoryIndex {
     /// Open (or create) `.basemind/git-history.fjall/` LOCALLY, taking fjall's exclusive lock. Only
     /// the process that owns the index may call this: a standalone `scan` / `rescan` / writable
-    /// `serve`, or the daemon. An OLDER on-disk schema wipes the directory and recreates it empty (the
-    /// caller rebuilds via the builder); a NEWER one is left untouched and fails with
-    /// [`GitHistoryError::NewerSchema`]. Returns `Err` if another process holds the Fjall lock —
+    /// `serve`, or the daemon. On schema mismatch the directory is wiped and recreated empty (the
+    /// caller rebuilds via the builder). Returns `Err` if another process holds the Fjall lock —
     /// read-only callers swallow that to `None`.
     pub fn open(basemind_dir: &Path) -> Result<Self, GitHistoryError> {
         let dir = basemind_dir.join(GIT_HISTORY_DIR);
@@ -287,28 +249,46 @@ impl GitHistoryIndex {
         }
     }
 
-    /// A handle backed by an index another process holds (the DAEMON's), reached through
-    /// `forwarder`. Takes no lock and performs no IO: this is what every front-end running under a
-    /// live daemon holds — a `daemon_writer` serve, and the one-shot CLI — instead of opening the
-    /// database the daemon has locked.
-    pub fn forwarded(forwarder: std::sync::Arc<dyn HistoryForwarder>) -> Self {
+    /// A handle backed by the DAEMON's index for the repo at `root`. Takes no lock and performs no
+    /// IO: this is what every front-end running under a live daemon holds — a `daemon_writer` serve,
+    /// and the one-shot CLI — instead of opening the database the daemon has locked.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    pub fn remote(root: std::path::PathBuf, agent: crate::comms::ids::AgentId) -> Self {
         Self {
-            backend: Backend::Remote(forwarder),
+            backend: Backend::Remote(remote::RemoteHistory::new(root, agent)),
+        }
+    }
+
+    /// A DAEMON-BACKED handle whose daemon is *this process* — a daemon-hosted connection. Instead of
+    /// dialing the daemon over its own socket (a loopback), history ops run in-process through `host`,
+    /// which shares the daemon's single open handle and per-repo build lock. Takes no lock and
+    /// performs no IO.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
+    pub fn hosted(
+        root: std::path::PathBuf,
+        agent: crate::comms::ids::AgentId,
+        host: std::sync::Arc<dyn remote::HistoryHost>,
+    ) -> Self {
+        Self {
+            backend: Backend::Remote(remote::RemoteHistory::hosted(root, agent, host)),
         }
     }
 
     /// True when this handle forwards to the daemon rather than holding the database. The write side
     /// keys off it: the builder can only run in the process that owns the lock, so a daemon-backed
     /// session must ASK the daemon to build instead of calling the builder itself.
+    #[cfg(all(feature = "comms", any(unix, windows)))]
     pub fn is_daemon_backed(&self) -> bool {
         matches!(self.backend, Backend::Remote(_))
     }
 
-    /// The forwarder of a daemon-backed handle, `None` for a local one.
+    /// The in-process host of a daemon-hosted handle, if any. A hosted connection uses it to run the
+    /// startup git-history sync directly (through the daemon's build lock) instead of forwarding the
+    /// `Sync` op back over the socket. `None` for a local handle or a socket-forwarding one.
     #[cfg(all(feature = "comms", any(unix, windows)))]
-    pub(crate) fn forwarder(&self) -> Option<&std::sync::Arc<dyn HistoryForwarder>> {
+    pub(crate) fn history_host(&self) -> Option<std::sync::Arc<dyn remote::HistoryHost>> {
         match &self.backend {
-            Backend::Remote(forwarder) => Some(forwarder),
+            Backend::Remote(remote) => remote.host(),
             Backend::Local(_) => None,
         }
     }
@@ -318,6 +298,7 @@ impl GitHistoryIndex {
     pub(crate) fn local(&self) -> Option<&LocalDb> {
         match &self.backend {
             Backend::Local(db) => Some(db),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
             Backend::Remote(_) => None,
         }
     }
@@ -333,14 +314,8 @@ impl GitHistoryIndex {
             source,
         })?;
         let mut db = Database::builder(dir).worker_threads(1).open()?;
-        let mut meta = db.keyspace("gh_meta", keyspace_options)?;
+        let mut meta = db.keyspace("gh_meta", KeyspaceCreateOptions::default)?;
         let on_disk_ver = meta.get(keys::META_SCHEMA_VER)?.and_then(|b| keys::parse_u32(&b));
-        if let Some(stored) = on_disk_ver.filter(|ver| *ver > GIT_HISTORY_SCHEMA) {
-            return Err(GitHistoryError::NewerSchema {
-                stored,
-                current: GIT_HISTORY_SCHEMA,
-            });
-        }
         if matches!(on_disk_ver, Some(ver) if ver != GIT_HISTORY_SCHEMA) {
             drop(meta);
             drop(db);
@@ -353,15 +328,15 @@ impl GitHistoryIndex {
                 source,
             })?;
             db = Database::builder(dir).worker_threads(1).open()?;
-            meta = db.keyspace("gh_meta", keyspace_options)?;
+            meta = db.keyspace("gh_meta", KeyspaceCreateOptions::default)?;
         }
-        let commit_by_ord = db.keyspace("gh_commit_by_ord", keyspace_options)?;
-        let ord_by_sha = db.keyspace("gh_ord_by_sha", keyspace_options)?;
-        let path_id_by_path = db.keyspace("gh_path_id_by_path", keyspace_options)?;
-        let path_by_id = db.keyspace("gh_path_by_id", keyspace_options)?;
-        let path_to_ords = db.keyspace("gh_path_to_ords", keyspace_options)?;
-        let commit_text_by_ord = db.keyspace("gh_commit_text_by_ord", keyspace_options)?;
-        let term_to_ords = db.keyspace("gh_term_to_ords", keyspace_options)?;
+        let commit_by_ord = db.keyspace("gh_commit_by_ord", KeyspaceCreateOptions::default)?;
+        let ord_by_sha = db.keyspace("gh_ord_by_sha", KeyspaceCreateOptions::default)?;
+        let path_id_by_path = db.keyspace("gh_path_id_by_path", KeyspaceCreateOptions::default)?;
+        let path_by_id = db.keyspace("gh_path_by_id", KeyspaceCreateOptions::default)?;
+        let path_to_ords = db.keyspace("gh_path_to_ords", KeyspaceCreateOptions::default)?;
+        let commit_text_by_ord = db.keyspace("gh_commit_text_by_ord", KeyspaceCreateOptions::default)?;
+        let term_to_ords = db.keyspace("gh_term_to_ords", KeyspaceCreateOptions::default)?;
         meta.insert(keys::META_SCHEMA_VER, GIT_HISTORY_SCHEMA.to_be_bytes())?;
         Ok(Self {
             backend: Backend::Local(LocalDb {
@@ -408,6 +383,7 @@ impl GitHistoryIndex {
     pub fn last_indexed_head_hex(&self) -> Option<String> {
         match &self.backend {
             Backend::Local(db) => db.meta_sha(keys::META_LAST_HEAD).map(|s| keys::sha_raw_to_hex(&s)),
+            #[cfg(all(feature = "comms", any(unix, windows)))]
             Backend::Remote(remote) => remote.indexed_head(),
         }
     }
@@ -695,80 +671,5 @@ impl GitHistoryWriter {
         meta.commit()?;
         self.db.compact()?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn stamp_schema_ver(basemind_dir: &Path, ver: u32) {
-        let index = GitHistoryIndex::open(basemind_dir).expect("open index");
-        let db = index.local().expect("local handle");
-        db.meta.insert(keys::META_ROOT_SHA, vec![7u8; 20]).expect("write a row");
-        db.meta
-            .insert(keys::META_SCHEMA_VER, ver.to_be_bytes())
-            .expect("stamp schema version");
-    }
-
-    fn raw_meta(basemind_dir: &Path, key: &[u8]) -> Option<Vec<u8>> {
-        let db = Database::builder(basemind_dir.join(GIT_HISTORY_DIR))
-            .worker_threads(1)
-            .open()
-            .expect("open raw index");
-        let meta = db.keyspace("gh_meta", keyspace_options).expect("meta keyspace");
-        meta.get(key).expect("read meta").map(|value| value.to_vec())
-    }
-
-    #[test]
-    fn open_refuses_an_index_stamped_by_a_newer_basemind_and_leaves_it_intact() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let newer = GIT_HISTORY_SCHEMA + 1;
-        stamp_schema_ver(dir.path(), newer);
-
-        let Err(error) = GitHistoryIndex::open(dir.path()) else {
-            panic!("a newer git-history index must not open");
-        };
-
-        assert!(
-            matches!(
-                error,
-                GitHistoryError::NewerSchema { stored, current } if stored == newer && current == GIT_HISTORY_SCHEMA
-            ),
-            "expected NewerSchema, got: {error}"
-        );
-        assert!(
-            error.to_string().contains("upgrade basemind"),
-            "the error must be actionable, got: {error}"
-        );
-        assert_eq!(
-            raw_meta(dir.path(), keys::META_SCHEMA_VER),
-            Some(newer.to_be_bytes().to_vec()),
-            "the newer index keeps its stamp: it was neither wiped nor restamped"
-        );
-        assert_eq!(
-            raw_meta(dir.path(), keys::META_ROOT_SHA),
-            Some(vec![7u8; 20]),
-            "the newer index keeps its rows"
-        );
-    }
-
-    #[test]
-    fn open_wipes_an_index_stamped_by_an_older_basemind() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        stamp_schema_ver(dir.path(), GIT_HISTORY_SCHEMA - 1);
-
-        drop(GitHistoryIndex::open(dir.path()).expect("an older index is wiped and reopened"));
-
-        assert_eq!(
-            raw_meta(dir.path(), keys::META_SCHEMA_VER),
-            Some(GIT_HISTORY_SCHEMA.to_be_bytes().to_vec()),
-            "the rebuilt index carries the current stamp"
-        );
-        assert_eq!(
-            raw_meta(dir.path(), keys::META_ROOT_SHA),
-            None,
-            "rows written under the older schema are gone"
-        );
     }
 }

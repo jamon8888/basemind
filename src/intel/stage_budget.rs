@@ -37,9 +37,6 @@ pub(crate) struct BudgetedWriter<'a> {
     /// Bytes already reported to `ledger`; released in full on commit and on drop so the ledger
     /// never drifts from the true in-flight total.
     reported_bytes: u64,
-    /// Sticky: set by any failed commit so [`Self::finish`] reports the whole batch's outcome, not
-    /// just the trailing commit's.
-    failed: bool,
     max_items: usize,
     byte_budget: u64,
     ledger: &'static StagedByteLedger,
@@ -65,7 +62,6 @@ impl<'a> BudgetedWriter<'a> {
             writer: None,
             staged: 0,
             reported_bytes: 0,
-            failed: false,
             max_items,
             byte_budget,
             ledger,
@@ -100,21 +96,12 @@ impl<'a> BudgetedWriter<'a> {
         if let Some(writer) = self.writer.take()
             && let Err(error) = writer.commit()
         {
-            if self.index_db.fatal_fault().is_some() {
-                tracing::error!(
-                    %error,
-                    phase = self.phase,
-                    "index commit failed fatally (disk full or poisoned handle); the scan will abort"
-                );
-            } else {
-                tracing::warn!(
-                    %error,
-                    phase = self.phase,
-                    "index commit failed — resolved navigation may be stale"
-                );
-            }
+            tracing::warn!(
+                %error,
+                phase = self.phase,
+                "index commit failed — resolved navigation may be stale"
+            );
             ok = false;
-            self.failed = true;
         }
         self.release_reported();
         self.staged = 0;
@@ -126,11 +113,10 @@ impl<'a> BudgetedWriter<'a> {
         self.reported_bytes = 0;
     }
 
-    /// Commit the trailing partial batch. Returns false when that commit *or any earlier one* failed,
-    /// so a caller can skip its own success log and refuse to record the pass as complete.
+    /// Commit the trailing partial batch. Returns false when that commit failed, so a caller can
+    /// skip its own success log.
     pub(crate) fn finish(mut self) -> bool {
-        self.commit();
-        !self.failed
+        self.commit()
     }
 }
 
@@ -193,10 +179,7 @@ mod tests {
             "the item-count bound must not be what committed here"
         );
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::RefsByDef)
-                .iter()
-                .next()
-                .is_some(),
+            db.refs_by_def.iter().next().is_some(),
             "the byte budget must have forced a commit already"
         );
         assert!(batch.finish());
@@ -267,7 +250,7 @@ mod tests {
         }
 
         let dump = |db: &IndexDb| -> Vec<Vec<u8>> {
-            db.keyspace_for_test(crate::index::view::Part::RefsByDef)
+            db.refs_by_def
                 .iter()
                 .map(|guard| (*guard.into_inner().expect("read entry").0).to_vec())
                 .collect()

@@ -2,9 +2,6 @@
 
 (function_item name: (identifier) @symbol.name) @symbol.function
 
-;; Bodiless declarations: trait methods without a default body and `extern` block functions.
-(function_signature_item name: (identifier) @symbol.name) @symbol.function
-
 (struct_item name: (type_identifier) @symbol.name) @symbol.struct
 
 (enum_item name: (type_identifier) @symbol.name) @symbol.enum
@@ -29,7 +26,6 @@
 (impl_item type: (type_identifier) @symbol.name) @symbol.impl
 (impl_item type: (scoped_type_identifier name: (type_identifier) @symbol.name)) @symbol.impl
 (impl_item type: (generic_type type: (type_identifier) @symbol.name)) @symbol.impl
-(impl_item type: (generic_type type: (scoped_type_identifier name: (type_identifier) @symbol.name))) @symbol.impl
 
 ;; section: imports
 
@@ -44,23 +40,7 @@
   function: (field_expression field: (field_identifier) @call.callee)) @call.range
 (call_expression
   function: (scoped_identifier name: (identifier) @call.callee)) @call.range
-(call_expression
-  function: (generic_function function: (identifier) @call.callee)) @call.range
-(call_expression
-  function: (generic_function
-    function: (field_expression field: (field_identifier) @call.callee))) @call.range
-(call_expression
-  function: (generic_function
-    function: (scoped_identifier name: (identifier) @call.callee))) @call.range
 (macro_invocation macro: (identifier) @call.callee) @call.range
-
-;; Macro arguments stay an unparsed `token_tree`, so a call there is recognised lexically: an
-;; identifier directly followed by a parenthesised token tree. `l2::build_call` keeps only those
-;; inside a `macro_invocation` and drops definitions (`fn name(`, `struct Name(`).
-(token_tree
-  (identifier) @call.lexical_callee
-  .
-  (token_tree) @call.lexical_args)
 
 ;; section: implementations
 ;;
@@ -70,25 +50,17 @@
 ;; Inherent impls (`impl Foo { … }`) have no trait — we emit only the type as @impl.implementor
 ;; and omit the trait_name so `build_implementation` skips the match (trait_name is required).
 
-;; The trait is keyed by its last path segment, so `impl crate::a::Observer for X` and
-;; `impl<T> Extend<T> for Vec<T>` both index under the bare trait name.
 (impl_item
-  trait: [
-    (type_identifier) @impl.trait_name
-    (scoped_type_identifier name: (type_identifier) @impl.trait_name)
-    (generic_type type: [
-      (type_identifier) @impl.trait_name
-      (scoped_type_identifier name: (type_identifier) @impl.trait_name)
-    ])
-  ]
-  type: [
-    (type_identifier) @impl.implementor
-    (scoped_type_identifier name: (type_identifier) @impl.implementor)
-    (generic_type type: [
-      (type_identifier) @impl.implementor
-      (scoped_type_identifier name: (type_identifier) @impl.implementor)
-    ])
-  ]) @impl.range
+  trait: (type_identifier) @impl.trait_name
+  type: (type_identifier) @impl.implementor) @impl.range
+
+(impl_item
+  trait: (type_identifier) @impl.trait_name
+  type: (scoped_type_identifier name: (type_identifier) @impl.implementor)) @impl.range
+
+(impl_item
+  trait: (type_identifier) @impl.trait_name
+  type: (generic_type type: (type_identifier) @impl.implementor)) @impl.range
 
 ;; section: docs
 

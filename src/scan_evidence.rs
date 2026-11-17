@@ -61,36 +61,8 @@ pub fn read(cache_dir: &Path) -> Option<ScanInflight> {
 
 /// Remove the breadcrumb in a workspace cache dir. Returns whether one was actually removed.
 pub fn clear(cache_dir: &Path) -> bool {
-    note_unclean_scan(cache_dir);
     std::fs::remove_file(inflight_path(cache_dir)).is_ok()
 }
-
-/// Marker in a workspace cache dir: a scan of it never finished, so blobs the file map names may
-/// be torn. Blobs are written without an fsync while the file map is fsynced, so after a power
-/// loss the map can name a blob whose bytes never reached the disk.
-pub(crate) const VERIFY_BLOBS_FILE: &str = "verify-blobs";
-
-/// Turn a breadcrumb found in `cache_dir` into the durable request to verify blobs. Called wherever
-/// a breadcrumb is about to be replaced or removed by anything but the scan that wrote it, since a
-/// breadcrumb nobody retracted is the only trace an unclean shutdown leaves.
-fn note_unclean_scan(cache_dir: &Path) {
-    if inflight_path(cache_dir).exists() {
-        let _ = std::fs::write(cache_dir.join(VERIFY_BLOBS_FILE), b"");
-    }
-}
-
-/// Whether the next scan of this workspace must be a full one that validates each blob it would
-/// otherwise trust for merely existing.
-pub fn blobs_need_verifying(cache_dir: &Path) -> bool {
-    cache_dir.join(VERIFY_BLOBS_FILE).exists()
-}
-
-/// A full scan validated every blob it kept: withdraw the request.
-pub fn blobs_verified(cache_dir: &Path) {
-    let _ = std::fs::remove_file(cache_dir.join(VERIFY_BLOBS_FILE));
-}
-
-pub use crate::scan_evidence_hosts::{HostingMarker, settle_dead_hosts};
 
 /// A live scan's breadcrumb. Hold it for the duration of the pass; dropping it retracts the claim.
 ///
@@ -112,7 +84,6 @@ impl ScanBreadcrumb {
     /// [`begin`](Self::begin) against an explicit cache dir, so tests need no global cache root.
     pub fn begin_in(cache_dir: &Path, root: &Path) -> Option<Self> {
         std::fs::create_dir_all(cache_dir).ok()?;
-        note_unclean_scan(cache_dir);
         let record = ScanInflight {
             started_unix: now_unix(),
             pid: std::process::id(),
@@ -338,7 +309,7 @@ pub struct MemoryLog {
 impl MemoryLog {
     /// Start sampling for `root`. Returns `None` if the thread cannot be spawned — evidence
     /// gathering must never be the reason a scan fails to run.
-    pub fn start(root: &Path, peaks: crate::scan_phase_peaks::PhasePeaks) -> Option<Self> {
+    pub fn start(root: &Path) -> Option<Self> {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let worker_stop = Arc::clone(&stop);
         let root = root.to_path_buf();
@@ -367,7 +338,6 @@ impl MemoryLog {
                     }
                     drop(guard);
                     if let Some(reading) = crate::sysres::memory_reading() {
-                        peaks.observe(reading.used_bytes);
                         let spike = window.observe(reading.used_bytes);
                         if spike || last_line.elapsed() >= MEMORY_LOG_EVERY {
                             let peak = window.written();
@@ -409,7 +379,7 @@ mod tests {
     #[test]
     fn the_memory_log_stops_when_dropped_instead_of_sleeping_out_its_interval() {
         let started = std::time::Instant::now();
-        let log = MemoryLog::start(Path::new("/repo/under/test"), Default::default()).expect("sampler thread spawns");
+        let log = MemoryLog::start(Path::new("/repo/under/test")).expect("sampler thread spawns");
         drop(log);
         let elapsed = started.elapsed();
         assert!(

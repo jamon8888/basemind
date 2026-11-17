@@ -36,7 +36,7 @@ use super::proto::{GitHistoryOp, GitHistoryReply, SyncOutcome};
 use crate::comms::client::CommsClient;
 use crate::comms::ids::AgentId;
 use crate::git::CommitInfo;
-use crate::git_history::{GitHistoryError, GitHistoryIndex, HistoryForwarder};
+use crate::git_history::GitHistoryError;
 
 /// In-process access to the daemon-held git-history index, for a daemon-hosted connection.
 ///
@@ -103,6 +103,27 @@ impl RemoteHistory {
         self.host.clone()
     }
 
+    /// The HEAD the daemon's index is synced to, or `None` when unbuilt / unreachable. `None` makes
+    /// the caller's freshness check fail closed — it live-walks rather than trusting an index it
+    /// could not confirm.
+    pub fn indexed_head(&self) -> Option<String> {
+        match self.call(GitHistoryOp::IndexedHead)? {
+            GitHistoryReply::IndexedHead(head) => head,
+            _ => None,
+        }
+    }
+
+    /// Run a commit-returning op against the daemon's index. An unreachable daemon or a shape
+    /// mismatch yields an empty result; the freshness check in
+    /// [`git_history_if_fresh`](crate::mcp) has already gated this call, so the only way to get here
+    /// with a dead daemon is a race, and an empty page is the safe answer.
+    pub fn commits(&self, op: GitHistoryOp) -> Vec<CommitInfo> {
+        match self.call(op) {
+            Some(GitHistoryReply::Commits(commits)) => commits,
+            _ => Vec::new(),
+        }
+    }
+
     /// Block the current task on one forwarded op. See the module docs for the runtime contract.
     fn call(&self, op: GitHistoryOp) -> Option<GitHistoryReply> {
         let handle = Handle::try_current().ok()?;
@@ -143,65 +164,6 @@ impl RemoteHistory {
             .inspect_err(|error| tracing::warn!(%error, "git-history: forwarded query failed; tools live-walk"))
             .ok()
     }
-}
-
-impl HistoryForwarder for RemoteHistory {
-    /// The HEAD the daemon's index is synced to, or `None` when unbuilt / unreachable. `None` makes
-    /// the caller's freshness check fail closed — it live-walks rather than trusting an index it
-    /// could not confirm.
-    fn indexed_head(&self) -> Option<String> {
-        match self.call(GitHistoryOp::IndexedHead)? {
-            GitHistoryReply::IndexedHead(head) => head,
-            _ => None,
-        }
-    }
-
-    /// Run a commit-returning op against the daemon's index. An unreachable daemon or a shape
-    /// mismatch yields an empty result; the freshness check in
-    /// [`git_history_if_fresh`](crate::mcp) has already gated this call, so the only way to get here
-    /// with a dead daemon is a race, and an empty page is the safe answer.
-    fn commits(&self, op: GitHistoryOp) -> Vec<CommitInfo> {
-        match self.call(op) {
-            Some(GitHistoryReply::Commits(commits)) => commits,
-            _ => Vec::new(),
-        }
-    }
-
-    fn hosts_in_process(&self) -> bool {
-        self.host.is_some()
-    }
-}
-
-/// A handle backed by the DAEMON's index for the repo at `root`. Takes no lock and performs no IO:
-/// this is what every front-end running under a live daemon holds — a `daemon_writer` serve, and the
-/// one-shot CLI — instead of opening the database the daemon has locked.
-pub fn remote_index(root: PathBuf, agent: AgentId) -> GitHistoryIndex {
-    GitHistoryIndex::forwarded(Arc::new(RemoteHistory::new(root, agent)))
-}
-
-/// A DAEMON-BACKED handle whose daemon is *this process* — a daemon-hosted connection. Instead of
-/// dialing the daemon over its own socket (a loopback), history ops run in-process through `host`,
-/// which shares the daemon's single open handle and per-repo build lock. Takes no lock and performs
-/// no IO.
-pub fn hosted_index(root: PathBuf, agent: AgentId, host: Arc<dyn HistoryHost>) -> GitHistoryIndex {
-    GitHistoryIndex::forwarded(Arc::new(RemoteHistory::hosted(root, agent, host)))
-}
-
-/// The in-process host of a daemon-hosted handle, if any. A hosted connection uses it to run the
-/// startup git-history sync directly (through the daemon's build lock) instead of forwarding the
-/// `Sync` op back over the socket. `None` for a local handle or a socket-forwarding one.
-///
-/// A forwarder that [hosts in process](HistoryForwarder::hosts_in_process) but is not a
-/// [`RemoteHistory`] yields `None` too; that is a wiring bug, logged here, and the caller must still
-/// not fall back to the socket (it checks `hosts_in_process` itself).
-pub(crate) fn history_host(index: &GitHistoryIndex) -> Option<Arc<dyn HistoryHost>> {
-    let forwarder = index.forwarder()?;
-    let any: &dyn std::any::Any = forwarder.as_ref();
-    let host = any.downcast_ref::<RemoteHistory>().and_then(RemoteHistory::host);
-    if host.is_none() && forwarder.hosts_in_process() {
-        tracing::error!("git-history: an in-process forwarder exposes no host; its startup sync is skipped");
-    }
-    host
 }
 
 /// Whether a machine daemon is up — and therefore holds this machine's git-history databases.
@@ -295,42 +257,5 @@ async fn try_sync(
         _ => Err(crate::comms::client::CommsClientError::Unexpected {
             request: "git_history sync",
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct DecliningHost;
-
-    impl HistoryHost for DecliningHost {
-        fn run_history(
-            &self,
-            _root: PathBuf,
-            _op: GitHistoryOp,
-        ) -> Pin<Box<dyn Future<Output = Result<GitHistoryReply, GitHistoryError>> + Send + '_>> {
-            Box::pin(async { Err(GitHistoryError::Disabled) })
-        }
-    }
-
-    fn agent() -> AgentId {
-        AgentId::parse("agent-1".to_string()).expect("agent id")
-    }
-
-    #[test]
-    fn a_hosted_index_syncs_in_process_and_never_over_the_socket() {
-        let index = hosted_index(PathBuf::from("/repo"), agent(), Arc::new(DecliningHost));
-        let forwarder = index.forwarder().expect("a hosted index is daemon-backed");
-        assert!(forwarder.hosts_in_process());
-        assert!(history_host(&index).is_some());
-    }
-
-    #[test]
-    fn a_remote_index_has_no_in_process_host() {
-        let index = remote_index(PathBuf::from("/repo"), agent());
-        let forwarder = index.forwarder().expect("a remote index is daemon-backed");
-        assert!(!forwarder.hosts_in_process());
-        assert!(history_host(&index).is_none());
     }
 }

@@ -7,8 +7,6 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use super::baseline_items::baseline_items;
-use super::score::Item;
 use super::task::BaselineSpec;
 
 /// Result of running a baseline.
@@ -16,8 +14,6 @@ use super::task::BaselineSpec;
 pub struct BaselineRun {
     pub tokens: u64,
     pub elapsed_us: u64,
-    /// The output read as items (`spec.items`), for scoring against the task's gold.
-    pub items: Option<Vec<Item>>,
 }
 
 /// Run `spec` in `root`. A non-zero exit from a grep-style command is tolerated (`git grep` exits
@@ -26,22 +22,16 @@ pub struct BaselineRun {
 pub fn run_baseline(root: &Path, spec: &BaselineSpec, count: fn(&str) -> u64) -> Result<BaselineRun> {
     let started = std::time::Instant::now();
     let mut text = String::new();
-    let mut files: Vec<(String, String)> = Vec::new();
     if let Some(cmds) = &spec.grep {
         for cmd in cmds.items() {
-            let mut command = Command::new("sh");
-            command
+            let out = Command::new("sh")
                 .arg("-c")
                 .arg(cmd)
                 .current_dir(root)
                 .stdin(Stdio::null())
-                .stderr(Stdio::null());
-            // Git for Windows' `sh` rewrites an argument that looks like a POSIX path into a
-            // Windows path before it runs a native program, so `git blame -L '/fn alpha/,/^}/'`
-            // reached git as a path and exited 129. A baseline means its arguments verbatim.
-            #[cfg(windows)]
-            command.env("MSYS_NO_PATHCONV", "1").env("MSYS2_ARG_CONV_EXCL", "*");
-            let out = command.output().with_context(|| format!("spawn baseline `{cmd}`"))?;
+                .stderr(Stdio::null())
+                .output()
+                .with_context(|| format!("spawn baseline `{cmd}`"))?;
             match out.status.code() {
                 Some(0 | 1) => {}
                 other => bail!("baseline `{cmd}` failed (exit {other:?})"),
@@ -59,24 +49,18 @@ pub fn run_baseline(root: &Path, spec: &BaselineSpec, count: fn(&str) -> u64) ->
             bail!("baseline read `{rel}` escapes the workspace root");
         }
         let raw = std::fs::read(&canonical).with_context(|| format!("baseline read `{rel}`"))?;
-        files.push((rel.clone(), String::from_utf8_lossy(&raw).into_owned()));
+        text.push_str(&String::from_utf8_lossy(&raw));
     }
-    let command_output = text.clone();
-    for (_, body) in &files {
-        text.push_str(body);
-    }
-    let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     Ok(BaselineRun {
         tokens: count(&text),
-        elapsed_us,
-        items: spec.items.map(|k| baseline_items(k, root, &command_output, &files)),
+        elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::task::{BaselineItems, OneOrMany};
+    use crate::eval::task::OneOrMany;
 
     fn count(s: &str) -> u64 {
         s.len() as u64
@@ -89,30 +73,8 @@ mod tests {
         let spec = BaselineSpec {
             grep: Some(OneOrMany::One("printf abc".into())),
             read: vec!["f.txt".into()],
-            items: None,
         };
-        let run = run_baseline(dir.path(), &spec, count).unwrap();
-        assert_eq!(run.tokens, 8);
-        assert!(run.items.is_none());
-    }
-
-    #[test]
-    fn reads_items_from_command_output_only_unless_the_reader_is_read() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.rs"), "a\nb\n").unwrap();
-        let grep = BaselineSpec {
-            grep: Some(OneOrMany::One("printf 'f.rs:2:b\\n'".into())),
-            read: vec!["f.rs".into()],
-            items: Some(BaselineItems::GrepLines),
-        };
-        let items = run_baseline(dir.path(), &grep, count).unwrap().items.unwrap();
-        assert_eq!(items, vec![Item::parse("f.rs:2")]);
-        let read = BaselineSpec {
-            items: Some(BaselineItems::Read),
-            ..grep
-        };
-        let items = run_baseline(dir.path(), &read, count).unwrap().items.unwrap();
-        assert_eq!(items, vec![Item::parse("f.rs:1"), Item::parse("f.rs:2")]);
+        assert_eq!(run_baseline(dir.path(), &spec, count).unwrap().tokens, 8);
     }
 
     #[test]
@@ -121,19 +83,16 @@ mod tests {
         let no_match = BaselineSpec {
             grep: Some(OneOrMany::One("exit 1".into())),
             read: vec![],
-            items: None,
         };
         assert_eq!(run_baseline(dir.path(), &no_match, count).unwrap().tokens, 0);
         let broken = BaselineSpec {
             grep: Some(OneOrMany::One("exit 2".into())),
             read: vec![],
-            items: None,
         };
         assert!(run_baseline(dir.path(), &broken, count).is_err());
         let escape = BaselineSpec {
             grep: None,
             read: vec!["../outside".into()],
-            items: None,
         };
         assert!(run_baseline(dir.path(), &escape, count).is_err());
     }

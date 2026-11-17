@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::extract::{FileMapL1, FileMapL2};
 use crate::index::{IndexDb, writer::IndexWriter};
 use crate::path::RelPath;
-use crate::scanner::{FileResult, FileStatus};
+use crate::scanner::FileResult;
 use crate::store::Store;
 
 /// Number of files whose index entries are accumulated into one Fjall write batch before
@@ -146,26 +146,6 @@ pub(crate) struct WorkerIndexBatch<'a> {
     byte_budget: u64,
     ledger: &'static StagedByteLedger,
     results: Vec<FileResult>,
-    /// `results[..settled]` have every index row committed or already disowned; the rest still ride
-    /// the open batch.
-    settled: usize,
-    /// The file being staged lost rows (a failed upsert, or a failed commit of a batch holding some
-    /// of them) before its result was pushed, so [`Self::push_result`] must disown it.
-    lost_in_flight: bool,
-}
-
-/// Withdraw `result`'s claim that its file is indexed: its rows did not reach the index, so the file
-/// map must not record it. It is reported as a failed extraction, which leaves it out of the file map
-/// and makes the next scan process it again.
-fn disown(result: &mut FileResult) {
-    if matches!(result.status, FileStatus::Updated { .. }) {
-        *result = FileResult::bare(
-            std::mem::take(&mut result.path),
-            FileStatus::ExtractFailed {
-                msg: "index commit failed".to_string(),
-            },
-        );
-    }
 }
 
 impl<'a> WorkerIndexBatch<'a> {
@@ -182,8 +162,6 @@ impl<'a> WorkerIndexBatch<'a> {
             byte_budget,
             ledger,
             results: Vec::new(),
-            settled: 0,
-            lost_in_flight: false,
         }
     }
 
@@ -201,8 +179,6 @@ impl<'a> WorkerIndexBatch<'a> {
         let staged_ok = writer.upsert_file(rel, l1, l2).is_ok();
         if staged_ok {
             self.staged += 1;
-        } else {
-            self.lost_in_flight = true;
         }
         self.commit_if_full();
         staged_ok
@@ -225,48 +201,49 @@ impl<'a> WorkerIndexBatch<'a> {
         };
         let writer = self.writer.get_or_insert_with(|| index.writer());
         if writer.upsert_bm25_file(rel, postings).is_err() {
-            tracing::warn!(rel = %rel, "bm25 upsert failed; the file is left for the next scan");
-            self.lost_in_flight = true;
+            tracing::warn!(rel = %rel, "bm25 upsert failed; keyword search may be incomplete");
         }
         self.commit_if_full();
     }
 
-    /// Stage the grep trigram bloom for the content `hash_hex`, whose bytes the scanner already
-    /// holds. No extra read: the bloom is built from the very buffer the extractor parsed. Counts
-    /// against the byte budget (rows are up to 1/8 of the file) and may force a commit, exactly as
-    /// [`Self::stage_bm25`] does. A `None` index is a no-op.
-    pub(crate) fn stage_grep_bloom(&mut self, hash_hex: &str, bytes: &[u8]) {
+    /// Stage the grep trigram bloom for a file whose bytes the scanner already holds, stamped with
+    /// the `(size, mtime_ns)` they were read under. No extra read: the bloom is built from the very
+    /// buffer the extractor parsed. Counts against the byte budget (rows are up to 1/8 of the file)
+    /// and may force a commit, exactly as [`Self::stage_bm25`] does. A `None` index is a no-op.
+    pub(crate) fn stage_grep_bloom(&mut self, rel: &RelPath, bytes: &[u8], size: u64, mtime_ns: i64) {
         let Some(index) = self.index else {
             return;
         };
-        let row = crate::index::grep_bloom::build_row(bytes);
+        let row = crate::index::grep_bloom::build_row(bytes, size, mtime_ns);
         self.writer
             .get_or_insert_with(|| index.writer())
-            .upsert_grep_bloom(hash_hex, row);
+            .upsert_grep_bloom(rel, row);
         self.commit_if_full();
     }
 
-    /// [`Self::stage_grep_bloom`] unless the content already has an intact row. For the
+    /// [`Self::stage_grep_bloom`] unless the stored row already carries this exact stamp. For the
     /// content-unchanged-but-restamped path, which is re-entered on every scan until the store's own
     /// entry is refreshed and must not rewrite an identical row each time.
-    pub(crate) fn restamp_grep_bloom(&mut self, hash_hex: &str, bytes: &[u8]) {
-        if self.index.is_some_and(|index| index.grep_bloom_current(hash_hex)) {
+    pub(crate) fn restamp_grep_bloom(&mut self, rel: &RelPath, bytes: &[u8], size: u64, mtime_ns: i64) {
+        if self
+            .index
+            .is_some_and(|index| index.grep_bloom_current(rel, size, mtime_ns))
+        {
             return;
         }
-        self.stage_grep_bloom(hash_hex, bytes);
+        self.stage_grep_bloom(rel, bytes, size, mtime_ns);
     }
 
     /// Backfill the bloom of a file the scan classed `Unchanged` (so its bytes were NOT read): an
-    /// index built before blooms existed, or one whose row was swept, gets its row on the next
-    /// rescan without a wipe. A current row costs one point lookup; only a missing one costs a read,
-    /// once. A file that cannot be read, or whose bytes no longer hash to `hash_hex`, is left
-    /// rowless (a candidate, never skipped).
-    pub(crate) fn backfill_grep_bloom(&mut self, root: &std::path::Path, rel: &RelPath, hash_hex: &str) {
+    /// index built before blooms existed, or one whose row went stale, gets its row on the next
+    /// rescan without a wipe. A current row costs one point lookup; only a missing/stale one costs
+    /// a read, once. A file that cannot be read is left rowless (a candidate, never skipped).
+    pub(crate) fn backfill_grep_bloom(&mut self, root: &std::path::Path, rel: &RelPath, size: u64, mtime_ns: i64) {
         use std::io::Read;
         let Some(index) = self.index else {
             return;
         };
-        if index.grep_bloom_current(hash_hex) {
+        if index.grep_bloom_current(rel, size, mtime_ns) {
             return;
         }
         let Ok(file) = std::fs::File::open(root.join(rel.to_path_buf())) else {
@@ -282,10 +259,7 @@ impl<'a> WorkerIndexBatch<'a> {
         if file.take(meta.len().saturating_add(1)).read_to_end(&mut bytes).is_err() {
             return;
         }
-        if crate::hashing::hex(&crate::hashing::hash_bytes(&bytes)) != hash_hex {
-            return;
-        }
-        self.stage_grep_bloom(hash_hex, &bytes);
+        self.stage_grep_bloom(rel, &bytes, meta.len(), crate::scanner_file::mtime_nanos(&meta));
     }
 
     /// Report what the writer has staged since the last report to the ledger, and commit when
@@ -301,22 +275,14 @@ impl<'a> WorkerIndexBatch<'a> {
         }
     }
 
-    /// Flush the staged batch under Fjall's write lock and reset both counters. A failed commit
-    /// disowns every file with rows in the batch, pushed or still being staged.
+    /// Flush the staged batch under Fjall's write lock and reset both counters.
     fn commit(&mut self) {
         if let Some(writer) = self.writer.take() {
             self.ledger.record_commit();
-            if let Err(error) = writer.commit() {
-                if self.index.is_some_and(|index| index.fatal_fault().is_some()) {
-                    tracing::error!(%error, "index commit failed fatally (disk full or poisoned handle); the scan will abort");
-                } else {
-                    tracing::warn!(%error, "index batch commit failed; its files are left for the next scan");
-                }
-                self.results[self.settled..].iter_mut().for_each(disown);
-                self.lost_in_flight = true;
+            if writer.commit().is_err() {
+                tracing::warn!("index batch commit failed; reference search may be incomplete");
             }
         }
-        self.settled = self.results.len();
         self.release_reported();
         self.staged = 0;
     }
@@ -328,10 +294,7 @@ impl<'a> WorkerIndexBatch<'a> {
 
     /// Record one file's scan outcome alongside the index work, so the parallel fold carries
     /// both out of the worker in a single pass.
-    pub(crate) fn push_result(&mut self, mut result: FileResult) {
-        if std::mem::take(&mut self.lost_in_flight) {
-            disown(&mut result);
-        }
+    pub(crate) fn push_result(&mut self, result: FileResult) {
         self.results.push(result);
     }
 
@@ -404,16 +367,16 @@ mod tests {
     /// compared byte for byte.
     fn dump_all(db: &IndexDb) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
         vec![
-            dump(db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)),
-            dump(db.keyspace_for_test(crate::index::view::Part::SymbolsByName)),
-            dump(db.keyspace_for_test(crate::index::view::Part::CallsByPath)),
-            dump(db.keyspace_for_test(crate::index::view::Part::CallsByCallee)),
-            dump(db.keyspace_for_test(crate::index::view::Part::ImportsByModule)),
-            dump(db.keyspace_for_test(crate::index::view::Part::ImportsByPath)),
-            dump(db.keyspace_for_test(crate::index::view::Part::ImplementationsByTrait)),
-            dump(db.keyspace_for_test(crate::index::view::Part::ImplementationsByPath)),
-            dump(db.keyspace_for_test(crate::index::view::Part::CodeBm25Postings)),
-            dump(db.keyspace_for_test(crate::index::view::Part::CodeBm25ByPath)),
+            dump(&db.symbols_by_path),
+            dump(&db.symbols_by_name),
+            dump(&db.calls_by_path),
+            dump(&db.calls_by_callee),
+            dump(&db.imports_by_module),
+            dump(&db.imports_by_path),
+            dump(&db.implementations_by_trait),
+            dump(&db.implementations_by_path),
+            dump(&db.code_bm25_postings),
+            dump(&db.code_bm25_by_path),
         ]
     }
 
@@ -435,10 +398,7 @@ mod tests {
             "the file-count bound must not be what committed here"
         );
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-                .iter()
-                .next()
-                .is_some(),
+            db.symbols_by_path.iter().next().is_some(),
             "the byte budget must have forced a commit already"
         );
         drop(batch);
@@ -461,19 +421,13 @@ mod tests {
             assert!(batch.stage(&RelPath::from(format!("src/f{i}.rs")), &l1, None));
         }
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-                .iter()
-                .next()
-                .is_none(),
+            db.symbols_by_path.iter().next().is_none(),
             "nothing may commit before the file counter reaches the bound"
         );
 
         assert!(batch.stage(&RelPath::from("src/last.rs"), &l1, None));
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-                .iter()
-                .next()
-                .is_some(),
+            db.symbols_by_path.iter().next().is_some(),
             "the {INDEX_COMMIT_BATCH}th file must force the commit"
         );
         assert_eq!(batch.staged, 0, "the file counter resets at its own commit");
@@ -504,22 +458,13 @@ mod tests {
 
         let mut batch = WorkerIndexBatch::with_budget(Some(&db), INDEX_COMMIT_BATCH_BYTES, &SCAN_STAGED_BYTES);
         let mut files = 0usize;
-        while db
-            .keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-            .iter()
-            .next()
-            .is_none()
-            && files < INDEX_COMMIT_BATCH
-        {
+        while db.symbols_by_path.iter().next().is_none() && files < INDEX_COMMIT_BATCH {
             assert!(batch.stage(&RelPath::from(format!("src/f{files}.rs")), &l1, None));
             files += 1;
         }
 
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-                .iter()
-                .next()
-                .is_some(),
+            db.symbols_by_path.iter().next().is_some(),
             "staging {INDEX_COMMIT_BATCH} bulky files must have committed something"
         );
         assert!(
@@ -562,11 +507,7 @@ mod tests {
         let mut under_budget = WorkerIndexBatch::with_budget(Some(&control), 8 * 1024 * 1024, &LEDGER);
         under_budget.stage_bm25(&RelPath::from("src/small.rs"), &postings(1, 4));
         assert!(
-            control
-                .keyspace_for_test(crate::index::view::Part::CodeBm25Postings)
-                .iter()
-                .next()
-                .is_none(),
+            control.code_bm25_postings.iter().next().is_none(),
             "staging well under the byte budget must leave the batch uncommitted"
         );
         drop(under_budget);
@@ -577,10 +518,7 @@ mod tests {
 
         assert_eq!(batch.staged, 0, "bm25 staging must not bump the file counter");
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::CodeBm25Postings)
-                .iter()
-                .next()
-                .is_some(),
+            db.code_bm25_postings.iter().next().is_some(),
             "bm25 staging alone must be able to force a commit"
         );
         drop(batch);
@@ -616,10 +554,7 @@ mod tests {
             "the file-count bound must not be what committed here"
         );
         assert!(
-            db.keyspace_for_test(crate::index::view::Part::SymbolsByPath)
-                .iter()
-                .next()
-                .is_some(),
+            db.symbols_by_path.iter().next().is_some(),
             "the ceiling commit must have reached disk"
         );
         worker.finish();
@@ -706,139 +641,6 @@ mod tests {
         assert_eq!(LEDGER.in_flight(), 0);
     }
 
-    fn updated(path: &str) -> FileResult {
-        let mut result = FileResult::bare(
-            path.to_string(),
-            FileStatus::Updated {
-                had_errors: false,
-                error_count: 0,
-                reused: false,
-            },
-        );
-        result.upsert = Some(crate::store::FileEntry {
-            hash_hex: "00".to_string(),
-            language: "rust".to_string(),
-            size_bytes: 0,
-            mtime: 0,
-            extract_epoch: crate::extract::EXTRACT_EPOCH,
-        });
-        result
-    }
-
-    /// `(path, still claims to be indexed)` for each result, in order.
-    fn claims(results: &[FileResult]) -> Vec<(&str, bool)> {
-        results
-            .iter()
-            .map(|result| (result.path.as_str(), result.upsert.is_some()))
-            .collect()
-    }
-
-    /// A lost batch must take back exactly its own files: the ones already pushed since the last
-    /// good commit and the one whose staging triggered the commit. Files committed before it, files
-    /// staged after it, and files that never claimed new rows keep their outcome.
-    #[test]
-    fn a_failed_commit_disowns_exactly_the_files_riding_that_batch() {
-        static LEDGER: StagedByteLedger = StagedByteLedger::new(u64::MAX);
-        let (_dir, db) = fresh_index();
-        let l1 = bulky_l1(4);
-        let mut batch = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-
-        assert!(batch.stage(&RelPath::from("src/committed.rs"), &l1, None));
-        batch.push_result(updated("src/committed.rs"));
-        batch.commit();
-
-        assert!(batch.stage(&RelPath::from("src/lost.rs"), &l1, None));
-        batch.push_result(updated("src/lost.rs"));
-        batch.push_result(FileResult::bare("src/unchanged.rs".to_string(), FileStatus::Unchanged));
-        assert!(batch.stage(&RelPath::from("src/in_flight.rs"), &l1, None));
-        db.fault.inject_commit_failures(1);
-        batch.commit();
-        batch.push_result(updated("src/in_flight.rs"));
-
-        assert!(batch.stage(&RelPath::from("src/after.rs"), &l1, None));
-        batch.push_result(updated("src/after.rs"));
-        let results = batch.finish();
-
-        assert_eq!(
-            claims(&results),
-            vec![
-                ("src/committed.rs", true),
-                ("src/lost.rs", false),
-                ("src/unchanged.rs", false),
-                ("src/in_flight.rs", false),
-                ("src/after.rs", true),
-            ]
-        );
-        assert!(matches!(results[1].status, FileStatus::ExtractFailed { .. }));
-        assert!(matches!(results[2].status, FileStatus::Unchanged));
-        assert!(matches!(results[3].status, FileStatus::ExtractFailed { .. }));
-        let indexed: ahash::AHashSet<String> = dump(db.keyspace_for_test(crate::index::view::Part::SymbolsByPath))
-            .iter()
-            .filter_map(|(key, _)| crate::index::keys::parse_symbol_by_path(key))
-            .map(|(path, _)| path.to_string())
-            .collect();
-        let expected: ahash::AHashSet<String> = ["src/committed.rs", "src/after.rs"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(indexed, expected, "the claims match what the index actually holds");
-        assert_eq!(LEDGER.in_flight(), 0);
-    }
-
-    /// A failed upsert leaves partial rows staged, so its file is no more indexed than one whose
-    /// commit failed, and must not be recorded either.
-    #[test]
-    fn a_failed_upsert_disowns_its_file() {
-        static LEDGER: StagedByteLedger = StagedByteLedger::new(u64::MAX);
-        let (_dir, db) = fresh_index();
-        let l1 = bulky_l1(4);
-        let mut batch = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-
-        assert!(batch.stage(&RelPath::from("src/ok.rs"), &l1, None));
-        batch.push_result(updated("src/ok.rs"));
-        batch.writer.as_mut().expect("writer").fail_after_staging = true;
-        assert!(!batch.stage(&RelPath::from("src/doomed.rs"), &l1, None));
-        batch.push_result(updated("src/doomed.rs"));
-        batch.writer.as_mut().expect("writer").fail_after_staging = false;
-        assert!(batch.stage(&RelPath::from("src/next.rs"), &l1, None));
-        batch.push_result(updated("src/next.rs"));
-
-        assert_eq!(
-            claims(&batch.finish()),
-            vec![("src/ok.rs", true), ("src/doomed.rs", false), ("src/next.rs", true)]
-        );
-    }
-
-    /// A file whose keyword postings failed to stage would otherwise keep its place in the file map
-    /// and never be seen by keyword search: no later scan re-stages an unchanged file.
-    #[cfg(feature = "code-search")]
-    #[test]
-    fn a_failed_bm25_upsert_disowns_its_file() {
-        static LEDGER: StagedByteLedger = StagedByteLedger::new(u64::MAX);
-        let (_dir, db) = fresh_index();
-        let l1 = bulky_l1(4);
-        let postings = [crate::search::bm25::ChunkPosting {
-            chunk_id: "hash:0".to_string(),
-            doclen: 1,
-            terms: vec![("term".to_string(), 1)],
-        }];
-        let mut batch = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-
-        assert!(batch.stage(&RelPath::from("src/ok.rs"), &l1, None));
-        batch.stage_bm25(&RelPath::from("src/ok.rs"), &postings);
-        batch.push_result(updated("src/ok.rs"));
-        assert!(batch.stage(&RelPath::from("src/doomed.rs"), &l1, None));
-        batch.writer.as_mut().expect("writer").fail_after_staging = true;
-        batch.stage_bm25(&RelPath::from("src/doomed.rs"), &postings);
-        batch.writer.as_mut().expect("writer").fail_after_staging = false;
-        batch.push_result(updated("src/doomed.rs"));
-
-        assert_eq!(
-            claims(&batch.finish()),
-            vec![("src/ok.rs", true), ("src/doomed.rs", false)]
-        );
-    }
-
     /// The shared ceiling has no hysteresis of its own: past `ceiling / per-worker budget` workers
     /// the process sits pinned over it, and without [`CEILING_MIN_COMMIT_BYTES`] every worker then
     /// commits at almost every file — a cadence that degrades linearly with core count, which is
@@ -921,45 +723,31 @@ mod tests {
         static LEDGER: StagedByteLedger = StagedByteLedger::new(u64::MAX);
         let (_index_dir, db) = fresh_index();
         let dir = tempfile::tempdir().expect("tempdir");
-        let body = "fn needle_function() {}\n".repeat(40);
-        std::fs::write(dir.path().join("a.rs"), &body).expect("write");
-        let hash = crate::hashing::hex(&crate::hashing::hash_bytes(body.as_bytes()));
+        std::fs::write(dir.path().join("a.rs"), "fn needle_function() {}\n".repeat(40)).expect("write");
+        let meta = std::fs::metadata(dir.path().join("a.rs")).expect("stat");
+        let (size, mtime) = (meta.len(), crate::scanner_file::mtime_nanos(&meta));
         let rel = RelPath::from("a.rs");
 
         let mut batch = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-        batch.backfill_grep_bloom(dir.path(), &rel, &hash);
+        batch.backfill_grep_bloom(dir.path(), &rel, size, mtime);
         assert!(
             LEDGER.in_flight() > 0,
             "the staged bloom row must count against the byte ledger"
         );
         batch.finish();
         assert_eq!(LEDGER.in_flight(), 0);
-        assert!(db.grep_bloom_current(&hash), "backfill wrote the row");
+        assert!(db.grep_bloom_current(&rel, size, mtime), "backfill wrote the row");
 
         let mut again = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-        again.backfill_grep_bloom(dir.path(), &rel, &hash);
-        again.restamp_grep_bloom(&hash, b"ignored");
+        again.backfill_grep_bloom(dir.path(), &rel, size, mtime);
+        again.restamp_grep_bloom(&rel, b"ignored", size, mtime);
         assert_eq!(LEDGER.in_flight(), 0, "a current row is neither rebuilt nor restaged");
         again.finish();
 
-        db.drop_grep_bloom_row_for_test(&hash);
         let mut moved = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-        moved.restamp_grep_bloom(&hash, body.as_bytes());
-        assert!(LEDGER.in_flight() > 0, "a missing row is re-staged");
+        moved.restamp_grep_bloom(&rel, b"fn needle_function() {}", size, mtime + 1);
+        assert!(LEDGER.in_flight() > 0, "a moved stamp re-stages the row");
         moved.finish();
-        assert!(db.grep_bloom_current(&hash));
-    }
-
-    /// The bytes on disk must hash to the indexed hash, or the row would describe other content.
-    #[test]
-    fn backfill_refuses_bytes_that_no_longer_match_the_indexed_hash() {
-        static LEDGER: StagedByteLedger = StagedByteLedger::new(u64::MAX);
-        let (_index_dir, db) = fresh_index();
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("a.rs"), "fn edited() {}\n").expect("write");
-        let mut batch = WorkerIndexBatch::with_budget(Some(&db), u64::MAX, &LEDGER);
-        batch.backfill_grep_bloom(dir.path(), &RelPath::from("a.rs"), "not-the-hash");
-        batch.finish();
-        assert_eq!(db.grep_bloom_row_count(), 0);
+        assert!(db.grep_bloom_current(&rel, size, mtime + 1));
     }
 }

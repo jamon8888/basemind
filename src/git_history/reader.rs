@@ -56,10 +56,12 @@ impl GitHistoryIndex {
     /// check (`last_indexed_head_hex`, itself a forwarded call) fails closed first, so a tool
     /// live-walks rather than ever seeing this.
     pub(crate) fn forward(&self, op: GitHistoryOp) -> Vec<CommitInfo> {
-        match &self.backend {
-            super::Backend::Remote(remote) => remote.commits(op),
-            super::Backend::Local(_) => Vec::new(),
+        #[cfg(all(feature = "comms", any(unix, windows)))]
+        if let super::Backend::Remote(remote) = &self.backend {
+            return remote.commits(op);
         }
+        let _ = op;
+        Vec::new()
     }
 }
 
@@ -83,18 +85,10 @@ impl LocalDb {
 
     fn recent_commits(&self, skip: usize, take: usize, include_files: bool) -> Vec<CommitInfo> {
         let mut cache = PathCache::new();
-        // The skipped commits are decoded head-only; only the page's file lists are decoded.
-        self.commits_desc(false)
+        self.commits_desc(include_files)
             .skip(skip)
             .take(take)
-            .filter_map(|(ord, head)| {
-                if include_files {
-                    self.commit_meta(ord, true)
-                } else {
-                    Some(head)
-                }
-            })
-            .map(|meta| self.meta_to_info(meta, &mut cache))
+            .map(|(_, meta)| self.meta_to_info(meta, &mut cache))
             .collect()
     }
 

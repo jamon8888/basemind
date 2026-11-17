@@ -85,7 +85,7 @@ fn check_root(root: &Path) -> Check {
 }
 
 fn check_config(root: &Path) -> Check {
-    match basemind::config::overrides::load_with_overrides(root, None, None) {
+    match basemind::config::load_with_overrides(root, None, None) {
         Ok(_) => Check::new("config", Level::Ok, "basemind.toml loaded"),
         Err(basemind::config::ConfigError::NotFound(_)) => Check::new(
             "config",
@@ -112,14 +112,7 @@ fn check_index(root: &Path) -> Check {
         }
         basemind::store::WriterProbe::Held { holder: None } => "a writer holds the lock".to_string(),
     };
-    match basemind::store::read_status_sidecar(&cache).and_then(|status| status.degraded_summary()) {
-        Some(summary) => Check::new(
-            "index",
-            Level::Warn,
-            format!("degraded: {summary}; run `basemind scan`; {writer}"),
-        ),
-        None => Check::new("index", Level::Ok, format!("{}; {writer}", index.display())),
-    }
+    Check::new("index", Level::Ok, format!("{}; {writer}", index.display()))
 }
 
 fn check_grammars() -> Check {

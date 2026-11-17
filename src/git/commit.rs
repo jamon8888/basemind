@@ -8,18 +8,7 @@
 
 use super::*;
 
-#[cfg(test)]
-thread_local! {
-    /// Commits whose changed files [`build_commit_info`] listed on this thread, so a test can tell a
-    /// walk that lists files only where it must from one that lists them for every commit it passes.
-    pub(crate) static FILE_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 pub(super) fn build_commit_info(local: &gix::Repository, id: gix::ObjectId, include_files: bool) -> Option<CommitInfo> {
-    #[cfg(test)]
-    if include_files {
-        FILE_LISTINGS.with(|listed| listed.set(listed.get() + 1));
-    }
     let commit = local.find_commit(id).ok()?;
     let sha = id.to_string();
     let short_sha = sha[..7.min(sha.len())].to_string();
@@ -50,12 +39,6 @@ pub(super) fn build_commit_info(local: &gix::Repository, id: gix::ObjectId, incl
         body,
         files,
     })
-}
-
-/// Whether [`build_commit_info`] would list `id`, without building the record: the commit reads and
-/// has an author.
-fn listable(local: &gix::Repository, id: gix::ObjectId) -> bool {
-    local.find_commit(id).is_ok_and(|commit| commit.author().is_ok())
 }
 
 /// Diff `commit_id`'s tree against its parent(s) and return (path, change-kind) pairs.
@@ -95,7 +78,7 @@ pub(super) fn commit_files(
             Err(_) => continue,
         };
         let _ = platform.for_each_to_obtain_tree(&tree, |change| {
-            let mut record = |path, kind| {
+            if let Some((path, kind)) = classify_tree_change(&change) {
                 union
                     .entry(path)
                     .and_modify(|existing| {
@@ -104,21 +87,6 @@ pub(super) fn commit_files(
                         }
                     })
                     .or_insert(kind);
-            };
-            if let Some((path, kind)) = classify_tree_change(&change) {
-                record(path, kind);
-            }
-            // A move names its destination as `renamed`; its source is gone from this commit's tree,
-            // so it is listed as deleted too. Without it the history of the source's directory
-            // missed the commit that moved the last file out of it.
-            if let gix::object::tree::diff::Change::Rewrite {
-                source_location,
-                copy: false,
-                ..
-            } = &change
-                && let Some(source) = decode_path(source_location)
-            {
-                record(source, ChangeKind::Deleted);
             }
             Ok(gix::object::tree::diff::Action::Continue(()))
         });
@@ -260,7 +228,7 @@ fn line_byte_offsets(buf: &[u8]) -> Vec<(u32, u32)> {
     out
 }
 
-pub(super) fn classify_tree_change(
+fn classify_tree_change(
     change: &gix::object::tree::diff::Change<'_, '_, '_>,
 ) -> Option<(crate::path::RelPath, ChangeKind)> {
     use gix::object::tree::diff::Change::*;
@@ -276,17 +244,6 @@ pub(super) fn decode_path(bstr: &gix::bstr::BStr) -> Option<crate::path::RelPath
     Some(crate::path::RelPath::from(<gix::bstr::BStr as AsRef<[u8]>>::as_ref(
         bstr,
     )))
-}
-
-/// One step of a history walk, as a result. A commit the walk cannot read (missing or corrupt) is an
-/// error: skipping it would end the history there, its ancestors never queued, with nothing to say
-/// the list is short. A shallow clone's boundary is not such a step, since gix's walk honours
-/// `.git/shallow` and never asks for the parents the clone lacks.
-pub(super) fn walk_step<T, E: std::fmt::Display>(step: Result<T, E>) -> Result<T, GitError> {
-    step.map_err(|error| GitError::Read {
-        what: "rev walk".to_string(),
-        msg: error.to_string(),
-    })
 }
 
 impl Repo {
@@ -313,84 +270,7 @@ impl Repo {
                 what: "rev walk".to_string(),
                 msg: e.to_string(),
             })?;
-        walk.map(|step| walk_step(step).map(|info| info.id.to_string()))
-            .collect()
-    }
-
-    /// The commits at `skip..skip + take` of [`Repo::log_paths`]' list for `head`, with their
-    /// changed files when `include_files`. The `skip` commits before them are walked without listing
-    /// files, so a page deep in the history costs one walk to it and a file listing per commit on the
-    /// page.
-    pub fn log_window(
-        &self,
-        head: &str,
-        skip: usize,
-        take: usize,
-        include_files: bool,
-    ) -> Result<Vec<CommitInfo>, GitError> {
-        self.window(head, skip, take, include_files, |_, _| true)
-    }
-
-    /// The commits at `skip..skip + take` of [`Repo::log_for_path`]'s list for `head`: those that
-    /// changed the entry at exactly `rel`. The commits before them are only tested against `rel`.
-    pub fn log_window_touching(
-        &self,
-        head: &str,
-        rel: &crate::path::RelPath,
-        skip: usize,
-        take: usize,
-    ) -> Result<Vec<CommitInfo>, GitError> {
-        self.window(head, skip, take, false, |local, id| {
-            commit_touches_path(local, id, rel.as_bytes())
-        })
-    }
-
-    /// The commits at `skip..skip + take` of `head`'s newest-first history that `keep` admits.
-    fn window(
-        &self,
-        head: &str,
-        skip: usize,
-        take: usize,
-        include_files: bool,
-        keep: impl Fn(&gix::Repository, gix::ObjectId) -> bool,
-    ) -> Result<Vec<CommitInfo>, GitError> {
-        let local = self.local();
-        let Some(head) = Self::resolve_oid(&local, head) else {
-            return Err(GitError::RevParse {
-                rev: head.to_string(),
-                msg: "does not resolve to a commit".to_string(),
-            });
-        };
-        let walk = local
-            .rev_walk([head])
-            .sorting(gix::revision::walk::Sorting::ByCommitTime(
-                gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
-            ))
-            .all()
-            .map_err(|e| GitError::Read {
-                what: "rev walk".to_string(),
-                msg: e.to_string(),
-            })?;
-        let mut kept = 0usize;
-        let mut out = Vec::new();
-        for step in walk {
-            if out.len() >= take {
-                break;
-            }
-            let id = walk_step(step)?.id;
-            // Offsets count the commits the whole-list walks list: one that does not decode is
-            // skipped there, so it is not counted here either.
-            if !keep(&local, id) || !listable(&local, id) {
-                continue;
-            }
-            kept += 1;
-            if kept > skip
-                && let Some(commit) = build_commit_info(&local, id, include_files)
-            {
-                out.push(commit);
-            }
-        }
-        Ok(out)
+        Ok(walk.filter_map(|i| i.ok()).map(|i| i.id.to_string()).collect())
     }
 
     /// Commit shas reachable from HEAD but **not** from `hidden` (the previously-indexed head),
@@ -414,8 +294,7 @@ impl Repo {
             what: "rev walk (hidden)".to_string(),
             msg: e.to_string(),
         })?;
-        walk.map(|step| walk_step(step).map(|info| info.id.to_string()))
-            .collect()
+        Ok(walk.filter_map(|i| i.ok()).map(|i| i.id.to_string()).collect())
     }
 
     /// Full record (header + per-file change list, union-across-parents) for one commit sha — the

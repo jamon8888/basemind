@@ -7,128 +7,11 @@ use std::io;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, BufReader};
 
 const BACKEND_RESTARTED_CODE: i64 = -32001;
-/// JSON-RPC code answering a request while no backend can be reached; the message says why.
-const BACKEND_UNAVAILABLE_CODE: i64 = -32003;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
-/// Cap on the back-off while something outside this process keeps the backend away.
-const MAX_BLOCKED_RECONNECT_DELAY: Duration = Duration::from_secs(60);
-/// How long the relay keeps answering the host after a fatal reconnect failure, so a request
-/// already on its way gets the reason rather than a closed pipe.
-const FATAL_ANSWER_WINDOW: Duration = Duration::from_secs(1);
-/// How long a host that has sent nothing yet is given to send its first request after a fatal
-/// failure. A session that cannot start still owes `initialize` the reason.
-const FATAL_FIRST_REQUEST_WINDOW: Duration = Duration::from_secs(10);
-/// How long a host frame waits for a backend that is not there. It runs from the moment the oldest
-/// one began to wait, whether it arrived with no backend connected or was in flight when the
-/// backend went. Until it ends everything waiting is kept and goes through if a backend arrives.
-/// Past it the relay answers the host itself while the retries go on: `initialize` from this
-/// binary, so the session starts, and a request only a backend can serve with the reason. A
-/// connection attempt in flight extends the wait to [`ATTEMPT_HOLD_LIMIT`].
-const HOLD_WINDOW: Duration = Duration::from_secs(10);
-/// How long what is waiting is kept on one connection attempt that has neither failed nor
-/// succeeded, when that is later than its [`HOLD_WINDOW`]. An attempt takes long by design: a
-/// takeover waits up to 27 s for an older daemon to go, a spawned daemon gets 30 s to come up, and
-/// the relay handshake then opens the workspace.
-const ATTEMPT_HOLD_LIMIT: Duration = Duration::from_secs(90);
-/// The reason given when the window ends before any connection attempt has failed.
-const NOT_REACHED_YET: &str = "the basemind daemon has not become reachable yet; still trying";
-/// Failed attempts in a row after which a restarting backend is reported at warn, and how often
-/// after that.
-const TRANSIENT_WARN_AFTER: u32 = 4;
-const TRANSIENT_WARN_EVERY: u32 = 12;
-/// The least time between two reconnect attempts that ask an older daemon to stop.
-const STOP_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
-
-/// What a failed reconnect means for the relay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReconnectFailure {
-    /// The backend is restarting; retry soon.
-    Transient,
-    /// Something outside this process must change first, such as an older daemon that will not
-    /// stop. Retried with a long back-off; once [`HOLD_WINDOW`] has passed, the host is answered
-    /// with the reason meanwhile.
-    Blocked,
-    /// No retry can succeed. The relay answers what is pending with the reason and ends.
-    Fatal,
-}
-
-/// An error a reconnect attempt can fail with.
-pub(crate) trait ReconnectError: std::fmt::Display {
-    /// How the relay should treat this failure.
-    fn failure(&self) -> ReconnectFailure {
-        ReconnectFailure::Transient
-    }
-
-    /// The text given to the host and the log.
-    fn reason(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl ReconnectError for &str {}
-
-impl ReconnectError for anyhow::Error {
-    fn failure(&self) -> ReconnectFailure {
-        use crate::relay_refusal::RelayRefusal;
-        use basemind::comms::singleton::SingletonError;
-        if let Some(refusal) = self.chain().find_map(|cause| cause.downcast_ref::<RelayRefusal>()) {
-            return refusal.failure();
-        }
-        match self.chain().find_map(|cause| cause.downcast_ref::<SingletonError>()) {
-            // Nothing a retry does changes the installed version, the path or the platform.
-            Some(SingletonError::NewerDaemon { .. } | SingletonError::NoDataDir) => ReconnectFailure::Fatal,
-            #[cfg(unix)]
-            Some(SingletonError::SocketPathTooLong { .. }) => ReconnectFailure::Fatal,
-            // These clear when a daemon stops, exits or is started by whoever owns that.
-            Some(
-                SingletonError::BusyPredecessor { .. }
-                | SingletonError::StalePredecessor { .. }
-                | SingletonError::FailingPredecessor { .. }
-                | SingletonError::TooManyDaemons { .. }
-                | SingletonError::AutospawnDisabled { .. },
-            ) => ReconnectFailure::Blocked,
-            _ => ReconnectFailure::Transient,
-        }
-    }
-
-    fn reason(&self) -> String {
-        format!("{self:#}")
-    }
-}
-
-/// Decides which reconnect attempts may ask an older daemon to stop: any until one has sent
-/// `Stop`, and then one per [`STOP_REQUEST_INTERVAL`], so a daemon that declined is not sent `Stop`
-/// on every retry. Only a `Stop` that was sent counts; an attempt that found nothing to ask does
-/// not use up the interval.
-#[derive(Debug, Default)]
-pub(crate) struct StopPacing {
-    last_asked: Option<std::time::Instant>,
-}
-
-impl StopPacing {
-    /// Whether the attempt starting now may ask.
-    pub(crate) fn may_ask(&self) -> bool {
-        self.may_ask_at(std::time::Instant::now())
-    }
-
-    /// Record that an attempt sent `Stop` just now.
-    pub(crate) fn asked(&mut self) {
-        self.asked_at(std::time::Instant::now());
-    }
-
-    fn may_ask_at(&self, now: std::time::Instant) -> bool {
-        self.last_asked
-            .is_none_or(|asked| now.duration_since(asked) >= STOP_REQUEST_INTERVAL)
-    }
-
-    fn asked_at(&mut self, now: std::time::Instant) {
-        self.last_asked = Some(now);
-    }
-}
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_JSON_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// JSON-RPC code answering a request the backend never replied to within the relay deadline.
@@ -150,19 +33,16 @@ const REPLAYABLE_METHODS: &[&str] = &[
     "prompts/get",
     "completion/complete",
 ];
-/// Whether `tool` only reads, and is safe to replay after a backend restart. A tool is safe
-/// because it is listed as safe, never because it is not listed as writing.
-fn is_read_only_tool(tool: &str) -> bool {
-    basemind::mcp::replay::REPLAY_SAFE_TOOLS.contains(&tool)
-}
-/// `agents` modes that are reads or naturally idempotent. `post` is made so by a key, and `inbox`
-/// is one only while it marks nothing read.
+/// Tools whose every mode is read-only.
+const READ_ONLY_TOOLS: &[&str] = &["code", "git", "graph"];
+/// `agents` modes that are reads or naturally idempotent (`post` is made so by a key).
 const REPLAYABLE_AGENTS_MODES: &[&str] = &[
     "list",
     "thread_list",
     "members",
     "history",
     "message",
+    "inbox",
     "ack",
     "wait",
     "status",
@@ -195,14 +75,8 @@ fn classify_request(message: &mut Value, line: &str) -> (String, bool) {
         .pointer("/params/arguments/mode")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if is_read_only_tool(tool) || (tool == "agents" && REPLAYABLE_AGENTS_MODES.contains(&mode)) {
+    if READ_ONLY_TOOLS.contains(&tool) || (tool == "agents" && REPLAYABLE_AGENTS_MODES.contains(&mode)) {
         return (line.to_owned(), true);
-    }
-    if tool == "agents" && mode == "inbox" {
-        let marks_read = message
-            .pointer("/params/arguments/mark_read")
-            .is_some_and(|mark| !matches!(mark, Value::Null | Value::Bool(false)));
-        return (line.to_owned(), !marks_read);
     }
     if tool == "agents" && mode == "post" {
         let has_key = message
@@ -249,23 +123,11 @@ struct SessionState {
     /// Ids already answered with a timeout error; the backend's late reply is dropped so the host
     /// never sees two responses for one request.
     abandoned: std::collections::VecDeque<String>,
-    /// Whether the host has sent anything yet.
-    heard_from_host: bool,
-    /// Host frames read while no backend was connected, in arrival order, each without its
-    /// newline. They are forwarded when a backend arrives, or answered when the hold window ends.
-    held: std::collections::VecDeque<String>,
-    /// Whether `initialize` was answered from this binary, which told the host that the tool list
-    /// can change.
-    initialized_locally: bool,
-    /// Whether the host holds an answer from this binary that the backend may give differently,
-    /// and is owed `notifications/tools/list_changed` once a backend serves the session.
-    owes_list_changed: bool,
 }
 
 impl SessionState {
     /// Track a host frame; returns the line to forward (rewritten for a keyless `post`).
     fn observe_client(&mut self, line: &str) -> String {
-        self.heard_from_host = true;
         let Ok(mut message) = serde_json::from_str::<Value>(line) else {
             return line.to_owned();
         };
@@ -274,8 +136,6 @@ impl SessionState {
         if method == Some("initialize") {
             self.initialize = Some(line.to_owned());
             self.initialize_id = id.cloned();
-            self.initialize_complete = false;
-            self.initialized = None;
         } else if method == Some("notifications/initialized") {
             self.initialized = Some(line.to_owned());
         }
@@ -433,39 +293,23 @@ impl SessionState {
     }
 }
 
-impl SessionState {
-    /// The notification telling the host to list the tools again, once: when a backend serves a
-    /// session this binary answered for and the host has said it is initialized, before which a
-    /// server sends it nothing.
-    fn list_changed_due(&mut self) -> Vec<String> {
-        if !self.owes_list_changed || self.initialized.is_none() {
-            return Vec::new();
-        }
-        self.owes_list_changed = false;
-        vec![serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }).to_string()]
-    }
-}
-
 fn id_key(id: &Value) -> String {
     id.to_string()
 }
 
-/// Relay newline-framed MCP messages until the client closes stdin. Every backend, the first
-/// included, comes from `reconnect`, so a daemon that cannot be reached when the session starts is
-/// handled exactly like one lost later: the host's pipes stay open and its requests are answered.
-/// When the backend disappears, every in-flight request that cannot be replayed fails once with
-/// `backend_restarted`; the proxy reconnects, silently replays MCP initialization, and forwards
-/// later requests over the replacement connection.
-pub(crate) async fn run<R, W, S, C, F, E>(input: R, output: W, reconnect: C) -> io::Result<()>
+/// Relay newline-framed MCP messages until the client closes stdin. When the backend disappears,
+/// every in-flight request fails once with `backend_restarted`; the proxy reconnects, silently
+/// replays MCP initialization, and forwards later requests over the replacement connection.
+pub(crate) async fn run<R, W, S, C, F, E>(input: R, output: W, stream: S, reconnect: C) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
     C: FnMut() -> F,
     F: Future<Output = Result<S, E>>,
-    E: ReconnectError,
+    E: std::fmt::Display,
 {
-    run_with_deadline(input, output, reconnect, request_deadline_from_env()).await
+    run_with_deadline(input, output, stream, reconnect, request_deadline_from_env()).await
 }
 
 /// [`run`] with an explicit per-request `deadline`: a request still unanswered after it gets a
@@ -473,6 +317,7 @@ where
 async fn run_with_deadline<R, W, S, C, F, E>(
     input: R,
     mut output: W,
+    mut stream: S,
     mut reconnect: C,
     deadline: Option<Duration>,
 ) -> io::Result<()>
@@ -482,55 +327,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     C: FnMut() -> F,
     F: Future<Output = Result<S, E>>,
-    E: ReconnectError,
+    E: std::fmt::Display,
 {
     let mut input = BufReader::new(input).lines();
     let mut state = SessionState::default();
-    let mut connected_before = false;
     loop {
-        let reconnected = reconnect_and_replay(&mut reconnect, &mut state, &mut input, &mut output).await?;
-        let (mut stream, initialize_response, buffered) = match reconnected {
-            Reconnected::Backend {
-                stream,
-                initialize_response,
-                buffered,
-            } => (stream, initialize_response, buffered),
-            Reconnected::HostClosed => return Ok(()),
-            Reconnected::Fatal(reason) => {
-                tracing::error!(%reason, "daemon relay cannot connect; ending the session");
-                write_lines(&mut output, state.fail_waiting(&reason)).await?;
-                answer_before_ending(&mut input, &mut output, &mut state, &reason).await?;
-                return Err(io::Error::other(reason));
-            }
-        };
-        let mut lines = state.take_replays();
-        for mut held in state.take_held() {
-            held.push('\n');
-            lines.push(state.observe_client(&held));
-        }
-        for line in lines {
-            // A write failure here just means the replacement died too; the read half sees EOF and
-            // the loop reconnects, failing the (now already replayed) requests.
-            if stream.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
-        }
-        let _ = stream.flush().await;
-        if let Some(response) = initialize_response {
-            output.write_all(response.as_bytes()).await?;
-            output.write_all(b"\n").await?;
-        }
-        for frame in buffered {
-            output.write_all(frame.as_bytes()).await?;
-            output.write_all(b"\n").await?;
-        }
-        output.flush().await?;
-        write_lines(&mut output, state.list_changed_due()).await?;
-        if connected_before {
-            tracing::info!("daemon relay backend reconnected");
-        }
-        connected_before = true;
-
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut backend = BufReader::new(read_half).lines();
         loop {
@@ -546,10 +347,6 @@ where
                         || write_half.flush().await.is_err()
                     {
                         break;
-                    }
-                    let due = state.list_changed_due();
-                    if !due.is_empty() {
-                        write_lines(&mut output, due).await?;
                     }
                 }
                 read = backend.next_line() => {
@@ -583,15 +380,399 @@ where
             in_flight = state.pending.len(),
             "daemon relay backend disconnected; reconnecting"
         );
-        write_lines(&mut output, state.drain_restart_errors()).await?;
+        for error in state.drain_restart_errors() {
+            output.write_all(error.as_bytes()).await?;
+            output.write_all(b"\n").await?;
+        }
+        output.flush().await?;
+
+        let (mut replacement, initialize_response, buffered) = reconnect_and_replay(&mut reconnect, &mut state).await?;
+        for line in state.take_replays() {
+            // A write failure here just means the replacement died too; the read half sees EOF and
+            // the loop reconnects, failing the (now already replayed) requests.
+            if replacement.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+        let _ = replacement.flush().await;
+        if let Some(response) = initialize_response {
+            output.write_all(response.as_bytes()).await?;
+        }
+        for frame in buffered {
+            output.write_all(frame.as_bytes()).await?;
+            output.write_all(b"\n").await?;
+        }
+        output.flush().await?;
+        tracing::info!("daemon relay backend reconnected");
+        stream = replacement;
     }
 }
 
-/// Obtaining a backend, and answering the host while there is none.
-#[path = "stdio_relay_reconnect.rs"]
-mod reconnect;
-use reconnect::{Reconnected, answer_before_ending, reconnect_and_replay, write_lines};
+async fn reconnect_and_replay<S, C, F, E>(
+    reconnect: &mut C,
+    state: &mut SessionState,
+) -> io::Result<(S, Option<String>, Vec<String>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: FnMut() -> F,
+    F: Future<Output = Result<S, E>>,
+    E: std::fmt::Display,
+{
+    let mut delay = INITIAL_RECONNECT_DELAY;
+    loop {
+        match reconnect().await {
+            Ok(mut stream) => match replay_initialization(&mut stream, state).await {
+                Ok((initialize_response, buffered)) => {
+                    state.initialize_complete |= initialize_response.is_some();
+                    return Ok((stream, initialize_response, buffered));
+                }
+                Err(error) => tracing::warn!(%error, "daemon reconnect initialization failed; retrying"),
+            },
+            Err(error) => tracing::debug!(%error, "daemon reconnect failed; retrying"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2).min(MAX_RECONNECT_DELAY);
+    }
+}
+
+async fn replay_initialization<S>(stream: &mut S, state: &SessionState) -> io::Result<(Option<String>, Vec<String>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (Some(initialize), Some(initialize_id)) = (&state.initialize, &state.initialize_id) else {
+        return Ok((None, Vec::new()));
+    };
+    stream.write_all(initialize.as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut buffered = Vec::new();
+    let response = loop {
+        let frame = tokio::time::timeout(REPLAY_TIMEOUT, read_json_line(stream))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out replaying MCP initialize"))??;
+        let message =
+            serde_json::from_str::<Value>(&frame).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if message.get("id").filter(|id| !id.is_null()) == Some(initialize_id) {
+            break frame;
+        }
+        buffered.push(frame);
+    };
+    if let Some(initialized) = &state.initialized {
+        stream.write_all(initialized.as_bytes()).await?;
+        stream.flush().await?;
+    }
+    if state.initialize_complete {
+        Ok((None, buffered))
+    } else {
+        Ok((Some(response), buffered))
+    }
+}
+
+async fn read_json_line<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_JSON_LINE_BYTES {
+        let byte = stream.read_u8().await?;
+        if byte == b'\n' {
+            return String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+        }
+        bytes.push(byte);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "MCP JSON line exceeds relay limit",
+    ))
+}
 
 #[cfg(test)]
-#[path = "stdio_relay_tests.rs"]
-mod tests;
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[test]
+    fn restart_errors_preserve_json_rpc_ids_and_exclude_completed_requests() {
+        let mut state = SessionState::default();
+        state.observe_client("{\"jsonrpc\":\"2.0\",\"id\":\"done\",\"method\":\"tools/call\"}\n");
+        state.observe_client("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\"}\n");
+        state.observe_backend("{\"jsonrpc\":\"2.0\",\"id\":\"done\",\"result\":{}}\n");
+        state.observe_backend("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"roots/list\"}\n");
+
+        let errors = state.drain_restart_errors();
+
+        assert_eq!(errors.len(), 1);
+        let error: Value = serde_json::from_str(&errors[0]).expect("valid restart error");
+        assert_eq!(error["id"], serde_json::json!(7));
+        assert_eq!(error["error"]["message"], "backend_restarted");
+        assert_eq!(error["error"]["data"]["retryable"], true);
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_initialization_and_keeps_client_transport_open() {
+        let (client_input, proxy_input) = tokio::io::duplex(4096);
+        let (proxy_output, client_output) = tokio::io::duplex(4096);
+        let (proxy_backend_one, backend_one) = tokio::io::duplex(4096);
+        let (proxy_backend_two, backend_two) = tokio::io::duplex(4096);
+        let replacements = Arc::new(Mutex::new(VecDeque::from([proxy_backend_two])));
+        let connector_replacements = Arc::clone(&replacements);
+
+        let proxy = tokio::spawn(run(proxy_input, proxy_output, proxy_backend_one, move || {
+            let replacement = connector_replacements.lock().expect("replacement lock").pop_front();
+            std::future::ready(replacement.ok_or("no replacement backend"))
+        }));
+        let first_backend = tokio::spawn(fake_first_backend(backend_one));
+        let second_backend = tokio::spawn(fake_second_backend(backend_two));
+
+        let mut client_write = client_input;
+        let mut client_read = BufReader::new(client_output);
+        client_write
+            .write_all(initialize_line().as_bytes())
+            .await
+            .expect("send initialize");
+        let mut line = String::new();
+        client_read
+            .read_line(&mut line)
+            .await
+            .expect("read initialize response");
+        assert_eq!(response_id(&line), serde_json::json!(1));
+        client_write
+            .write_all(initialized_line().as_bytes())
+            .await
+            .expect("send initialized");
+        client_write
+            .write_all(call_line(2, "shell", "run").as_bytes())
+            .await
+            .expect("send interrupted request");
+
+        line.clear();
+        client_read.read_line(&mut line).await.expect("read restart error");
+        let restart: Value = serde_json::from_str(&line).expect("restart JSON");
+        assert_eq!(restart["id"], serde_json::json!(2));
+        assert_eq!(restart["error"]["message"], "backend_restarted");
+
+        line.clear();
+        client_read
+            .read_line(&mut line)
+            .await
+            .expect("read buffered notification");
+        let notification: Value = serde_json::from_str(&line).expect("notification JSON");
+        assert_eq!(notification["method"], "notifications/progress");
+
+        client_write
+            .write_all(request_line(3).as_bytes())
+            .await
+            .expect("send request after restart");
+        line.clear();
+        client_read.read_line(&mut line).await.expect("read recovered response");
+        assert_eq!(response_id(&line), serde_json::json!(3));
+
+        drop(client_write);
+        proxy.await.expect("proxy join").expect("proxy result");
+        first_backend.await.expect("first backend join");
+        second_backend.await.expect("second backend join");
+    }
+
+    /// A backend that swallows a request must not hang the host: the relay answers with a retryable
+    /// `backend_timeout` and drops the backend's late reply so the host never sees two responses.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_request_gets_a_timeout_error_and_the_late_reply_is_dropped() {
+        let (client_input, proxy_input) = tokio::io::duplex(4096);
+        let (proxy_output, client_output) = tokio::io::duplex(4096);
+        let (proxy_backend, backend) = tokio::io::duplex(4096);
+        let proxy = tokio::spawn(run_with_deadline(
+            proxy_input,
+            proxy_output,
+            proxy_backend,
+            || std::future::ready(Err::<tokio::io::DuplexStream, _>("no replacement")),
+            Some(Duration::from_secs(30)),
+        ));
+        let (backend_read, mut backend_write) = tokio::io::split(backend);
+        let mut backend_read = BufReader::new(backend_read);
+
+        let mut client_write = client_input;
+        let mut client_read = BufReader::new(client_output);
+        client_write.write_all(request_line(5).as_bytes()).await.expect("send");
+        let mut line = String::new();
+        backend_read
+            .read_line(&mut line)
+            .await
+            .expect("backend sees the request");
+
+        line.clear();
+        client_read.read_line(&mut line).await.expect("timeout error");
+        let error: Value = serde_json::from_str(&line).expect("error JSON");
+        assert_eq!(error["id"], serde_json::json!(5));
+        assert_eq!(error["error"]["code"], BACKEND_TIMEOUT_CODE);
+        assert_eq!(error["error"]["data"]["retryable"], true);
+
+        // The late reply is swallowed; the next request's reply is the next thing the host reads.
+        backend_write
+            .write_all(response_line(5).as_bytes())
+            .await
+            .expect("late reply");
+        client_write.write_all(request_line(6).as_bytes()).await.expect("send");
+        backend_write
+            .write_all(response_line(6).as_bytes())
+            .await
+            .expect("reply");
+        line.clear();
+        client_read.read_line(&mut line).await.expect("next response");
+        assert_eq!(response_id(&line), serde_json::json!(6));
+
+        drop(client_write);
+        let _ = proxy.await;
+    }
+
+    async fn fake_first_backend(stream: tokio::io::DuplexStream) {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        read.read_line(&mut line).await.expect("first initialize");
+        write
+            .write_all(response_line(1).as_bytes())
+            .await
+            .expect("initialize response");
+        line.clear();
+        read.read_line(&mut line).await.expect("initialized notification");
+        line.clear();
+        read.read_line(&mut line).await.expect("interrupted request");
+    }
+
+    async fn fake_second_backend(stream: tokio::io::DuplexStream) {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut read = BufReader::new(read);
+        let mut line = String::new();
+        read.read_line(&mut line).await.expect("replayed initialize");
+        assert_eq!(line, initialize_line());
+        let replay_frames = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}}\n{}",
+            response_line(1)
+        );
+        write
+            .write_all(replay_frames.as_bytes())
+            .await
+            .expect("notification and replayed initialize response");
+        line.clear();
+        read.read_line(&mut line).await.expect("replayed initialized");
+        assert_eq!(line, initialized_line());
+        line.clear();
+        read.read_line(&mut line).await.expect("post-restart request");
+        assert_eq!(response_id(&line), serde_json::json!(3));
+        write
+            .write_all(response_line(3).as_bytes())
+            .await
+            .expect("post-restart response");
+        line.clear();
+        assert_eq!(
+            read.read_line(&mut line).await.expect("client shutdown"),
+            0,
+            "proxy closes the backend write half after client EOF"
+        );
+    }
+
+    fn call_line(id: u64, tool: &str, mode: &str) -> String {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{tool}\",\"arguments\":{{\"mode\":\"{mode}\"}}}}}}\n"
+        )
+    }
+
+    #[test]
+    fn keyless_post_is_stamped_with_an_idempotency_key_and_is_replayable() {
+        let mut state = SessionState::default();
+        let forwarded = state.observe_client(&call_line(1, "agents", "post"));
+        let message: Value = serde_json::from_str(&forwarded).expect("forwarded JSON");
+        let key = message["params"]["arguments"]["idempotency_key"].as_str().expect("key");
+        assert!(key.starts_with("relay-"));
+        assert!(forwarded.ends_with('\n'));
+        assert_eq!(state.replay.get("1").expect("replayable").line, forwarded);
+
+        let keyed = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"agents\",\"arguments\":{\"mode\":\"post\",\"idempotency_key\":\"mine\"}}}\n";
+        assert_eq!(state.observe_client(keyed), keyed);
+        assert!(state.replay.contains_key("2"));
+    }
+
+    #[test]
+    fn only_reads_and_keyed_posts_are_replayable() {
+        let mut state = SessionState::default();
+        state.observe_client(&request_line(1));
+        state.observe_client(&call_line(2, "code", "outline"));
+        state.observe_client(&call_line(3, "agents", "inbox"));
+        state.observe_client(&call_line(4, "agents", "thread_start"));
+        state.observe_client(&call_line(5, "shell", "run"));
+        state.observe_client(&call_line(6, "memory", "store"));
+        let errors = state.drain_restart_errors();
+        let failed: Vec<Value> = errors
+            .iter()
+            .map(|e| serde_json::from_str::<Value>(e).expect("json")["id"].clone())
+            .collect();
+        assert_eq!(
+            failed,
+            vec![serde_json::json!(4), serde_json::json!(5), serde_json::json!(6)]
+        );
+        assert_eq!(state.take_replays().len(), 3);
+        // A second restart fails what was already replayed once.
+        assert_eq!(state.drain_restart_errors().len(), 3);
+    }
+
+    /// An in-flight keyed post survives a backend restart: the replacement backend receives the
+    /// identical line (same key) once, and the host sees only the real reply, no `backend_restarted`.
+    #[tokio::test]
+    async fn in_flight_post_is_replayed_once_on_the_replacement_backend() {
+        let (client_input, proxy_input) = tokio::io::duplex(4096);
+        let (proxy_output, client_output) = tokio::io::duplex(4096);
+        let (proxy_backend_one, backend_one) = tokio::io::duplex(4096);
+        let (proxy_backend_two, backend_two) = tokio::io::duplex(4096);
+        let replacements = Arc::new(Mutex::new(VecDeque::from([proxy_backend_two])));
+        let connector = Arc::clone(&replacements);
+        let proxy = tokio::spawn(run(proxy_input, proxy_output, proxy_backend_one, move || {
+            std::future::ready(connector.lock().expect("lock").pop_front().ok_or("none"))
+        }));
+
+        let mut client_write = client_input;
+        let mut client_read = BufReader::new(client_output);
+        client_write
+            .write_all(call_line(9, "agents", "post").as_bytes())
+            .await
+            .expect("send post");
+
+        let mut first = BufReader::new(backend_one);
+        let mut sent = String::new();
+        first.read_line(&mut sent).await.expect("first backend sees post");
+        drop(first);
+
+        let (read, mut write) = tokio::io::split(backend_two);
+        let mut read = BufReader::new(read);
+        let mut replayed = String::new();
+        read.read_line(&mut replayed).await.expect("replayed post");
+        assert_eq!(replayed, sent, "same line, same idempotency key");
+        write.write_all(response_line(9).as_bytes()).await.expect("reply");
+
+        let mut line = String::new();
+        client_read.read_line(&mut line).await.expect("response");
+        assert_eq!(response_id(&line), serde_json::json!(9));
+        assert!(line.contains("result"));
+
+        drop(client_write);
+        let _ = proxy.await;
+    }
+
+    fn initialize_line() -> String {
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_owned()
+    }
+
+    fn initialized_line() -> String {
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n".to_owned()
+    }
+
+    fn request_line(id: u64) -> String {
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\"}}\n")
+    }
+
+    fn response_line(id: u64) -> String {
+        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}\n")
+    }
+
+    fn response_id(line: &str) -> Value {
+        serde_json::from_str::<Value>(line).expect("valid response")["id"].clone()
+    }
+}

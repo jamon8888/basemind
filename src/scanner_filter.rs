@@ -201,10 +201,6 @@ impl Gate {
 }
 
 pub(crate) struct Filters {
-    /// The document and vector stack this scan hands chunks and documents to, bound once here so
-    /// no file pays for resolving it.
-    #[cfg(any(feature = "documents", feature = "code-search"))]
-    pub(crate) retrieval: crate::scan_retrieval::Retrieval,
     include: globset::GlobSet,
     exclude: globset::GlobSet,
     /// Directory-level view of `exclude`: every `P/**` pattern also present as bare `P`, so a
@@ -228,7 +224,7 @@ pub(crate) struct Filters {
     /// The current scan's document-phase budget (`[documents] phase_budget_secs`), re-armed by every
     /// drive. Shared with extraction through [`crate::extract::doc::DocConfig::phase`].
     #[cfg(feature = "documents")]
-    pub(crate) doc_phase: std::sync::Arc<crate::backpressure::DocPhase>,
+    pub(crate) doc_phase: std::sync::Arc<crate::extract::doc_guard::DocPhase>,
     /// [`crate::config::DocumentsConfig::effective_phase_budget_secs`], to re-arm [`Self::doc_phase`].
     #[cfg_attr(not(feature = "documents"), allow(dead_code))]
     pub(crate) doc_phase_budget_secs: u64,
@@ -258,14 +254,6 @@ pub(crate) struct Filters {
     /// since the last scan: unchanged files must then be re-flushed so their vector rows are rebuilt.
     #[cfg_attr(not(any(feature = "code-search", feature = "documents")), allow(dead_code))]
     pub(crate) reflush_embeds: bool,
-    /// Validate each blob the pass would otherwise trust for existing: a scan of this workspace
-    /// never finished (see [`crate::scan_evidence::blobs_need_verifying`]), or the caller named
-    /// these paths to have them looked at again.
-    pub(crate) verify_blobs: bool,
-    /// Set by the full pass that verifies blobs after an unclean stop: the vector rows written
-    /// shortly before it may be lost too, so every indexed path is owed its rows again.
-    #[cfg_attr(not(any(feature = "code-search", feature = "documents")), allow(dead_code))]
-    pub(crate) vector_rows_unsure: bool,
 }
 
 impl Filters {
@@ -299,15 +287,9 @@ impl Filters {
                     .map(|s| format!("{}/", s.replace('\\', "/").trim_end_matches('/')))
             })
             .collect();
-        #[cfg(any(feature = "documents", feature = "code-search"))]
-        let retrieval = crate::retrieval_wiring::backend();
-        #[cfg(feature = "documents")]
-        retrieval.documents.warn_unavailable_settings(&config.documents);
-        let doc_digest = crate::config::rules::doc_digest(&config.documents, &config.resources);
+        let doc_digest = crate::config::rules::doc_digest(&config.documents, &config.resources, &config.llm);
         let doc_guard_digest = crate::config::rules::doc_guard_digest(&config.documents, &doc_digest);
         Ok(Self {
-            #[cfg(any(feature = "documents", feature = "code-search"))]
-            retrieval,
             include,
             exclude,
             dir_exclude: Arc::new(dir_exclude),
@@ -327,8 +309,6 @@ impl Filters {
             code_embed: Gate::build(&config.code_search.embed_include, &config.code_search.embed_exclude)?,
             extra_prefixes,
             reflush_embeds: false,
-            verify_blobs: false,
-            vector_rows_unsure: false,
         })
     }
 
@@ -600,12 +580,6 @@ impl IndexFilter {
     /// `Filters`.
     pub(crate) fn filters(&self) -> &Filters {
         &self.filters
-    }
-
-    /// Make the pass validate the blob of a file it would skip as unchanged, instead of trusting
-    /// the blob for existing.
-    pub(crate) fn verify_blobs(&mut self) {
-        self.filters.verify_blobs = true;
     }
 
     /// Repo-relative, forward-slash path for `abs`, or `None` when `abs` is outside the root.

@@ -284,55 +284,6 @@ pub(crate) fn is_external_key(key: &[u8]) -> bool {
     }
 }
 
-/// A caller-supplied path that does not name a file inside the repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutsideRoot;
-
-/// `root` joined with `rel`, when `rel` is a plain relative path: not empty, not absolute, not an
-/// external key and free of `..`. Nothing on disk is consulted, so a symlink on the way is followed
-/// by whoever reads the result. Enough on its own only for a read that never touches the disk (a
-/// git blob) or for an indexed path under `scan.follow_symlinks`; otherwise see [`contained_file`].
-pub fn lexical_file(root: &Path, rel: &RelPath) -> Result<PathBuf, OutsideRoot> {
-    use std::path::Component;
-
-    let relative = Path::new(rel.as_os_str());
-    if rel.is_empty() || rel.is_external() || relative.is_absolute() {
-        return Err(OutsideRoot);
-    }
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(OutsideRoot);
-    }
-    Ok(root.join(relative))
-}
-
-/// The file `rel` names under `root`, for reading.
-///
-/// `RelPath` deserialisation does not normalise, so a path taken from a tool call can be absolute,
-/// climb out with `..`, or name a symlink whose target is elsewhere. All three are refused: the
-/// first two lexically ([`lexical_file`]), the third by canonicalising both sides. A path that does
-/// not exist (no such entry, or a component that is a file) is returned as joined: there is nothing
-/// to read through it. One that cannot be resolved for any other reason (a permission error, a
-/// symlink loop) is refused, because where it leads is unknown.
-pub fn contained_file(root: &Path, rel: &RelPath) -> Result<PathBuf, OutsideRoot> {
-    use std::io::ErrorKind;
-
-    let joined = lexical_file(root, rel)?;
-    let target = match joined.canonicalize() {
-        Ok(target) => target,
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(joined),
-        Err(_) => return Err(OutsideRoot),
-    };
-    let root = root.canonicalize().map_err(|_| OutsideRoot)?;
-    if target.starts_with(&root) {
-        Ok(target)
-    } else {
-        Err(OutsideRoot)
-    }
-}
-
 impl Serialize for RelPath {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         match std::str::from_utf8(self.0.as_slice()) {
@@ -385,7 +336,7 @@ impl<'de> Deserialize<'de> for RelPath {
     }
 }
 
-impl schemars::JsonSchema for RelPath {
+impl rmcp::schemars::JsonSchema for RelPath {
     /// Inlined rather than referenced: a `$ref` into `$defs` (especially one carrying a sibling
     /// `description`, as every path parameter does) is rejected by the Anthropic `input_schema`
     /// subset, and that rejection drops the server's ENTIRE tool registry silently — see the module
@@ -405,8 +356,8 @@ impl schemars::JsonSchema for RelPath {
     /// But advertising that arm as a schema `oneOf` is what made every tool carrying a path
     /// unregistrable: `oneOf` at a property type is outside the accepted subset, and no MCP caller
     /// would ever send the byte form anyway.
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
+    fn json_schema(_: &mut rmcp::schemars::SchemaGenerator) -> rmcp::schemars::Schema {
+        rmcp::schemars::json_schema!({
             "type": "string"
         })
     }
@@ -550,81 +501,6 @@ mod tests {
         let root = std::path::Path::new("/abs/repo");
         assert_eq!(normalize_query_path("/abs/repo", root), None);
         assert_eq!(normalize_query_path(".", root), None);
-    }
-
-    #[test]
-    fn contained_file_accepts_a_file_inside_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/a.rs"), b"x").unwrap();
-        let resolved = contained_file(dir.path(), &RelPath::from("src/a.rs")).expect("inside");
-        assert_eq!(std::fs::read(resolved).unwrap(), b"x");
-        assert!(contained_file(dir.path(), &RelPath::from("src/missing.rs")).is_ok());
-    }
-
-    #[test]
-    fn contained_file_refuses_parent_and_absolute_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(dir.path().join("secret"), b"s").unwrap();
-        assert_eq!(contained_file(&root, &RelPath::from("../secret")), Err(OutsideRoot));
-        assert_eq!(
-            contained_file(&root, &RelPath::from("src/../../secret")),
-            Err(OutsideRoot)
-        );
-        assert_eq!(contained_file(&root, &RelPath::from("")), Err(OutsideRoot));
-        let absolute = dir.path().join("secret");
-        assert_eq!(
-            contained_file(&root, &RelPath::from(absolute.as_path())),
-            Err(OutsideRoot)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn contained_file_refuses_a_symlink_leaving_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("repo");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(dir.path().join("secret"), b"s").unwrap();
-        std::fs::write(root.join("real"), b"r").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("secret"), root.join("escape")).unwrap();
-        std::os::unix::fs::symlink(root.join("real"), root.join("inside")).unwrap();
-        assert_eq!(contained_file(&root, &RelPath::from("escape")), Err(OutsideRoot));
-        assert!(contained_file(&root, &RelPath::from("inside")).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn contained_file_refuses_a_symlinked_directory_leaving_the_root() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).expect("mkdir");
-        std::fs::create_dir_all(dir.path().join("outside")).expect("mkdir");
-        std::fs::write(dir.path().join("outside/secret.txt"), b"x").expect("write");
-        std::os::unix::fs::symlink(dir.path().join("outside"), root.join("linkdir")).expect("symlink");
-        assert_eq!(
-            contained_file(&root, &RelPath::from("linkdir/secret.txt")),
-            Err(OutsideRoot)
-        );
-        assert!(lexical_file(&root, &RelPath::from("linkdir/secret.txt")).is_ok());
-    }
-
-    /// Only "there is nothing there" falls back to the joined path. A path that cannot be resolved
-    /// for another reason is refused: where it leads is unknown.
-    #[cfg(unix)]
-    #[test]
-    fn contained_file_refuses_a_path_it_cannot_resolve() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).expect("mkdir");
-        std::fs::write(root.join("a.rs"), b"x").expect("write");
-        std::os::unix::fs::symlink(root.join("loop"), root.join("loop")).expect("symlink");
-        assert_eq!(contained_file(&root, &RelPath::from("loop")), Err(OutsideRoot));
-        assert_eq!(contained_file(&root, &RelPath::from("loop/x.rs")), Err(OutsideRoot));
-        assert!(contained_file(&root, &RelPath::from("a.rs/x")).is_ok(), "names nothing");
-        assert!(contained_file(&root, &RelPath::from("missing/x.rs")).is_ok());
     }
 
     #[test]

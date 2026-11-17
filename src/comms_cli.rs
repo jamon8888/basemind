@@ -93,9 +93,6 @@ fn render_repo_statusline(root: &std::path::Path) -> String {
         fmt_count(calls),
         fmt_count(saved),
     ));
-    if status.is_degraded() {
-        out.push_str(&format!("  {SEP}│{RESET}  {BOLD}{MAGENTA}degraded{RESET}"));
-    }
     out
 }
 
@@ -213,12 +210,18 @@ pub(crate) fn cmd_comms(action: crate::CommsLifecycleCmd, json: bool) -> Result<
     match action {
         crate::CommsLifecycleCmd::Daemon => basemind::cli::comms_daemon::run(),
         crate::CommsLifecycleCmd::Start => cmd_comms_start(),
-        crate::CommsLifecycleCmd::Stop { all: true } => crate::comms_stop::cmd_comms_stop_all(json),
-        crate::CommsLifecycleCmd::Stop { all: false } => crate::comms_stop::cmd_comms_stop(json),
-        crate::CommsLifecycleCmd::Status => cmd_comms_status(json),
+        crate::CommsLifecycleCmd::Stop { all: true } => cmd_comms_stop_all(json),
+        crate::CommsLifecycleCmd::Stop { all: false } => cmd_comms_lifecycle_rpc(CommsRpc::Stop, json),
+        crate::CommsLifecycleCmd::Status => cmd_comms_lifecycle_rpc(CommsRpc::Status, json),
         crate::CommsLifecycleCmd::Doctor { probe, clear_fatal } => cmd_comms_doctor(json, probe, clear_fatal),
-        crate::CommsLifecycleCmd::Cleanup { dry_run, older_than } => cmd_comms_cleanup(json, dry_run, older_than),
     }
+}
+
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommsRpc {
+    Stop,
+    Status,
 }
 
 /// How long `daemon ensure` waits for the streamable-HTTP transport to answer after ensuring the
@@ -319,122 +322,127 @@ fn cmd_comms_start() -> Result<()> {
     Ok(())
 }
 
-/// `basemind comms cleanup`: remove the rendezvous of other protocol generations, and of releases
-/// up to 0.33, that no daemon holds and nothing has used for `older_than_days`. Reads locks and
-/// file ages only; this generation's directory is never a candidate. With `older_than_days` zero
-/// the age test is off, so the previous release's message store goes as soon as none of its
-/// daemons is running. It also removes the registry records other generations left for daemons
-/// that are gone, which otherwise count toward the daemon ceiling whenever their pid is reused.
+/// Connect to the running daemon and issue a Stop or Status RPC.
 #[cfg(all(feature = "comms", any(unix, windows)))]
-fn cmd_comms_cleanup(json: bool, dry_run: bool, older_than_days: u64) -> Result<()> {
-    use basemind::comms::generation_cleanup::{self, Rendezvous, Verdict};
-    const DAY_SECS: u64 = 24 * 60 * 60;
-
-    let base = basemind::comms::singleton::comms_base_dir().context("resolve the comms directory")?;
-    let max_age = std::time::Duration::from_secs(older_than_days.saturating_mul(DAY_SECS));
-    let findings = generation_cleanup::sweep(&base, max_age, dry_run, std::time::SystemTime::now());
-    // After the sweep, so that the record of a daemon whose directory it just removed goes too.
-    let stale_records = basemind::daemon_lock::prune_other_generations_records(dry_run);
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dry_run": dry_run,
-                "rendezvous": findings,
-                "stale_registry_records": stale_records,
-            })
-        );
-    } else if findings.is_empty() {
-        println!("nothing to clean up in {}", base.display());
-    }
-    if !json && stale_records > 0 {
-        let outcome = if dry_run { "would remove" } else { "removed" };
-        println!("{outcome}: {stale_records} registry record(s) of other generations whose daemon is gone");
-    }
-    for finding in findings.iter().filter(|_| !json) {
-        let name = match &finding.rendezvous {
-            Rendezvous::Generation(name) => base.join(name).display().to_string(),
-            Rendezvous::PreGeneration => format!("{} (files of releases up to 0.33)", base.display()),
-            Rendezvous::Leftover(name) => format!("{} (left by an interrupted cleanup)", base.join(name).display()),
-        };
-        let outcome = match finding.verdict {
-            Verdict::Removed if dry_run => "would remove",
-            Verdict::Removed => "removed",
-            Verdict::InUse => "kept (a daemon holds its lock)",
-            Verdict::Recent => "kept (used too recently)",
-            Verdict::Skipped => "skipped (no daemon.lock, so not a rendezvous)",
-            Verdict::Failed => "could not remove all of",
-        };
-        println!(
-            "{outcome}: {name} — {} bytes, idle {} days",
-            finding.bytes,
-            finding.idle_secs / DAY_SECS
-        );
-    }
-    anyhow::ensure!(
-        findings.iter().all(|finding| finding.verdict != Verdict::Failed),
-        "some files could not be removed"
-    );
-    Ok(())
-}
-
-/// `basemind comms status`: connect to the running daemon and print what it reports.
-#[cfg(all(feature = "comms", any(unix, windows)))]
-fn cmd_comms_status(json: bool) -> Result<()> {
+fn cmd_comms_lifecycle_rpc(rpc: CommsRpc, json: bool) -> Result<()> {
     use basemind::comms::client::CommsClient;
     use basemind::comms::singleton;
 
     let paths = singleton::resolve_paths().context("resolve comms paths")?;
+    let comms_dir = paths.comms_dir.clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
 
-    runtime.block_on(async move {
+    let verdict = runtime.block_on(async move {
         let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let agent = basemind::comms::identity::cli_agent_id(&root);
-        let mut client = CommsClient::connect(&paths, agent, None, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect to comms daemon: {e}"))?;
-        let status = client.status().await.map_err(|e| anyhow::anyhow!("status: {e}"))?;
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string(&status).map_err(|e| anyhow::anyhow!("serialize status: {e}"))?
-            );
-        } else {
-            println!(
-                "pid={} version={} build={} proto={} uptime={}s threads={} subscribers={}",
-                status.pid,
-                status.version,
-                if status.build_id.is_empty() {
-                    "unreported"
+        match rpc {
+            CommsRpc::Stop => {
+                // Bound the whole RPC, and never propagate its failure. A daemon that cannot answer
+                // is precisely the one an operator is trying to stop, and it fails in two ways that
+                // both used to defeat `stop`: a poisoned store fails the Hello handshake, so the
+                // command aborted before doing anything; and a daemon wedged before its accept loop
+                // never completes `connect` at all, so the command hung indefinitely. Time-box it
+                // and report what the RPC managed — the caller escalates to the pid. ~keep
+                match tokio::time::timeout(STOP_RPC_TIMEOUT, async {
+                    CommsClient::connect(&paths, agent, None, None).await?.stop().await
+                })
+                .await
+                {
+                    Ok(Ok(())) => return Ok::<StopVerdict, anyhow::Error>(StopVerdict::Accepted),
+                    // A daemon that answered with a refusal made an informed decision — `daemon_busy`
+                    // means persistent clients are still attached — so surface it and stop here. The
+                    // one exception is `store_error`: that daemon answered only to say it cannot
+                    // serve, which is the wedge the pid escalation exists for. ~keep
+                    Ok(Err(error)) => {
+                        if !is_broken_store_error(&error) {
+                            return Err(anyhow::anyhow!("stop: {error}"));
+                        }
+                        tracing::warn!(%error, "comms: daemon reports a broken store; falling back to pid reclaim");
+                        return Ok(StopVerdict::Reclaimable);
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_secs = STOP_RPC_TIMEOUT.as_secs(),
+                            "comms: daemon did not answer the stop RPC in time; falling back to pid reclaim"
+                        );
+                        return Ok(StopVerdict::Reclaimable);
+                    }
+                }
+            }
+            CommsRpc::Status => {
+                let mut client = CommsClient::connect(&paths, agent, None, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect to comms daemon: {e}"))?;
+                let status = client.status().await.map_err(|e| anyhow::anyhow!("status: {e}"))?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&status).map_err(|e| anyhow::anyhow!("serialize status: {e}"))?
+                    );
                 } else {
-                    &status.build_id
-                },
-                status.proto_ver,
-                status.uptime_secs,
-                status.threads,
-                status.subscribers,
-            );
-            // Same version, different binary: the case every version check passes and
-            // nobody thinks to look for. Say it outright — the symptom is a daemon quietly
-            // answering with the code it was built from, not the code just installed.
-            let ours = basemind::version::build_id();
-            if !status.build_id.is_empty() && status.build_id != ours {
-                println!(
-                    "  WARNING: this daemon is running a DIFFERENT build of the same version \
-                     (daemon {} vs this binary {}).",
-                    status.build_id, ours
-                );
-                println!(
-                    "  It will keep answering with its own code — a version check cannot see this. \
-                     Restart it with `basemind comms stop` to pick up the current binary."
-                );
+                    println!(
+                        "pid={} version={} build={} proto={} uptime={}s threads={} subscribers={}",
+                        status.pid,
+                        status.version,
+                        if status.build_id.is_empty() {
+                            "unreported"
+                        } else {
+                            &status.build_id
+                        },
+                        status.proto_ver,
+                        status.uptime_secs,
+                        status.threads,
+                        status.subscribers,
+                    );
+                    // Same version, different binary: the case every version check passes and
+                    // nobody thinks to look for. Say it outright — the symptom is a daemon quietly
+                    // answering with the code it was built from, not the code just installed.
+                    let ours = basemind::version::build_id();
+                    if !status.build_id.is_empty() && status.build_id != ours {
+                        println!(
+                            "  WARNING: this daemon is running a DIFFERENT build of the same version \
+                             (daemon {} vs this binary {}).",
+                            status.build_id, ours
+                        );
+                        println!(
+                            "  It will keep answering with its own code — a version check cannot see this. \
+                             Restart it with `basemind comms stop` to pick up the current binary."
+                        );
+                    }
+                }
             }
         }
-        Ok(())
-    })
+        Ok::<StopVerdict, anyhow::Error>(StopVerdict::Accepted)
+    })?;
+
+    if !matches!(rpc, CommsRpc::Stop) {
+        return Ok(());
+    }
+    // Confirm the daemon for THIS comms dir actually went away, escalating to its pid if it did not.
+    // `asked_to_stop` only records whether the RPC was accepted — a daemon can accept a Stop and
+    // still be wedged before it reaches the drain, so the pid is the thing worth verifying. ~keep
+    let ours: Vec<_> = basemind::daemon_lock::live_daemons_of(basemind::daemon_lock::DaemonKind::Comms)
+        .into_iter()
+        .filter(|record| record.dir == comms_dir)
+        .collect();
+    let forced = reclaim_unresponsive(&ours);
+    let accepted = verdict == StopVerdict::Accepted;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "stopped": accepted, "force_terminated": forced })
+        );
+    } else if forced > 0 {
+        println!("comms daemon did not answer; terminated it by pid");
+    } else if accepted {
+        println!("comms daemon stopping");
+    } else {
+        println!("no live comms daemon for {}", comms_dir.display());
+    }
+    Ok(())
 }
 
 /// Unix seconds now, or `0` if the clock is before the epoch.
@@ -446,10 +454,8 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// `basemind comms doctor`: enumerate this protocol generation's live daemons registered on this
-/// machine — every family in the registry, each row tagged with its `kind` — and flag a pile-up
-/// over the ceiling. Daemons of other generations (a release up to 0.33, say) are counted from
-/// their registry records and never listed or probed: they may not speak this binary's protocol.
+/// `basemind comms doctor`: enumerate the live daemons registered on this machine — every family in
+/// the shared registry, each row tagged with its `kind` — and flag a pile-up over the ceiling.
 ///
 /// The default report is pure and cheap — it reads the pidfile registry (pruning dead holders) and
 /// issues no daemon RPC — so it is safe to run even when the machine is in a bad state. That
@@ -541,12 +547,11 @@ fn cmd_comms_doctor(json: bool, probe: bool, clear_fatal: bool) -> Result<()> {
     let stale_scans = basemind::scan_evidence::stale_inflight_scans();
 
     let daemons = daemon_lock::live_daemons();
-    let other_generations = daemon_lock::count_live_daemons_of_other_generations(DaemonKind::Comms);
     let ceiling = daemon_lock::max_live_daemons();
     let now = now_unix();
 
-    // Probe only the comms family: a `shells` daemon left by an older release sits in the same registry
-    // but does not speak this protocol on a comms socket, so a Status RPC there would be meaningless.
+    // Probe only the comms family: `agent` and `shells` daemons are registered in the same registry
+    // but do not speak this protocol on a comms socket, so a Status RPC there would be meaningless.
     let verdicts: Vec<Option<singleton::DaemonProbe>> = daemons
         .iter()
         .map(|record| {
@@ -583,9 +588,8 @@ fn cmd_comms_doctor(json: bool, probe: bool, clear_fatal: bool) -> Result<()> {
             .collect();
         let report = serde_json::json!({
             "count": daemons.len(),
-            "other_generations": other_generations,
             "ceiling": ceiling,
-            "over_ceiling": daemons.len() + other_generations > ceiling,
+            "over_ceiling": daemons.len() > ceiling,
             "checked": if probe { "registry+probe" } else { "registry" },
             "daemons": items,
             "last_fatal_store_error": fatal.as_ref().map(|(dir, record)| serde_json::json!({
@@ -622,18 +626,12 @@ fn cmd_comms_doctor(json: bool, probe: bool, clear_fatal: bool) -> Result<()> {
                 );
             }
         }
-        if daemons.len() + other_generations > ceiling {
+        if daemons.len() > ceiling {
             println!(
                 "WARNING: {} daemons exceed the ceiling of {ceiling}; run `basemind comms stop --all` to reclaim",
-                daemons.len() + other_generations,
+                daemons.len(),
             );
         }
-    }
-    if other_generations > 0 {
-        println!(
-            "{other_generations} more comms daemon(s) belong to other basemind versions' protocol generations. \
-             They count toward the ceiling; this version does not list, probe or stop them."
-        );
     }
 
     if let Some((dir, record)) = &fatal {
@@ -696,6 +694,123 @@ fn humanize_age(secs: i64) -> String {
         s if s < 86400 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86400),
     }
+}
+
+/// `basemind comms stop --all`: signal every live comms daemon on this machine to drain, addressing
+/// each by its own socket. Uses the low-level [`singleton::request_stop`] rather than a `CommsClient`
+/// (which could respawn the very daemon it meant to stop).
+#[cfg(all(feature = "comms", any(unix, windows)))]
+fn cmd_comms_stop_all(json: bool) -> Result<()> {
+    use basemind::comms::singleton;
+    use basemind::daemon_lock::{self, DaemonKind};
+
+    // Comms-only: this addresses each holder over the comms stop protocol, which another daemon
+    // family in the shared registry does not speak.
+    let daemons = daemon_lock::live_daemons_of(DaemonKind::Comms);
+    // Classify each answer rather than discarding it. A daemon that ignored the request is exactly
+    // the case `stop` most needs to handle — asking it to drain is itself a request, and a daemon
+    // whose store is broken can refuse it, so the documented recovery path would otherwise route
+    // through the very subsystem that is down. But a daemon that answered `daemon_busy` made an
+    // informed decision to protect the persistent clients attached to it, and reclaiming THAT one
+    // by pid is the severing the refusal exists to prevent. Only the former may be escalated. ~keep
+    let mut reclaimable = Vec::new();
+    let mut refused = Vec::new();
+    for record in &daemons {
+        let outcome = singleton::request_stop_classified(&singleton::comms_socket_path(&record.dir));
+        if outcome.permits_reclaim() {
+            reclaimable.push(record.clone());
+        } else if let singleton::StopOutcome::Refused { code, message } = outcome {
+            refused.push((record.pid, code, message));
+        }
+    }
+    let forced = reclaim_unresponsive(&reclaimable);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "stopped": reclaimable.len(),
+                "force_terminated": forced,
+                "refused": refused
+                    .iter()
+                    .map(|(pid, code, message)| serde_json::json!({
+                        "pid": pid,
+                        "code": code,
+                        "message": message,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        );
+    } else if daemons.is_empty() {
+        println!("no live basemind daemons to stop");
+    } else {
+        println!("asked {} daemon(s) to stop", daemons.len());
+        if forced > 0 {
+            println!("  force-terminated {forced} daemon(s) that did not answer the stop request");
+        }
+        for (pid, code, message) in &refused {
+            println!("  pid={pid} refused [{code}]: {message}");
+            println!("    left running — stopping it would disconnect the clients it is serving");
+        }
+    }
+    Ok(())
+}
+
+/// What the `Stop` RPC established, and therefore whether escalating to the pid is warranted.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopVerdict {
+    /// The daemon took the request (or there was nothing to ask).
+    Accepted,
+    /// Nothing answered, or the answer proved the store is broken.
+    Reclaimable,
+}
+
+/// Whether a failed `Stop` came back as the broker's `store_error` — the one refusal that is not a
+/// decision but a symptom, and so does not protect the daemon from being reclaimed.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+fn is_broken_store_error(error: &basemind::comms::client::CommsClientError) -> bool {
+    matches!(error, basemind::comms::client::CommsClientError::Broker { code, .. } if code == "store_error")
+}
+
+/// Hard bound on the `Stop` RPC itself — connect plus request. A daemon wedged before its accept
+/// loop never completes the connect, which used to hang `basemind comms stop` indefinitely: the
+/// documented recovery path blocked on the very daemon it was meant to reclaim.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+const STOP_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a daemon has to honour a `Stop` request before [`reclaim_unresponsive`] escalates to
+/// its pid. Generous relative to a drain that is actually progressing (the daemon's own drain grace
+/// is 10s), so a busy-but-healthy daemon is never killed out from under an in-flight request.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Wait out [`STOP_GRACE`] and terminate any daemon still alive, returning how many were forced.
+///
+/// This is the half of recovery that `stop` was missing. `request_stop` is best-effort by design,
+/// so a daemon that cannot serve simply stays put — holding the singleton flock and the socket,
+/// with `pid_is_live` keeping its registry row alive, indefinitely.
+#[cfg(all(feature = "comms", any(unix, windows)))]
+fn reclaim_unresponsive(daemons: &[basemind::daemon_lock::DaemonRecord]) -> usize {
+    use basemind::comms::singleton;
+    use basemind::daemon_lock::pid_is_live;
+
+    let deadline = std::time::Instant::now() + STOP_GRACE;
+    let mut stubborn: Vec<u32> = daemons.iter().map(|record| record.pid).collect();
+    while std::time::Instant::now() < deadline {
+        stubborn.retain(|pid| pid_is_live(*pid));
+        if stubborn.is_empty() {
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    stubborn
+        .iter()
+        .filter(|pid| {
+            tracing::warn!(pid, "comms: daemon ignored the stop request; terminating by pid");
+            singleton::force_terminate(**pid, std::time::Duration::from_secs(3))
+        })
+        .count()
 }
 
 #[cfg(all(test, feature = "comms", any(unix, windows)))]
