@@ -6,959 +6,952 @@
       "code": "AR021",
       "file": ".ai-rulez/agents/surface-docs-writer.md",
       "message": "runs \"ai-rulez@latest\" without pinning it (@latest is a moving tag); pin a version so a new release cannot change what runs",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f95a9ad739d2114cbb3bff56",
       "code": "AR964",
       "file": ".ai-rulez/config.toml",
       "message": "rules and context add up to 46877 bytes, past the 32768-bytes AGENTS.md chain limit of the codex harness (https://learn.chatgpt.com/docs/agent-configuration/agents-md); content past it is not loaded",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:50e0e18462cbba7747a6a1db",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/agents/development.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:5296b255785e6f4a9225ead2",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/agents/codebase-map.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:5ea74c3f4d74e850413785f2",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/ARCHITECTURE.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9476969e041021096b61d5e6",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/agents/README.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ee00000127073836abfc484a",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/agents/integrations.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f9a34be1e582eb6d3ef230ce",
       "code": "AR9B2",
       "file": ".ai-rulez/context/crate-layout.md",
       "message": "link ../../docs/agents/features.md does not resolve to a file in the bundle",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:543ad0a417e396f56f2e5acc",
       "code": "AR703",
       "file": ".ai-rulez/rules/adr-immutability.md",
       "message": "rule \"adr-immutability\" is defined in .ai-rulez/rules/adr-immutability.md (kept) and builtin://universal/documentation/rules/adr-immutability.md (dropped); rename one, or list \"adr-immutability\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:b5a28a6e1e0b79a4a9014aee",
       "code": "AR301",
       "file": ".ai-rulez/rules/basemind-usage.md",
       "message": "references command \"bm-init\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:34c0f7ead4492b30fa5f0769",
       "code": "AR301",
       "file": ".codex-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:57a75cefcccd097c7d3d2dda",
       "code": "AR301",
       "file": ".codex-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:92885dcbf0e4942c3dc15f21",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2d803d01e8de4a40be4df597",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:bab95b9328c8b739b91105bf",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1ba066609aa8d696384510d7",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2a8aa84efef21c1161d35e65",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:872b8c134e194d8e65b4c608",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:b1a9646fb403fe90f69bbdf2",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3f3ee70d31191554d5fc4cc6",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e03a305c30b64fc0c463ccc1",
       "code": "AR301",
       "file": ".cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:eeceee7b4be06dd7c7aace4d",
       "code": "AR301",
       "file": ".cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:200be3c695c945dd75b364e4",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:568ef46c74f914c6cbadf3a2",
       "code": "AR701",
       "file": ".cursor-plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:dd1fc3e0a30517bd2973faf0",
       "code": "AR301",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f15c03368623ea3716439389",
       "code": "AR301",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:35861f8fcae8468a2b2f262e",
       "code": "AR301",
       "file": ".hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:4a67cafe9d23932da747d3f0",
       "code": "AR301",
       "file": ".hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d81e65f7db3c7ccb5b69797c",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1a14cf16f95e0b31e3f8bfa4",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e061057e809db8dc5582f287",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:10b0b1f188b383a8f28a2cb9",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:7dd231629ec0a93f901a2644",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:66788691e3b3b6c2c008109a",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2cff69c4b88c8a30f315babe",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9de72920d25f898508ff2083",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3b1676216b264d0335197e54",
       "code": "AR301",
       "file": "opencode-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d3f338e2a7cf977f4be6918a",
       "code": "AR301",
       "file": "opencode-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:6bf1ebd106696a7978a5a907",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:fa37a6f0473eac83063e9b80",
       "code": "AR701",
       "file": "opencode-plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:64bea92c92db0da208c33ca0",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d2b8bd4f2b65e2cc4eb8aa57",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:48144241e22975825b70c4f5",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:0ed2449e18aff054f0c27725",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:502cf03dc43279381147fafd",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:c78984da668d357f75fa355e",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3785938cd84ab762d4868cbd",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ac509e364c7b003468df3a5a",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1bd517fb68c7d15b2b495181",
       "code": "AR301",
       "file": "plugin/.ai-rulez/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:50fd9f193975f4931bee2c72",
       "code": "AR301",
       "file": "plugin/.ai-rulez/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e3f16e1b07d0a5fac50fc873",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ae212b269695ff04ddadf96e",
       "code": "AR701",
       "file": "plugin/.ai-rulez/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3ed1464551c423a6b743c5d5",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:389ea416ec9799b7c6cbc453",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ba6d178e8187ce027bd111e6",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:c6cf72dae7ccb01ec054f1ce",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:4cce48905cb0f490ba4ea188",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:bc9a28867a45e6bb1e4f78c5",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ac243bc6143f24daf4962693",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:b1474fdab77eac8fdadcc3f3",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9780f837cb8fb326cdfbb3aa",
       "code": "AR301",
       "file": "plugin/.cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:b16d8558137b9703685b634f",
       "code": "AR301",
       "file": "plugin/.cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e0e57773aa5b83c8c1ba61fa",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:c71d75fda0bc55fa0a49ce28",
       "code": "AR701",
       "file": "plugin/.cursor-plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d21ce3a864bc8d1dbc95c515",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:8f18ae718ce88a74d6504e70",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:bd8dec3eae77b8325eda3036",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:12051ffff15a04e4c09d9aeb",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:37a4e8c2072d677f0c14b66e",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:472ff3c068feb827b64490dc",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:127ecbf27122365c666cfbeb",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:6aa4eb5bd2250bc3339d2a33",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:97065b999f1767b66d6220c0",
       "code": "AR301",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:fa0c61f0df96a2d9dd55388e",
       "code": "AR301",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:142a6bb4646e0532a8dcff47",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3b35531b8ae78bc1c368d231",
       "code": "AR701",
       "file": "plugin/.hermes/package/src/basemind_hermes_plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:92981999780ad07071190e38",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:c0789248d22666b08b3e28da",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:31bd7866eec84d8854cc0280",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:b84c6362fb4340cb5e9457d8",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ddc86b46fbd714f9ffb5dbf0",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:705204950e91d227389f5212",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:0fb3c4b8ed5d0da67f93346c",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2efb9997e1f259d0d4a67163",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:410d261d10158081b202c49c",
       "code": "AR301",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9c6707dd55535e0f82e9131f",
       "code": "AR301",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:39e7e012cadf552e1128c4ed",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:c57074eb2dfecb066dd943c2",
       "code": "AR701",
       "file": "plugin/.hermes/plugins/basemind/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
-    },
-    {
-      "fingerprint": "ar1:2ed7dc514816f64fac275bec",
-      "code": "AR602",
-      "file": "plugin/.mcp.json",
-      "message": "MCP server \"basemind\": conflicts with the definition in .mcp.json: the same name resolves to a different endpoint or transport, and a harness reads only one of them",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:020190bb92dc05b7b2ee620b",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3b74b413be1a1290f68f0dcb",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:af0729ced345c4fc43d3e4ee",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:607a7b25ecf8c6ee281615c3",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1fcce5d0ffda219bb43b8808",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:20508a0e9ecdae3b0d0e7c3f",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:ebe1970ac98abe6960d9d90f",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9b5b30df38e9f9d1b097c602",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:5e0565da7b1a6e99394220c5",
       "code": "AR301",
       "file": "plugin/.opencode/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:66ed69174ecd77d4a75b9b3d",
       "code": "AR301",
       "file": "plugin/.opencode/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:71a9ad298fa5cbde41c264c4",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:7eff5d7ba7a0976e3149a0cc",
       "code": "AR701",
       "file": "plugin/.opencode/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:9cc225d944cd7ac808d24109",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:84d10d95111818f7c1acb03c",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f537baafd616731835916787",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2a8d88492d5d50262a32e0f1",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:28d4d170789916e575e86b8b",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1a3925322ca22f5d00bce95a",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:2b96c61544a3289c08f83b14",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:0130674c5f7e863243beaab6",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:4617731cc0e997d10bbd75c9",
       "code": "AR301",
       "file": "plugin/.pi/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f898071ba741a9403a15d04a",
       "code": "AR301",
       "file": "plugin/.pi/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:522efc2f91c953df26224673",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d62a6c0a2920f6715300b487",
       "code": "AR701",
       "file": "plugin/.pi/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d61cdb87fe81a43a7260f7f7",
       "code": "AR701",
       "file": "plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:aed1c2d117ae015fb0ce8d53",
       "code": "AR701",
       "file": "plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:f189953720f3c34a288dd4d3",
       "code": "AR701",
       "file": "plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:201546c456b10bc56d3053a9",
       "code": "AR701",
       "file": "plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:1527b3f6cd3746ffc96b01f1",
       "code": "AR701",
       "file": "plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:576ad5eb3ae5cf547dbe367d",
       "code": "AR701",
       "file": "plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:d8f125c7b08e473c6c02f257",
       "code": "AR701",
       "file": "plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:eee754c486ecd487f5270a25",
       "code": "AR701",
       "file": "plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:882e3b01c88c22b9e04c884f",
       "code": "AR301",
       "file": "plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:decffb7431c1c4578a6a04b9",
       "code": "AR301",
       "file": "plugin/skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:cbbf464f1ef7d244d9a958bf",
       "code": "AR701",
       "file": "plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:cd27363b5d91e75e966d3ae4",
       "code": "AR701",
       "file": "plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:3e0f655324235a6aba443f69",
       "code": "AR701",
       "file": "skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (.codex-plugin/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:7b5d9695ab6c5b6e93d266e1",
       "code": "AR701",
       "file": "skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (.codex-plugin/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e171564f26feab5968fb6de7",
       "code": "AR701",
       "file": "skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (.codex-plugin/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:67d44b67507a2071deed3af5",
       "code": "AR701",
       "file": "skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (.codex-plugin/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:889195bc0cbf7458853cea5d",
       "code": "AR701",
       "file": "skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (.codex-plugin/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:896a212e443ccea529b29c9a",
       "code": "AR701",
       "file": "skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (.codex-plugin/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:833bf6cf8620441a97d69dfc",
       "code": "AR701",
       "file": "skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (.codex-plugin/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:19a7c0b14a563eb4754f7ce6",
       "code": "AR701",
       "file": "skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (.codex-plugin/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:5d9486e580cbeff50977c02d",
       "code": "AR301",
       "file": "skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:e36f15a9f234f4bda186e13a",
       "code": "AR301",
       "file": "skills/basemind-stats/SKILL.md",
       "message": "references command \"bm-stats\", which no local file defines; it may come from an installed plugin",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:69fa7fb6efd61c9a638c4c9d",
       "code": "AR701",
       "file": "skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (.codex-plugin/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     },
     {
       "fingerprint": "ar1:524ba2beb66a7e51af8f186f",
       "code": "AR701",
       "file": "skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (.codex-plugin/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config"
+      "reason": "pre-existing fork governance findings carried over from v4 config"
     }
   ]
 }
