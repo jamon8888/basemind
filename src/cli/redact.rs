@@ -52,6 +52,12 @@ pub struct RedactArgs {
     #[arg(long, value_name = "PROFILE")]
     pub ner_profile: Option<String>,
 
+    /// Comma-separated Tesseract language packs for OCR (ISO 639-3 codes like `fra`, `eng`).
+    /// Overrides the `[documents.ocr] languages` config when set. Only used when `--file`
+    /// points to an image or scanned PDF.
+    #[arg(long, value_delimiter = ',', value_name = "LANGS")]
+    pub ocr_languages: Vec<String>,
+
     /// Output machine-readable JSON regardless of TTY.
     #[arg(long)]
     pub json: bool,
@@ -108,6 +114,11 @@ pub async fn run(server: &BasemindServer, args: &RedactArgs, opts: &render::Emit
         ner_model_dir: args.ner_model_dir.clone(),
         ner_profile: args.ner_profile.clone(),
         require_ner: false,
+        ocr_languages: if args.ocr_languages.is_empty() {
+            None
+        } else {
+            Some(args.ocr_languages.clone())
+        },
     };
 
     let result = server
