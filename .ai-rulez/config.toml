@@ -1,4 +1,4 @@
-version = "4.0"
+version = "5.0"
 name = "basemind"
 description = "Code-map MCP server + scanner — pure-Rust, content-addressed, Fjall-backed inverted index."
 gitignore = true
@@ -6,10 +6,12 @@ gitignore = true
 presets = ["claude", "codex"]
 
 builtins = ["rust", "cicd", "documentation", "observability", "default-commands"]
+# Pinned by `ai-rulez migrate v5`: the 4.x default. Remove this line to take the v5 default.
+agents_md = false
 
 [plugin]
 name = "basemind"
-version = "0.38.0"
+version = "0.38.1"
 display_name = "basemind"
 description = "Full AI context layer over MCP — tree-sitter code-map, document RAG (PDF/Office/HTML/email + OCR + reranker), shared agent memory, on-demand web crawl, git history + blame + per-symbol diff. 300+ languages, 10+ coding-agent harnesses, content-addressed Fjall + LanceDB."
 homepage = "https://github.com/Goldziher/basemind"
@@ -47,3 +49,11 @@ marketplace = "basemind"
 name = "basemind"
 scope = "project"
 enabled = true
+
+# Pinned by `ai-rulez migrate v5`: the 4.x default. Remove this line to take the v5 default.
+[header]
+hashes = "full"
+
+# Pinned by `ai-rulez migrate v5`: the 4.x default. Remove this line to take the v5 default.
+[mcp]
+self_server = false

@@ -21,7 +21,7 @@ store cannot exist at all in an embedding-free deployment:
   `website/src/content/docs/reference/configuration.mdx:157` both promise "keyword search" in that
   mode. No such lane exists — the promise is unimplemented.
 - No FTS index is ever created. `grep` finds no `Index::FTS` / `create_index` call for the
-  documents table. LanceDB 0.37.1 (pinned at `Cargo.toml:170`; 0.38.0 does not build without its
+  documents table. LanceDB 0.37.1 (pinned at `Cargo.toml:170`; 0.38.1 does not build without its
   `remote` feature) exposes the machinery in Rust: `Index::FTS(FtsIndexBuilder)`,
   `Query::full_text_search(FullTextSearchQuery)`, `.rerank(Arc<dyn Reranker>)` with
   `lancedb::rerankers::rrf::RRFReranker`, and `lancedb::tokenize`.
