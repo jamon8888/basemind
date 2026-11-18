@@ -11,9 +11,9 @@
     },
     "ai-rulez": {
       "args": [
-        "mcp"
+        "-y", "ai-rulez@5.14.0", "mcp"
       ],
-      "command": "ai-rulez",
+      "command": "npx",
       "type": "stdio"
     }
   }
