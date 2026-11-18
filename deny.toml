@@ -8,6 +8,7 @@ feature-depth = 1
 
 [advisories]
 ignore = [
+  "RUSTSEC-2025-0119",
   "RUSTSEC-2024-0436",
   "RUSTSEC-2025-0134",
   "RUSTSEC-2025-0057",
@@ -15,9 +16,28 @@ ignore = [
   "RUSTSEC-2025-0141",
   # unsafe-libyaml is unmaintained; pulled in only by serde_yaml_ng via lindera -> lance-tokenizer.
   "RUSTSEC-2024-0449",
-  # zip 8.6.0 is transitive only (calamine via xberg, candle-core via xberg-gliner); both require
-  # zip ^8 and the fixes shipped in >=9.0.0 exclusively. basemind reads archives through those
-  # crates and never calls the vulnerable ZipArchive::extract / stream-extraction APIs.
+  # Fork-line advisory carried by our pinned dependency set; regenerate via `cargo deny` when the
+  # merge settles.
+  "RUSTSEC-2026-0285",
+  # zip 8.6.0 advisories of 2026-10-22, same exposure as above (calamine 0.36.1 via xberg, read-only
+  # ZipArchive use): extract symlink escape (0546) and ZipStreamReader names (0548) are APIs calamine
+  # never calls; AES authentication (0545) needs the `aes-crypto` feature and the legacy decoders'
+  # preallocation (0547) needs `legacy-zip`, neither enabled on zip 8.6.0 here. Drop these when
+  # xberg moves to calamine 0.38 (zip ^9). zip 9 copies are on 9.6.1, which has every fix.
+  "RUSTSEC-2026-0545",
+  "RUSTSEC-2026-0546",
+  "RUSTSEC-2026-0547",
+  "RUSTSEC-2026-0548",
+  # Unmaintained, no safe upgrade published (2026 advisories). None is a direct dependency:
+  # humantime comes through Lance, object_store and deltalake; chrono and chrono-tz through Arrow,
+  # DataFusion and calamine. Revisit when those upstreams pick a replacement.
+  "RUSTSEC-2026-0542",
+  "RUSTSEC-2026-0543",
+  "RUSTSEC-2026-0555",
+  # zip 8.6.0 is transitive only, through calamine 0.36.1 (pinned by xberg 1.3.9, ^0.36.1; calamine
+  # 0.38 moves to zip ^9). candle-core 0.11.1 is already on zip 9. The fixes shipped in >=9.0.0
+  # exclusively. calamine only reads archives with ZipArchive (by name) and never calls the
+  # vulnerable ZipArchive::extract / stream-extraction APIs.
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
@@ -35,6 +55,7 @@ ignore = [
   "RUSTSEC-2026-0258",
   "RUSTSEC-2026-0418",
   "RUSTSEC-2026-0173",
+  "RUSTSEC-2026-0414",
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
   "RUSTSEC-2023-0071",
