@@ -23,8 +23,14 @@ if [ -z "$PLUGIN_ROOT" ]; then
 fi
 
 BINARY_NAME="basemind"
+# Set on Git Bash, MSYS2 and Cygwin, whose ps and paths differ from every Unix. ~keep
+MSYS_SHELL=""
 case "$(uname -s)" in
-MINGW* | MSYS* | CYGWIN* | Windows_NT) BINARY_NAME="basemind.exe" ;;
+MINGW* | MSYS* | CYGWIN*)
+  BINARY_NAME="basemind.exe"
+  MSYS_SHELL=1
+  ;;
+Windows_NT) BINARY_NAME="basemind.exe" ;;
 esac
 
 # BASEMIND_FORCE_VERSION pins the launcher to a specific version instead of the ~keep
@@ -50,64 +56,161 @@ else
   [ -n "$VERSION" ] || die "could not read version from $MANIFEST"
 fi
 
-CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/basemind/bin/$VERSION"
+# Cached versions live under versions/. Launchers up to 0.33 keep theirs under the sibling bin/, ~keep
+# where each of them stops every process started from another version's directory and deletes ~keep
+# that directory. Nothing here installs into or launches from bin/, so those launchers never see ~keep
+# this one's versions. While such a launcher is still in use it manages bin/ itself; this one only ~keep
+# removes what is left there once nothing has used it for PRUNE_AFTER_DAYS. ~keep
+PARENT="${XDG_CACHE_HOME:-$HOME/.cache}/basemind/versions"
+LEGACY_PARENT="${XDG_CACHE_HOME:-$HOME/.cache}/basemind/bin"
+CACHE_ROOT="$PARENT/$VERSION"
 MANAGED_BIN="$CACHE_ROOT/$BINARY_NAME"
-PARENT="$(dirname "$CACHE_ROOT")"
+
+# Days a cached version must go unused before it may be pruned. ~keep
+PRUNE_AFTER_DAYS="${BASEMIND_PRUNE_AFTER_DAYS:-14}"
+case "$PRUNE_AFTER_DAYS" in
+'' | *[!0-9]*) PRUNE_AFTER_DAYS=14 ;;
+esac
+# Minutes an install lock or staging directory must sit untouched before it counts as abandoned. ~keep
+STALE_INSTALL_MINUTES=10
 
 binary_version() { "$1" --version 2>/dev/null | awk '{print $2}'; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-prune_stale_versions() {
-  [ -d "$PARENT" ] || return 0
-  local entry base
-  for entry in "$PARENT"/*/; do
+# The running processes, one per line, each line starting with the path the process was started ~keep
+# from. Fails when the list cannot be read. On Unix a line is the whole argument string. The ps of ~keep
+# Git Bash, MSYS2 and Cygwin takes none of the POSIX output options; its -W lists every Windows ~keep
+# process with the executable's path as the last column, which is cut out from the first drive ~keep
+# letter or slash on, since the columns before it hold neither. ~keep
+process_list() {
+  have ps || return 1
+  if [ -n "$MSYS_SHELL" ]; then
+    ps -W 2>/dev/null | awk 'NR > 1 && match($0, /[A-Za-z]:[\\\/]|\//) { print substr($0, RSTART) }'
+  else
+    # -ww: BSD and macOS ps otherwise cut each line at the terminal width. ~keep
+    ps -A -ww -o args= 2>/dev/null
+  fi
+}
+
+# Whether a running process may have been started from the cached version directory $1 (trailing ~keep
+# slash included). Each line of the process list is matched by prefix, so a cache path with spaces ~keep
+# still matches, against the directory as given and as `pwd -P` resolves it. Under an MSYS shell ~keep
+# the list holds Windows paths, so both spellings go through cygpath first and the comparison ~keep
+# ignores case and the direction of the slashes. Answers yes when the process list cannot be read ~keep
+# or a path cannot be converted: an unused directory costs disk, a deleted one in use costs a ~keep
+# session. ~keep
+version_in_use() {
+  local dir="$1" physical listing
+  listing="$(process_list)" || return 0
+  [ -n "$listing" ] || return 0
+  physical="$(cd "$dir" 2>/dev/null && pwd -P)" || physical=""
+  [ -n "$physical" ] && physical="${physical%/}/"
+  if [ -n "$MSYS_SHELL" ]; then
+    have cygpath || return 0
+    dir="$(cygpath -m "$dir" 2>/dev/null)" || return 0
+    [ -n "$dir" ] || return 0
+    dir="${dir%/}/"
+    if [ -n "$physical" ]; then
+      physical="$(cygpath -m "$physical" 2>/dev/null)" || return 0
+      [ -n "$physical" ] && physical="${physical%/}/"
+    fi
+  fi
+  # Through the environment, not -v: awk unescapes a -v value, and a path may hold a backslash. ~keep
+  printf '%s\n' "$listing" | PRUNE_DIR="$dir" PRUNE_PHYSICAL="$physical" PRUNE_WINDOWS="$MSYS_SHELL" awk '
+    BEGIN {
+      dir = ENVIRON["PRUNE_DIR"]
+      physical = ENVIRON["PRUNE_PHYSICAL"]
+      windows = ENVIRON["PRUNE_WINDOWS"]
+      if (windows != "") {
+        dir = tolower(dir)
+        physical = tolower(physical)
+      }
+    }
+    {
+      line = $0
+      if (windows != "") {
+        gsub(/\\/, "/", line)
+        line = tolower(line)
+      }
+      if (index(line, dir) == 1 || (physical != "" && index(line, physical) == 1)) found = 1
+    }
+    END { exit !found }'
+}
+
+# Whether $1 was last modified more than $2 minutes ago. No when its age cannot be read. ~keep
+older_than_minutes() {
+  local old
+  old="$(find "$1" -maxdepth 0 -mmin "+$2" 2>/dev/null)" || return 1
+  [ -n "$old" ]
+}
+
+# Record that the cached version in directory $1 is being launched now. A launcher is a shell until ~keep
+# it execs, so the process list cannot show that it is about to start that version; the marker can. ~keep
+mark_used() {
+  [ -d "$1" ] || return 0
+  touch "$1/.last-used" 2>/dev/null || true
+}
+
+# Whether the cached version directory $1 (trailing slash included) was last launched more than ~keep
+# PRUNE_AFTER_DAYS ago, by its marker, or by its own age when it has none. ~keep
+unused_long_enough() {
+  local marker="$1.last-used"
+  [ -e "$marker" ] || marker="$1"
+  older_than_minutes "$marker" "$((PRUNE_AFTER_DAYS * 1440))"
+}
+
+# Remove the cached version directories under $1, except the one named $2, but only those nothing ~keep
+# has launched for PRUNE_AFTER_DAYS and no running process was started from (another install, or a ~keep
+# session opened before an update, whose daemon re-executes the binary), and never one an install ~keep
+# holds the lock for. Nothing here stops a process of another version; daemons of different ~keep
+# versions coexist, and each exits on its own once idle. A symlinked entry is never touched: the ~keep
+# launcher did not create it, and removing through it would empty the directory it points at. ~keep
+prune_unused_under() {
+  local parent="$1" keep="$2" entry base
+  [ -d "$parent" ] || return 0
+  for entry in "$parent"/*/; do
     [ -d "$entry" ] || continue
+    [ -L "${entry%/}" ] && continue
     base="$(basename "$entry")"
-    [ "$base" = "$VERSION" ] && continue
+    [ "$base" = "$keep" ] && continue
     case "$base" in
-    [0-9]*) rm -rf "$entry" 2>/dev/null || true ;;
+    [0-9]*)
+      [ -e "$parent/.lock-$base" ] && continue
+      unused_long_enough "$entry" || continue
+      version_in_use "$entry" || rm -rf "${entry%/}" 2>/dev/null || true
+      ;;
     esac
   done
 }
 
-# Terminate basemind processes (serve, comms/write/shell daemons — all the same binary) that ~keep
-# belong to a DIFFERENT cached version than the one we are about to exec, so a version update ~keep
-# converges the machine on a single generation instead of leaking orphans across sessions. Matches ~keep
-# by argv[0] under the cache bin root; keeps everything under keep_dir. Unix-only and strictly ~keep
-# best-effort — it never blocks or fails the launch (Windows has no reliable ps-based reap). ~keep
-reap_other_versions() {
-  local keep_dir="$1"
-  case "$(uname -s)" in
-  MINGW* | MSYS* | CYGWIN* | Windows_NT) return 0 ;;
-  esac
-  have ps || return 0
-  local pids
-  pids="$(ps -axo pid=,args= 2>/dev/null | awk -v root="$PARENT/" -v keep="$keep_dir/" -v me="$$" '
-		{ pid = $1; path = $2 }
-		pid == me { next }
-		index(path, root) == 1 && index(path, keep) != 1 { print pid }')"
-  [ -n "$pids" ] || return 0
-  log "reaping stale-version basemind processes: $(printf '%s' "$pids" | tr '\n' ' ')"
-  printf '%s\n' "$pids" | xargs kill -TERM 2>/dev/null || true
-  local waited=0 alive p
-  while [ "$waited" -lt 20 ]; do
-    alive=0
-    for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
-    [ "$alive" -eq 0 ] && break
-    sleep 0.1
-    waited=$((waited + 1))
-  done
-  printf '%s\n' "$pids" | xargs kill -KILL 2>/dev/null || true
+# Prune this launcher's cache, and the cache the launchers up to 0.33 left behind. A version there ~keep
+# has no marker, so it is judged by its directory's age: one installed long ago that nothing runs ~keep
+# from. If a 0.33 launcher is still in use after all, it downloads its version again. ~keep
+prune_stale_versions() {
+  prune_unused_under "$PARENT" "$VERSION"
+  prune_unused_under "$LEGACY_PARENT" ""
 }
 
-# Remove leftover install lock/staging dirs from other versions (crashed or superseded installs). ~keep
-# The lock for VERSION is preserved — a concurrent session may be holding it to install right now. ~keep
+# Remove install lock and staging directories a crashed install left behind. Another version's ~keep
+# install may be running right now, so an entry goes only once it has sat untouched for ~keep
+# STALE_INSTALL_MINUTES, and a staging directory only when the process named in it is gone too. ~keep
+# The lock for VERSION is never removed here: its waiters break it themselves. ~keep
 cleanup_stale_state() {
   [ -d "$PARENT" ] || return 0
-  local entry
+  local entry pid
   for entry in "$PARENT"/.lock-* "$PARENT"/.staging-*; do
     [ -e "$entry" ] || continue
     [ "$entry" = "$PARENT/.lock-$VERSION" ] && continue
+    older_than_minutes "$entry" "$STALE_INSTALL_MINUTES" || continue
+    case "${entry##*/}" in
+    .staging-*)
+      pid="${entry##*-}"
+      case "$pid" in
+      '' | *[!0-9]*) ;;
+      *) kill -0 "$pid" 2>/dev/null && continue ;;
+      esac
+      ;;
+    esac
     rm -rf "$entry" 2>/dev/null || true
   done
 }
@@ -181,7 +284,7 @@ if [ -n "${BASEMIND_BIN:-}" ] && [ -x "${BASEMIND_BIN}" ]; then
   exec "$BASEMIND_BIN" "$@"
 fi
 if [ -x "$MANAGED_BIN" ] && [ "$(binary_version "$MANAGED_BIN")" = "$VERSION" ]; then
-  reap_other_versions "$CACHE_ROOT"
+  mark_used "$CACHE_ROOT"
   prune_stale_versions
   cleanup_stale_state
   exec "$MANAGED_BIN" "$@"
@@ -199,7 +302,7 @@ Darwin)
     [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
     TRIPLE="aarch64-apple-darwin"
   else
-    TRIPLE="x86_64-apple-darwin"
+    die "macOS on Intel (x86_64) is not supported; basemind publishes Apple Silicon (arm64) binaries only"
   fi
   ;;
 Linux)
@@ -240,19 +343,11 @@ fi
 mkdir -p "$PARENT"
 LOCK="$PARENT/.lock-$VERSION"
 STAGING=""
-release_lock() {
-  if [ -n "${LOCK_HELD:-}" ]; then
-    rmdir "$LOCK" 2>/dev/null || true
-  fi
-}
+release_lock() { [ -n "${LOCK_HELD:-}" ] && rmdir "$LOCK" 2>/dev/null || true; }
 cleanup() {
   release_lock
-  if [ -n "${TMP:-}" ]; then
-    rm -rf "$TMP" 2>/dev/null || true
-  fi
-  if [ -n "$STAGING" ]; then
-    rm -rf "$STAGING" 2>/dev/null || true
-  fi
+  [ -n "${TMP:-}" ] && rm -rf "$TMP" 2>/dev/null || true
+  [ -n "$STAGING" ] && rm -rf "$STAGING" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -340,8 +435,7 @@ fallback_or_die() {
       log "v${VERSION} is not installable; running basemind ${cand} instead — Claude Code will auto-update to v${VERSION} once its release completes"
       release_lock
       LOCK_HELD=""
-      env BASEMIND_FORCE_VERSION="$cand" "$0" "${ARGS[@]}"
-      exit "$?"
+      exec env BASEMIND_FORCE_VERSION="$cand" "$0" "${ARGS[@]}"
     done
   fi
   fb="$(newest_compatible_cached)"
@@ -350,7 +444,7 @@ fallback_or_die() {
     log "v${VERSION} not yet downloadable; falling back to compatible cached basemind $(binary_version "$fb") at $fb — run \`/plugin update\` once the release completes"
     release_lock
     LOCK_HELD=""
-    reap_other_versions "$(dirname "$fb")"
+    mark_used "$(dirname "$fb")"
     cleanup_stale_state
     exec "$fb" "${ARGS[@]}"
   fi
@@ -360,6 +454,7 @@ fallback_or_die() {
 LOCK_HELD=""
 waited=0
 while ! mkdir "$LOCK" 2>/dev/null; do
+  mark_used "$CACHE_ROOT"
   try_exec "$MANAGED_BIN" "$@"
   sleep 0.2
   waited=$((waited + 1))
@@ -370,6 +465,7 @@ while ! mkdir "$LOCK" 2>/dev/null; do
 done
 LOCK_HELD=1
 
+mark_used "$CACHE_ROOT"
 try_exec "$MANAGED_BIN" "$@"
 
 TMP="$(mktemp -d)"
@@ -412,6 +508,7 @@ chmod +x "$STAGING/$BINARY_NAME"
 [ -e "$CACHE_ROOT" ] && rm -rf "$CACHE_ROOT"
 mv "$STAGING" "$CACHE_ROOT"
 STAGING=""
+mark_used "$CACHE_ROOT"
 log "installed basemind $VERSION to $CACHE_ROOT"
 
 rm -rf "$TMP"
@@ -419,7 +516,6 @@ TMP=""
 release_lock
 LOCK_HELD=""
 
-reap_other_versions "$CACHE_ROOT"
 prune_stale_versions
 cleanup_stale_state
 

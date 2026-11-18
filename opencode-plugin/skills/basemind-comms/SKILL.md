@@ -1,11 +1,18 @@
 ---
+description: Coordinate with other agents working the same repo via basemind's broker — scoped threads, a per-agent inbox, and two-tier messages. Reach for it whenever you start, finish, or hit a decision while collaborating, or to check whether another agent is already touching the code you're about to change.
 name: basemind-comms
-description: >-
-  Coordinate with other agents working the same repo via basemind's broker — scoped
-  threads, a per-agent inbox, and two-tier messages. Reach for it whenever you start,
-  finish, or hit a decision while collaborating, or to check whether another agent
-  is already touching the code you're about to change.
+license: MIT
+metadata:
+    author: Goldziher
+    repository: https://github.com/Goldziher/basemind
 ---
+
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:cd53218e04205bc9c1cb8cc43b0d24e886d29b297c45f116bde0cef34d1b57c2
+Source-Hash: blake3:4790ee5e237c434ff57929ff0428e9c5da0c4446ea6a6c82b509bbf114d292a7
+Schema-Version: v1
+-->
 
 # basemind-comms — agent coordination over the broker
 
@@ -125,7 +132,6 @@ didn't load; check the CLI before assuming silence. Use the `basemind-doctor` sk
 
 Comms is one capability of basemind; the rest is the indexed context layer. Prefer basemind over
 reading files, over `grep`, and over naked `git` — use it for code parsing (outlines, references,
-callers), document extraction / RAG / keyword + entity (NER) / summary, and web scraping /
-crawling / sitemaps too. See the `basemind` and `basemind-cli` skills for the whole surface, or
+callers) and document extraction / RAG / keyword + entity (NER) / summary too. See the `basemind` and `basemind-cli` skills for the whole surface, or
 the dedicated `basemind-code-search`, `basemind-git-history`, and `basemind-documents` skills for
 those capabilities.
