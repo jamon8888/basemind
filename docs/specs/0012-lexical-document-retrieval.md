@@ -10,7 +10,7 @@
 
 ---
 
-## 1. Problem
+## Context and Problem Statement
 
 Retrieval quality for documents is bounded by a single embedding model, and an embedding-free
 deployment cannot retrieve documents at all. Concretely, three defects:
