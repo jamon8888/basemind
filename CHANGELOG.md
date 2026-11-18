@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Tesseract data is automatically used when the requested languages are covered by the
   built-in packs (eng, deu, fra, spa, ita, nld, pol) (#183).
 
+### Changed
+
+- `redact_text`/`redact --file` OCRs a file in the root's `[documents.ocr] languages`, as document
+  indexing does, instead of English only: by default the seven bundled languages (eng, deu, fra,
+  spa, ita, nld, pol). On a one-image test of French text, the seven defaults read one line of
+  three where `fra` (or `fra`, `eng`) read all three and `eng` two: a root whose documents use one or
+  two languages should list only those.
+
+### Fixed
+
+- `redact_text`/`redact --file` no longer leaves the extracted, unredacted text of a file in
+  xberg's on-disk caches (whole-extraction and Tesseract result caches, `~/Library/Caches/xberg/`
+  on macOS). Its OCR now reads the Tesseract data bundled in the binary instead of a system copy or
+  a download at first use: a scanned PDF is now redacted offline.
+
 ## [0.38.0] - 2026-11-14
 
 > **Minor release.** This release uses persisted-schema version `38`; the first

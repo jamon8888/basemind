@@ -97,19 +97,3 @@ pub fn xberg_ocr_config(languages: &[String], tessdata_path: Option<&Path>) -> x
         ..Default::default()
     }
 }
-
-fn ensure_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if std::fs::read(path).is_ok_and(|cached| cached == bytes) {
-        return Ok(());
-    }
-
-    let temporary = path.with_extension(format!("traineddata.tmp-{}", std::process::id()));
-    std::fs::write(&temporary, bytes)
-        .map_err(|error| format!("write temporary OCR data {}: {error}", temporary.display()))?;
-    if let Err(error) = std::fs::rename(&temporary, path)
-        && !std::fs::read(path).is_ok_and(|cached| cached == bytes)
-    {
-        return Err(format!("install OCR data {}: {error}", path.display()));
-    }
-    Ok(())
-}

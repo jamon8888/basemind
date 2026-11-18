@@ -38,10 +38,10 @@ use self::tools_redact_filters::{
 };
 /// Resolve the OCR languages for redaction: use the per-call override if provided and non-empty,
 /// otherwise fall back to the configured default OCR languages.
-fn resolve_ocr_languages(override_langs: Option<Vec<String>>, default_langs: &[String]) -> Option<Vec<String>> {
+fn resolve_ocr_languages(override_langs: Option<Vec<String>>, default_langs: &[String]) -> Vec<String> {
     override_langs
         .filter(|langs| !langs.is_empty())
-        .or_else(|| Some(default_langs.to_vec()))
+        .unwrap_or_else(|| default_langs.to_vec())
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -202,7 +202,8 @@ fn file_extraction_config(ocr_languages: &[String]) -> Result<xberg::core::confi
 /// xberg redact them together with its own pattern detectors in one pass.
 /// When NER cannot run it falls back to pattern-only redaction and reports
 /// `ner_ran: false`, or returns an error if `require_ner` is set.
-/// `ocr_languages` is the root's `[documents.ocr] languages`, used for a scanned `file_path`.
+/// `ocr_languages` is the call's `ocr_languages`, else the root's `[documents.ocr] languages`, used
+/// for a scanned `file_path`.
 async fn run_redact(args: RedactTextParams, ocr_languages: &[String]) -> Result<CallToolResult, McpError> {
     let ner_profile =
         resolve_ner_profile(args.ner_profile.as_deref()).map_err(|reason| McpError::invalid_params(reason, None))?;
@@ -289,10 +290,10 @@ async fn run_redact(args: RedactTextParams, ocr_languages: &[String]) -> Result<
     let mut doc = match source {
         Source::File(input) => {
             let input = *input;
+            let extraction_config =
+                file_extraction_config(ocr_languages).map_err(|error| McpError::internal_error(error, None))?;
             let budget_start = Instant::now();
             let deadline = budget_start + file_extraction_timeout();
-            let extraction_config =
-                file_extraction_config(ocr_languages).map_err(|e| McpError::internal_error(e, None))?;
             let mut extraction = extract_file_with_deadline(input.clone(), &extraction_config, budget_start, deadline)
                 .await
                 .map_err(|error| McpError::internal_error(error, None))?;
