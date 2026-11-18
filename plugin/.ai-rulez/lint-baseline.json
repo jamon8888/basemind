@@ -6,301 +6,301 @@
       "code": "AR021",
       "file": ".ai-rulez/agents/surface-docs-writer.md",
       "message": "runs \"ai-rulez@latest\" without pinning it (@latest is a moving tag); pin a version so a new release cannot change what runs",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:487e0bf9a8214fbe9e04f6d0",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (plugin/.ai-rulez/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:5d97c5f9ae665e081c4638c5",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-cli/SKILL.md",
       "message": "skill \"basemind-cli\" is defined in plugin/.ai-rulez/skills/basemind-cli/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-cli/SKILL.md (dropped); rename one, or list \"basemind-cli\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:a728d6c69d4fbacfe02853e5",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (plugin/.ai-rulez/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:0efeacb7a0d0711aa6520b06",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-code-search/SKILL.md",
       "message": "skill \"basemind-code-search\" is defined in plugin/.ai-rulez/skills/basemind-code-search/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-code-search/SKILL.md (dropped); rename one, or list \"basemind-code-search\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:d670a0db1f6bf41ba63a38af",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (plugin/.ai-rulez/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:cc21ea0e80fcb8211b1545e4",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-comms/SKILL.md",
       "message": "skill \"basemind-comms\" is defined in plugin/.ai-rulez/skills/basemind-comms/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-comms/SKILL.md (dropped); rename one, or list \"basemind-comms\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:1d8cee861e3d48f18cfc75cf",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (plugin/.ai-rulez/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:6dfed1a782c4a414ffbb93a8",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-doctor/SKILL.md",
       "message": "skill \"basemind-doctor\" is defined in plugin/.ai-rulez/skills/basemind-doctor/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-doctor/SKILL.md (dropped); rename one, or list \"basemind-doctor\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:d5d2b51399bf5ba0a03c41dd",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (plugin/.ai-rulez/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:b4eb61d952818d1fe6f500e7",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-documents/SKILL.md",
       "message": "skill \"basemind-documents\" is defined in plugin/.ai-rulez/skills/basemind-documents/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-documents/SKILL.md (dropped); rename one, or list \"basemind-documents\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:2a1c4b297d5595e52a0be515",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (plugin/.ai-rulez/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:be4c7857bf535ce0d8667d95",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-git-history/SKILL.md",
       "message": "skill \"basemind-git-history\" is defined in plugin/.ai-rulez/skills/basemind-git-history/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-git-history/SKILL.md (dropped); rename one, or list \"basemind-git-history\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:accd582f4f8115c40af9dba7",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (plugin/.ai-rulez/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:d6b760b15478269f490a73d7",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-multi-agent-room/SKILL.md",
       "message": "skill \"basemind-multi-agent-room\" is defined in plugin/.ai-rulez/skills/basemind-multi-agent-room/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-multi-agent-room/SKILL.md (dropped); rename one, or list \"basemind-multi-agent-room\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:adfebb29a6befa0aa2b02af9",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (plugin/.ai-rulez/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:141d3186a021cd571d23c17c",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-scan/SKILL.md",
       "message": "skill \"basemind-scan\" is defined in plugin/.ai-rulez/skills/basemind-scan/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-scan/SKILL.md (dropped); rename one, or list \"basemind-scan\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:a8d7424b5b84ab90b0aa535d",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (plugin/.ai-rulez/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:3952edc8538e71f1a4bdb454",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md",
       "message": "skill \"basemind-stats\" is defined in plugin/.ai-rulez/skills/basemind-stats/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind-stats/SKILL.md (dropped); rename one, or list \"basemind-stats\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:8e52709b0dd8d4feb5d48082",
       "code": "AR701",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (plugin/.ai-rulez/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:139e55e763cc869a2ba426d0",
       "code": "AR703",
       "file": ".hermes/package/src/basemind_hermes_plugin/skills/basemind/SKILL.md",
       "message": "skill \"basemind\" is defined in plugin/.ai-rulez/skills/basemind/SKILL.md (kept) and .hermes/package/src/basemind_hermes_plugin/skills/basemind/SKILL.md (dropped); rename one, or list \"basemind\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:65f9ddb9175044abf37a7f97",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-cli/SKILL.md",
       "message": "description is identical to skill \"basemind-cli\" (plugin/.ai-rulez/skills/basemind-cli/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:459d90db8e54379d723f0f5c",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-cli/SKILL.md",
       "message": "skill \"basemind-cli\" is defined in plugin/.ai-rulez/skills/basemind-cli/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-cli/SKILL.md (dropped); rename one, or list \"basemind-cli\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:9d70d75be0a50cea7272b21a",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-code-search/SKILL.md",
       "message": "description is identical to skill \"basemind-code-search\" (plugin/.ai-rulez/skills/basemind-code-search/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:4b0b82530f21036da37d4c64",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-code-search/SKILL.md",
       "message": "skill \"basemind-code-search\" is defined in plugin/.ai-rulez/skills/basemind-code-search/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-code-search/SKILL.md (dropped); rename one, or list \"basemind-code-search\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:5b01eb6919fe7b29a33f16b4",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-comms/SKILL.md",
       "message": "description is identical to skill \"basemind-comms\" (plugin/.ai-rulez/skills/basemind-comms/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:6cf019cadad300232ab1a390",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-comms/SKILL.md",
       "message": "skill \"basemind-comms\" is defined in plugin/.ai-rulez/skills/basemind-comms/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-comms/SKILL.md (dropped); rename one, or list \"basemind-comms\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:8584e28c8985337fb92e2d64",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-doctor/SKILL.md",
       "message": "description is identical to skill \"basemind-doctor\" (plugin/.ai-rulez/skills/basemind-doctor/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:8c2d004abff97089cf29838b",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-doctor/SKILL.md",
       "message": "skill \"basemind-doctor\" is defined in plugin/.ai-rulez/skills/basemind-doctor/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-doctor/SKILL.md (dropped); rename one, or list \"basemind-doctor\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:8a0d6c5e8caf1d1ad7beafbd",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-documents/SKILL.md",
       "message": "description is identical to skill \"basemind-documents\" (plugin/.ai-rulez/skills/basemind-documents/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:fe40cb2cbcd754d657a03387",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-documents/SKILL.md",
       "message": "skill \"basemind-documents\" is defined in plugin/.ai-rulez/skills/basemind-documents/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-documents/SKILL.md (dropped); rename one, or list \"basemind-documents\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:702c337a73c13dbd29a9f853",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-git-history/SKILL.md",
       "message": "description is identical to skill \"basemind-git-history\" (plugin/.ai-rulez/skills/basemind-git-history/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:7cfbc677e5cd2ba0457104f5",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-git-history/SKILL.md",
       "message": "skill \"basemind-git-history\" is defined in plugin/.ai-rulez/skills/basemind-git-history/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-git-history/SKILL.md (dropped); rename one, or list \"basemind-git-history\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:1255fe67cd742544ff42da7b",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-multi-agent-room/SKILL.md",
       "message": "description is identical to skill \"basemind-multi-agent-room\" (plugin/.ai-rulez/skills/basemind-multi-agent-room/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:b56c102d6833d44cd64c1dc3",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-multi-agent-room/SKILL.md",
       "message": "skill \"basemind-multi-agent-room\" is defined in plugin/.ai-rulez/skills/basemind-multi-agent-room/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-multi-agent-room/SKILL.md (dropped); rename one, or list \"basemind-multi-agent-room\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:bbd861a41c964f5e556b3846",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-scan/SKILL.md",
       "message": "description is identical to skill \"basemind-scan\" (plugin/.ai-rulez/skills/basemind-scan/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:199527725a279260c9dd7804",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-scan/SKILL.md",
       "message": "skill \"basemind-scan\" is defined in plugin/.ai-rulez/skills/basemind-scan/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-scan/SKILL.md (dropped); rename one, or list \"basemind-scan\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:f2d25814796058a7f50331d3",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "description is identical to skill \"basemind-stats\" (plugin/.ai-rulez/skills/basemind-stats/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:30aab88ec14831fab1e29254",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind-stats/SKILL.md",
       "message": "skill \"basemind-stats\" is defined in plugin/.ai-rulez/skills/basemind-stats/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind-stats/SKILL.md (dropped); rename one, or list \"basemind-stats\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:ad4c21b79415be9272581e2e",
       "code": "AR701",
       "file": ".hermes/plugins/basemind/skills/basemind/SKILL.md",
       "message": "description is identical to skill \"basemind\" (plugin/.ai-rulez/skills/basemind/SKILL.md)",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:4319761493519105172f19a9",
       "code": "AR703",
       "file": ".hermes/plugins/basemind/skills/basemind/SKILL.md",
       "message": "skill \"basemind\" is defined in plugin/.ai-rulez/skills/basemind/SKILL.md (kept) and .hermes/plugins/basemind/skills/basemind/SKILL.md (dropped); rename one, or list \"basemind\" in lint.allow_overrides if the shadowing is intended",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:ff64aca0aef1032bcda4a31a",
       "code": "AR602",
       "file": ".mcp.json",
       "message": "MCP server \"basemind\": conflicts with the definition in .mcp.json: the same name resolves to a different endpoint or transport, and a harness reads only one of them",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     },
     {
       "fingerprint": "ar1:4fd0a0fef51232e6c525559f",
       "code": "AR019",
       "file": "plugin/.ai-rulez/commands/bm-statusline.md",
       "message": "tells the agent to modify its own instruction or settings files (\"Update `~/.claude/settings.json\"); text that persists itself this way outlives the session",
-      "reason": "pre-existing fork governance findings carried over from the v4 config; not introduced by the v5 migration"
+      "reason": "pre-existing fork governance findings carried over from the v4 config"
     }
   ]
 }
