@@ -1,4 +1,7 @@
 version = "5.0"
+
+# AGENTS.md and CLAUDE.md are hand-written in this fork; do not generate/overwrite them.
+skip_outputs = ["instructions"]
 name = "basemind"
 description = "Code-map MCP server + scanner — pure-Rust, content-addressed, Fjall-backed inverted index."
 gitignore = true
@@ -78,6 +81,12 @@ rule = "AR9B2"
 path = ".ai-rulez/context/crate-layout.md"
 match = "does not resolve to a file in the bundle"
 reason = "OKF links point to repo docs outside the governance bundle"
+
+[[lint.accept]]
+rule = "AR602"
+path = ".mcp.json"
+match = "basemind"
+reason = "root harness config intentionally differs from plugin manifest"
 
 [[lint.accept]]
 rule = "AR602"
