@@ -1,4 +1,7 @@
 version = "5.0"
+
+# AGENTS.md and CLAUDE.md are hand-written in this fork; do not generate/overwrite them.
+skip_outputs = ["instructions"]
 name = "basemind"
 default_layers = ["plugins"]
 agents_md = false

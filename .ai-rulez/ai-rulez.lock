@@ -5,7 +5,7 @@ version = 1
 ai_rulez_version = '5.14.0'
 scope = 'all'
 outputs_pinned = true
-tree = 'sha256:821b6f788137a21299571e975f6b9eb2b377583812a824dbd874e5ac3c6291a0'
+tree = 'sha256:f68e1807af2749eadca08efe62ec4a7d89f30a8c32a2767a07b34f409d1d1c10'
 
 [[served]]
 name = 'adr-workflow'
@@ -789,11 +789,3 @@ digest = 'sha256:b50888e3d38783d790f241dd3ed3b21575aeb64814618aba7165cb6594e8801
 [[output]]
 path = '.codex/agents/test-writer.toml'
 digest = 'sha256:b5ddf7b9c593232dbfb7880f1b4aa6ab1b90f2ea3abf7fb8498822f76c32e73e'
-
-[[output]]
-path = 'AGENTS.md'
-digest = 'sha256:fd1fda6738d4d18490a479e743b53397f660ccf13a6c5f353cbae320640d950f'
-
-[[output]]
-path = 'CLAUDE.md'
-digest = 'sha256:acea2df0debf0115e9a0ef636ecb7196a85a9fb59eefa0a37739c1cddc8242de'
