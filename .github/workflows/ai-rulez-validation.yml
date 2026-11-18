@@ -1,0 +1,88 @@
+name: AI-Rulez validation
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".ai-rulez/**"
+      - "modules/**"
+      - "plugin/**"
+      - "skills/**"
+      - ".agents/plugins/**"
+      - ".claude-plugin/**"
+      - ".codex/**"
+      - "scripts/sync*"
+      - "scripts/tests/**"
+      - "pip-package-hermes/tests/**"
+      - "mise.toml"
+      - "mise.lock"
+      - "mise-tasks/**"
+      - "Cargo.toml"
+      - "pyproject.toml"
+      - "package.json"
+      - ".gitignore"
+      - ".github/workflows/ai-rulez-validation.yml"
+  pull_request:
+    paths:
+      - ".ai-rulez/**"
+      - "modules/**"
+      - "plugin/**"
+      - "skills/**"
+      - ".agents/plugins/**"
+      - ".claude-plugin/**"
+      - ".codex/**"
+      - "scripts/sync*"
+      - "scripts/tests/**"
+      - "pip-package-hermes/tests/**"
+      - "mise.toml"
+      - "mise.lock"
+      - "mise-tasks/**"
+      - "Cargo.toml"
+      - "pyproject.toml"
+      - "package.json"
+      - ".gitignore"
+      - ".github/workflows/ai-rulez-validation.yml"
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: xberg-io/actions/setup-ai-rulez@v1
+      - uses: xberg-io/actions/validate-ai-rulez@v1
+        with:
+          expected-config-count: "2"
+          additional-config-directories: "plugin/.ai-rulez"
+          verify-plugin: "true"
+      - uses: xberg-io/actions/setup-mise@v1
+        with:
+          install-args: python uv
+      - name: Build and strictly validate the Hermes wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel_directory="$(mktemp -d)"
+          test -n "$wheel_directory"
+          uv build --wheel --out-dir "$wheel_directory" plugin/.hermes/package
+          mapfile -t wheels < <(find "$wheel_directory" -maxdepth 1 -type f -name '*.whl')
+          test "${#wheels[@]}" -eq 1
+          uvx --from twine==7.0.0 --with packaging==26.3 twine check --strict "${wheels[0]}"
+      - name: Verify required registration with the native Hermes SDK
+        shell: bash
+        env:
+          HERMES_SDK_REVISION: caf557be5b4c9ae75b3a7566d65d3df2c701c5df
+        run: |
+          set -euo pipefail
+          hermes_sdk="$(mktemp -d)"
+          test -n "$hermes_sdk"
+          git init "$hermes_sdk"
+          git -C "$hermes_sdk" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$hermes_sdk" fetch --depth=1 origin "$HERMES_SDK_REVISION"
+          git -C "$hermes_sdk" checkout --detach FETCH_HEAD
+          test "$(git -C "$hermes_sdk" rev-parse HEAD)" = "$HERMES_SDK_REVISION"
+          PYTHONPATH="$hermes_sdk" uv run --no-project --with PyYAML==6.0.3 \
+            --with python-dotenv==1.2.2 --with mcp==1.28.1 python scripts/tests/native_hermes_registration.py
+      - name: Verify required skill and MCP error propagation
+        run: >-
+          uv run --no-project --with pytest --with mcp==1.28.1 python -m pytest
+          pip-package-hermes/tests/test_hermes_register.py

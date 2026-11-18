@@ -1,8 +1,16 @@
 ---
-name: bm-init
 description: Onboard (or refresh) basemind in this repo — write basemind.toml and inject a "prefer basemind over grep/read/git" rules block into a rules file you choose (CLAUDE.local.md / AGENTS.local.md / CLAUDE.md / AGENTS.md / ai-rulez).
-argument-hint: [capabilities…]
+argument-hint:
+    - capabilities…
+name: bm-init
 ---
+
+<!--
+AI-RULEZ :: GENERATED FILE — DO NOT EDIT
+Content-Hash: blake3:345f725ea99cb95587f8f9093dab0b338cdb3e0bd8a9f1823e7c615b6a912b13
+Source-Hash: blake3:4790ee5e237c434ff57929ff0428e9c5da0c4446ea6a6c82b509bbf114d292a7
+Schema-Version: v1
+-->
 
 # bm-init — onboard basemind into this repo
 
@@ -72,20 +80,22 @@ capabilities (documents/RAG, agent-comms, semantic search). Safe to re-run: it's
 - The block is wrapped in an idempotent `<!-- BEGIN basemind … -->` … `<!-- END basemind -->`
   block that is replaced in place on re-run, never duplicated. Content outside the markers is
   never touched.
-- **`.gitignore` coverage**: whenever `init` is about to write one of the gitignored-by-convention
-  files (`CLAUDE.local.md`, `AGENTS.local.md`, `.claude/settings.local.json`, anything under
-  `.ai-rulez/local/`), it checks whether an existing `.gitignore` already covers that path. If not,
-  it prompts `add "<pattern>" to .gitignore? [Y/n]` interactively, or appends the pattern
-  automatically with `--yes`, so a personal `.local` file is never one accidental `git add -A` away
-  from being committed.
+- **`.gitignore` coverage**: whenever `init` is about to write one of the files that are
+  gitignored by convention (`CLAUDE.local.md`, `AGENTS.local.md`, `.claude/settings.local.json`,
+  anything under `.ai-rulez/local/`), it checks whether an existing `.gitignore` already covers
+  that path. If not, it prompts `add "<pattern>" to .gitignore? [Y/n]` interactively, or appends
+  the pattern automatically with `--yes`, so a personal `.local` file is never one accidental
+  `git add -A` away from being committed.
 - The settings-permissions step is opt-in and defaults to **skipped** non-interactively — pass
   `--settings-target local` (or `shared`) explicitly to enable it. The merge only ever
   adds/dedupes basemind's own entry inside `permissions.allow`; every other key in
   `.claude/settings*.json` (e.g. `skillOverrides`), and its position in the file, is left exactly
   as it was.
 - An existing `basemind.toml` is kept verbatim, never clobbered.
-- If `basemind` isn't on `PATH`: use the plugin-managed cache binary or build a dev binary with
-  `cargo build --release` and use `./target/release/basemind`.
+- Prefer the plugin-managed, version-matched binary: `${CLAUDE_PLUGIN_ROOT}/scripts/mcp-launch.sh init …`
+  (in other hosts, `scripts/mcp-launch.sh` in the plugin directory). Use bare `basemind` from `PATH`
+  only when no plugin launcher exists, or build a dev binary with `cargo build --release` and use
+  `./target/release/basemind`.
 
 ## See also
 

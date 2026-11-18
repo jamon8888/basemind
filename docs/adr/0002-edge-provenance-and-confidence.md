@@ -1,6 +1,12 @@
+---
+status: superseded
+superseded-by: "0017"
+date: 2026-08-02
+---
+
 # ADR-0002: Edge provenance and confidence
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0017 (2026-11-14)
 - **Date:** 2026-08-02
 - **Deciders:** basemind maintainers
 - **Related:** ADR-0001 (unified typed code-graph), ADR-0003 (traversal), ADR-0005 (rendering engine)

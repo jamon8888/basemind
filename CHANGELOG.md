@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `redact_text` (MCP) and `basemind redact` (CLI) accept an optional per-call `ocr_languages`
+  parameter (`--ocr-languages fra,eng` on the CLI) to override the configured
+  `[documents.ocr] languages` default when redacting images or scanned PDFs. The bundled
+  Tesseract data is automatically used when the requested languages are covered by the
+  built-in packs (eng, deu, fra, spa, ita, nld, pol) (#183).
+
 ### Changed
 
 - `redact_text`/`redact --file` OCRs a file in the root's `[documents.ocr] languages`, as document

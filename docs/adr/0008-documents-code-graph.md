@@ -1,6 +1,12 @@
+---
+status: superseded
+superseded-by: "0017"
+date: 2026-08-02
+---
+
 # ADR-0008: Documents ↔ code graph
 
-- **Status:** Accepted (implemented on `feat/agent-layer`, 2026-08-04)
+- **Status:** Superseded by ADR-0017 (2026-11-14)
 - **Date:** 2026-08-02
 - **Deciders:** basemind maintainers
 - **Related:** ADR-0001 (unified typed code-graph), ADR-0002 (edge provenance + confidence),
