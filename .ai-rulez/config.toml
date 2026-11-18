@@ -57,3 +57,30 @@ hashes = "full"
 # Pinned by `ai-rulez migrate v5`: the 4.x default. Remove this line to take the v5 default.
 [mcp]
 self_server = false
+
+[lint]
+profile = "permissive"
+
+[[lint.accept]]
+rule = "AR021"
+path = ".ai-rulez/agents/surface-docs-writer.md"
+match = "ai-rulez@latest"
+reason = "doc example uses the moving tag deliberately"
+
+[[lint.accept]]
+rule = "AR964"
+path = ".ai-rulez/config.toml"
+match = "AGENTS.md chain limit"
+reason = "fork carries extended governance content by design"
+
+[[lint.accept]]
+rule = "AR9B2"
+path = ".ai-rulez/context/crate-layout.md"
+match = "does not resolve to a file in the bundle"
+reason = "OKF links point to repo docs outside the governance bundle"
+
+[[lint.accept]]
+rule = "AR602"
+path = "**/.mcp.json"
+match = "basemind"
+reason = "root harness config intentionally differs from plugin manifest"
