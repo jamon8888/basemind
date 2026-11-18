@@ -1,30 +1,16 @@
 ---
+description: Coordinate with other agents working the same repo via basemind's broker — scoped threads, a per-agent inbox, and two-tier messages. Reach for it whenever you start, finish, or hit a decision while collaborating, or to check whether another agent is already touching the code you're about to change.
 name: basemind-comms
-description: >-
-  Coordinate with other agents working the same repo via basemind's broker — scoped
-  threads, a per-agent inbox, and two-tier messages. Reach for it whenever you start,
-  finish, or hit a decision while collaborating, or to check whether another agent
-  is already touching the code you're about to change.
+license: MIT
+metadata:
+    author: Goldziher
+    repository: https://github.com/Goldziher/basemind
 ---
 
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:047650176ae64322043a20f35b99221c562b4b803ccda326ea1bee46877d4e9d
-Source-Hash: blake3:b96764c6a3abaec704dffd3abf56607bc3114b4b29a212e60ff7d6e43ca5e678
-Schema-Version: v1
--->
-
-<!--
-AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:d11ecab18536021127703c562d662e72a04d51eb570025a18b05bc2b4bfa713c
-Source-Hash: blake3:aa3fdcfda21e2102d900287f385f78de45def44813de651b4666209c45fafc67
-Schema-Version: v1
--->
-
-<!--
-AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:7a0a443f940cf2e0cfaa3c25415fa855c9fa0a4ed0296ca46ebe577fcd28f57e
-Source-Hash: blake3:378e61c2bd27ae140e75d818f27005fac54d22d0ad24de4163a71e8572a15c72
+Content-Hash: blake3:cd53218e04205bc9c1cb8cc43b0d24e886d29b297c45f116bde0cef34d1b57c2
+Source-Hash: blake3:6d38d35f3be733742b2c64884bd8a46d378e1e5b35adacb7cc4ad1d5453aec22
 Schema-Version: v1
 -->
 
@@ -146,7 +132,6 @@ didn't load; check the CLI before assuming silence. Use the `basemind-doctor` sk
 
 Comms is one capability of basemind; the rest is the indexed context layer. Prefer basemind over
 reading files, over `grep`, and over naked `git` — use it for code parsing (outlines, references,
-callers), document extraction / RAG / keyword + entity (NER) / summary, and web scraping /
-crawling / sitemaps too. See the `basemind` and `basemind-cli` skills for the whole surface, or
+callers) and document extraction / RAG / keyword + entity (NER) / summary too. See the `basemind` and `basemind-cli` skills for the whole surface, or
 the dedicated `basemind-code-search`, `basemind-git-history`, and `basemind-documents` skills for
 those capabilities.

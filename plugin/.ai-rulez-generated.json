@@ -1,7 +1,15 @@
 {
   "schema_version": "v1",
-  "source_hash": "blake3:4790ee5e237c434ff57929ff0428e9c5da0c4446ea6a6c82b509bbf114d292a7",
+  "source_hash": "blake3:51c631689e7d8a9a97195926032c30788f350c3c47fce1f7dd95d2d9260c9d18",
   "outputs": {
+    ".agents/plugins/marketplace.json": {
+      "content_hash": "blake3:78189fefdd8492d75281889f129959af92da377da3cb98413c3abd1b040d2691",
+      "mode": "0644"
+    },
+    ".claude-plugin/marketplace.json": {
+      "content_hash": "blake3:d26c92d1354f00deddc1a632083de4910050f48c6dc26c67d8f5457e7ab5f0bc",
+      "mode": "0644"
+    },
     ".claude-plugin/plugin.json": {
       "content_hash": "blake3:36f4c5d42de76b97fcdd6b403dbf02672a487f20ded1da4874805a58e3a4d019",
       "mode": "0644"
@@ -36,6 +44,10 @@
     },
     ".cursor-plugin/hooks/hooks.json": {
       "content_hash": "blake3:64c8d81c526b58552d3aa12e639fd07d257c3982de3faa26a751868d7434b044",
+      "mode": "0644"
+    },
+    ".cursor-plugin/marketplace.json": {
+      "content_hash": "blake3:b59ef6ee5084b6a15195f373e8f4c4803697dd621e51bbc0cba9f660bccadf6b",
       "mode": "0644"
     },
     ".cursor-plugin/plugin.json": {
@@ -124,6 +136,10 @@
     },
     ".factory-plugin/plugin.json": {
       "content_hash": "blake3:358dd5cdebd9f771107aa31cbcb8900263fa242059f2035080b0564e2cc6bedc",
+      "mode": "0644"
+    },
+    ".github/plugin/marketplace.json": {
+      "content_hash": "blake3:13303129fc8c63600cc3a6a8532da590b58dd55fdcc234dd51e30dbfcc2238a8",
       "mode": "0644"
     },
     ".hermes/package/pyproject.toml": {

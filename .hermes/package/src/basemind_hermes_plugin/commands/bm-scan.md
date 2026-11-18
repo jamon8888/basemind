@@ -1,13 +1,14 @@
 ---
-name: bm-scan
 description: Build or refresh the basemind index by running `basemind scan` via the CLI — works without the MCP server (use it when basemind reports "no index" / "no indexed files").
-argument-hint: [path]
+argument-hint:
+    - path
+name: bm-scan
 ---
 
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:8ab1a7f320d8915e6b15699eccfe4ac4317a7369ea572e5781b738d5caa12c41
-Source-Hash: blake3:b96764c6a3abaec704dffd3abf56607bc3114b4b29a212e60ff7d6e43ca5e678
+Content-Hash: blake3:f41c52efc4a466e6fc1e999e9bacc8d1a13043bca05993e37d0ae2ef12d67a6c
+Source-Hash: blake3:6d38d35f3be733742b2c64884bd8a46d378e1e5b35adacb7cc4ad1d5453aec22
 Schema-Version: v1
 -->
 
@@ -28,16 +29,17 @@ basemind scan ${ARGUMENTS:-}
 
 - No argument → full working-tree scan.
 - A path argument (`/bm-scan src/mcp`) → scope the scan to that path (incremental).
-- If `basemind` isn't on `PATH`: use the plugin-managed cache
-  (`${XDG_CACHE_HOME:-~/.cache}/basemind/bin/<version>/basemind`), or build a dev binary with
-  `cargo build --release` and use `./target/release/basemind`.
+- Prefer the plugin-managed, version-matched binary: run `${CLAUDE_PLUGIN_ROOT}/scripts/mcp-launch.sh scan ${ARGUMENTS:-}`
+  (in other hosts, `scripts/mcp-launch.sh` in the plugin directory). Use bare `basemind` from `PATH`
+  only when no plugin launcher exists, or build a dev binary with `cargo build --release` and use
+  `./target/release/basemind`.
 
 ## Notes
 
 - Report files scanned / updated / skipped and elapsed time. Non-extractable files are
   **skipped**, not failures.
 - If a `basemind serve` MCP server already holds the store lock for this repo, `scan` errors on
-  the lock — use `basemind rescan [path…]` (forwards to the running daemon) or `admin { mode: "rescan" }` over MCP instead (lock errors exit 3).
+  the lock — use `basemind rescan [path…]` (forwards to the running daemon) or `index_rescan {}` over MCP instead (lock errors exit 3).
 
 ## See also
 
