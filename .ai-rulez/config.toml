@@ -37,7 +37,7 @@ requires_python = ">=3.9"
 name = "ai-rulez"
 description = "Manage AI governance config via MCP."
 command = "npx"
-args = ["-y", "ai-rulez@latest", "mcp"]
+args = ["-y", "ai-rulez@5.14.0", "mcp"]
 
 [[marketplaces]]
 name = "basemind"

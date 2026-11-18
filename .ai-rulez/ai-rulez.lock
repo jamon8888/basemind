@@ -5,7 +5,7 @@ version = 1
 ai_rulez_version = '5.14.0'
 scope = 'all'
 outputs_pinned = true
-tree = 'sha256:343e672fb682aaf5ea672149991fb4d1985b0f88fa97873f73464c7f7262ddf8'
+tree = 'sha256:821b6f788137a21299571e975f6b9eb2b377583812a824dbd874e5ac3c6291a0'
 
 [[served]]
 name = 'adr-workflow'
@@ -263,7 +263,7 @@ digest = 'sha256:11e2ffe63678e74b67fdb24aef3cdcb702fe661b588f4174c3ab167363eb2cf
 kind = 'rule'
 id = 'agent-comms'
 path = 'rules/agent-comms.md'
-digest = 'sha256:202516436d9ab7982496cc73b1d6bb3e03d3d19e9fb16a626788284e8239c2a3'
+digest = 'sha256:bfd0d6e29946d7a55aca360e5d9cf56624300cd84bde34537a8a3e0317229072'
 
 [[item]]
 kind = 'rule'
@@ -310,7 +310,7 @@ digest = 'sha256:fb6741608467741215d5fe61cf83f2ae2d31c25eca8cae0dc336f1c196bd237
 [[item]]
 kind = 'settings'
 id = 'mcp-servers'
-digest = 'sha256:ca980d73e880171d9de25617e08d3a1a8ae44b65b14c4c651a1ac719f293fc46'
+digest = 'sha256:da042a7231c384dac20c563c13dc32e09b4d244d536fb76eadf2128464524311'
 
 [[item]]
 kind = 'skill'
@@ -516,7 +516,7 @@ digest = 'sha256:d6b72f7892ac7880ccbfd20f2be1947bb9017a2a7085c3f4cdb0ccca8814e1a
 
 [[output]]
 path = '.claude/rules/agent-comms.md'
-digest = 'sha256:b6af7c8fa4c9ae397a2f9285932ce67cdc8f8be079ff7f66e428e0fbe0f7c978'
+digest = 'sha256:0ca1d1a497913347bcaeef90cb5ef8a735a45a7a620c028e37da61edb6a52dda'
 
 [[output]]
 path = '.claude/rules/agent-workflow.md'
@@ -792,7 +792,7 @@ digest = 'sha256:b5ddf7b9c593232dbfb7880f1b4aa6ab1b90f2ea3abf7fb8498822f76c32e73
 
 [[output]]
 path = 'AGENTS.md'
-digest = 'sha256:dea2ba4ac07851a4b2abf8deb06a3b3df120ff65ca65614e47094adfe86e7251'
+digest = 'sha256:fd1fda6738d4d18490a479e743b53397f660ccf13a6c5f353cbae320640d950f'
 
 [[output]]
 path = 'CLAUDE.md'
