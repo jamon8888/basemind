@@ -194,14 +194,6 @@ extend_exclude = ["tests/fixtures/**"]
 # every file that carries it, so exactly this pair is exempt; a third 0000 file is still reported.
 "docs/adr/0000-record-architecture-decisions.md" = ["MADR43"]
 "docs/adr/0000-template.md" = ["MADR43"]
-# Fork-line ADRs reuse numbers already taken upstream (upstream 0012-0015 are different records).
-# Keep the fork's numbering stable; exempt the duplicate-number rule for exactly these four files.
-"docs/adr/0012-multi-lane-document-retrieval.md" = ["MADR43"]
-"docs/adr/0013-encryption-at-rest-comes-from-the-volume.md" = ["MADR43"]
-"docs/adr/0014-tier-routing-is-declared-by-the-caller.md" = ["MADR43"]
-"docs/adr/0015-privacy-gateway-boundary.md" = ["MADR43"]
-# The lexical retrieval spec is an implementation spec, not an ADR; its numbered title trips adrlint.
-"docs/specs/0012-lexical-document-retrieval.md" = ["MADR01b"]
 
 [hooks]
 stages = ["pre-commit"]
