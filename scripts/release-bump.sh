@@ -82,7 +82,36 @@ command -v "$AI_RULEZ" >/dev/null 2>&1 || {
   echo "error: ai-rulez is required to regenerate the Hermes package" >&2
   exit 1
 }
-"$AI_RULEZ" generate --plugin
+
+# The validation reads the JSON manifests with jq. Without it every read yields an empty
+# string and each surface is reported as a mismatch with a blank version, which points at the
+# manifests instead of at the missing tool.
+command -v jq >/dev/null 2>&1 || {
+  echo "error: jq is required to read the version from the JSON manifests" >&2
+  exit 1
+}
+
+# The shipped plugin bundle is generated from `plugin/`, whose config carries every runtime.
+# The repository-root config only declares the Hermes runtime and its entrypoint moved into
+# the plugin tree, so generating from the root fails before it writes anything. Re-pin the
+# plugin's own version to the bumped crate version first, then generate from `plugin/`.
+echo "→ plugin config      → $VERSION"
+python3 scripts/sync_plugin_version.py
+(
+  cd plugin
+  "$AI_RULEZ" generate --plugin
+)
+
+# Regenerating rewrites the Source-Hash lines the generated skill files carry, so the public
+# skills export under skills/ is stale afterwards and `plugin:verify` fails. Sync it here
+# rather than leaving every release with a red freshness check.
+echo "→ public skills export"
+python3 scripts/sync_public_skills.py
+
+# The legacy per-harness mirrors drift for the same reason, and had already drifted on main
+# before this release. The bumper leaves them synchronized.
+echo "→ legacy compatibility exports"
+python3 scripts/sync_legacy_plugin_exports.py
 
 if [[ "$CURRENT_RELEASE_MINOR" != "$RELEASE_MINOR" ]]; then
   echo "→ RELEASE_MINOR      $CURRENT_RELEASE_MINOR → $RELEASE_MINOR (minor bump — schema wipe on next scan)"
@@ -104,14 +133,9 @@ if [ "$cargo_version" != "$VERSION" ]; then
   validation_failed=1
 fi
 
-for crate_manifest in "${WORKSPACE_CRATES[@]}"; do
-  [[ -f "$crate_manifest" ]] || continue
-  crate_version="$(grep -E '^version = "' "$crate_manifest" | head -1 | cut -d'"' -f2)"
-  if [ "$crate_version" != "$VERSION" ]; then
-    echo "✗ ${crate_manifest}: expected $VERSION, got $crate_version"
-    validation_failed=1
-  fi
-done
+# The four vendored crates under crates/ are forks we publish under their own `basemind-*` names,
+# each on its own version line (they track their upstream releases). They are deliberately not
+# bumped here, so they are not checked against the root version either.
 
 if [ -f npm-package/package.json ]; then
   npm_version="$(jq -r '.version' npm-package/package.json 2>/dev/null || echo '')"
@@ -137,16 +161,16 @@ if [ -f pip-package/basemind/__init__.py ]; then
   fi
 fi
 
-if [ -f .hermes/package/pyproject.toml ]; then
-  hermes_pypi_version="$(awk '/^version = / {value=$3; gsub(/[\"\047]/, "", value); print value; exit}' .hermes/package/pyproject.toml)"
+if [ -f plugin/.hermes/package/pyproject.toml ]; then
+  hermes_pypi_version="$(awk '/^version = / {value=$3; gsub(/[\"\047]/, "", value); print value; exit}' plugin/.hermes/package/pyproject.toml)"
   if [ "$hermes_pypi_version" != "$PY_VERSION" ]; then
-    echo "✗ .hermes/package/pyproject.toml: expected $PY_VERSION, got $hermes_pypi_version"
+    echo "✗ plugin/.hermes/package/pyproject.toml: expected $PY_VERSION, got $hermes_pypi_version"
     validation_failed=1
   fi
 fi
 
-if [ -f .hermes/package/src/basemind_hermes_plugin/plugin.yaml ]; then
-  hermes_plugin_version="$(grep -E '^version: ' .hermes/package/src/basemind_hermes_plugin/plugin.yaml | head -1 | sed -E 's/^version: "?([^"]+)"?/\1/')"
+if [ -f plugin/.hermes/package/src/basemind_hermes_plugin/plugin.yaml ]; then
+  hermes_plugin_version="$(grep -E '^version: ' plugin/.hermes/package/src/basemind_hermes_plugin/plugin.yaml | head -1 | sed -E 's/^version: "?([^"]+)"?/\1/')"
   if [ "$hermes_plugin_version" != "$VERSION" ]; then
     echo "✗ Hermes plugin.yaml: expected $VERSION, got $hermes_plugin_version"
     validation_failed=1
@@ -178,16 +202,19 @@ if [ -f .claude-plugin/plugin.json ]; then
 fi
 
 if [ -f .claude-plugin/marketplace.json ]; then
-  marketplace_version="$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json 2>/dev/null || echo '')"
-  if [ "$marketplace_version" != "$VERSION" ]; then
+  # The marketplace entry points at ./plugin and delegates its version to that plugin's own
+  # manifest, so the field is optional; check it only when the listing carries one.
+  marketplace_version="$(jq -r '.plugins[0].version // empty' .claude-plugin/marketplace.json 2>/dev/null || echo '')"
+  if [ -n "$marketplace_version" ] && [ "$marketplace_version" != "$VERSION" ]; then
     echo "✗ .claude-plugin/marketplace.json: expected $VERSION, got $marketplace_version"
     validation_failed=1
   fi
 fi
 
 if [ -f .agents/plugins/marketplace.json ]; then
-  codex_marketplace_version="$(jq -r '.plugins[0].version' .agents/plugins/marketplace.json 2>/dev/null || echo '')"
-  if [ "$codex_marketplace_version" != "$VERSION" ]; then
+  # Same delegation as the Claude marketplace: no version field means ./plugin owns it.
+  codex_marketplace_version="$(jq -r '.plugins[0].version // empty' .agents/plugins/marketplace.json 2>/dev/null || echo '')"
+  if [ -n "$codex_marketplace_version" ] && [ "$codex_marketplace_version" != "$VERSION" ]; then
     echo "✗ .agents/plugins/marketplace.json: expected $VERSION, got $codex_marketplace_version"
     validation_failed=1
   fi

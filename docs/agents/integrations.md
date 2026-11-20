@@ -25,7 +25,7 @@ diffs and retain the shared guide and existing issue/domain instructions.
 | Cursor | [`.cursor-plugin/`](../../.cursor-plugin/), shared launcher and copied content | Harness-specific packaging around the same server. |
 | OpenCode | [`opencode-plugin/basemind.js`](../../opencode-plugin/basemind.js), `tui.js`, `package.json` | Native adapter/TUI with bundled skills and commands. |
 | Pi | [`.pi/extensions/basemind.ts`](../../.pi/extensions/basemind.ts), root `package.json` Pi metadata | Native extension, also staged into the combined OpenCode/Pi package. |
-| Hermes | [`pip-package-hermes/basemind_hermes_plugin/hermes.py`](../../pip-package-hermes/basemind_hermes_plugin/hermes.py), `.ai-rulez/config.toml` | Canonical adapter source used to generate `.hermes/plugins/basemind/` and `.hermes/package/`. |
+| Hermes | [`plugin/.ai-rulez/hermes/index.py`](../../plugin/.ai-rulez/hermes/index.py), `.ai-rulez/config.toml` | Canonical adapter source used to generate `plugin/.hermes/plugins/basemind/` and `plugin/.hermes/package/`. |
 | Gemini / Kimi / Agent Plugins | `gemini-extension.json`, `kimi.plugin.json`, root `plugin.json` / `mcp.json` | Additional manifests exposing the same product capabilities. |
 | npm binary wrapper | [`npm-package/`](../../npm-package/) | Downloads a release executable and launches it; not the Rust implementation. |
 | PyPI binary wrapper | [`pip-package/`](../../pip-package/) | Platform-aware download and CLI entry; separate from the Hermes plugin wheel. |
@@ -46,7 +46,7 @@ harness configuration and may contain other servers.
 | Hermes implementation | `pip-package-hermes/basemind_hermes_plugin/hermes.py` | `ai-rulez generate --plugin`; tests in `pip-package-hermes/tests/`. |
 | Repository context | `.ai-rulez/context/`, `.ai-rulez/rules/`, shared `docs/agents/` | Review harness generation output; do not fork shared guidance between AGENTS and CLAUDE. |
 | Config schema | Rust config types | See [schema workflow](development.md#change-configuration). |
-| Version | Root Cargo package version through release script | `task release:sync-version VERSION=X.Y.Z` updates shipped surfaces together. |
+| Version | Root Cargo package version through release script | `mise run release:sync-version X.Y.Z` updates shipped surfaces together; sequence in the [release runbook](release.md). |
 
 `scripts/sync-plugin-skills.sh` requires the `ai-rulez` executable. Its inputs are
 root skills/commands, selected hooks, the Pi extension and plugin configuration.

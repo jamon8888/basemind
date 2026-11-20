@@ -11,8 +11,10 @@ x-ai-rulez:
 # Release Versioning
 
 Basemind versions are bumped across every shipped surface in lock-step. The single sanctioned bumper is
-`task release:sync-version VERSION=X.Y.Z` (script: `scripts/release-bump.sh`, also bumps every plugin
-manifest version in lock-step). Never hand-edit one
+`mise run release:sync-version <version>` (positional argument: `mise run release:sync-version 0.40.0`;
+script: `scripts/release-bump.sh`, also bumps every plugin
+manifest version in lock-step). The full release sequence, including tagging and publish recovery, is the
+[release runbook](../../docs/agents/release.md). Never hand-edit one
 surface without the others — `cargo publish` / npm / PyPI all enforce version uniqueness, so
 the workflow's per-registry skip detection breaks on a partial bump.
 
@@ -24,14 +26,14 @@ the workflow's per-registry skip detection breaks on a partial bump.
 | `npm-package/package.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Same shape as Cargo. |
 | `pip-package/pyproject.toml` `version` | `X.Y.Z` or `X.Y.ZrcN` | PyPI canonical form (`basemind`, binary wrapper). |
 | `pip-package/basemind/__init__.py` `__version__` | matches `pyproject.toml` | Used by `downloader.py` to compute the GH release URL. |
-| `.hermes/package/pyproject.toml` `version` | `X.Y.Z` or `X.Y.ZrcN` | PyPI canonical form (`basemind-hermes-plugin`, standalone Hermes plugin). |
-| `.hermes/package/src/basemind_hermes_plugin/__init__.py` `__version__` | matches `pyproject.toml` | Plugin package version. |
-| `.hermes/package/src/basemind_hermes_plugin/plugin.yaml` `version` | `X.Y.Z` or `X.Y.Z-rc.N` | Hermes Agent plugin manifest (Cargo form, bundled in the plugin wheel). |
+| `plugin/.hermes/package/pyproject.toml` `version` | `X.Y.Z` or `X.Y.ZrcN` | PyPI canonical form (`basemind-hermes-plugin`, standalone Hermes plugin). |
+| `plugin/.hermes/package/src/basemind_hermes_plugin/__init__.py` `__version__` | matches `pyproject.toml` | Plugin package version. |
+| `plugin/.hermes/package/src/basemind_hermes_plugin/plugin.yaml` `version` | `X.Y.Z` or `X.Y.Z-rc.N` | Hermes Agent plugin manifest (Cargo form, bundled in the plugin wheel). |
 | `src/version.rs` `RELEASE_MINOR` | `u16` | Bumped only when the MINOR component changes (or major-100 carry for `1.X` and beyond). |
 | `package.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Workspace root marker (private). |
 | `opencode-plugin/package.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | `basemind-opencode` npm package. |
 | `.claude-plugin/plugin.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Claude Code plugin manifest. |
-| `.claude-plugin/marketplace.json` `plugins[0].version` | `X.Y.Z` or `X.Y.Z-rc.N` | Claude Code marketplace listing. |
+| `.claude-plugin/marketplace.json` `plugins[0].version` | optional | Marketplace listing; when present it must match. The entry points at `./plugin` and delegates to that plugin's manifest, so the field is usually absent. |
 | `.codex-plugin/plugin.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Codex plugin manifest. |
 | `.cursor-plugin/plugin.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Cursor plugin manifest. |
 | `gemini-extension.json` `"version"` | `X.Y.Z` or `X.Y.Z-rc.N` | Gemini CLI extension manifest. |

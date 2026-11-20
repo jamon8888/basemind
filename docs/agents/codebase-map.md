@@ -18,11 +18,11 @@ modules. [Architecture](../ARCHITECTURE.md) explains the data flows;
 | [`skills/`](../../skills/), [`commands/`](../../commands/), [`hooks/`](../../hooks/) | Canonical product skills, slash-command content, and harness hooks. |
 | [`.claude-plugin/`](../../.claude-plugin/), [`.codex-plugin/`](../../.codex-plugin/), [`.cursor-plugin/`](../../.cursor-plugin/) | Harness-specific plugin metadata and bundled content. |
 | [`opencode-plugin/`](../../opencode-plugin/), [`.pi/`](../../.pi/) | OpenCode plugin/TUI and Pi extension; packaging shares canonical skills. |
-| [`pip-package-hermes/`](../../pip-package-hermes/), [`.hermes/`](../../.hermes/) | Hermes source/tests and generated installable plugin packages. |
+| [`pip-package-hermes/`](../../pip-package-hermes/), [`plugin/.hermes/`](../../plugin/.hermes/) | Hermes source/tests and generated installable plugin packages. |
 | [`npm-package/`](../../npm-package/), [`pip-package/`](../../pip-package/) | Binary download/launch wrappers for npm and PyPI. |
 | [`scripts/`](../../scripts/), [`.github/`](../../.github/) | Launchers, synchronization, packaging, release, CI, and hardening automation. |
 | [`schema/`](../../schema/), [`build.rs`](../../build.rs) | Derived config schema and Cargo rebuild triggers for schema/query changes. |
-| [`Taskfile.yaml`](../../Taskfile.yaml), [`poly.toml`](../../poly.toml), [`deny.toml`](../../deny.toml), [`rustfmt.toml`](../../rustfmt.toml) | Task, lint/hook, dependency policy, and formatting configuration. |
+| [`mise.toml`](../../mise.toml), [`poly.toml`](../../poly.toml), [`deny.toml`](../../deny.toml), [`rustfmt.toml`](../../rustfmt.toml) | Task, lint/hook, dependency policy, and formatting configuration. |
 
 `target/`, dependency directories, downloaded binaries, release archives, and
 machine cache state are build/runtime artifacts. They are not source modules.

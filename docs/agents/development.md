@@ -172,5 +172,6 @@ The test, not a poly custom rule, implements that check.
 For a completed change, account for relevant feature gates, public behavior,
 tests, generated artifacts and user-facing docs. Keep generated product copies
 in sync via the [integration workflow](integrations.md). Release/version work
-uses `task release:sync-version VERSION=...`; ordinary changes do not need a
+follows the [release runbook](release.md) and is bumped only by
+`mise run release:sync-version <version>`; ordinary changes do not need a
 version bump. User-visible behavior changes get an Unreleased changelog entry.

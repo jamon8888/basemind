@@ -15,6 +15,7 @@ Code. Both lead here. Product usage is documented in the root
 | Feature work | [Feature catalog](features.md) | Identify build gates, runtime settings, and implemented versus incomplete surfaces. |
 | Code/config/schema change | [Development workflow](development.md) | Select checks for the changed contract and feature configuration. |
 | Agent integration or packaging | [Integrations](integrations.md) | Identify canonical inputs and generated copies before editing. |
+| Release or failed publish run | [Release runbook](release.md) | Bumper green on `main`, tag on that commit, publish run green. |
 | Architectural decision | [ADR index](../adr/README.md) | Read the relevant decision and its status. |
 | Issue or triage work | [Issue tracker](issue-tracker.md), [labels](triage-labels.md) | Resolve the repository and use its existing issue/label conventions. |
 
@@ -44,7 +45,7 @@ Use these small lookups instead of assuming a release description is current:
   [`server_handler.rs`](../../src/mcp/server_handler.rs).
 - Config model: [`src/config/v1.rs`](../../src/config/v1.rs) and sub-configs;
   validation snapshot: [`schema/`](../../schema/).
-- Verification commands: [`Taskfile.yaml`](../../Taskfile.yaml),
+- Verification commands: [`mise.toml`](../../mise.toml),
   [`poly.toml`](../../poly.toml), and [CI](../../.github/workflows/ci.yaml).
 
 The guides describe the checked-in implementation, including known gaps; they

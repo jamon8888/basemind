@@ -16,6 +16,7 @@ the reference for the area being changed:
 | Find a capability, build gate, or implementation limitation | [Feature catalog](docs/agents/features.md) |
 | Implement and validate a change | [Development workflow](docs/agents/development.md) |
 | Change Claude Code, Codex, other plugins, or distribution | [Integrations](docs/agents/integrations.md) |
+| Cut a release, or fix a failed publish run | [Release runbook](docs/agents/release.md) |
 
 ## Repository conventions
 
