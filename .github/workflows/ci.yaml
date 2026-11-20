@@ -40,9 +40,16 @@ jobs:
     name: test / ${{ matrix.os }} / ${{ matrix.features }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
+    # ~keep continue-on-error belongs at the job level, not inside a matrix `include` entry: there
+    # ~keep the key is a job key and `matrix` is not in scope, so the workflow fails to parse with
+    # ~keep "Unrecognized named-value: 'matrix'". Only the intel-macos entry sets tolerate_failure.
+    continue-on-error: ${{ matrix.tolerate_failure == true }}
     env:
       CARGO_PROFILE_DEV_DEBUG: ${{ matrix.debug }}
       CARGO_PROFILE_TEST_DEBUG: ${{ matrix.debug }}
+      # The legacy Intel macOS runner is slow; daemon IPC handshakes can exceed the 30s default
+      # there. Give them headroom so the timing tests don't flake.
+      BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS: ${{ matrix.handshake_timeout_secs || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -82,11 +89,8 @@ jobs:
             features: "intel-macos"
             timeout_minutes: 240
             debug: "1"
-            continue-on-error: ${{ matrix.features == 'intel-macos' }}
-            # The legacy Intel macOS runner is slow; daemon IPC handshakes can exceed the
-            # 30s default there. Give them headroom so the timing tests don't flake.
-            env:
-              BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS: "120"
+            tolerate_failure: true
+            handshake_timeout_secs: "120"
           - os: windows-latest
             features: "comms shells"
             timeout_minutes: 180
