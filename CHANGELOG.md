@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.39.0] - 2026-11-20
 
 ### Fixed
+
 - macOS CI: drop debug symbols on `full` leg to prevent ENOSPC disk exhaustion (`debug=0`)
 - macOS CI: add `continue-on-error` for slow Intel macOS x86_64 leg (`intel-macos`)
 - macOS CI: increase `BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS` to 120s for daemon IPC headroom
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - macOS CI: fix cgroup harness self-check to use Python instead of `tail /dev/zero`
 
 ### Changed
+
 - Bump version to 0.39.0
 
 ## [0.38.0] - 2026-11-14
