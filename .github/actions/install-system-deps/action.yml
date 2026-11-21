@@ -85,8 +85,51 @@ runs:
           echo "/usr/local/sbin" >> "$GITHUB_PATH"
         fi
 
-        # Install all dependencies
-        brew install cmake tesseract tesseract-lang libheif libmagic pkg-config protobuf || true
+        # Install all dependencies. libheif is deliberately NOT taken from the cask list: the
+        # Homebrew bottle is built for the current macOS (26.x at the time of writing) while
+        # rustc targets macOS 11.0 by default, so linking it fails with undefined
+        # `___isPlatformVersionAtLeast` symbols and blocks every macOS archive. Build it from
+        # source below, against the deployment target we ship, exactly as the Linux branch does.
+        brew install cmake tesseract tesseract-lang libmagic pkg-config protobuf \
+          libde265 x265 aom || true
+
+        echo "::group::Building libheif from source (1.23.0)"
+
+        LIBHEIF_VERSION="1.23.0"
+        LIBHEIF_PREFIX="${RUNNER_TEMP}/libheif"
+
+        if [ -f "$LIBHEIF_PREFIX/lib/pkgconfig/libheif.pc" ] && \
+           pkg-config --modversion libheif 2>/dev/null | grep -q "^${LIBHEIF_VERSION}$"; then
+          echo "✓ libheif ${LIBHEIF_VERSION} already installed (cached)"
+        else
+          echo "Building libheif ${LIBHEIF_VERSION} from source..."
+          build_dir="$(mktemp -d)"
+          trap "rm -rf '$build_dir'" EXIT
+
+          curl -fsSL -o "$build_dir/libheif.tar.gz" \
+            "https://github.com/strukturag/libheif/releases/download/v${LIBHEIF_VERSION}/libheif-${LIBHEIF_VERSION}.tar.gz"
+          tar xzf "$build_dir/libheif.tar.gz" -C "$build_dir"
+          cd "$build_dir/libheif-${LIBHEIF_VERSION}"
+          mkdir build && cd build
+
+          # The Homebrew codecs are discovered through their pkg-config; the version in the
+          # bottle is newer than the headers the source build wants, so pin the ones it needs.
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$LIBHEIF_PREFIX" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DWITH_EXAMPLES=OFF \
+            -DWITH_GDK_PIXBUF=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+          echo "✓ libheif ${LIBHEIF_VERSION} installed"
+        fi
+
+        echo "PKG_CONFIG_PATH=$LIBHEIF_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
         echo "::endgroup::"
 
