@@ -424,14 +424,6 @@ required-features = ["documents"]
 name = "lance_bench"
 required-features = ["documents"]
 
-# retrieval_bench is a directory example with `#![cfg(feature = "documents")]` at its crate
-# attribute, so with the feature off the whole crate is cfg'd out and rustc reports
-# "main function not found". Auto-discovery carries no required-features, so declare it and
-# cargo skips it on the default-features legs like the other document-tool examples.
-[[example]]
-name = "retrieval_bench"
-required-features = ["documents"]
-
 [[bench]]
 name = "extract"
 harness = false

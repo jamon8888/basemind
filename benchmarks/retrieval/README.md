@@ -1,9 +1,16 @@
 # Retrieval backend benchmark
 
-Measures stores for document retrieval on one synthetic corpus and applies the decision rule of ADR-0029, rule 12
+Measured stores for document retrieval on one synthetic corpus and applied the decision rule of ADR-0029, rule 12
 (`docs/adr/0029-document-retrieval-pipeline-and-store.md`). Nothing here
-changes what basemind does: the harness is the `retrieval_bench` example, it takes every directory as an argument and
-never opens basemind's data home.
+changed what basemind does: the harness **was** the `retrieval_bench` example, it took every directory as an argument and
+never opened basemind's data home.
+
+> **The harness is gone; this file is a record.** `examples/retrieval_bench` was deleted: 2,288 lines across eight
+> files that never compiled. Without the `documents` feature the whole crate was `#![cfg]`-ed out, so rustc reported
+> "main function not found"; with it, `fjall_flat.rs` imported `memmap2`, which is not a dependency, and
+> `lance_indexed.rs` line 122 closed its `.context(...)?` one line early, so the `?` landed on a comparison. It had
+> not compiled since it was added. The decision rule and the measured results below stand as the record of why the
+> store was chosen; re-run them by rebuilding the harness against the current store API.
 
 | Arm | Store | Vector lane | Lexical lane |
 |---|---|---|---|
