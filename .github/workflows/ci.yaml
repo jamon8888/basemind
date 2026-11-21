@@ -50,6 +50,9 @@ jobs:
       # The legacy Intel macOS runner is slow; daemon IPC handshakes can exceed the 30s default
       # there. Give them headroom so the timing tests don't flake.
       BASEMIND_COMMS_HANDSHAKE_TIMEOUT_SECS: ${{ matrix.handshake_timeout_secs || 30 }}
+      # Keep the C toolchain on the version rustc links for, exactly as the publish
+      # workflow's build-binaries job does — see the note there.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:

@@ -450,6 +450,15 @@ jobs:
     # not prevent required full-feature archives or checksums, but checksums still
     # wait for every matrix leg's upload attempt.
     continue-on-error: ${{ matrix.variant != '' }}
+    env:
+      # rustc targets macOS 11.0 on aarch64-apple-darwin by default, and nothing else sets
+      # this, so cc and cmake default to the runner's own macOS (26.x on current images).
+      # The C side — libheif built from source, ring's armv8 assembly — then ships objects
+      # "built for newer 'macOS' version" than the link target, and the ONNX Runtime
+      # artifact's CoreML code fails to resolve `___isPlatformVersionAtLeast`. Setting it
+      # explicitly puts the C toolchain on the same version rustc links for. This is what
+      # the v0.38.0 archives were built on; newer runners drifted the default.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
