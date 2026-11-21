@@ -804,6 +804,14 @@ jobs:
       # died with "manifest unknown". The glibc-floor audit below catches
       # any drift the floating image introduces.
       image: quay.io/pypa/manylinux_2_28_x86_64:latest
+    env:
+      # The container runs as root, but the runner injects HOME=/github/home, which is not
+      # root's home. cargo then aborts with "$HOME differs from euid-obtained home
+      # directory", and git resolves its global config against a directory that is not the
+      # user's, so the ONNX Runtime clone fails with "could not read Username for
+      # 'https://github.com'" — there is no TTY to ask on. Point HOME at root's own home
+      # and both tools behave.
+      HOME: /root
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -904,8 +912,20 @@ jobs:
 
       - name: Build ONNX Runtime from source (no AVX)
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # The container has no GitHub credentials and an anonymous clone of
+          # microsoft/onnxruntime is refused, so git asks for a username there is no TTY
+          # to answer on and the step dies at "could not read Username for
+          # 'https://github.com'". Authenticate with the checkout's own token — reading a
+          # public repository is allowed for any valid token — and leave it unset when
+          # there is none, so a local run stays anonymous.
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            git config --global credential."https://github.com".username x-access-token
+            git config --global credential."https://github.com".password "$GITHUB_TOKEN"
+          fi
           # ORT_VERSION must match ort-sys's dist.tsv for x86_64-unknown-linux-gnu.
           ./scripts/build-ort-noavx2.sh /tmp/ort-src /tmp/ort-build /opt/ort
 
