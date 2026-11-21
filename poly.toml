@@ -28,6 +28,11 @@ exclude = [
   "mcp.json",
   "dist/**",
   "node_modules/**",
+  # Design specs, not ADRs. adrlint matches any `NNNN-slug.md` anywhere in the tree, so
+  # docs/specs/0012-*.md is read as an ADR and fails MADR01b for lacking the "Context and
+  # Problem Statement" section a spec does not carry. Renaming it would break the two ADRs
+  # that link it, and the backend reads no scope setting, so exclude the directory.
+  "docs/specs/**",
   "target/**",
   "vendor/**",
   "website/dist/**",
