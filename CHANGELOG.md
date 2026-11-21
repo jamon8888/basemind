@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.39.0] - 2026-11-20
 
+> **Minor release.** This release uses persisted-schema version `39`; the first
+> scan after upgrading may pay one full re-index (durable, not destructive — see
+> `src/version.rs`).
+
 ### Fixed
 
 - macOS CI: drop debug symbols on `full` leg to prevent ENOSPC disk exhaustion (`debug=0`)
@@ -21,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Release: version surfaces are bumped by `scripts/release-bump.sh`, which now
+  regenerates the plugin bundle from `plugin/`, synchronizes the public-skills and
+  legacy compatibility exports, and validates every surface before it finishes.
+- CI: `continue-on-error` moved to the job level so the workflow parses; the
+  `poly fmt`/`poly lint` checks pass, and `docs/specs` is no longer read as an ADR.
+- Repo: deleted 164 source files that no module declares, and the `index_read`
+  bench that had not compiled since the read path moved to `IndexDb`.
 - Bump version to 0.39.0
 
 ## [0.38.0] - 2026-11-14
