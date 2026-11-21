@@ -3,12 +3,20 @@
 Read latency of the Fjall index, recorded on the layout where every git worktree owns a full index.
 The move to one content-keyed index per repository group is gated on these numbers.
 
-## What is measured
+> **The bench is gone; this file is a record, not a procedure.**
+> `benches/index_read` and `benches/index_read/` were deleted: they timed reads over the public
+> `IndexView` trait and `grep_bloom::GrepEntry`, neither of which the crate exposes any more — the
+> read path went to direct `IndexDb` keyspace reads, and `IndexDb`'s fields are `pub(crate)`, so an
+> external bench cannot reach them. The bench had not compiled since that change. The measured
+> numbers below stand as the record of why the layout moved; the worktree cost below comes from
+> `tests/harden.rs`, which still runs.
 
-`benches/index_read.rs` builds a synthetic repository group: a git repository of 900 source files
+## What was measured
+
+`benches/index_read.rs` built a synthetic repository group: a git repository of 900 source files
 (Rust, TypeScript and Python in equal parts, 8 functions and 40 call sites per file, 25% of call
-sites spread over five hot callee names) plus linked worktrees that each change 10% of the files.
-It indexes every worktree with `basemind::scanner::scan` and times these reads over `IndexView`:
+sites spread over five hot callee names) plus linked worktrees that each changed 10% of the files.
+It indexed every worktree with `basemind::scanner::scan` and timed these reads over `IndexView`:
 
 | operation | read |
 |---|---|
@@ -29,15 +37,8 @@ mismatch, so a read that returns nothing cannot be timed as a fast read.
 BM25 keyword search is not covered: `basemind::search` and the posting writer exist only under the
 `code-search` feature, and this baseline is a default-feature build.
 
-## Run it
-
-```sh
-cargo bench --bench index_read -- --out benchmarks/index/baseline-<date>.json
-cargo bench --bench index_read -- --quick     # 300 files, 200 samples
-```
-
-The benchmark points `BASEMIND_DATA_HOME` and `BASEMIND_COMMS_DIR` at its own temp directory and
-never starts a `basemind` binary.
+The corpus pointed `BASEMIND_DATA_HOME` and `BASEMIND_COMMS_DIR` at its own temp directory and never
+started a `basemind` binary.
 
 ## Baseline, 2026-11-16
 
@@ -95,9 +96,10 @@ within 10% of the per-worktree layout, for every operation.
 4. Fail if `after` p95 at 3x exceeds the larger "before" p95 by more than 10% for any judged
    operation. Report `rows/read` next to it: a regression with unchanged rows is not the layout's.
 
-The workload (corpus, queries, sample order) lives in `benches/index_read.rs` and
-`benches/index_read/corpus.rs` and must not change between the two sides. Only
-`benches/index_read/ops.rs` knows the layout.
+The workload (corpus, queries, sample order) lived in `benches/index_read.rs` and
+`benches/index_read/corpus.rs`, and only `benches/index_read/ops.rs` knew the layout. Both sides of
+that comparison are now gone with the bench, so the gate cannot be re-run as written; it is
+recorded here as the standard the layout change had to meet.
 
 ## Cost of an added worktree
 
