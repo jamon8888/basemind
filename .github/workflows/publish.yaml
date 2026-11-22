@@ -451,14 +451,15 @@ jobs:
     # wait for every matrix leg's upload attempt.
     continue-on-error: ${{ matrix.variant != '' }}
     env:
-      # rustc targets macOS 11.0 on aarch64-apple-darwin by default, and nothing else sets
-      # this, so cc and cmake default to the runner's own macOS (26.x on current images).
-      # The C side — libheif built from source, ring's armv8 assembly — then ships objects
-      # "built for newer 'macOS' version" than the link target, and the ONNX Runtime
-      # artifact's CoreML code fails to resolve `___isPlatformVersionAtLeast`. Setting it
-      # explicitly puts the C toolchain on the same version rustc links for. This is what
-      # the v0.38.0 archives were built on; newer runners drifted the default.
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      # The ONNX Runtime artifact ort-sys ships for aarch64-apple-darwin is compiled against
+      # a macOS 13.4 deployment target — every object in it is stamped 13.4 — and its CoreML
+      # code references `___isPlatformVersionAtLeast`, which the linker cannot resolve when we
+      # link for anything older. rustc defaults to 11.0 on aarch64-apple-darwin, and cc and
+      # cmake default to the runner's own macOS, so without this the link dies with:
+      #   Undefined symbols for architecture arm64: "___isPlatformVersionAtLeast"
+      # Matching the artifact's target is the only value that links, so the macOS binaries
+      # require macOS 13.4 or later.
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -923,8 +924,12 @@ jobs:
           # public repository is allowed for any valid token — and leave it unset when
           # there is none, so a local run stays anonymous.
           if [ -n "${GITHUB_TOKEN:-}" ]; then
-            git config --global credential."https://github.com".username x-access-token
-            git config --global credential."https://github.com".password "$GITHUB_TOKEN"
+            # Write the credential to a file git reads through the store helper: the
+            # config-file pair leaves the password empty when HOME is not the user's,
+            # and git then prompts with no TTY to answer on.
+            printf 'https://x-access-token:%s@github.com\n' "$GITHUB_TOKEN" > "$HOME/.git-credentials"
+            chmod 600 "$HOME/.git-credentials"
+            git config --global credential.helper store
           fi
           # ORT_VERSION must match ort-sys's dist.tsv for x86_64-unknown-linux-gnu.
           ./scripts/build-ort-noavx2.sh /tmp/ort-src /tmp/ort-build /opt/ort
