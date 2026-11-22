@@ -29,7 +29,7 @@ email = "nhirschfeld@gmail.com"
 url = "https://github.com/Goldziher"
 
 [plugin.hermes]
-source = "pip-package-hermes/basemind_hermes_plugin/hermes.py"
+source = "plugin/.hermes/package/src/basemind_hermes_plugin/hermes.py"
 requires_python = ">=3.9"
 
 
