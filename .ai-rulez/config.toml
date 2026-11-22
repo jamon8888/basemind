@@ -1,5 +1,7 @@
 version = "5.0"
 name = "basemind"
+# AGENTS.md and CLAUDE.md are hand-authored in this fork; never let generation overwrite them.
+skip_outputs = ["instructions"]
 description = "Code-map MCP server + scanner — pure-Rust, content-addressed, Fjall-backed inverted index."
 gitignore = true
 
@@ -37,7 +39,7 @@ requires_python = ">=3.9"
 name = "ai-rulez"
 description = "Manage AI governance config via MCP."
 command = "npx"
-args = ["-y", "ai-rulez@latest", "mcp"]
+args = ["-y", "ai-rulez@5.14.1", "mcp"]
 
 [[marketplaces]]
 name = "basemind"
@@ -57,3 +59,42 @@ hashes = "full"
 # Pinned by `ai-rulez migrate v5`: the 4.x default. Remove this line to take the v5 default.
 [mcp]
 self_server = false
+
+# The local ADR intentionally shadows the universal documentation builtin of the same name.
+[lint]
+allow_overrides = ["adr-immutability"]
+
+# Every authored skill is mirrored verbatim into eight harness bundles (.cursor-plugin/,
+# opencode-plugin/, plugin/.hermes/, ...). AR701 is description-duplicate: those mirrors are
+# deliberately identical to skills/, so the finding is informational here, not a defect.
+[lint.severity]
+AR701 = "info"
+
+# OKF context/rules link to real repository docs under docs/, which is outside the .ai-rulez
+# bundle; the links are valid in the checkout, not broken references.
+[[lint.accept]]
+rule = "AR9B2"
+path = ".ai-rulez/context/crate-layout.md"
+match = "docs/"
+reason = "link targets are repo docs outside the governance bundle"
+
+[[lint.accept]]
+rule = "AR9B2"
+path = ".ai-rulez/rules/release-versioning.md"
+match = "docs/"
+reason = "link targets are repo docs outside the governance bundle"
+
+# This fork carries a wider governance tree than the stock 32 KiB Codex AGENTS.md chain.
+[[lint.accept]]
+rule = "AR964"
+path = ".ai-rulez/config.toml"
+match = "AGENTS.md chain limit"
+reason = "extended fork governance content is intentionally loaded by operators"
+
+# The development .mcp.json launches the local binary while the shipped plugin uses
+# ${PLUGIN_ROOT}; one harness reads only one of them.
+[[lint.accept]]
+rule = "AR602"
+path = ".mcp.json"
+match = "basemind"
+reason = "root harness MCP config intentionally differs from the plugin manifest"

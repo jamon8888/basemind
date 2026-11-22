@@ -2,9 +2,10 @@
 # Refresh it with `ai-rulez lock`; `ai-rulez generate --locked` fails when it is stale.
 
 version = 1
-ai_rulez_version = '5.13.4'
+ai_rulez_version = '5.14.1'
 scope = 'all'
-tree = 'sha256:8834cd5106b0c9ba746cf2b186f5e0174a8653110d02528a1fbba62389ac2c13'
+outputs_pinned = true
+tree = 'sha256:46d2a4f40208d13adeaa4a4a58516061ec0c1753a2a7dded9eb3b1a232a37b32'
 
 [[served]]
 name = 'adr-workflow'
@@ -52,7 +53,7 @@ digest = 'sha256:e799ec02d769aa6adbd54efb6397fa8a5cd130cc3ff322b926452e868edd05d
 name = 'harness-canary-authoring'
 source = '.ai-rulez/skills/harness-canary-authoring/SKILL.md'
 commit = ''
-digest = 'sha256:e88ea2b4f48df5e8b04232ac1b27d531dc4323c8b0703f4b3c395c2a00160934'
+digest = 'sha256:59300322794fbcd4f1e1f9a0152f3daf503b2f8561ed29551966379e1b774db3'
 
 [[served]]
 name = 'incremental-approach'
@@ -76,13 +77,13 @@ digest = 'sha256:5cb87728d1449fadda6d8557501fcc0823509c60a37058ce4d2dda123296f67
 name = 'language-support'
 source = '.ai-rulez/skills/language-support/SKILL.md'
 commit = ''
-digest = 'sha256:4d3b5b0484e83f60b407764f9d0961b222d87d79582b1f90577cd79f06c7976a'
+digest = 'sha256:84e5accbc416c06db9e45ee9cc4c75a48debeea78a224ed0d2698557bb9e8483'
 
 [[served]]
 name = 'mcp-tool-checklist'
 source = '.ai-rulez/skills/mcp-tool-checklist/SKILL.md'
 commit = ''
-digest = 'sha256:9b41a7a8d8928f0eec046585868302d1a3798f83806e2aa330fec57ad0f66673'
+digest = 'sha256:615c2f9a0d379a04355204a509989bfe8dab1a5d092f4eb8892c3fa0ced39215'
 
 [[served]]
 name = 'observability-standards'
@@ -158,9 +159,15 @@ digest = 'sha256:ada4405aa2cd8071ff0dcd12117493229d428f843925952483050a980084ff5
 
 [[item]]
 kind = 'agent'
+id = 'mcp-domain-migrator'
+path = 'agents/mcp-domain-migrator.md'
+digest = 'sha256:5892d60670090fedf7da867ecd3f381df8d3df3164b8705ed8f463424172214d'
+
+[[item]]
+kind = 'agent'
 id = 'mcp-tool-author'
 path = 'agents/mcp-tool-author.md'
-digest = 'sha256:41fdfb1c8aceca82989f118d0ac506a2ce1bc67f579f303a111d1c92a7b5845b'
+digest = 'sha256:4e65c4b6a46103bb20ac90ff25ed391d1885a1f28f8f054b95277eb4257b4958'
 
 [[item]]
 kind = 'agent'
@@ -172,13 +179,13 @@ digest = 'sha256:287ab551e196dbfcf63c59ac83ce1f63e0454894bdc45a6f3b609ca939b04a1
 kind = 'agent'
 id = 'scanner-extension'
 path = 'agents/scanner-extension.md'
-digest = 'sha256:76716e24bca7307696ea06a849b375540acab5527ff650e006af3e4e5887d485'
+digest = 'sha256:ce6b621eef9d66c75fef943199bb6f0371c1970883d6bb6948c7cdd36db32d61'
 
 [[item]]
 kind = 'agent'
 id = 'surface-docs-writer'
 path = 'agents/surface-docs-writer.md'
-digest = 'sha256:8627290562881b5c929c3b7c281a001da76a8267628c1b83eb6efd15e9b8e980'
+digest = 'sha256:14bbf6773f1c700b7aafc2552d190a8bf924a98d07436499258fc7b90085a947'
 
 [[item]]
 kind = 'command'
@@ -208,31 +215,31 @@ digest = 'sha256:f9a074aa5dc1be25cebb0bbf868273fb044e041decb823db6e28c44e1992073
 kind = 'context'
 id = 'code-style'
 path = 'context/code-style.md'
-digest = 'sha256:8806192f4d7f4b53b2d4b40eaee75aee6ea6cf23fb78356cbad30ebc2228545f'
+digest = 'sha256:f53a9c7057ae9bd52f1566031bdf45fd4188a069a16548a51675894ca1a344b5'
 
 [[item]]
 kind = 'context'
 id = 'crate-layout'
 path = 'context/crate-layout.md'
-digest = 'sha256:9520f56350a2d5a6a7c4dc9968abe0f857ad0400a2206ccd77d3db264676916e'
+digest = 'sha256:d80b9ef39f6ee555fc2ef7a65a33673518c2d2eec1b6a4aa76a70363ee0c4bb4'
 
 [[item]]
 kind = 'context'
 id = 'harden-harness'
 path = 'context/harden-harness.md'
-digest = 'sha256:ac461e60c8bcbc32236f3042de314491ed90529dbebeb87e64680f1cac4fdf30'
+digest = 'sha256:4117453ce3b3717868c5b90c90eed5d7616f5a728ae2b4b4279197d2b4cd1829'
 
 [[item]]
 kind = 'context'
 id = 'inverted-index'
 path = 'context/inverted-index.md'
-digest = 'sha256:ff9e2660b0851ae58c9e5912a62c7e57a598ef95db774fe7cbe1e4950679b70b'
+digest = 'sha256:2d23ea5488d2fcd665d4b170b1cefe57c255f221dd58dcc38f2d4a8577d66f91'
 
 [[item]]
 kind = 'context'
 id = 'mcp-surface'
 path = 'context/mcp-surface.md'
-digest = 'sha256:1f396a7bbc7bc36fffd3929fd37f747192e81922ee0440cbb12ec092e7f6abe6'
+digest = 'sha256:5696cab5259fc2ac7d8816b17ae3d9afb467d1176d6b6033da1f8d46488b792b'
 
 [[item]]
 kind = 'context'
@@ -244,7 +251,7 @@ digest = 'sha256:e9c6df79b2a88560e4f432fdaab739d857fad86e3a536603afdb6537ae90c90
 kind = 'context'
 id = 'scanner-pipeline'
 path = 'context/scanner-pipeline.md'
-digest = 'sha256:b8708c0e2cad3be814cc827a11e2d3482ecac5291928ea6603a15741c50e6c4a'
+digest = 'sha256:c3db36f444af0cd5cf853d1a1d17158e70b2cd1fa2c5b854f5b3a7d105fb984d'
 
 [[item]]
 kind = 'rule'
@@ -256,19 +263,19 @@ digest = 'sha256:11e2ffe63678e74b67fdb24aef3cdcb702fe661b588f4174c3ab167363eb2cf
 kind = 'rule'
 id = 'agent-comms'
 path = 'rules/agent-comms.md'
-digest = 'sha256:3c3bbd84863c3034f92efb217483192708a2ca8d15dbd276e317beb84629c093'
+digest = 'sha256:8e9e2e2500523bdc4e1fe666e365b84984887bfb1a3f3342ecc5582489baecde'
 
 [[item]]
 kind = 'rule'
 id = 'basemind-usage'
 path = 'rules/basemind-usage.md'
-digest = 'sha256:e30b0e30da222dc818b7b4186186d64ba90d38a0bb3e6fcb4f8b6128a3fd9100'
+digest = 'sha256:80366fb9cd12187515df4139bf34b6ff72e282c1e7afd5da60344a48126b4e2a'
 
 [[item]]
 kind = 'rule'
 id = 'mcp-tool-conventions'
 path = 'rules/mcp-tool-conventions.md'
-digest = 'sha256:2c1594adfcc271908b2384bbe8a97728cad048e842622871ebacbb27979bd7ca'
+digest = 'sha256:32ca183acb5589549c4e36f5b28f7664b3cee082709307b0722ec60492d3cb83'
 
 [[item]]
 kind = 'rule'
@@ -286,30 +293,30 @@ digest = 'sha256:de5f1b738a9101ac064e363c8a60db9a35cf2b1e2275fd77e4fb94f609a9578
 kind = 'rule'
 id = 'release-versioning'
 path = 'rules/release-versioning.md'
-digest = 'sha256:96eca079872a6471bf1544074311004946435bfb055a3cb12aecc3d08457483f'
+digest = 'sha256:a0329c9d2778a5ef9404b69cd3049a51cdb617334df1e271a97dae45b61f160f'
 
 [[item]]
 kind = 'rule'
 id = 'schema-and-blob-compat'
 path = 'rules/schema-and-blob-compat.md'
-digest = 'sha256:2e2e6421f96d245a5ededcdfd5df14bd6d494da7ceb2158ff61dfd7148737f4f'
+digest = 'sha256:39ce8a7906f7d573f170d74947b62baeb084eae776d17b05ef706f56af928295'
 
 [[item]]
 kind = 'rule'
 id = 'tdd-and-poly'
 path = 'rules/tdd-and-poly.md'
-digest = 'sha256:a2ddaaebf8ce0c85716892b10d1189e3d318d57246677471fa987752f83ff5d6'
+digest = 'sha256:fb6741608467741215d5fe61cf83f2ae2d31c25eca8cae0dc336f1c196bd2370'
 
 [[item]]
 kind = 'settings'
 id = 'mcp-servers'
-digest = 'sha256:293561f7e7f3440b6c5353bc2dda9bde07f874a944f5b600904ef46e47bee011'
+digest = 'sha256:e7a676b18b97de2df53a2736d0f8f9b68d3566c9e07ddf3f760aa9ec4dd4a9c6'
 
 [[item]]
 kind = 'skill'
 id = 'harness-canary-authoring'
 path = 'skills/harness-canary-authoring'
-digest = 'sha256:93c4a3420429aacfe64a43a64719903c50e499b7f303d798187cc7a6f7326448'
+digest = 'sha256:443cf6efafdead93f19d6b978e8049494f2d79e614ea6d4b5c1526d5abe92057'
 
 [[item]]
 kind = 'skill'
@@ -321,16 +328,464 @@ digest = 'sha256:f79840142cfffeeda2e0633b1390ad3644f6a78e30f5db8ba6f7250da9f67b2
 kind = 'skill'
 id = 'language-support'
 path = 'skills/language-support'
-digest = 'sha256:027e48d484ec7d38c2da9d8d8c0388b600395d5c31c8ccf851ebbcd9c7e85a7a'
+digest = 'sha256:27e543d1fe46f898f576d26df3e5eb0a956bf205db881c1f8b64108d4ed226da'
 
 [[item]]
 kind = 'skill'
 id = 'mcp-tool-checklist'
 path = 'skills/mcp-tool-checklist'
-digest = 'sha256:865f80dae9bfd57c9a9e3b13053097687467c67c9828b507af2622ff5f672157'
+digest = 'sha256:a12d41bad7a3e870f521dd6d6827523bd9a84f9a9376769d6edfb4e584adf5c1'
 
 [[item]]
 kind = 'skill'
 id = 'poly-and-release-workflow'
 path = 'skills/poly-and-release-workflow'
 digest = 'sha256:235fd401bf5ef07147d2ed9989ec3b60cc439f6f521dfc8dd7a68030b996c41a'
+
+[[output]]
+path = '.agents/skills/adr-workflow/SKILL.md'
+digest = 'sha256:29a8fb402f0b1a673c62cf8b3b2bfb53b13e6e71590bbb8d7c0eaa734225a8bb'
+
+[[output]]
+path = '.agents/skills/check/SKILL.md'
+digest = 'sha256:938eb9ff3f9b36bc56cededaa972a2261323f4f478da8e18dbfb29844e0c4091'
+
+[[output]]
+path = '.agents/skills/check/agents/openai.yaml'
+digest = 'sha256:1a87ca55ded6e6b2c2bf18db6b8fd51380db4aab1a725b392d0038dc29241e35'
+
+[[output]]
+path = '.agents/skills/code-quality-standards/SKILL.md'
+digest = 'sha256:840eaa541ffc44bfda55bb1ac924bea11896b12bde07cf825aa5f096c33b145d'
+
+[[output]]
+path = '.agents/skills/config-placement/SKILL.md'
+digest = 'sha256:ff1eb6a859d459fb6dc6bb59aae1901fee29eb50c608b8f29d70db43545fa674'
+
+[[output]]
+path = '.agents/skills/dependency-awareness/SKILL.md'
+digest = 'sha256:b129a5e910919e31a0f1363ba451e01eb4490ddd31855e49923e65e04ae27b02'
+
+[[output]]
+path = '.agents/skills/error-handling/SKILL.md'
+digest = 'sha256:4da7ed51fd6baa793a70800e3315e8924fecd65019cfeb3d132fe0739ed25493'
+
+[[output]]
+path = '.agents/skills/harden/SKILL.md'
+digest = 'sha256:8728cf4b2fd41612e5ca859c239b2bc4ea6cd188847e80f503ec68b7aff895a7'
+
+[[output]]
+path = '.agents/skills/harden/agents/openai.yaml'
+digest = 'sha256:cfa0ac01cc6b11510e68bcd3174f24bb2335b7badf15f1eddc2be057a31083c5'
+
+[[output]]
+path = '.agents/skills/harness-canary-authoring/SKILL.md'
+digest = 'sha256:546d9cb8f9b8ac0aa5557417aba31a43b05085325211045afa6dedd8da2bea7e'
+
+[[output]]
+path = '.agents/skills/incremental-approach/SKILL.md'
+digest = 'sha256:da5eb010fee0b048e1c4868581bb331624ddb4936b4db792e72cf9c201388a27'
+
+[[output]]
+path = '.agents/skills/index-keyspace-evolution/SKILL.md'
+digest = 'sha256:3a5b44981396bbcbf950cfb2af61cb2fbbfedb553cbd6f772ef26867fdc5bd7b'
+
+[[output]]
+path = '.agents/skills/iterate/SKILL.md'
+digest = 'sha256:5dc4df87b2133c46b0ba3f527283f5a2102ab050caf54ca38444eb452af471d6'
+
+[[output]]
+path = '.agents/skills/iterate/agents/openai.yaml'
+digest = 'sha256:7a7f43fae2dd4008b6f44baa71143e4ea6179e8e5bec61857a18c396220f7064'
+
+[[output]]
+path = '.agents/skills/language-support/SKILL.md'
+digest = 'sha256:aed77318b4040aac662acbb052cadc07c089f33a7860205822ba7c13417e8a01'
+
+[[output]]
+path = '.agents/skills/mcp-tool-checklist/SKILL.md'
+digest = 'sha256:1e2f11cf1f256c6dc9c6fb26707f1db95513a76b07ce6ef135b556a6a1eea032'
+
+[[output]]
+path = '.agents/skills/observability-standards/SKILL.md'
+digest = 'sha256:c285fd25870d58002c2676c3c65b79a3c06186ffb6e6e190623d40f29b21bfaa'
+
+[[output]]
+path = '.agents/skills/owasp-quick-reference/SKILL.md'
+digest = 'sha256:7b7116183f28397a65320288bb0a43f58a30df8368ff2d50741547c19b13320a'
+
+[[output]]
+path = '.agents/skills/parallelize/SKILL.md'
+digest = 'sha256:dc7cc133f031f8861476bfc45c909fbf3737d8f3fa04fa3da18bd3e4c71eef1a'
+
+[[output]]
+path = '.agents/skills/parallelize/agents/openai.yaml'
+digest = 'sha256:5ac9c5f5820177d734f7112bfc1c6ba668aadee4c173121648c548a4b5bc9bbb'
+
+[[output]]
+path = '.agents/skills/poly-and-release-workflow/SKILL.md'
+digest = 'sha256:d56971c6d01f7be266358c24609a5a6c8b0438a65352e4af97645dc3d9e617b2'
+
+[[output]]
+path = '.agents/skills/rust-conventions/SKILL.md'
+digest = 'sha256:903f428e007b66924dcfe5f48970d4a81b52eccb0ef3817085737ccf66b6eb2f'
+
+[[output]]
+path = '.agents/skills/scan/SKILL.md'
+digest = 'sha256:4dc70f8bce919fdff6e460091ba8f4f9c6a1690a19a8f95d62c0b46993a7d883'
+
+[[output]]
+path = '.agents/skills/scan/agents/openai.yaml'
+digest = 'sha256:8e1f42df896f157dfed6c6e89771cefa92193572ff1188307863d457b1a6e2d8'
+
+[[output]]
+path = '.agents/skills/serve/SKILL.md'
+digest = 'sha256:64a4c9d0b294ac7c278c5010021b658728ff6764fab85b3c01085e13b5c30023'
+
+[[output]]
+path = '.agents/skills/serve/agents/openai.yaml'
+digest = 'sha256:18fd785bd1aa61a19c783fa8578013d8f836deea31076180dcf71f0e2c626be8'
+
+[[output]]
+path = '.agents/skills/skill-authoring/SKILL.md'
+digest = 'sha256:c680174624778e321e11fb8342f1eefeaf5023a76451814ee8ce7056b142e602'
+
+[[output]]
+path = '.agents/skills/task-runner/SKILL.md'
+digest = 'sha256:fc4c3cef4224be14eb0ff3d8a9ed1705d64bf9462709ef2ba853e87bb7156b10'
+
+[[output]]
+path = '.agents/skills/tdd-workflow/SKILL.md'
+digest = 'sha256:0f84366aef0566c6dd677059e8f7886f2e9de57633f88467de76fcd1305c0947'
+
+[[output]]
+path = '.agents/skills/testing-conventions/SKILL.md'
+digest = 'sha256:66df73eab8717e01ab79a243699a9dc8a6daf23a9215d9d2199bb6fb523d2f1d'
+
+[[output]]
+path = '.claude/agents/code-reviewer.md'
+digest = 'sha256:a3bf5a5fa6ad07eba09df9ab3db48ba431c5d6e620a13e76a8750e6c0ca93b0a'
+
+[[output]]
+path = '.claude/agents/devops-engineer.md'
+digest = 'sha256:d5f0bbf9556c146f6d689c0bc5b5146b57cfe9e326140db0c45164cdd6839c01'
+
+[[output]]
+path = '.claude/agents/docs-writer.md'
+digest = 'sha256:1ff7df03fa49273dd175ac3e37d8848eff9687af0b07f99fdc9240d1df21a767'
+
+[[output]]
+path = '.claude/agents/harness-interpreter.md'
+digest = 'sha256:66814140e9ff1d0f528b13cdc94f5484ab33afe27ad5e619d26e79c665edfd0d'
+
+[[output]]
+path = '.claude/agents/mcp-domain-migrator.md'
+digest = 'sha256:9acec3009b84c0b37ce5a0de62a95693978ac252839516edf1dcbfb8d48d2d4f'
+
+[[output]]
+path = '.claude/agents/mcp-tool-author.md'
+digest = 'sha256:2994f7367123a1280563ee03074f519710b4e4d7d5fed1c4700c236d98d24c50'
+
+[[output]]
+path = '.claude/agents/release-engineer.md'
+digest = 'sha256:11691590c17b76c23ebbb90c977c8267fad7b013310b5e41521076284a8e9dbe'
+
+[[output]]
+path = '.claude/agents/rust-perf-engineer.md'
+digest = 'sha256:39f791c93db62cc273fb3377f778ed9ef453ec271809d7875ccb7a60180d4ace'
+
+[[output]]
+path = '.claude/agents/scanner-extension.md'
+digest = 'sha256:ffabd3d9abdd8a21e4ca87afff113747970eaf86a93d5aeb2b41c92b68a6dc83'
+
+[[output]]
+path = '.claude/agents/security-auditor.md'
+digest = 'sha256:c495594e5f70cc3396192fe1a84c37b909294d05a18908f8b41f7d65f78b12d0'
+
+[[output]]
+path = '.claude/agents/surface-docs-writer.md'
+digest = 'sha256:e3188efde7b543403ffcefac02069fd35e0d98b52b591aa474f3e18ea7cb53c7'
+
+[[output]]
+path = '.claude/agents/test-writer.md'
+digest = 'sha256:5ae153274e29824cc8b87584dbfd30132f8b080ceeb5ee88406e347909c29bbd'
+
+[[output]]
+path = '.claude/rules/adr-immutability.md'
+digest = 'sha256:d6b72f7892ac7880ccbfd20f2be1947bb9017a2a7085c3f4cdb0ccca8814e1a8'
+
+[[output]]
+path = '.claude/rules/agent-comms.md'
+digest = 'sha256:0d4866cf018115910111026fc8d64c1e7fefd34e015cfde8b642b5169dbe8e40'
+
+[[output]]
+path = '.claude/rules/agent-workflow.md'
+digest = 'sha256:91f293b63721fae11948643b2b0874611675b1a8e7a4551d16a35fa081ed332a'
+
+[[output]]
+path = '.claude/rules/atomic-commits.md'
+digest = 'sha256:42c0e94e5af50f667b5bef7edc89db3007e3787fcba4e7a35028b8adfa913dfe'
+
+[[output]]
+path = '.claude/rules/basemind-usage.md'
+digest = 'sha256:a2df51d9a1a11af777b2f220b328d094a2d58ee7538f8c230ccac36b2ff94e48'
+
+[[output]]
+path = '.claude/rules/branch-hygiene.md'
+digest = 'sha256:5eb217f072be3c90297ba058386c35b4edea80fc07c7169879bd58f007e609c7'
+
+[[output]]
+path = '.claude/rules/commit-messages.md'
+digest = 'sha256:7f706771a73cbb1f9d08857dbbe292181d96966aea61c02d12968396dbe7296a'
+
+[[output]]
+path = '.claude/rules/communication-style.md'
+digest = 'sha256:e08af8b19366e9d780276e8f984874e26bfa4e30766377d5f818ee3f22a8fe4a'
+
+[[output]]
+path = '.claude/rules/context-preservation.md'
+digest = 'sha256:459091208323c0ab8b81460db8d3bf6fdf8f851c70e0c8cfd74a6c9770ac2c9f'
+
+[[output]]
+path = '.claude/rules/customer-data-boundary.md'
+digest = 'sha256:d3750690e10ab6b3c8fd11c843fcf109bd2b6321cfc11067b22024bd7e45ea5e'
+
+[[output]]
+path = '.claude/rules/explain-reasoning.md'
+digest = 'sha256:c7f108a6bce109a03f51f283a0df1fc392b2a1320649c6f4bb7b60f74412a42e'
+
+[[output]]
+path = '.claude/rules/generated-files.md'
+digest = 'sha256:d53fb3fe3349d2d5837d3484366bb8deed8d0c0e344bad0b3f5262b8fd844e22'
+
+[[output]]
+path = '.claude/rules/github-workflow.md'
+digest = 'sha256:5e2adac1152d12fa4ab69206a14c7be976b8922eb7faa860a1430190c97dd5f2'
+
+[[output]]
+path = '.claude/rules/inline-documentation.md'
+digest = 'sha256:d278110c53cf67f07b0799ac835a91d3d59d539b420ebe2b80dce9d2c2596ed0'
+
+[[output]]
+path = '.claude/rules/input-validation.md'
+digest = 'sha256:54b1f5d9d5ec6d45a9e70f336afe51c6e84d3807392d6d3639a3ae1b0de7375d'
+
+[[output]]
+path = '.claude/rules/least-privilege.md'
+digest = 'sha256:63fcdc66a15c2872171b371549b6ca349255377e5365958e0e6144f70cb7fedc'
+
+[[output]]
+path = '.claude/rules/mcp-tool-conventions.md'
+digest = 'sha256:0b0e934a1b1117c4dee0e88a0be9cebc5e0e7c937980930044770fe88b00b8bb'
+
+[[output]]
+path = '.claude/rules/minimal-changes.md'
+digest = 'sha256:3127a05999cb97592d4c67cceb6312fd3008f72ecd8e1fd9f4552e6fd1480559'
+
+[[output]]
+path = '.claude/rules/module-size-cap.md'
+digest = 'sha256:30f2d122e553343c1e132b219fadd6ca4a0ad6f7218b69286aa0c8daa083e06e'
+
+[[output]]
+path = '.claude/rules/no-ai-signatures.md'
+digest = 'sha256:209f68d6b02941a7bc0ee60ee20f6e099cabddfb870a219e6f46ee92f45e3f7e'
+
+[[output]]
+path = '.claude/rules/output-awareness.md'
+digest = 'sha256:7fca3d26b99145d236d9aa2d82d6867d88998f2a7bb722894575c43219043c67'
+
+[[output]]
+path = '.claude/rules/perf-discipline.md'
+digest = 'sha256:c36bb744869ea9013db54d3c9ed4b9d1f0c5e392f8c8d3fba476794e165fa399'
+
+[[output]]
+path = '.claude/rules/pipeline-standards.md'
+digest = 'sha256:6b1b024513cf3fbef96f0620a35e7e2536faee5d308abbd9652d39a774198c13'
+
+[[output]]
+path = '.claude/rules/read-before-write.md'
+digest = 'sha256:9b3239ebbf63c6ab65a6c75f60b548fcb800debf61b3f300ebf34ba1b7959fd1'
+
+[[output]]
+path = '.claude/rules/readme-standards.md'
+digest = 'sha256:0168da4209c0407b86dedf17463144457cfd65326659ae9876c05623df2b2351'
+
+[[output]]
+path = '.claude/rules/release-versioning.md'
+digest = 'sha256:18d2d3602a2121a6d72157d57f611d673ea87f5596bc6c3410d7c2fbfb4540a3'
+
+[[output]]
+path = '.claude/rules/safe-git-operations.md'
+digest = 'sha256:c798344119c577942c1f6988401689ff702fb7058b96cf830259d8aedb384594'
+
+[[output]]
+path = '.claude/rules/schema-and-blob-compat.md'
+digest = 'sha256:90a1bcb9a0cd4eb06c01c0f4ef5dfe8ec7364c5ca324ea407b668c503f0b12ee'
+
+[[output]]
+path = '.claude/rules/secrets-handling.md'
+digest = 'sha256:92a7d29003705f5ab283866bc66df59faa15d51d54204969459fb17b22c747a5'
+
+[[output]]
+path = '.claude/rules/systematic-debugging.md'
+digest = 'sha256:0d963a741afbf8707bfbb5e3197c7a85d0ceadfe8546f15771b9290860bfb08a'
+
+[[output]]
+path = '.claude/rules/tdd-and-poly.md'
+digest = 'sha256:83eda043eb92fa43d50e7ff1df7e57087f941fbab9ea8446074044bd5adc0ded'
+
+[[output]]
+path = '.claude/rules/test-alongside-code.md'
+digest = 'sha256:84846db5150a3e5daa63d7ce7a55f83fc34fa7dcba7a7f257f0aba54844509a8'
+
+[[output]]
+path = '.claude/rules/update-docs-with-code.md'
+digest = 'sha256:577ff5fb7781ec3de102ab6eed70b30ac0951ff2b5086455353b12aea614cefb'
+
+[[output]]
+path = '.claude/rules/verification-before-completion.md'
+digest = 'sha256:5f5b8429862290425f7c212b99396c51bdfba39a713096b42838b9303b61003e'
+
+[[output]]
+path = '.claude/skills/adr-workflow/SKILL.md'
+digest = 'sha256:ae93edab380f97ee3aaf36ba9008812200ab035e5733bfa7b428e23034ecfc83'
+
+[[output]]
+path = '.claude/skills/check/SKILL.md'
+digest = 'sha256:1eb72cdd5334e31c81d07bbaeb3cc05a8dd184cc36da82b199faa17f744167dc'
+
+[[output]]
+path = '.claude/skills/code-quality-standards/SKILL.md'
+digest = 'sha256:ad1a0d2c4cee1094b09af508a82ca74d6bfade34c4effcd8bd4cda3be18961ad'
+
+[[output]]
+path = '.claude/skills/config-placement/SKILL.md'
+digest = 'sha256:8025aef001cdb0369e2a3fede07c752295647f543bcfe3713ac459e73975d9c9'
+
+[[output]]
+path = '.claude/skills/dependency-awareness/SKILL.md'
+digest = 'sha256:d8ce4e5809abd3d5fe45d910bc5b05125b2468ded57a287a53303f12179a6199'
+
+[[output]]
+path = '.claude/skills/error-handling/SKILL.md'
+digest = 'sha256:4da684a36f95fef857028bfa68c8dd9fb45a814368b8c87ee9f853e69c412a90'
+
+[[output]]
+path = '.claude/skills/harden/SKILL.md'
+digest = 'sha256:2ad13c5656604b1602a4a76f368036999814a2da3d70ee8179a3c1ffbd6e0c58'
+
+[[output]]
+path = '.claude/skills/harness-canary-authoring/SKILL.md'
+digest = 'sha256:bde5e5e7687f1cb5917dda7ef429bb1098e75b610a5b3152346df2d5fd90b57a'
+
+[[output]]
+path = '.claude/skills/incremental-approach/SKILL.md'
+digest = 'sha256:be53ae818c7a95c3bce055863d20d86a32dd22db09c3494805b85582a343c081'
+
+[[output]]
+path = '.claude/skills/index-keyspace-evolution/SKILL.md'
+digest = 'sha256:24784b0cfe18eb94aba554a04e42b460f794cd39540573883f067177a80364b5'
+
+[[output]]
+path = '.claude/skills/iterate/SKILL.md'
+digest = 'sha256:92d70487fab58f7c6779b5e9c1148c324f9652365b4aa2680103feec8a9444f0'
+
+[[output]]
+path = '.claude/skills/language-support/SKILL.md'
+digest = 'sha256:2a52558a3bfb2e795884ce90edb35fa358d9edcc8dde00fb0a54d9175efd7778'
+
+[[output]]
+path = '.claude/skills/mcp-tool-checklist/SKILL.md'
+digest = 'sha256:18b5dbcb5155fda1cd2127095003c9c80c258f3870cf961b2a5cad78e6608972'
+
+[[output]]
+path = '.claude/skills/observability-standards/SKILL.md'
+digest = 'sha256:7e4196df958e4ca18210f23f840aebf787d600ca47ea56d89dfaff1fe8513afc'
+
+[[output]]
+path = '.claude/skills/owasp-quick-reference/SKILL.md'
+digest = 'sha256:ab148c5f8269e8135dbee15af2bc7042337dad2f747dfda829ea2fa12d99ed05'
+
+[[output]]
+path = '.claude/skills/parallelize/SKILL.md'
+digest = 'sha256:7d0a2802e5329452b7c015e45c28d09c33c35837331603ac29a73792ad9f84ac'
+
+[[output]]
+path = '.claude/skills/poly-and-release-workflow/SKILL.md'
+digest = 'sha256:8346515d400a04ab973d4a4284f8c80df4258b068609782cc6e3bc6e5e93284d'
+
+[[output]]
+path = '.claude/skills/rust-conventions/SKILL.md'
+digest = 'sha256:8273f7e92cdc74bd6e27c6fcb8a1ed646c92eed29bf7b83dd1bd49e083ca89e4'
+
+[[output]]
+path = '.claude/skills/scan/SKILL.md'
+digest = 'sha256:718ae657233ca805581c3f2ef9c4873ca03e0a5c198d80d2881dc363b119f55c'
+
+[[output]]
+path = '.claude/skills/serve/SKILL.md'
+digest = 'sha256:70ca6c569cbea52eff19414567e88c316a7543ae27f655f22eebf5cb91638fcf'
+
+[[output]]
+path = '.claude/skills/skill-authoring/SKILL.md'
+digest = 'sha256:efb485edaba87d71c4cc5dfb7feb6c8920c6ccd4f2e584ea5f054ff9485e7ba0'
+
+[[output]]
+path = '.claude/skills/task-runner/SKILL.md'
+digest = 'sha256:26dad84e7b4cad61a00455b8c2362686aa1f2109a6f4cb3320e8ef6119c1baa6'
+
+[[output]]
+path = '.claude/skills/tdd-workflow/SKILL.md'
+digest = 'sha256:a76a3886f360fd2185775c3eba5feef7def33f59c62d66a5df24d0a19945b6ea'
+
+[[output]]
+path = '.claude/skills/testing-conventions/SKILL.md'
+digest = 'sha256:3b4fc2f27cb2e2466420d5ec5a130ebd4f07b424115c4ee6ec0140ca52153e53'
+
+[[output]]
+path = '.codex/agents/code-reviewer.toml'
+digest = 'sha256:afa86024512ecbfa9422330a448e74076746bc447f28eb31d91c3a55923911c5'
+
+[[output]]
+path = '.codex/agents/devops-engineer.toml'
+digest = 'sha256:d8520222b49f74b75bba0c0a209ef21bc59d3e1d22d01d5cfda79657601335c6'
+
+[[output]]
+path = '.codex/agents/docs-writer.toml'
+digest = 'sha256:e5ae08f036b599eabd920538bba2da9397db5481b341e16e40515f31561edc5d'
+
+[[output]]
+path = '.codex/agents/harness-interpreter.toml'
+digest = 'sha256:56c3793eaab9f4ba25bec6e0963aefff2fd66ad33295d203013be6e9be2ccc5b'
+
+[[output]]
+path = '.codex/agents/mcp-domain-migrator.toml'
+digest = 'sha256:b9bd8653f41d1a41c8823099f9ede9d0175f179cfaf44c3369cca36bdf991b9f'
+
+[[output]]
+path = '.codex/agents/mcp-tool-author.toml'
+digest = 'sha256:649cfefa845b9fc71ff7c0651e0a4c1256ca0c68914c171755cff07c0a8c92db'
+
+[[output]]
+path = '.codex/agents/release-engineer.toml'
+digest = 'sha256:1bcb18df107d7b3a9efad4837e8bbaf55efd24cee533afcd8561093a5e57a8d4'
+
+[[output]]
+path = '.codex/agents/rust-perf-engineer.toml'
+digest = 'sha256:4bea165899a8b432d07e0fa19d900f5bfe223b44cac99ea8fdb0e49e221b9d0f'
+
+[[output]]
+path = '.codex/agents/scanner-extension.toml'
+digest = 'sha256:bf292b8f831e3aebb39976da9d2bf3c78ec903d3d04f677e709de17a08d40d2f'
+
+[[output]]
+path = '.codex/agents/security-auditor.toml'
+digest = 'sha256:64080792987b7208727528ac21f475189dc50dd3a98db8b29f1b2c15e932a4ea'
+
+[[output]]
+path = '.codex/agents/surface-docs-writer.toml'
+digest = 'sha256:dfdc011659b288c1ae9e2bac957f963952c511ed507b6e50c7c938351fa6a05b'
+
+[[output]]
+path = '.codex/agents/test-writer.toml'
+digest = 'sha256:b5ddf7b9c593232dbfb7880f1b4aa6ab1b90f2ea3abf7fb8498822f76c32e73e'
