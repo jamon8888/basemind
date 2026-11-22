@@ -108,7 +108,11 @@ fn canonical_key(tool: &str) -> Cow<'_, str> {
     let Some((domain, mode)) = tool.split_once('_') else {
         return Cow::Borrowed(tool);
     };
-    let known = super::mode::domain_modes()
+    // Use the full vocabulary, not `domain_modes()`: that list is gated by the compiled profile
+    // (the confidential legal build withholds the `code` domain), but telemetry keys are stable
+    // across builds. Looking them up through the advertised list made `code_outline` fall through
+    // to `unclassified` in that profile.
+    let known = super::mode::all_domain_modes()
         .into_iter()
         .any(|(d, modes)| d == domain && modes.contains(&mode));
     if known {
