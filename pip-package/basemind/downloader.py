@@ -24,6 +24,26 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+#: Distribution profiles. `full` is the default for the legacy `pip install
+#: basemind` command; `hacienda-legal` is the confidential profile (documents +
+#: memory + NER + GraphRAG, no code/comms/crawl tooling). Set
+#: BASEMIND_PROFILE=hacienda-legal to select it; never fall back silently.
+PROFILES = ("full", "hacienda-legal")
+
+
+def _profile() -> str:
+    profile = os.getenv("BASEMIND_PROFILE", "full")
+    if profile not in PROFILES:
+        raise RuntimeError(
+            f"unknown BASEMIND_PROFILE {profile!r} — choose one of: {', '.join(PROFILES)} ('full' is the default)"
+        )
+    return profile
+
+
+def _asset_prefix(profile: str) -> str:
+    """Release asset prefix: full keeps the historical unprefixed name."""
+    return "basemind" if profile == "full" else f"basemind-{profile}"
+
 
 def _sysctl(name: str) -> str:
     """Return the trimmed value of a sysctl, or "" if it can't be read."""
@@ -83,16 +103,28 @@ def _python_version_to_tag(version: str) -> str:
     return version
 
 
-def _asset(version: str) -> tuple[str, str, str, str]:
-    """Return (archive_url, ext, asset_name, checksums_url) for this platform."""
+def _asset(version: str, profile: str | None = None) -> tuple[str, str, str, str]:
+    """Return (archive_url, ext, asset_name, checksums_url) for profile + OS + arch."""
+    profile = profile or _profile()
     tag = _python_version_to_tag(version)
     triple = _platform_triple()
     ext = "zip" if "windows" in triple else "tar.gz"
-    asset_name = f"basemind-{triple}.{ext}"
+    asset_name = f"{_asset_prefix(profile)}-{triple}.{ext}"
     base = f"https://github.com/Goldziher/basemind/releases/download/v{tag}"
     archive_url = f"{base}/{asset_name}"
     checksums_url = f"{base}/basemind_{tag}_checksums.txt"
     return archive_url, ext, asset_name, checksums_url
+
+
+def _missing_asset_error(kind: str, version: str, profile: str, asset_name: str) -> RuntimeError:
+    """One explicit failure for a missing asset or checksum — no silent fallback."""
+    tag = _python_version_to_tag(version)
+    return RuntimeError(
+        f"{kind} for profile {profile!r} / {_platform_triple()} at v{version} ({asset_name}). "
+        f"Check https://github.com/Goldziher/basemind/releases/tag/v{tag}: archives "
+        "(.tar.gz/.zip) and installers (.exe/.dmg) ship together at the same version, and the "
+        "checksums file must list this asset."
+    )
 
 
 def _is_retryable_error(error: Exception | str) -> bool:
@@ -190,7 +222,7 @@ def _expected_digest(checksums_text: str, asset_name: str) -> str | None:
     return None
 
 
-def _verify_checksum(archive: Path, asset_name: str, checksums_url: str) -> None:
+def _verify_checksum(archive: Path, asset_name: str, checksums_url: str, *, version: str, profile: str) -> None:
     """Verify the archive sha256 against the release checksums file.
 
     Fails CLOSED: any failure to fetch the checksums, locate the entry, or
@@ -206,9 +238,7 @@ def _verify_checksum(archive: Path, asset_name: str, checksums_url: str) -> None
 
     expected = _expected_digest(checksums_text, asset_name)
     if not expected:
-        raise RuntimeError(
-            f"no checksum entry for {asset_name} in {checksums_url} — refusing to install unverified binary"
-        )
+        raise _missing_asset_error(f"no SHA-256 entry in {checksums_url} for", version, profile, asset_name)
 
     digest = hashlib.sha256()
     digest.update(archive.read_bytes())
@@ -270,14 +300,17 @@ def ensure_binary() -> str:
     if override:
         return override
 
+    profile = _profile()
     cache_dir = _cache_dir(__version__)
     binary_path = cache_dir / _binary_name()
-    if binary_path.exists() and os.access(binary_path, os.X_OK):
+    marker_path = cache_dir / ".profile"
+    installed_profile = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else "full"
+    if binary_path.exists() and os.access(binary_path, os.X_OK) and installed_profile == profile:
         _prune_stale_versions(__version__)
         return str(binary_path)
 
-    archive_url, ext, asset_name, checksums_url = _asset(__version__)
-    print(f"Downloading basemind binary v{__version__}...", file=sys.stderr)
+    archive_url, ext, asset_name, checksums_url = _asset(__version__, profile)
+    print(f"Downloading basemind '{profile}' binary v{__version__}...", file=sys.stderr)
 
     lock_path = cache_dir / ".lock"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -291,7 +324,9 @@ def ensure_binary() -> str:
         for _ in range(30):
             time.sleep(0.1)
             if binary_path.exists() and os.access(binary_path, os.X_OK):
-                return str(binary_path)
+                current = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else "full"
+                if current == profile:
+                    return str(binary_path)
         raise RuntimeError(
             f"Timeout waiting for concurrent binary installation of {__version__}. "
             f"If this persists, remove {cache_dir} and retry."
@@ -299,15 +334,25 @@ def ensure_binary() -> str:
 
     try:
         if binary_path.exists() and os.access(binary_path, os.X_OK):
-            return str(binary_path)
+            current = marker_path.read_text(encoding="utf-8").strip() if marker_path.exists() else "full"
+            if current == profile:
+                return str(binary_path)
 
         # Stage under the cache root, not the system temp dir: the final ~keep
         # ``staging_dir.replace(cache_dir)`` is an atomic rename that fails with ~keep
         # EXDEV (cross-device link) when /tmp and $HOME are on different filesystems (#38). ~keep
         with tempfile.TemporaryDirectory(dir=cache_dir.parent) as tmpdir:
             archive_path = Path(tmpdir) / asset_name
-            _download(archive_url, archive_path)
-            _verify_checksum(archive_path, asset_name, checksums_url)
+            try:
+                _download(archive_url, archive_path)
+            except RuntimeError as exc:
+                raise _missing_asset_error(
+                    f"release asset {asset_name} is missing or unreachable ({exc}) —",
+                    __version__,
+                    profile,
+                    asset_name,
+                ) from exc
+            _verify_checksum(archive_path, asset_name, checksums_url, version=__version__, profile=profile)
 
             staging_dir = Path(tmpdir) / "staging"
             staging_dir.mkdir()
@@ -316,7 +361,10 @@ def ensure_binary() -> str:
             try:
                 staging_dir.replace(cache_dir)
             except (OSError, FileExistsError) as exc:
-                if not (binary_path.exists() and os.access(binary_path, os.X_OK)):
+                # A non-empty target cannot be renamed over. When switching
+                # profiles the old binary is present but belongs to the other
+                # profile, so it must be replaced rather than kept.
+                if installed_profile != profile or not (binary_path.exists() and os.access(binary_path, os.X_OK)):
                     shutil.rmtree(cache_dir, ignore_errors=True)
                     staging_dir.replace(cache_dir)
                 if not binary_path.exists():
@@ -324,6 +372,7 @@ def ensure_binary() -> str:
 
         if not binary_path.exists():
             raise RuntimeError(f"binary {_binary_name()} not found after extracting {asset_name}")
+        marker_path.write_text(profile, encoding="utf-8")
 
         if platform.system().lower() != "windows":
             binary_path.chmod(0o755)

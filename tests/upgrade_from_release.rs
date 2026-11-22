@@ -13,6 +13,8 @@
 //! - opening the upgraded data with the old binary again fails safe (it works, never corrupts) and
 //!   converges once more on re-upgrade.
 
+// Every test in this file drives the `code` tool/CLI group, which the confidential profile withholds.
+#![cfg(not(feature = "hacienda-legal"))]
 #![cfg(feature = "documents")]
 
 use std::fs;
@@ -273,6 +275,7 @@ fn upgrade_from(old: &Path) {
     assert_eq!(env.code_paths(new).len(), 3);
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn upgrading_from_cached_releases_migrates_cleans_and_converges() {
     let olds = old_binaries();

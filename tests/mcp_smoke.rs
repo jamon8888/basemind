@@ -127,6 +127,7 @@ fn decode_text(result: &CallToolResult) -> Value {
 
 /// Return the first text content item verbatim (no JSON parse) — used to inspect the
 /// raw TOON payload a tool emits when `format="toon"`.
+#[cfg(not(feature = "hacienda-legal"))]
 fn raw_text(result: &CallToolResult) -> String {
     use rmcp::model::ContentBlock;
     result
@@ -161,6 +162,7 @@ fn call_params(name: &'static str, args: Value) -> CallToolRequestParams {
     params
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_server_exercises_representative_tools() {
     let dir = build_repo();
@@ -3684,6 +3686,7 @@ async fn serve_auto_scan_reports_index_build_ms_on_status() {
 ///
 /// This asserts the absence deliberately rather than leaving it untested: a well-meaning "add the
 /// output schema back" change would look like an improvement and take the whole registry down.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tools_advertise_output_schema() {
     let dir = build_repo();
@@ -3724,6 +3727,7 @@ async fn tools_advertise_output_schema() {
     let _ = server.cancel().await;
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lean_surface_is_opt_in_and_round_trips_through_invoke_tool() {
     let dir = build_repo();
@@ -4066,6 +4070,7 @@ async fn rescan_emits_progress_and_no_logging() {
 /// belongs in `harden.rs`), but to catch a unit error. If `elapsed_us` were ever populated with
 /// nanoseconds, or with a raw `Duration` debug value, a real call against a 1-file repo would blow
 /// past this; a genuine microsecond reading cannot.
+#[cfg(not(feature = "hacienda-legal"))]
 const SANE_ELAPSED_US_MAX: u64 = 60_000_000;
 
 /// Extract `elapsed_us` from a tool response, asserting it is present and plausibly a microsecond
@@ -4076,6 +4081,7 @@ const SANE_ELAPSED_US_MAX: u64 = 60_000_000;
 /// assertion would test something the contract does not promise and would flake on a fast machine.
 /// Callers that perform work with a hard floor above a microsecond (a store read, a git walk) assert
 /// `> 0` themselves via [`assert_stamped`].
+#[cfg(not(feature = "hacienda-legal"))]
 fn assert_sane_elapsed_us(tool: &str, body: &Value) -> u64 {
     let us = body
         .get("elapsed_us")
@@ -4092,6 +4098,7 @@ fn assert_sane_elapsed_us(tool: &str, body: &Value) -> u64 {
 /// Assert `elapsed_us` was actually stamped from the body timer rather than left at the `0`
 /// initializer. Only valid for tools whose measured region contains work with a floor comfortably
 /// above one microsecond (reading a blob off disk, walking git history).
+#[cfg(not(feature = "hacienda-legal"))]
 fn assert_stamped(tool: &str, body: &Value) {
     let us = assert_sane_elapsed_us(tool, body);
     assert!(
@@ -4103,6 +4110,7 @@ fn assert_stamped(tool: &str, body: &Value) {
 
 /// The timing contract: every latency-relevant tool reports its own server-side handler latency in
 /// microseconds, on both the code-map and the git surface.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn latency_tools_report_microsecond_elapsed_us() {
     let (_dir, service) = spawn_paging_server().await;
@@ -4155,6 +4163,7 @@ async fn latency_tools_report_microsecond_elapsed_us() {
 /// This is the compatibility guarantee the repo's schema convention requires (new response fields
 /// are additive). It holds because no response struct sets `deny_unknown_fields`, so serde skips
 /// keys the old client doesn't know.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn elapsed_us_is_additive_for_older_clients() {
     /// A verbatim copy of the pre-`elapsed_us` `search_symbols` response shape.
@@ -4207,6 +4216,7 @@ async fn elapsed_us_is_additive_for_older_clients() {
 /// `BTreeMap`, so `zzz/` sorts after `src/`). That placement is the whole point: a rare
 /// identifier — precisely what one greps for — is exactly what does not live in the first
 /// 2000 files.
+#[cfg(not(feature = "hacienda-legal"))]
 fn build_wide_repo(files: usize, rare_token: &str) -> TempDir {
     basemind::store::init_isolated_cache();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4235,6 +4245,7 @@ fn build_wide_repo(files: usize, rare_token: &str) -> TempDir {
 /// a default `limit = 100` grep visited 2000 files of a 68 k-file monorepo (2.9 %, in path order)
 /// and returned a fast, confident, wrong zero for any token that lived past the cut. `limit` caps
 /// HITS; the corpus is always fully scanned (subject to the `language` / `path_contains` filters).
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workspace_grep_finds_a_rare_token_past_the_old_scan_cap() {
     const RARE: &str = "OptimizationStatusZQX";
@@ -4290,6 +4301,7 @@ async fn workspace_grep_finds_a_rare_token_past_the_old_scan_cap() {
 /// several `pub fn` occurrences). A file-granular cursor would either replay that file's leading
 /// hits forever or skip its tail, so the cursor resolves to a HIT, not to a file. Paged with
 /// `limit = 1`, every step exercises a mid-file resume.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paging_a_grep_one_hit_at_a_time_reconstructs_the_whole_result() {
     let dir = build_repo();
@@ -4346,6 +4358,7 @@ async fn paging_a_grep_one_hit_at_a_time_reconstructs_the_whole_result() {
 }
 
 /// `(path, line_num)` of every hit in a grep response, in response order.
+#[cfg(not(feature = "hacienda-legal"))]
 fn grep_keys(body: &Value) -> Vec<(String, u64)> {
     body.get("hits")
         .and_then(Value::as_array)
@@ -4372,6 +4385,7 @@ fn grep_keys(body: &Value) -> Vec<(String, u64)> {
 ///
 /// The name scan is the sound floor, so `find_callers` and `find_references` must AGREE on the count
 /// for this unambiguous name, and `resolved_total` may only ever be a subset of `total`.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn find_callers_never_reports_a_resolution_limited_subset_as_complete() {
     basemind::store::init_isolated_cache();

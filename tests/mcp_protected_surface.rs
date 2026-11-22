@@ -76,8 +76,15 @@ async fn the_two_tools_are_withheld_in_a_protected_workspace() {
     let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_ref()).collect();
     assert!(!names.contains(&"redact_text"), "{names:?}");
     assert!(!names.contains(&"vault"), "{names:?}");
-    // The rest of the surface is untouched.
+    // The rest of the surface is untouched. The confidential profile never registers the code
+    // tool in the first place, so it is withheld here too rather than filtered by the mirror.
+    #[cfg(not(feature = "hacienda-legal"))]
     assert!(names.contains(&"code"), "{names:?}");
+    #[cfg(feature = "hacienda-legal")]
+    assert!(
+        !names.contains(&"code"),
+        "the confidential profile must withhold code: {names:?}"
+    );
 }
 
 #[cfg(feature = "documents")]

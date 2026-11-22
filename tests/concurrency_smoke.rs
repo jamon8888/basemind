@@ -180,6 +180,7 @@ async fn parallel_symbol_history_same_symbol() {
 ///
 /// Asserts: all 10 reader calls complete without error; the single rescan also
 /// completes; no deadlock within 60 s.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_search_and_rescan() {
     let dir = build_repo();
@@ -450,6 +451,7 @@ async fn concurrent_same_key_put_preserves_created_at() {
 ///
 /// Before the fix this returned a `read_only_index_unavailable` error (the
 /// reported "blocked / not responsive"); now it resolves the references.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_session_resolves_find_references_from_blobs() {
     let dir = build_repo();
@@ -484,6 +486,7 @@ async fn second_session_resolves_find_references_from_blobs() {
 /// The other two Fjall-backed tools — `call_graph` and `find_implementations` —
 /// must also work on the read-only 2nd session, via the same in-RAM indexes built
 /// from the shared blobs.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_session_resolves_call_graph_and_impls_from_blobs() {
     let dir = build_repo();
@@ -614,6 +617,7 @@ async fn spawn_daemon_writer_server(root: &Path) -> rmcp::service::RunningServic
 /// returns fresh symbols. A second serve on the same repo answers queries AND rescans too — N
 /// sessions read + write with no single-holder downgrade (the whole point of the daemon model).
 #[cfg(all(feature = "comms", any(unix, windows)))]
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_writer_serve_forwards_rescan_and_sees_fresh_symbols() {
     let dir = build_repo();
@@ -704,6 +708,7 @@ fn build_ts_crossfile_repo() -> TempDir {
 /// serve recovers the cross-file callers and reports `resolved: true` again. Uses TypeScript (oxc)
 /// so it runs on any `code-intel-js` build without the heavier Python/Java stack-graph engine.
 #[cfg(all(feature = "comms", feature = "code-intel-js", any(unix, windows)))]
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_writer_serve_resolves_cross_file_callers_through_the_daemon() {
     let dir = build_ts_crossfile_repo();
@@ -756,6 +761,7 @@ async fn daemon_writer_serve_resolves_cross_file_callers_through_the_daemon() {
 /// restores precise cross-file resolution for the stack-graph languages too (the grantflow target),
 /// not just oxc JS/TS. Gated on `code-intel-stack`, so it only runs where the Python engine is in.
 #[cfg(all(feature = "comms", feature = "code-intel-stack", any(unix, windows)))]
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_writer_serve_resolves_cross_file_python_callers_through_the_daemon() {
     basemind::store::init_isolated_cache();

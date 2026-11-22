@@ -4,7 +4,9 @@
 
 use std::process::Command;
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(not(feature = "hacienda-legal"))]
+use serde_json::json;
 
 use crate::capabilities::{McpOp, Row};
 
@@ -18,6 +20,7 @@ pub struct Case {
 }
 
 impl Case {
+    #[cfg_attr(feature = "hacienda-legal", allow(dead_code))]
     fn new(tool: &'static str, mode: &'static str, mcp: Value, cli_operands: &'static [&'static str]) -> Self {
         Self {
             op: McpOp { tool, mode },
@@ -28,6 +31,14 @@ impl Case {
     }
 }
 
+#[cfg(feature = "hacienda-legal")]
+pub fn cases() -> Vec<Case> {
+    // The confidential profile registers no code tool and ships no `code` CLI group, so the
+    // behaviour fixtures (all code-map reads) have no live counterpart to compare.
+    Vec::new()
+}
+
+#[cfg(not(feature = "hacienda-legal"))]
 pub fn cases() -> Vec<Case> {
     vec![
         Case::new(

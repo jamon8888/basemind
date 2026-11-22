@@ -375,6 +375,9 @@ pub fn reject_unsupported(domain: &str, mode: &str, present: &[(&str, bool)]) ->
 pub fn domain_modes() -> Vec<(&'static str, &'static [&'static str])> {
     vec![
         (AdminMode::DOMAIN, AdminMode::ALL_MODES),
+        // The confidential legal profile does not advertise the code-map domain; its router does
+        // not register that tool, so parity must not expect a CLI counterpart either.
+        #[cfg(not(feature = "hacienda-legal"))]
         (CodeMode::DOMAIN, CodeMode::ALL_MODES),
         (GitMode::DOMAIN, GitMode::ALL_MODES),
         (GraphMode::DOMAIN, GraphMode::ALL_MODES),

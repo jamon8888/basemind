@@ -212,20 +212,82 @@ Full command list in the [CLI reference](/reference/cli/).
 The MCP and CLI paths need `basemind` available on your system. (The plugin does
 this for you.)
 
-| Channel | Command | Includes |
+There are two distribution profiles. **Full** is what every legacy channel
+name installs by default; **hacienda-legal** is the confidential profile
+(documents + memory + NER + GraphRAG), selected by an explicit name or choice.
+
+| Channel | Explicit name / choice | Includes |
 |---|---|---|
-| Homebrew | `brew install Goldziher/tap/basemind` | everything |
-| npm | `pnpm add -g basemind` | everything |
-| pip | `pip install basemind` | everything |
+| Homebrew (full) | `brew install Goldziher/tap/basemind` | everything |
+| Homebrew (confidential) | `brew install Goldziher/tap/basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
+| npm (full) | `pnpm add -g basemind` | everything |
+| npm (confidential) | `BASEMIND_PROFILE=hacienda-legal pnpm add -g basemind`, then run `basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
+| pip (full) | `pip install basemind` | everything |
+| pip (confidential) | `BASEMIND_PROFILE=hacienda-legal pip install basemind`, then run `basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
 | cargo | `cargo install basemind --locked` | code + git only |
 | cargo (full) | `cargo install basemind --features full --locked` | everything |
-| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | documents + rehydration vault + memory + NER + graphrag focus release — see [Legal workspaces](/capabilities/legal-workspaces/) |
-| GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything (`basemind-hacienda-legal-<triple>` assets carry the focus release) |
+| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | confidential profile — see [Legal workspaces](/capabilities/legal-workspaces/) |
+| GitHub releases (full) | `basemind-<triple>.tar.gz` / `.zip` from [releases](https://github.com/Goldziher/basemind/releases) | everything |
+| GitHub releases (confidential) | `basemind-hacienda-legal-<triple>.tar.gz` / `.zip` from the same release | documents + memory + NER + GraphRAG |
 
-The Homebrew / npm / pip / GitHub downloads include the full feature set —
-documents, OCR, search, web crawl, shared memory, agent comms, and agent shells
-— so the first run downloads the models it needs. The plain `cargo install`
-builds the code-map and git tools only.
+The Homebrew / npm / pip / GitHub **full** downloads include documents, OCR,
+search, web crawl, shared memory, agent comms, and agent shells — so the first
+run downloads the models it needs. The plain `cargo install` builds the code-map
+and git tools only. The confidential profile is described below.
+
+### Distribution plan: two profiles, one release
+
+Both profiles are published from the **same tagged release at the same
+version**. The `.tar.gz` (macOS/Linux) and `.zip` (Windows) archives, and any
+platform installers (`.exe` / `.dmg`), are distributed together as one asset
+set for that version — the wrapper never mixes versions or profiles.
+
+| Profile | Release asset prefix | Explicit channel name / choice |
+|---|---|---|
+| full | `basemind-<triple>` | `brew install .../basemind`, `pnpm add -g basemind`, `pip install basemind`, `--features full` |
+| hacienda-legal | `basemind-hacienda-legal-<triple>` | `brew install .../basemind-hacienda-legal`, `BASEMIND_PROFILE=hacienda-legal`, `--features hacienda-legal` |
+
+Each download resolves three things before it fetches anything: the **profile**
+(from the explicit name/choice, defaulting to `full`), the **OS/architecture**
+triple, and the **version**. Supported triples are `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
+`x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc` (native Apple Silicon
+is selected even under a Rosetta shell). The resolver then:
+
+1. downloads the profile-specific asset for that triple;
+2. fetches `basemind_<version>_checksums.txt` from the same release and verifies
+   the archive's **SHA-256** against the entry named after that exact asset;
+3. fails with an explicit error — naming the profile, triple, version and asset
+   — if the archive or its checksum entry is missing. It never falls back to a
+   different profile or architecture silently.
+
+<Aside type="note">
+Set `BASEMIND_BINARY=/path/to/basemind` (pip) or build from source with
+`BASEMIND_BIN` (plugin launcher) to bypass the download; see
+[Using a local build with the plugin](#using-a-local-build-with-the-plugin).
+</Aside>
+
+#### The confidential profile (`hacienda-legal`)
+
+The confidential profile is a documents-only build for sensitive client
+folders. It contains **documents + memory + NER + GraphRAG** — document
+ingestion and RAG retrieval, the rehydration vault, shared memory, Candle NER,
+and the entity graph. It has **no code-intelligence/code-search, comms, or web
+crawl tools**; `basemind serve` talks MCP directly over stdio without a broker.
+(The lightweight code-map and git helpers present in every build remain.)
+
+- **Local processing.** Indexing, retrieval, redaction and NER run on your
+  machine. The clear-text PII map is never persisted by basemind — it is
+  returned to the caller and can be kept in a caller-managed encrypted vault.
+  No document content is sent to a hosted analysis service.
+- **Model downloads are permitted.** The first run may download the embedding,
+  reranker and NER models to local cache so the document stack works; those
+  downloads are the only network egress the profile needs. For a strictly
+  offline, lexical-only store set `embed = false` (and supply a local NER model
+  directory) — see [Legal workspaces](/capabilities/legal-workspaces/).
+- **macOS coverage is universal.** Both `aarch64-apple-darwin` (Apple Silicon)
+  and `x86_64-apple-darwin` (Intel) assets ship in the same release. The Intel
+  build requires **macOS 15 (Sequoia) or newer**.
 
 ### Using a local build with the plugin
 

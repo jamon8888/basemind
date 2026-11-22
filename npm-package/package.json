@@ -9,18 +9,19 @@
     "rag",
     "tree-sitter"
   ],
-  "homepage": "https://github.com/jamon8888/basemind",
+  "homepage": "https://github.com/Goldziher/basemind",
   "bugs": {
-    "url": "https://github.com/jamon8888/basemind/issues"
+    "url": "https://github.com/Goldziher/basemind/issues"
   },
   "license": "MIT",
   "author": "Jamin Rubio",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jamon8888/basemind.git"
+    "url": "git+https://github.com/Goldziher/basemind.git"
   },
   "bin": {
-    "basemind": "bin/basemind.js"
+    "basemind": "bin/basemind.js",
+    "basemind-hacienda-legal": "bin/basemind-hacienda-legal.js"
   },
   "files": [
     "index.js",

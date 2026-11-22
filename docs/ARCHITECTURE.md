@@ -599,17 +599,19 @@ The main surface groups operations into domain tools with a required `mode`
 registration; `server_handler.rs` applies protected-workspace visibility.
 `src/mcp/mode.rs` (`define_mode!`) defines mode wire spellings and telemetry keys.
 CLI correspondence is checked by `tests/cli_parity/`, with documented exceptions
-(see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). Incomplete GraphRAG modes are
-called out in the [feature catalog](agents/features.md#incomplete-and-proposed-work).
+(see [ADR-0014](adr/0014-cli-mcp-parity-guard.md)). The `hacienda-legal` profile
+gates the `code` and `web` domains off on both sides; the complete `full` profile
+keeps them. GraphRAG is compiled only into `hacienda-legal`; see the
+[profile contracts](agents/features.md#the-two-profile-contracts).
 
 | Tool / CLI group | `mode` values | Gate |
 |---|---|---|
-| `code` | outline, symbols, grep, files, find, definition, references, callers, implementations, dependents, expand, semantic, chunk | always |
-| `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open; entities, rag | core always; entity modes require `graphrag`, with incomplete retrieval/CLI support |
+| `code` | outline, symbols, grep, files, find, definition, references, callers, implementations, dependents, expand, semantic, chunk | always **except `hacienda-legal`**, which registers no code tool and no CLI group |
+| `graph` | calls, neighbors, path, subgraph, communities, map, export, display, open; entities, rag | core always; entity/rag modes require `graphrag` (only `hacienda-legal`) |
 | `git` | status, recent, touching, by_path, churn, diff, diff_outline, blame, blame_symbol, symbol_history, search, show | always |
 | `memory` | put, get, list, search, delete, audit, documents, mine, proposals, accept, reject | always¹ |
 | `admin` | status, repo, rescan, cache_stats, gc, cache_clear, telemetry, compress, delta, checkpoint, waste | always |
-| `web` | scrape, crawl, map | `crawl` |
+| `web` | scrape, crawl, map | `crawl`, and withheld from `hacienda-legal` on both MCP and CLI |
 | `agents` | register, list, thread_start, thread_list, join, leave, members, add_member, remove_member, archive, post, history, message, inbox, ack, wait, cleanup, status | `comms` |
 | `workspace` | workspaces, worktrees, branches, claim, release | `comms` |
 | `shell` | spawn, send, capture, kill, list, broadcast | `shells` |

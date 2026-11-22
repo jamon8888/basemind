@@ -2,6 +2,9 @@
 //! shortens a body, the timing footer stays off stdout, and `--cursor` / `--max-tokens` reach the
 //! MCP tool.
 
+// Every test in this file drives the `code` tool/CLI group, which the confidential profile withholds.
+#![cfg(not(feature = "hacienda-legal"))]
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -71,6 +74,7 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn code_expand_prints_the_whole_body_and_keeps_timing_off_stdout() {
     let dir = build_repo();
@@ -83,6 +87,7 @@ fn code_expand_prints_the_whole_body_and_keeps_timing_off_stdout() {
     assert!(err.contains("startup"), "timing footer must be on stderr:\n{err}");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn format_toon_renders_and_json_wins_over_it() {
     let dir = build_repo();
@@ -99,6 +104,7 @@ fn format_toon_renders_and_json_wins_over_it() {
     assert!(parsed["results"].is_array(), "{json}");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn cursor_resumes_a_paged_listing() {
     let dir = build_repo();
@@ -118,6 +124,7 @@ fn cursor_resumes_a_paged_listing() {
     );
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn max_tokens_reaches_the_tool_and_flags_the_budget() {
     let dir = build_repo();

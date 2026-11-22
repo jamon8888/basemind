@@ -34,6 +34,7 @@ Issues = "https://github.com/Goldziher/basemind/issues"
 
 [project.scripts]
 basemind = "basemind.cli:main"
+basemind-hacienda-legal = "basemind.cli:main_legal"
 
 [tool.setuptools]
 packages = ["basemind"]

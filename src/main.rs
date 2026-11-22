@@ -76,7 +76,9 @@ enum Cmd {
     /// Long-running watcher; keeps the code map current as files change.
     Watch,
     /// Read the code map: outline, symbols, grep, files, find, definition, references, callers,
-    /// implementations, dependents, expand, semantic, chunk.
+    /// implementations, dependents, expand, semantic, chunk. Withheld from the confidential
+    /// `hacienda-legal` profile along with the MCP `code` tool.
+    #[cfg(not(feature = "hacienda-legal"))]
     #[command(subcommand)]
     Code(basemind::cli::code::CodeCmd),
     /// Git history / blame / diff queries.
@@ -88,7 +90,9 @@ enum Cmd {
     /// Shared agent memory + document search (needs `--features memory,documents`).
     #[command(subcommand)]
     Memory(basemind::cli::memory::MemoryCmd),
-    /// On-demand web ingestion (needs `--features crawl`).
+    /// On-demand web ingestion (needs `--features crawl`). Withheld from the confidential
+    /// `hacienda-legal` profile, which must not expose crawl at all.
+    #[cfg(not(feature = "hacienda-legal"))]
     #[command(subcommand)]
     Web(basemind::cli::web::WebCmd),
     /// Headless agent shell sessions: spawn / send / capture / kill / list / broadcast
@@ -330,6 +334,7 @@ fn run() -> Result<()> {
         Cmd::Scan(args) => cmd_scan(&root, &args, verbosity, no_color),
         Cmd::Rescan(args) => cmd_rescan(&root, &args, verbosity, no_color),
         Cmd::Watch => cmd_watch(&root, verbosity, no_color),
+        #[cfg(not(feature = "hacienda-legal"))]
         Cmd::Code(c) => {
             let _ = basemind::lang::ensure_grammars();
             dispatch(basemind::cli::ToolCmd::Code(c))
@@ -340,6 +345,7 @@ fn run() -> Result<()> {
             dispatch(basemind::cli::ToolCmd::Graph(g))
         }
         Cmd::Memory(m) => dispatch(basemind::cli::ToolCmd::Memory(m)),
+        #[cfg(not(feature = "hacienda-legal"))]
         Cmd::Web(w) => dispatch(basemind::cli::ToolCmd::Web(w)),
         #[cfg(all(feature = "shells", any(unix, windows)))]
         Cmd::Shell(s) => dispatch(basemind::cli::ToolCmd::Shell(s)),
@@ -396,16 +402,10 @@ fn run() -> Result<()> {
 fn warn_ignored_global_flags(cmd: &Cmd, json: bool, view: &str) {
     let consumes_json = matches!(
         cmd,
-        Cmd::Code(_)
-            | Cmd::Git(_)
-            | Cmd::Graph(_)
-            | Cmd::Memory(_)
-            | Cmd::Web(_)
-            | Cmd::Admin(_)
-            | Cmd::Cache(_)
-            | Cmd::Status
-            | Cmd::Doctor
+        Cmd::Git(_) | Cmd::Graph(_) | Cmd::Memory(_) | Cmd::Admin(_) | Cmd::Cache(_) | Cmd::Status | Cmd::Doctor
     );
+    #[cfg(not(feature = "hacienda-legal"))]
+    let consumes_json = consumes_json || matches!(cmd, Cmd::Code(_) | Cmd::Web(_));
     #[cfg(feature = "documents")]
     let consumes_json = consumes_json || matches!(cmd, Cmd::Vault(_));
     #[cfg(all(feature = "comms", any(unix, windows)))]

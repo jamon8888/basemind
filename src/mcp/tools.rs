@@ -20,6 +20,11 @@ use super::helpers::{LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX, record_call};
 use super::lenient::Lenient;
 use super::types_code::CodeParams;
 
+// The generated `tool_router_core()` is intentionally still compiled in the confidential
+// `hacienda-legal` profile: the library's eval/tests call `server.code()` directly, and the
+// withheld surface is the registered MCP/CLI tool, not the internal method. `assemble_router` is
+// where the profile decides not to register it.
+#[cfg_attr(feature = "hacienda-legal", allow(dead_code))]
 #[rmcp::tool_router(vis = "pub(super)", router = "tool_router_core")]
 impl BasemindServer {
     // No `output_schema`: the thirteen modes return thirteen different response shapes, and

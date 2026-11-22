@@ -4,16 +4,23 @@ const path = require("node:path");
 const os = require("node:os");
 const fs = require("node:fs");
 
+const profile = process.env.BASEMIND_PROFILE || "full";
 const binaryName = os.type() === "Windows_NT" ? "basemind.exe" : "basemind";
 const binaryPath = path.join(__dirname, binaryName);
+const markerPath = path.join(__dirname, ".profile");
 const packageJsonPath = path.join(__dirname, "..", "package.json");
 
+function installedProfile() {
+  if (!fs.existsSync(markerPath)) return "full";
+  return fs.readFileSync(markerPath, "utf8").trim();
+}
+
 function ensureBinaryExists() {
-  if (fs.existsSync(binaryPath)) {
+  if (fs.existsSync(binaryPath) && installedProfile() === profile) {
     return true;
   }
 
-  console.error(`basemind: binary not found at ${binaryPath}. Running install...`);
+  console.error(`basemind: '${profile}' binary not present at ${binaryPath}. Running install...`);
 
   const installScriptPath = path.join(__dirname, "..", "install.js");
   if (!fs.existsSync(installScriptPath)) {
@@ -24,9 +31,10 @@ function ensureBinaryExists() {
   const installResult = spawnSync(process.execPath, [installScriptPath], {
     stdio: "inherit",
     cwd: path.dirname(packageJsonPath),
+    env: { ...process.env, BASEMIND_PROFILE: profile },
   });
 
-  if (installResult.status === 0 && fs.existsSync(binaryPath)) {
+  if (installResult.status === 0 && fs.existsSync(binaryPath) && installedProfile() === profile) {
     return true;
   }
 
@@ -37,9 +45,12 @@ if (!ensureBinaryExists()) {
   console.error(
     `basemind: native binary not found at ${binaryPath}.\n` +
       `The postinstall step that downloads the binary from GitHub releases may have failed.\n` +
+      `For profile '${profile}', the expected asset is basemind-${profile}-<triple>.tar.gz/.zip ` +
+      `at the package version (full uses the unprefixed name).\n` +
       `You can try:\n` +
       `  1. Reinstall: pnpm add -g basemind\n` +
-      `  2. Use cargo: cargo install basemind`,
+      `  2. Select the confidential profile: BASEMIND_PROFILE=hacienda-legal pnpm add -g basemind\n` +
+      `  3. Use cargo: cargo install basemind --features ${profile} --locked`,
   );
   process.exit(1);
 }

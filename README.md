@@ -308,24 +308,43 @@ The MCP and CLI paths need `basemind` available on your system. (The plugin does
 
 <!-- markdownlint-disable MD013 -->
 
-| Channel | Command | Includes |
+Two profiles ship from the same release: **full** (the default of every legacy
+channel name) and **hacienda-legal** (the confidential documents + memory + NER +
+GraphRAG build, selected explicitly).
+
+<!-- markdownlint-disable MD013 -->
+
+| Channel | Explicit name / choice | Includes |
 |---|---|---|
-| Homebrew | `brew install Goldziher/tap/basemind` | everything |
-| npm | `pnpm add -g basemind` | everything |
-| pip | `pip install basemind` | everything |
+| Homebrew (full) | `brew install Goldziher/tap/basemind` | everything |
+| Homebrew (confidential) | `brew install Goldziher/tap/basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
+| npm (full) | `pnpm add -g basemind` | everything |
+| npm (confidential) | `BASEMIND_PROFILE=hacienda-legal pnpm add -g basemind`, then `basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
+| pip (full) | `pip install basemind` | everything |
+| pip (confidential) | `BASEMIND_PROFILE=hacienda-legal pip install basemind`, then `basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
 | cargo | `cargo install basemind --locked` | code + git only with direct stdio MCP transport |
 | cargo (full) | `cargo install basemind --features full --locked` | everything |
 | cargo (Intel macOS) | `ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib cargo install basemind --features intel-macos --locked` | everything with the dynamic x86_64 ONNX Runtime |
-| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | legal focus release: document ingestion/RAG + NER + rehydration vault + memory + graphrag, direct stdio MCP transport, no comms broker/shells/crawl/code-intel — shipped as `basemind-hacienda-legal-<triple>` release assets, preset at `examples/basemind-hacienda-legal.toml` |
-| GitHub releases | [Download a binary](https://github.com/Goldziher/basemind/releases) | everything |
+| cargo (hacienda-legal) | `cargo install basemind --features hacienda-legal --locked` | confidential legal focus release: documents + rehydration vault + memory + NER + graphrag, direct stdio MCP, no comms/shells/crawl/code-intel — shipped as `basemind-hacienda-legal-<triple>` assets, preset at `examples/basemind-hacienda-legal.toml` |
+| GitHub releases (full) | `basemind-<triple>.tar.gz` / `.zip` from [releases](https://github.com/Goldziher/basemind/releases) | everything |
+| GitHub releases (confidential) | `basemind-hacienda-legal-<triple>.tar.gz` / `.zip` from the same release | documents + memory + NER + GraphRAG |
 
 <!-- markdownlint-enable MD013 -->
 
-The Homebrew / npm / pip / GitHub downloads include the full feature set — documents, OCR, search,
-web crawl, shared memory, agent comms, and agent shells — so the first run downloads the models it
-needs. The plain `cargo install` builds the code-map and git tools only: the one-shot CLI works, but
-`basemind serve` relays to the daemon in a `comms`/`full` build; non-comms profiles serve the
-same MCP protocol directly over stdio without the broker.
+The Homebrew / npm / pip / GitHub **full** downloads include the full feature set —
+documents, OCR, search, web crawl, shared memory, agent comms, and agent shells — so the first run
+downloads the models it needs. The plain `cargo install` builds the code-map and git tools only: the
+one-shot CLI works, but `basemind serve` relays to the daemon in a `comms`/`full` build; non-comms
+profiles serve the same MCP protocol directly over stdio without the broker.
+
+Both profiles and their `.tar.gz` / `.zip` archives (plus any `.exe` / `.dmg`
+installers) are published together at the same version. Each wrapper picks the
+profile / OS / architecture triple, verifies the asset's SHA-256 against
+`basemind_<version>_checksums.txt`, and fails explicitly if the asset is
+missing. The confidential profile runs locally (no code/comms/crawl tools),
+permits model downloads on first run, and covers macOS universally with an
+Intel build that requires macOS 15 or newer. See
+[Legal workspaces](website/src/content/docs/capabilities/legal-workspaces.mdx).
 
 ### Get started
 

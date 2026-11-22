@@ -1,5 +1,8 @@
 //! `resources/*` through the in-process rmcp client.
 
+// Every test in this file drives the `code` tool/CLI group, which the confidential profile withholds.
+#![cfg(not(feature = "hacienda-legal"))]
+
 use rmcp::ServiceExt;
 use rmcp::model::{
     ArgumentInfo, CallToolRequestParams, CompleteRequestParams, ContentBlock, ReadResourceRequestParams, Reference,
@@ -39,6 +42,7 @@ fn text_of(contents: &[ResourceContents]) -> String {
     }
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resources_list_read_and_complete() {
     let (_dir, service) = server().await;
