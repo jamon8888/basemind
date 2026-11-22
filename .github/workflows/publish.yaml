@@ -1281,7 +1281,17 @@ jobs:
 
   checksums:
     name: Generate and upload checksums
-    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2, build-windows-installers, build-macos-installers, verify-macos-installers-intel]
+    needs:
+      [
+        meta,
+        create_release,
+        build-binaries,
+        build-linux-binaries,
+        build-linux-noavx2,
+        build-windows-installers,
+        build-macos-installers,
+        verify-macos-installers-intel,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -1370,7 +1380,18 @@ jobs:
 
   finalize_release:
     name: Publish GitHub release
-    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2, build-windows-installers, build-macos-installers, verify-macos-installers-intel, checksums]
+    needs:
+      [
+        meta,
+        create_release,
+        build-binaries,
+        build-linux-binaries,
+        build-linux-noavx2,
+        build-windows-installers,
+        build-macos-installers,
+        verify-macos-installers-intel,
+        checksums,
+      ]
     # Fail-closed: promotion runs only when meta and checksums succeeded and every
     # builder either succeeded or was skipped (skipped = the release was already
     # complete and idempotence short-circuited it). A FAILED leg — any archive,

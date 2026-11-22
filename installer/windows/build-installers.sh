@@ -29,14 +29,14 @@ if [ -z "$ZIP_LEGAL" ] && [ -f "basemind-hacienda-legal-${TRIPLE}.zip" ]; then
 fi
 
 case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW* | MSYS* | CYGWIN* | Windows_NT) ;;
-  *)
-    echo "ERROR: Windows installer build requires a Windows runner/host." >&2
-    echo "  Detected host: $(uname -s 2>/dev/null || echo unknown)." >&2
-    echo "  Missing runner: Windows (e.g. GitHub actions windows-2022) and Inno Setup 6 (ISCC.exe)." >&2
-    echo "  On a Windows host set ISCC to ISCC.exe if it is not on PATH, then rerun this script." >&2
-    exit 2
-    ;;
+MINGW* | MSYS* | CYGWIN* | Windows_NT) ;;
+*)
+  echo "ERROR: Windows installer build requires a Windows runner/host." >&2
+  echo "  Detected host: $(uname -s 2>/dev/null || echo unknown)." >&2
+  echo "  Missing runner: Windows (e.g. GitHub actions windows-2022) and Inno Setup 6 (ISCC.exe)." >&2
+  echo "  On a Windows host set ISCC to ISCC.exe if it is not on PATH, then rerun this script." >&2
+  exit 2
+  ;;
 esac
 
 if command -v pwsh >/dev/null 2>&1; then
