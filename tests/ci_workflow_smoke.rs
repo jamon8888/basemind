@@ -51,6 +51,22 @@ fn test_job(workflow: &str) -> &str {
     job_block(workflow, "test")
 }
 
+/// Every macOS feature build links against libheif. Keep the shared action responsible for both
+/// discovery at link time and loading at test time on ARM and Intel runners.
+#[test]
+fn macos_native_library_paths_are_exported_by_the_shared_action() {
+    let action = system_dependencies_action();
+    assert!(
+        action.contains("libheif")
+            && action.contains("libheif.1.dylib")
+            && action.contains("PKG_CONFIG_PATH=")
+            && action.contains("LDFLAGS=")
+            && action.contains("CPPFLAGS=")
+            && action.contains("DYLD_LIBRARY_PATH="),
+        "the shared macOS dependency action must expose libheif to both build and runtime"
+    );
+}
+
 /// A cache that is only written on success turns one slow run into a loop.
 ///
 /// `Swatinem/rust-cache` does not save when a job fails or is cancelled unless `cache-on-failure`
@@ -138,21 +154,5 @@ fn intel_macos_uses_the_dynamic_runtime_profile() {
     assert!(
         test.contains("os: macos-15-intel") && test.contains("features: \"intel-macos\""),
         "CI must keep a native Intel macOS leg on the `intel-macos` feature profile"
-    );
-}
-
-/// Every macOS feature build links against libheif. Keep the shared action responsible for both
-/// discovery at link time and loading at test time on ARM and Intel runners.
-#[test]
-fn macos_native_library_paths_are_exported_by_the_shared_action() {
-    let action = system_dependencies_action();
-    assert!(
-        action.contains("libheif")
-            && action.contains("libheif.1.dylib")
-            && action.contains("PKG_CONFIG_PATH=")
-            && action.contains("LDFLAGS=")
-            && action.contains("CPPFLAGS=")
-            && action.contains("DYLD_LIBRARY_PATH="),
-        "the shared macOS dependency action must expose libheif to both build and runtime"
     );
 }
