@@ -38,6 +38,7 @@ jobs:
   resolve-source:
     name: Resolve source commit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
@@ -49,9 +50,13 @@ jobs:
       - name: Resolve source_ref to a single commit
         id: resolve
         shell: bash
+        # Pass the ref through the environment: interpolating a dispatched input
+        # into the shell script itself would allow command injection.
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || github.sha }}
         run: |
           set -euo pipefail
-          ref="${{ inputs.source_ref || github.sha }}"
+          ref="$SOURCE_REF"
           # Full/abbreviated SHAs and already-fetched refs resolve locally.
           if ! sha="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
             # A branch/tag name: fetch it once here so every downstream job checks
@@ -102,6 +107,7 @@ jobs:
             variant: hacienda-legal
             features: hacienda-legal
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
     env:
       # Intel binaries must declare exactly 15.0 (scripts/macos/validate.sh bundle
       # enforces it); arm64 stays at 13.4 for the pinned aarch64 ONNX Runtime dylib.
@@ -191,6 +197,7 @@ jobs:
     name: Windows x64 setup.exe (full + hacienda-legal)
     needs: [resolve-source, archives]
     runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -262,7 +269,10 @@ jobs:
     name: macOS DMGs (Apple Silicon + Universal, both profiles)
     needs: [resolve-source, archives]
     runs-on: macos-latest
+    timeout-minutes: 120
     env:
+      # Packaging uses --skip-tar, so nothing is recompiled here; this is only a
+      # guard for incidental toolchain use and does not change the DMG minos.
       MACOSX_DEPLOYMENT_TARGET: "13.4"
     steps:
       - name: Checkout source
@@ -329,6 +339,7 @@ jobs:
     name: Verify Universal DMGs on Intel macOS 15
     needs: [resolve-source, macos-installers]
     runs-on: macos-15-intel
+    timeout-minutes: 60
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -368,6 +379,7 @@ jobs:
     name: Verify complete asset set and generate checksums
     needs: [resolve-source, archives, windows-installers, macos-installers, verify-macos-installers-intel]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
