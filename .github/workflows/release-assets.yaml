@@ -35,15 +35,48 @@ env:
   ASSET_VERSION: ${{ inputs.version || '0.39.0' }}
 
 jobs:
+  resolve-source:
+    name: Resolve source commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve source_ref to a single commit
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.source_ref || github.sha }}"
+          # Full/abbreviated SHAs and already-fetched refs resolve locally.
+          if ! sha="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+            # A branch/tag name: fetch it once here so every downstream job checks
+            # out this exact commit, not a tip that may move during the run.
+            git fetch --no-tags origin "$ref" || {
+              echo "::error::source_ref '$ref' could not be fetched" >&2
+              exit 1
+            }
+            sha="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved source_ref '$ref' to $sha"
+
   archives:
-    name: Archive / ${{ matrix.triple }} / ${{ matrix.variant }}
+    name: Archive / ${{ matrix.triple }} / ${{ matrix.variant || 'full' }}
+    needs: resolve-source
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Full-profile legs leave `variant` empty: package-release.sh then names
+          # them basemind-<triple>, which the installers, DMG packaging and the
+          # required-asset list all expect. hacienda-legal keeps its variant.
           - triple: aarch64-apple-darwin
             os: macos-latest
-            variant: full
             features: full
           - triple: aarch64-apple-darwin
             os: macos-latest
@@ -54,7 +87,6 @@ jobs:
           # universal DMG with the pinned universal ONNX Runtime dylib.
           - triple: x86_64-apple-darwin
             os: macos-15-intel
-            variant: full
             features: full,ort-dynamic
           - triple: x86_64-apple-darwin
             os: macos-15-intel
@@ -64,7 +96,6 @@ jobs:
           # not compile xberg-libwpd's vendored C++ (see publish.yaml).
           - triple: x86_64-pc-windows-msvc
             os: windows-2022
-            variant: full
             features: full
           - triple: x86_64-pc-windows-msvc
             os: windows-2022
@@ -72,14 +103,15 @@ jobs:
             features: hacienda-legal
     runs-on: ${{ matrix.os }}
     env:
-      # The pinned aarch64 ONNX Runtime artifact is stamped macOS 13.4.
-      MACOSX_DEPLOYMENT_TARGET: "13.4"
+      # Intel binaries must declare exactly 15.0 (scripts/macos/validate.sh bundle
+      # enforces it); arm64 stays at 13.4 for the pinned aarch64 ONNX Runtime dylib.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.triple == 'x86_64-apple-darwin' && '15.0' || '13.4' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -106,7 +138,7 @@ jobs:
       - name: Setup cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.triple }}-${{ matrix.variant }}-assets
+          key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}-assets
 
       - name: Discard incomplete xberg Tesseract source cache
         shell: bash
@@ -129,6 +161,7 @@ jobs:
 
       - name: Package release archive
         shell: bash
+        # Empty `matrix.variant` for full legs yields basemind-<triple> archives.
         run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
 
       - name: Smoke-test packaged Intel binary (ONNX Runtime loads)
@@ -137,7 +170,8 @@ jobs:
         run: |
           set -euo pipefail
           dir="$(mktemp -d)"
-          archive="basemind-${{ matrix.variant }}-x86_64-apple-darwin.tar.gz"
+          variant="${{ matrix.variant }}"
+          archive="basemind-${variant:+$variant-}x86_64-apple-darwin.tar.gz"
           tar xzf "$archive" -C "$dir"
           "$dir/basemind" --version
           test -f "$dir/libonnxruntime.dylib"
@@ -146,7 +180,7 @@ jobs:
       - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
-          name: archive-${{ matrix.triple }}-${{ matrix.variant }}
+          name: archive-${{ matrix.triple }}-${{ matrix.variant || 'full' }}
           path: |
             basemind-*.tar.gz
             basemind-*.zip
@@ -155,14 +189,14 @@ jobs:
 
   windows-installers:
     name: Windows x64 setup.exe (full + hacienda-legal)
-    needs: archives
+    needs: [resolve-source, archives]
     runs-on: windows-2022
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Download built archives
         uses: actions/download-artifact@v4
@@ -209,6 +243,11 @@ jobs:
               throw "Windows installer artifact missing before verification: $exe"
             }
             powershell -NoProfile -ExecutionPolicy Bypass -File installer/windows/smoke-test.ps1 -SetupExe $exe -Variant $variant -ExpectedVersion $env:VERSION
+            # A native process's nonzero exit is not covered by $ErrorActionPreference;
+            # check it before the next variant can overwrite $LASTEXITCODE with 0.
+            if ($LASTEXITCODE -ne 0) {
+              throw "smoke test failed for $variant (exit code $LASTEXITCODE)"
+            }
           }
 
       - name: Upload Windows installer artifacts
@@ -221,7 +260,7 @@ jobs:
 
   macos-installers:
     name: macOS DMGs (Apple Silicon + Universal, both profiles)
-    needs: archives
+    needs: [resolve-source, archives]
     runs-on: macos-latest
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.4"
@@ -230,7 +269,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Download built archives
         uses: actions/download-artifact@v4
@@ -288,14 +327,14 @@ jobs:
 
   verify-macos-installers-intel:
     name: Verify Universal DMGs on Intel macOS 15
-    needs: macos-installers
+    needs: [resolve-source, macos-installers]
     runs-on: macos-15-intel
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Download Universal DMGs
         uses: actions/download-artifact@v4
@@ -327,14 +366,14 @@ jobs:
 
   checksums:
     name: Verify complete asset set and generate checksums
-    needs: [archives, windows-installers, macos-installers, verify-macos-installers-intel]
+    needs: [resolve-source, archives, windows-installers, macos-installers, verify-macos-installers-intel]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Download every built asset
         uses: actions/download-artifact@v4
