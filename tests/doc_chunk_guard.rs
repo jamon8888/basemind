@@ -157,7 +157,6 @@ fn extraction_past_its_wall_clock_budget_is_abandoned() {
 }
 
 fn scan_once(root: &Path, cfg: &ConfigV1) -> basemind::scanner::ScanReport {
-    wait_for_abandoned_to_drain();
     let mut store = Store::open(root, basemind::store::VIEW_WORKING).expect("open store");
     scan(root, &mut store, cfg, ScanSource::WorkingTree, EmbedMode::Inline).expect("scan")
 }
@@ -176,6 +175,9 @@ fn scan_with_a_pathological_file_completes_and_counts_it_as_degraded() {
     fs::write(dir.path().join("syslog.txt"), pathological_log(5 * 1024 * 1024)).unwrap();
     fs::write(dir.path().join("guide.md"), markdown_doc()).unwrap();
 
+    // Drain a previous test's abandoned splitter while SERIAL is still held, but before the timer:
+    // otherwise its ~40 s of cleanup is charged to the scan's 30 s budget.
+    wait_for_abandoned_to_drain();
     let started = Instant::now();
     let report = scan_once(dir.path(), &offline_scan_config());
 
@@ -202,6 +204,7 @@ fn scan_counts_a_timed_out_document_and_still_indexes_the_rest() {
     cfg.documents.extraction_timeout_secs = 1;
     cfg.documents.plain_text_chunk_max_bytes = u64::MAX;
 
+    wait_for_abandoned_to_drain();
     let report = scan_once(dir.path(), &cfg);
 
     assert_eq!(report.stats.doc_timeouts, 1);
