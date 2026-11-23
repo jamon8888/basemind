@@ -90,8 +90,10 @@ runs:
         # rustc targets macOS 11.0 by default, so linking it fails with undefined
         # `___isPlatformVersionAtLeast` symbols and blocks every macOS archive. Build it from
         # source below, against the deployment target we ship, exactly as the Linux branch does.
+        # These packages are required by the source build and by the feature test binaries.
+        # Failing here is more useful than deferring the error to cargo test.
         brew install cmake tesseract tesseract-lang libmagic pkg-config protobuf \
-          libde265 x265 aom || true
+          libde265 x265 aom
 
         echo "::group::Building libheif from source (1.23.0)"
 
@@ -129,7 +131,19 @@ runs:
           echo "✓ libheif ${LIBHEIF_VERSION} installed"
         fi
 
-        echo "PKG_CONFIG_PATH=$LIBHEIF_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+        # The build can discover libheif through pkg-config, but macOS does not search the
+        # runner-temp prefix when it launches the test binaries. Export both build-time and
+        # runtime paths for ARM and Intel runners, and fail early if the source build did not
+        # produce the dylib the feature tests need.
+        brew_prefix="$(brew --prefix)"
+        libheif_libdir="$LIBHEIF_PREFIX/lib"
+        test -f "$libheif_libdir/libheif.1.dylib"
+        {
+          echo "PKG_CONFIG_PATH=$libheif_libdir/pkgconfig:${PKG_CONFIG_PATH:-}"
+          echo "LDFLAGS=-L$libheif_libdir -L$brew_prefix/lib ${LDFLAGS:-}"
+          echo "CPPFLAGS=-I$LIBHEIF_PREFIX/include ${CPPFLAGS:-}"
+          echo "DYLD_LIBRARY_PATH=$libheif_libdir:$brew_prefix/lib:${DYLD_LIBRARY_PATH:-}"
+        } >> "$GITHUB_ENV"
 
         echo "::endgroup::"
 
