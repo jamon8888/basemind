@@ -111,19 +111,100 @@ gh run list --workflow=publish.yaml --branch vX.Y.Z
 gh run watch <run-id>
 ```
 
-The `meta` job runs the guard first, then builds, then finalizes the GitHub
-release, then publishes to crates.io, npm, PyPI and Homebrew. A `meta` failure
-stops everything downstream.
+The `meta` job runs the guard first, then builds the archives and the Windows
+`.exe` / macOS `.dmg` installers, then finalizes the GitHub release, then publishes
+to crates.io, npm, PyPI and Homebrew. A `meta` failure, a failed installer build,
+or a failed install/launch verification stops everything downstream — see
+[§9](#9-fail-closed-installer-orchestration).
 
 **Done when:** the run completes green.
 
 ## 8. Confirm what shipped
 
-Check the GitHub release carries every platform archive and its checksums, and
-that each registry reports `X.Y.Z`. The registries are independent: a green run
-with one registry missing means that registry skipped, not that it published.
+Check the GitHub release carries every platform archive, both Windows `.exe`
+installers, all four macOS `.dmg` installers, and a checksums file that covers
+them all, and that each registry reports `X.Y.Z`. The registries are independent:
+a green run with one registry missing means that registry skipped, not that it
+published.
 
 **Done when:** the release page and each intended registry show `X.Y.Z`.
+
+## 9. Fail-closed installer orchestration
+
+`publish.yaml` still makes **one** GitHub Release page for **one** tag. Every later
+job addresses that record by its numeric id (`.github/scripts/release-asset.sh`),
+never by tag, so the installers cannot scatter onto a second record the way
+v0.27.0's archives did. The page is promoted (`draft=false`) only when the complete
+asset set is present, and only after `finalize_release` has observed **success or
+an idempotent skip** from every builder. There is no `continue-on-error` on a
+required leg: a failed archive, a failed Windows `.exe`, or a failed macOS `.dmg`
+fails `finalize_release`, and because every registry job requires
+`needs.finalize_release.result == 'success'`, a single failing combination blocks
+the **whole** release — crates.io, npm, OpenCode, PyPI (both), and Homebrew all
+stay at their previous version.
+
+Required assets, for both release profiles (`full` and `hacienda-legal`):
+
+| Group | Assets |
+| --- | --- |
+| Archives — `full` + baseline | `basemind-{x86_64,aarch64}-unknown-linux-gnu.tar.gz`, `basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz`, `basemind-{aarch64,x86_64}-apple-darwin.tar.gz`, `basemind-x86_64-pc-windows-msvc.zip` |
+| Archives — `hacienda-legal` | same five shapes, prefixed `basemind-hacienda-legal-` |
+| Archives — `hacienda` | same five shapes, prefixed `basemind-hacienda-` (a required matrix leg) |
+| Windows x64 installers | `basemind-x86_64-pc-windows-msvc-setup.exe`, `basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe` |
+| macOS installers | `basemind-aarch64-apple-darwin.dmg`, `basemind-hacienda-legal-aarch64-apple-darwin.dmg`, `basemind-universal-apple-darwin.dmg`, `basemind-hacienda-legal-universal-apple-darwin.dmg` |
+| Checksums | `basemind_<version>_checksums.txt` — SHA-256 over every archive **and** installer |
+
+`meta` counts this same set in `release_assets_exist`, so a draft missing an
+installer is reported incomplete and every builder reruns; `checksums` refuses to
+hash a partial set; `finalize_release` refuses to promote one. Idempotence is
+preserved: on an already-complete release the builders are skipped, checksums are
+regenerated, and the registry `*_exists` checks still skip versions already live.
+
+**Verification before promotion:** both installer jobs first check the tag-derived
+version against `Cargo.toml`. The Windows job then runs
+`installer/windows/smoke-test.ps1` for each variant — silent install, `--version`,
+`serve --help`, PATH/config checks, silent uninstall. The macOS build job runs
+`scripts/macos/validate.sh` on the pinned fat ORT (slices and minos) and
+`tests/macos_dmg_smoke.sh` on both arm64 DMGs (mount, payload, slice/minos,
+signature, throwaway-prefix install, `--version` and `serve --help`). The
+Universal DMGs are additionally downloaded and smoke-tested on Intel macOS 15 by
+`verify-macos-installers-intel`, the only host that can execute the `minos=15.0`
+x86_64 slice. None of this is `continue-on-error`.
+
+### Platform installer contract — exact, and where it disagrees
+
+The installer scripts are produced by the platform workers in **separate
+worktrees**; none of them is present on this branch yet. `publish.yaml` calls them
+by the exact paths below. The artifact names agree across every worker spec; the
+Windows commands still have one documented alternative, while the macOS
+interfaces were verified against the scripts the macOS worker actually
+implemented. The workflow cannot run end-to-end until the chosen scripts land on
+the release branch; no resolution was silently guessed.
+
+**Windows x64 — two competing implementations, identical asset names:**
+
+| Concern | Worker A (`bm-windows`, Inno Setup 6) — *wired* | Worker B (`proud-wizard`, NSIS 3) — *alternative* |
+| --- | --- | --- |
+| Build | `installer/windows/build-installers.sh` → `build-installer.ps1 -Variant full\|hacienda-legal` | `scripts/package-windows-installer.sh <triple> [variant]` (`""` = complete) |
+| Compiler | `ISCC.exe` (Inno Setup 6, on `windows-2022`) | `makensis` (NSIS 3) |
+| Verify | `installer/windows/smoke-test.ps1 -SetupExe <exe> -Variant full\|hacienda-legal -ExpectedVersion <v>` | `tests/windows_installer_smoke.ps1 -Installer <exe> -Variant ""\|hacienda-legal -ExpectedVersion <v>` |
+| Assets | `basemind-x86_64-pc-windows-msvc-setup.exe`, `basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe` | identical |
+| Docs | `docs/windows/installer.md` | `docs/agents/windows-installer.md` |
+
+`publish.yaml` wires worker A because it uses the `full` profile spelling that the
+release policy and the matrix use. Worker B uses the empty variant for the same
+profile. Merging worker B instead requires changing the build and verify steps
+here; do not merge both on top of one another.
+
+**macOS — implemented by the macOS worker in `bm-macos` (`scripts/macos/`):**
+
+- Pinned universal ORT: `bash scripts/macos/ort-universal.sh --out dist/libonnxruntime.universal.dylib`. It downloads the two PyPI `macosx_13_0` cp311 wheels for ONNX Runtime 1.23.2 and verifies their SHA-256 before extraction: arm64
+  `6f91d2c9b0965e86827a5ba01531d5b669770b01775b23199565d6c1f136616c`,
+  x86_64 `87d8b6eaf0fbeb6835a60a4265fde7a3b60157cf1b2764773ac47237b4d48612`. It lipos them, checks both slices are present and declares minos <= 15.0. A checksum mismatch fails closed — there is no repo-variable dylib path any more.
+- Package: `bash scripts/macos/package.sh --skip-tar --variant all --out-dir dist --fat-ort dist/libonnxruntime.universal.dylib`. `--skip-tar` preserves the matrix archives; `--variant all` builds both profiles; `--fat-ort` consumes the pinned dylib instead of auto-generating one. One invocation produces all four stable DMG names: `basemind-aarch64-apple-darwin.dmg`, `basemind-hacienda-legal-aarch64-apple-darwin.dmg`, `basemind-universal-apple-darwin.dmg`, `basemind-hacienda-legal-universal-apple-darwin.dmg`.
+- Verify: `bash tests/macos_dmg_smoke.sh <dmg> arm64|universal`. It mounts the DMG, checks CLI+MCP-only payload (no GUI), runs `scripts/macos/validate.sh bundle` (exact slices; x86_64 `basemind` minos **exactly 15.0**, libraries `<= 15.0`; arm64 `<= 13.0`), checks signatures, installs into a throwaway prefix and launches the installed CLI/MCP where the host can execute the slice. The workflow additionally calls `scripts/macos/validate.sh arch/minos` directly on the fat dylib.
+- **Only the official macOS 15 Intel minimum is used.** The x86_64 binary is compiled with `MACOSX_DEPLOYMENT_TARGET=15.0`, `validate.sh bundle` asserts `eq 15.0`, and `verify-macos-installers-intel` runs on `macos-15-intel` so the execution check actually happens. The workflow passes no `--min-macos` override and retains no preinstall-script gate — the documented "Intel from macOS 15" support comes from the binary's own `LC_BUILD_VERSION`.
+- The arm64 DMGs are built and launched on `macos-latest` (Apple Silicon); the Universal DMGs are smoke-tested on `macos-15-intel`. Both legs are required by `finalize_release`. The scripts and their validation logic are present in the macOS worker's worktree and were verified against these exact interfaces before wiring.
 
 ## Recovery: the guard failed
 

@@ -16,6 +16,9 @@
 //! while proving nothing. `map_cache_budget_is_enforced_and_streams_the_whole_corpus` in
 //! `src/mcp/state.rs` is the paired unit test that pins the eviction actually happening.
 
+// Every test in this file drives the `code` tool/CLI group, which the confidential profile withholds.
+#![cfg(not(feature = "hacienda-legal"))]
+
 use std::path::Path;
 
 use rmcp::ServiceExt;
@@ -233,6 +236,7 @@ where
 
 /// The whole point: identical bytes from a read stack that had to fault most of its outlines back
 /// in, and one that never evicted a single entry.
+#[cfg(not(feature = "hacienda-legal"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tool_output_is_identical_bounded_and_unbounded() {
     let dir = build_corpus();

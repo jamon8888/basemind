@@ -9,9 +9,9 @@
     "rag",
     "tree-sitter"
   ],
-  "homepage": "https://github.com/jamon8888/basemind",
+  "homepage": "https://github.com/Goldziher/basemind",
   "bugs": {
-    "url": "https://github.com/jamon8888/basemind/issues"
+    "url": "https://github.com/Goldziher/basemind/issues"
   },
   "license": "MIT",
   "author": {
@@ -19,7 +19,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jamon8888/basemind.git",
+    "url": "git+https://github.com/Goldziher/basemind.git",
     "directory": "opencode-plugin"
   },
   "files": [

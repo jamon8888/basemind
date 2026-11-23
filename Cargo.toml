@@ -171,8 +171,8 @@ intel-macos = ["full", "ort-dynamic"]
 # - ner-candle: GLiNER2 Candle NER backend for redact_text person/org/location
 #   (transitively includes documents).
 # - graphrag: entity graph (`graph entities`) built from the NER sidecar at scan
-#   time. NOTE: the GraphRAG *query* surface is partially implemented — see
-#   docs/agents/features.md#incomplete-and-proposed-work.
+#   time, plus the operational `graph rag` query surface (vector seeds → bounded
+#   entity expansion → fused retrieval). See docs/agents/features.md#the-two-profile-contracts.
 # Deliberately excluded: the comms broker/daemon and its agents/workspace domains; `serve` uses
 # rmcp's direct stdio transport in this profile. Also excluded are shells,
 # crawl, code-intel and code-search — a client folder is documents, not code.

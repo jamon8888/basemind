@@ -529,11 +529,16 @@ impl BasemindServer {
     /// `OnceLock` and hands back a clone. This is the one-time builder the cache calls into.
     fn assemble_router() -> ToolRouter<Self> {
         #[allow(unused_mut)]
-        let mut router = Self::tool_router_core()
-            + Self::tool_router_graph()
+        let mut router = Self::tool_router_graph()
             + Self::tool_router_git()
             + Self::tool_router_memory()
             + Self::tool_router_admin();
+        // `hacienda-legal` is the confidential client-folder profile: the code-map tool is not
+        // registered at all, so neither tools/list nor a direct call can reach source navigation.
+        #[cfg(not(feature = "hacienda-legal"))]
+        {
+            router += Self::tool_router_core();
+        }
         #[cfg(feature = "crawl")]
         {
             router += Self::tool_router_web();

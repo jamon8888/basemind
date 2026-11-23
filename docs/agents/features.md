@@ -27,13 +27,34 @@ unavailable; advertised modes alone do not prove that an operation can run.
 | `code-intel-stack` | In-tree stack-graph engines for Python/Java. |
 | `code-intel` | Both precise resolution engines. |
 | `ner-candle` | Documents plus Candle GLiNER2 NER and model-tokenizer support. |
-| `full` | Documents, memory, crawl, comms, shells, code intelligence, code search and Candle NER. **Does not include `graphrag`.** |
+| `full` | The complete profile: documents, memory, crawl, comms, shells, code intelligence, code search and Candle NER. **Does not include `graphrag`.** |
 | `hacienda` | Documents, memory, code search, Candle NER and comms for gateway integration. |
-| `hacienda-legal` | Legal focus release: documents (ingestion, RAG retrieval, redaction + `vault` rehydration), memory, Candle NER and graphrag — **no** comms broker/agents/workspace, shells/crawl/code-intel/code-search. `basemind serve` uses direct stdio. Ships as `basemind-hacienda-legal-<triple>` release assets. Config preset: `examples/basemind-hacienda-legal.toml`. |
-| `graphrag` | Optional entity graph dependencies and partially implemented query surface; see limitations below. |
+| `hacienda-legal` | The confidential professional profile: documents (ingestion, RAG retrieval, redaction + `vault` rehydration), memory, Candle NER and GraphRAG. It withholds **every code tool** (MCP `code` and CLI `code`), comms (`agents` / `workspace` / broker), and crawl (`web` / `crawl`) — as do shells, code-intel and code-search. `basemind serve` uses direct stdio. Ships as `basemind-hacienda-legal-<triple>` release assets. Config preset: `examples/basemind-hacienda-legal.toml`. |
+| `graphrag` | Optional entity graph dependencies plus the operational `graph entities` (restricted Cypher) and `graph rag` (vector seeds → bounded entity expansion → fused retrieval) query surface. Enabled by `hacienda-legal`, not by `full`. |
 | `ort-dynamic` | Dynamic ONNX Runtime loading through xberg when that dependency is enabled. |
 | `intel-macos` | `full` plus `ort-dynamic`; use this profile for x86_64 macOS when a runtime dylib is available. |
 | `test-support` | Test helper dependency support. |
+
+### The two profile contracts
+
+There are two supported release profiles. They are build-time contracts, not runtime switches: a
+binary is built for one profile and its advertised surface is fixed for the process lifetime.
+
+| Contract | `full` | `hacienda-legal` |
+| --- | --- | --- |
+| Cargo features | documents, memory, crawl, comms, shells, code-intel, code-search, ner-candle | documents, memory, ner-candle, graphrag |
+| MCP tools | code, graph, git, memory, admin, web, agents, workspace, shell, vault, redact_text | graph (incl. `entities` / `rag`), git, memory, admin, vault, redact_text |
+| CLI groups | the matching `code`, `web`, `agents`, `workspace`, `shell`, … groups | no `code` or `web` commands; comms/shell groups compiled out |
+| Data path | local index plus local models; crawl may reach public URLs | documents and memory processing stays local; model downloads are allowed, but no crawl/comms transport is compiled in |
+| Serve | relay to the daemon (`comms`) | direct stdio (`no comms`) |
+
+Gating lives in three places that must agree: Cargo feature composition (`Cargo.toml`), MCP router
+assembly and `mode::domain_modes()` (`src/mcp/mod.rs`, `src/mcp/mode.rs`), and the CLI command tree
+(`src/main.rs`, `src/cli/mod.rs`). `tests/cli_parity/` checks the MCP/CLI bijection for whichever
+profile is built; `tests/hacienda_legal_smoke.rs` and `tests/profile_contract.rs` assert the
+positive and negative capability sets of each profile. `hacienda-legal` must never advertise a
+code-map tool — with the tool absent, an agent has no MCP or CLI path to source navigation — while
+`full` must keep it.
 
 ## Capability map
 
@@ -91,12 +112,14 @@ not inherit the cancellation policy for disposable reads.
 
 These are implementation observations, not completed-feature claims:
 
-- **GraphRAG:** `lance/graphrag.rs` contains entity/edge construction and restricted
-  Cypher support. `graph entities` has an MCP handler, but `run_graph_rag` in
-  `mcp/helpers_graph.rs` returns empty hits when enabled. `src/cli/graph.rs` has
-  no `entities`/`rag` subcommands. Entity graph ingestion is configured under
-  `[documents.graphrag]` (`config/documents.rs`). Treat the retrieval and CLI
-  surface as incomplete; `full` does not exercise this feature.
+- **GraphRAG (implemented, but only in `hacienda-legal`):** `lance/graphrag.rs`
+  builds `graph_entities` / `graph_edges` from the NER sidecar at scan time;
+  `mcp/helpers_graph.rs::run_graph_rag` embeds the query, seeds from vector hits,
+  expands over co-occurrence edges (bounded) and fuses graph-only chunks, and
+  `src/cli/graph.rs` exposes `entities` / `rag` subcommands. Query modes are
+  advertised in every build's `graph` mode enum, but they only work when the
+  `graphrag` feature is compiled in — `full` does not include it. Entity graph
+  ingestion is configured under `[documents.graphrag]` (`config/documents.rs`).
 - **Desktop UI:** the Tauri ADR is proposed. The implemented graph UI lives in
   HTML/SVG rendering and the daemon HTTP frontend; there is no Tauri application
   package in this checkout.

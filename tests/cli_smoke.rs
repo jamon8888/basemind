@@ -93,6 +93,7 @@ fn assert_human_contains(root: &Path, args: &[&str], needle: &str) {
     );
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn code_outline_reports_symbols() {
     let dir = build_and_scan();
@@ -107,6 +108,7 @@ fn code_outline_reports_symbols() {
     assert_human_contains(root, &["code", "outline", "a.rs"], "alpha");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn code_symbols_finds_symbol() {
     let dir = build_and_scan();
@@ -116,6 +118,7 @@ fn code_symbols_finds_symbol() {
     assert_human_contains(root, &["code", "symbols", "alpha"], "alpha");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn code_references_finds_call_sites() {
     let dir = build_and_scan();
@@ -138,6 +141,7 @@ fn admin_status_reports_file_count() {
     assert_human_contains(root, &["status"], "file_count");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn code_files_enumerates() {
     let dir = build_and_scan();
@@ -170,6 +174,7 @@ fn git_search_finds_commit_by_author() {
     assert_human_contains(root, &["git", "search", "init", "--field", "message"], "init");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn rescan_full_reindexes_new_file() {
     let dir = build_and_scan();
@@ -185,6 +190,7 @@ fn rescan_full_reindexes_new_file() {
     assert_eq!(status["file_count"], 3, "rescan --full must index the new file");
 }
 
+#[cfg(not(feature = "hacienda-legal"))]
 #[test]
 fn rescan_scoped_path_reindexes_only_that_path() {
     let dir = build_and_scan();

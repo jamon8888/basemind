@@ -366,6 +366,28 @@ pub fn reject_unsupported(domain: &str, mode: &str, present: &[(&str, bool)]) ->
     ))
 }
 
+/// Every domain/mode pair the crate knows about, independent of the compiled profile.
+///
+/// Telemetry, savings baselines and the slow-tool table key on `domain:mode`. Those keys must
+/// stay stable across profiles: a `code_outline` call recorded by `full` still has to resolve to
+/// the same baseline when a confidential `hacienda-legal` build reads it. Use this when the
+/// question is "is this a real tool name?"; use [`domain_modes`] for "what does this build
+/// advertise?".
+pub fn all_domain_modes() -> Vec<(&'static str, &'static [&'static str])> {
+    vec![
+        (AdminMode::DOMAIN, AdminMode::ALL_MODES),
+        (CodeMode::DOMAIN, CodeMode::ALL_MODES),
+        (GitMode::DOMAIN, GitMode::ALL_MODES),
+        (GraphMode::DOMAIN, GraphMode::ALL_MODES),
+        (MemoryMode::DOMAIN, MemoryMode::ALL_MODES),
+        (ShellMode::DOMAIN, ShellMode::ALL_MODES),
+        (WebMode::DOMAIN, WebMode::ALL_MODES),
+        (AgentsMode::DOMAIN, AgentsMode::ALL_MODES),
+        (WorkspaceMode::DOMAIN, WorkspaceMode::ALL_MODES),
+        (VaultMode::DOMAIN, VaultMode::ALL_MODES),
+    ]
+}
+
 /// Every domain this build advertises, paired with the modes it accepts.
 ///
 /// Feature-gated exactly like the router's sub-router merges, so the list can never name a domain
@@ -375,6 +397,9 @@ pub fn reject_unsupported(domain: &str, mode: &str, present: &[(&str, bool)]) ->
 pub fn domain_modes() -> Vec<(&'static str, &'static [&'static str])> {
     vec![
         (AdminMode::DOMAIN, AdminMode::ALL_MODES),
+        // The confidential legal profile does not advertise the code-map domain; its router does
+        // not register that tool, so parity must not expect a CLI counterpart either.
+        #[cfg(not(feature = "hacienda-legal"))]
         (CodeMode::DOMAIN, CodeMode::ALL_MODES),
         (GitMode::DOMAIN, GitMode::ALL_MODES),
         (GraphMode::DOMAIN, GraphMode::ALL_MODES),

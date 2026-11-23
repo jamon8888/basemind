@@ -58,7 +58,8 @@ use crate::config::DocumentsCliOverrides;
 #[derive(Subcommand, Debug)]
 pub enum ToolCmd {
     /// Code-map lookups: outline, symbols, grep, files, find, definition, references, callers,
-    /// implementations, dependents, expand, semantic, chunk.
+    /// implementations, dependents, expand, semantic, chunk. Withheld from `hacienda-legal`.
+    #[cfg(not(feature = "hacienda-legal"))]
     #[command(subcommand)]
     Code(code::CodeCmd),
     /// Git history / blame / diff queries.
@@ -72,7 +73,8 @@ pub enum ToolCmd {
     /// (needs `--features memory,documents`).
     #[command(subcommand)]
     Memory(memory::MemoryCmd),
-    /// On-demand web ingestion (needs `--features crawl`).
+    /// On-demand web ingestion (needs `--features crawl`). Withheld from `hacienda-legal`.
+    #[cfg(not(feature = "hacienda-legal"))]
     #[command(subcommand)]
     Web(web::WebCmd),
     /// Server administration: repo identity, telemetry, compression, tokens, eval.
@@ -168,10 +170,12 @@ pub fn run(
             startup_us: u64::try_from(process_started.elapsed().as_micros()).unwrap_or(u64::MAX),
         };
         match cmd {
+            #[cfg(not(feature = "hacienda-legal"))]
             ToolCmd::Code(c) => code::run(&server, c, &opts, &mut out).await?,
             ToolCmd::Git(g) => git::run(&server, g, &opts, &mut out).await?,
             ToolCmd::Graph(g) => graph::run(&server, g, &opts, &mut out).await?,
             ToolCmd::Memory(m) => memory::run(&server, m, &opts, &mut out).await?,
+            #[cfg(not(feature = "hacienda-legal"))]
             ToolCmd::Web(w) => web::run(&server, w, &opts, &mut out).await?,
             ToolCmd::Admin(a) => admin::run(&server, a, &opts, &mut out).await?,
             ToolCmd::Status => admin::run_status(&server, &opts, &mut out).await?,

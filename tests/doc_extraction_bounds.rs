@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use basemind::config::ConfigV1;
 use basemind::scanner::{EmbedMode, ScanReport, ScanSource, scan};
@@ -56,7 +57,19 @@ fn slow_config() -> ConfigV1 {
     cfg
 }
 
+/// The abandoned-extraction ledger is process-wide. A timed-out splitter thread keeps running
+/// after its scan returned, so without draining it the next scan's timeout/deferral counts depend
+/// on which test finished last. `SERIAL` orders the scans; this waits for their leftovers too.
+fn wait_for_abandoned_to_drain() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while basemind::extract::doc_guard::abandoned_extractions() != 0 {
+        assert!(Instant::now() < deadline, "abandoned extraction threads did not drain");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn scan_once(root: &Path, cfg: &ConfigV1) -> ScanReport {
+    wait_for_abandoned_to_drain();
     let mut store = Store::open(root, VIEW_WORKING).expect("open store");
     scan(root, &mut store, cfg, ScanSource::WorkingTree, EmbedMode::Inline).expect("scan")
 }

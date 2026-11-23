@@ -685,7 +685,17 @@ pub(crate) fn extract_doc_with_metrics(
     }
     let extraction_started = std::time::Instant::now();
     let extraction_budget = std::time::Duration::from_secs(config.extraction_timeout_secs);
-    let mut outcome = run_guarded(path, mime_type, krz_config.clone(), config)?;
+    let mut outcome = match run_guarded(path, mime_type, krz_config.clone(), config) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if matches!(error, ExtractError::DocTimeout(_))
+                && let Some(phase) = &config.phase
+            {
+                phase.note_timeout();
+            }
+            return Err(error);
+        }
+    };
     if let Some(dictionary_warnings) = dictionary_filter_warnings(&outcome)
         && let Some(fallback_config) = plain_text_ocr_fallback_config(&krz_config)
     {

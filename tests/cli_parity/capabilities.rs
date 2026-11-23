@@ -77,27 +77,13 @@ const fn mcp_only(tool: &'static str, mode: &'static str, reason: &'static str) 
 const LIFECYCLE: &str = "process/index lifecycle, not a query an agent issues over MCP";
 #[cfg(all(feature = "comms", any(unix, windows)))]
 const BROKER: &str = "comms-broker daemon lifecycle; the MCP surface reaches the broker through `agents`/`workspace`";
-#[cfg(not(feature = "crawl"))]
+#[cfg(all(not(feature = "crawl"), not(feature = "hacienda-legal")))]
 const NO_CRAWL: &str =
     "the MCP `web` tool is compiled out without the `crawl` feature; the CLI reports the missing feature";
 
 pub fn table() -> Vec<Row> {
     #[allow(unused_mut)]
     let mut rows = vec![
-        // ---- code ----
-        pair("code", "outline", "code outline"),
-        pair("code", "symbols", "code symbols"),
-        pair("code", "grep", "code grep"),
-        pair("code", "files", "code files"),
-        pair("code", "find", "code find"),
-        pair("code", "definition", "code definition"),
-        pair("code", "references", "code references"),
-        pair("code", "callers", "code callers"),
-        pair("code", "implementations", "code implementations"),
-        pair("code", "dependents", "code dependents"),
-        pair("code", "expand", "code expand"),
-        pair("code", "semantic", "code semantic"),
-        pair("code", "chunk", "code chunk"),
         // ---- graph ----
         pair("graph", "calls", "graph calls"),
         pair("graph", "neighbors", "graph neighbors"),
@@ -189,14 +175,33 @@ pub fn table() -> Vec<Row> {
             "offline evaluation harness over a JSONL task file; drives the tools rather than being one",
         ),
     ];
+    // The confidential `hacienda-legal` profile registers neither the MCP `code` tool nor the CLI
+    // group, so it must have no parity rows for that domain.
+    #[cfg(not(feature = "hacienda-legal"))]
+    rows.extend([
+        pair("code", "outline", "code outline"),
+        pair("code", "symbols", "code symbols"),
+        pair("code", "grep", "code grep"),
+        pair("code", "files", "code files"),
+        pair("code", "find", "code find"),
+        pair("code", "definition", "code definition"),
+        pair("code", "references", "code references"),
+        pair("code", "callers", "code callers"),
+        pair("code", "implementations", "code implementations"),
+        pair("code", "dependents", "code dependents"),
+        pair("code", "expand", "code expand"),
+        pair("code", "semantic", "code semantic"),
+        pair("code", "chunk", "code chunk"),
+    ]);
     #[cfg(feature = "crawl")]
     rows.extend([
         pair("web", "scrape", "web scrape"),
         pair("web", "crawl", "web crawl"),
         pair("web", "map", "web map"),
     ]);
-    // The `web` CLI group is always compiled in; its MCP tool only exists with `crawl`.
-    #[cfg(not(feature = "crawl"))]
+    // The `web` CLI group is compiled in on every other profile; its MCP tool only exists with
+    // `crawl`. `hacienda-legal` withholds both, so it has no rows here at all.
+    #[cfg(all(not(feature = "crawl"), not(feature = "hacienda-legal")))]
     rows.extend([
         cli_only("web scrape", NO_CRAWL),
         cli_only("web crawl", NO_CRAWL),

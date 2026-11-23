@@ -1,5 +1,5 @@
 project_doc_max_bytes = 65536
 
 [mcp_servers.ai-rulez]
-args = ["mcp"]
-command = "ai-rulez"
+args = ["-y", "ai-rulez@5.14.1", "mcp"]
+command = "npx"

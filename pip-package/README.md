@@ -17,10 +17,23 @@ Full documentation: **[basemind.ai](https://basemind.ai)**
 pip install basemind
 ```
 
-On first invocation, the pre-compiled Rust binary for your platform (macOS, Linux, Windows;
-x86_64 + arm64) is downloaded from
-[GitHub Releases](https://github.com/Goldziher/basemind/releases) and cached under
-`~/.cache/basemind/<version>/`.
+This legacy name installs the **full** profile by default. To install the
+confidential `hacienda-legal` profile (documents + memory + NER + GraphRAG, no
+code/comms/crawl tools), use the explicit choice or the explicit command name:
+
+```bash
+BASEMIND_PROFILE=hacienda-legal pip install basemind
+basemind-hacienda-legal --version   # explicit command name for the same profile
+```
+
+On first invocation, the profile-specific pre-compiled Rust binary for your
+OS/architecture (`basemind-<triple>` or `basemind-hacienda-legal-<triple>`)
+is downloaded from [GitHub Releases](https://github.com/Goldziher/basemind/releases),
+verified against the SHA-256 entry in the shared checksums file, and cached under
+`~/.cache/basemind/<version>/`. A missing asset or checksum fails with an
+explicit error naming the profile, triple and version — no silent fallback.
+Archives (`.tar.gz` / `.zip`) and installers (`.exe` / `.dmg`) ship together at
+the same version; the Intel macOS asset requires macOS 15 or newer.
 
 Override the binary location with `BASEMIND_BINARY=/path/to/basemind`.
 

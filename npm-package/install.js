@@ -9,6 +9,28 @@ const AdmZip = require("adm-zip");
 
 const { version } = require("./package.json");
 
+/// Distribution profiles. `full` is the default for every legacy channel name;
+/// `hacienda-legal` is the confidential profile (documents + memory + NER +
+/// GraphRAG, no code/comms/crawl tooling). The profile is an explicit choice via
+/// BASEMIND_PROFILE; legacy channel names always install `full`.
+const PROFILES = ["full", "hacienda-legal"];
+
+function getProfile() {
+  const profile = process.env.BASEMIND_PROFILE || "full";
+  if (!PROFILES.includes(profile)) {
+    throw new Error(
+      `unknown BASEMIND_PROFILE '${profile}' — choose one of: ${PROFILES.join(", ")} ('full' is the default)`,
+    );
+  }
+  return profile;
+}
+
+/// Release asset prefix. The full profile keeps the historical unprefixed name;
+/// the confidential profile uses `basemind-hacienda-legal-<triple>`.
+function assetPrefix(profile) {
+  return profile === "full" ? "basemind" : `basemind-${profile}`;
+}
+
 /// One `sysctl` inquiry; `-n` prints the value of `name`, or "" when it is absent.
 function sysctl(name) {
   try {
@@ -47,15 +69,29 @@ function getPlatformTriple() {
 }
 
 function getReleaseAssets() {
+  const profile = getProfile();
   const platform = getPlatformTriple();
-  const baseUrl = `https://github.com/jamon8888/basemind/releases/download/v${version}`;
+  const baseUrl = `https://github.com/Goldziher/basemind/releases/download/v${version}`;
   const ext = platform.includes("windows") ? "zip" : "tar.gz";
-  const assetName = `basemind-${platform}.${ext}`;
+  const assetName = `${assetPrefix(profile)}-${platform}.${ext}`;
   return {
+    profile,
+    platform,
     assetName,
     archiveUrl: `${baseUrl}/${assetName}`,
     checksumsUrl: `${baseUrl}/basemind_${version}_checksums.txt`,
+    releaseUrl: `https://github.com/Goldziher/basemind/releases/tag/v${version}`,
   };
+}
+
+/// Single, explicit failure message for a missing asset or checksum. A wrapper
+/// must never fall back to another profile/architecture silently.
+function missingAssetError(kind, assets) {
+  return new Error(
+    `${kind} for profile '${assets.profile}' / ${assets.platform} at v${version} ` +
+      `(${assets.assetName}). Check ${assets.releaseUrl}: archives (.tar.gz/.zip) and installers ` +
+      `(.exe/.dmg) ship together at the same version, and the checksums file must list this asset.`,
+  );
 }
 
 function downloadWithRedirects(url, dest, maxRedirects = 5) {
@@ -206,7 +242,8 @@ function expectedDigest(checksumsText, assetName) {
   return null;
 }
 
-async function verifyChecksum(archivePath, assetName, checksumsUrl) {
+async function verifyChecksum(archivePath, assets) {
+  const { assetName, checksumsUrl } = assets;
   let checksumsText;
   try {
     checksumsText = await retryFetchText(checksumsUrl);
@@ -219,7 +256,7 @@ async function verifyChecksum(archivePath, assetName, checksumsUrl) {
 
   const expected = expectedDigest(checksumsText, assetName);
   if (!expected) {
-    throw new Error(`no checksum entry for ${assetName} in ${checksumsUrl} — refusing to install unverified binary`);
+    throw missingAssetError(`no SHA-256 entry in ${checksumsUrl} for`, assets);
   }
 
   const actual = sha256File(archivePath).toLowerCase();
@@ -232,26 +269,40 @@ async function verifyChecksum(archivePath, assetName, checksumsUrl) {
 
 async function installBinary() {
   try {
-    const { assetName, archiveUrl, checksumsUrl } = getReleaseAssets();
+    const assets = getReleaseAssets();
+    const { assetName, archiveUrl } = assets;
     const isZip = archiveUrl.endsWith(".zip");
     const binDir = path.join(__dirname, "bin");
     const archivePath = path.join(binDir, assetName);
     const binaryName = os.type() === "Windows_NT" ? "basemind.exe" : "basemind";
     const binaryPath = path.join(binDir, binaryName);
+    const markerPath = path.join(binDir, ".profile");
 
     if (!fs.existsSync(binDir)) {
       fs.mkdirSync(binDir, { recursive: true });
     }
 
-    if (fs.existsSync(binaryPath)) {
+    // One binary lives in `bin/`. A marker records which profile it came from so
+    // switching profiles re-downloads instead of silently running the wrong one.
+    const installedProfile = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").trim() : "full";
+    if (fs.existsSync(binaryPath) && installedProfile === assets.profile) {
       return;
     }
 
-    console.log(`Downloading basemind binary from ${archiveUrl}...`);
+    console.log(`Downloading basemind '${assets.profile}' binary from ${archiveUrl}...`);
 
-    await retryWithBackoff(() => downloadWithRedirects(archiveUrl, archivePath));
+    try {
+      await retryWithBackoff(() => downloadWithRedirects(archiveUrl, archivePath));
+    } catch (error) {
+      throw new Error(
+        `release asset ${assetName} (profile '${assets.profile}', ${assets.platform}, v${version}) ` +
+          `is missing or unreachable: ${error.message}. See ${assets.releaseUrl} — archives ` +
+          `(.tar.gz/.zip) and installers (.exe/.dmg) ship together at the same version.`,
+        { cause: error },
+      );
+    }
 
-    await verifyChecksum(archivePath, assetName, checksumsUrl);
+    await verifyChecksum(archivePath, assets);
 
     console.log("Extracting archive (binary + bundled libraries)...");
 
@@ -271,16 +322,29 @@ async function installBinary() {
     if (!fs.existsSync(binaryPath)) {
       throw new Error(`binary ${binaryName} not found after extracting ${assetName}`);
     }
+    fs.writeFileSync(markerPath, assets.profile);
 
     if (os.type() !== "Windows_NT") {
       fs.chmodSync(binaryPath, 0o755);
     }
 
-    console.log("basemind binary installed successfully!");
+    console.log(`basemind '${assets.profile}' binary installed successfully!`);
   } catch (error) {
     console.error("Error installing basemind binary:", error.message);
     process.exit(1);
   }
 }
 
-installBinary();
+module.exports = {
+  PROFILES,
+  getProfile,
+  assetPrefix,
+  getPlatformTriple,
+  getReleaseAssets,
+  expectedDigest,
+  installBinary,
+};
+
+if (require.main === module) {
+  installBinary();
+}

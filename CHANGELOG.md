@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Keep a Changelog repeats Added/Changed/Fixed headings per version. -->
 <!-- markdownlint-disable MD024 -->
 
+## [Unreleased]
+
+### Changed
+
+- Profile contract: `hacienda-legal` (documents + memory + Candle NER + GraphRAG)
+  now withholds the `code` and `web` domains on both MCP and CLI, in addition to
+  the already-excluded comms, shells and code-search surfaces. `full` keeps its
+  complete historical composition unchanged.
+- GraphRAG is now an explicit part of the `hacienda-legal` contract: `graph entities`
+  and `graph rag` are operationally covered by tests over the Lance graph lanes
+  and the fusion path; documentation no longer describes them as unimplemented.
+
 ## [0.39.0] - 2026-11-20
 
 > **Minor release.** This release uses persisted-schema version `39`; the first

@@ -19,13 +19,39 @@ the model downloads smaller.
 
 ## Install
 
-| Channel | Command | Includes |
+`hacienda-legal` is an explicit profile choice, never the default of a legacy
+channel name. Every channel below selects the same confidential build.
+
+| Channel | Explicit name / choice | Includes |
 |---|---|---|
-| GitHub releases | `basemind-hacienda-legal-<triple>.tar.gz` / `.zip` from [releases](https://github.com/Goldziher/basemind/releases) | documents + rehydration vault + memory + NER + graphrag |
+| Homebrew | `brew install Goldziher/tap/basemind-hacienda-legal` | documents + memory + NER + GraphRAG |
+| npm | `BASEMIND_PROFILE=hacienda-legal pnpm add -g basemind`, then `basemind-hacienda-legal` | same |
+| pip | `BASEMIND_PROFILE=hacienda-legal pip install basemind`, then `basemind-hacienda-legal` | same |
+| GitHub releases | `basemind-hacienda-legal-<triple>.tar.gz` / `.zip` from [releases](https://github.com/Goldziher/basemind/releases) | same |
 | cargo | `cargo install basemind --features hacienda-legal --locked` | same |
 
-The plain `basemind-<triple>` assets and `--features full` remain the everything build;
-`hacienda-legal` assets are additional archives on the same release.
+The plain `basemind-<triple>` assets and `--features full` remain the everything build.
+Both profiles, their `.tar.gz` / `.zip` archives and any `.exe` / `.dmg` installers
+are published together at the same version. Each wrapper selects the profile,
+OS and architecture first, verifies the asset's SHA-256 against the shared
+`basemind_<version>_checksums.txt`, and fails with an explicit error if the
+asset or checksum is missing — it never silently falls back to the full build.
+
+## Confidential profile requirements
+
+- **Contents:** documents + memory + NER + GraphRAG, including the rehydration
+  vault. **No** code-intelligence/code-search, comms or web-crawl tools;
+  `basemind serve` uses direct stdio without the comms broker.
+- **Local processing:** ingestion, RAG, redaction and NER run on the client
+  machine. basemind never persists the token → original map; the caller keeps
+  it (optionally in the encrypted vault). No document text is sent to a hosted
+  analysis service.
+- **Model downloads are permitted:** the first run may fetch the embedding,
+  reranker and NER models into a local cache. Set `embed = false` and provide a
+  local `ner_model_dir` for a fully offline, lexical-only deployment.
+- **macOS:** universal coverage — `aarch64-apple-darwin` and
+  `x86_64-apple-darwin` assets ship together; the Intel build requires
+  **macOS 15 (Sequoia) or newer**.
 
 ## Set up a client folder
 
@@ -90,10 +116,11 @@ itself, run the protected-workspace flow — the `safe/` mirror withholds `redac
 and `vault` from ordinary agents and only the gateway (marked via its environment) sees
 the true values.
 
-<Aside type="caution">
-The GraphRAG **query** surface (`graph` mode `rag`) is partially implemented; entity
-ingestion (`graph` mode `entities`) works when `[documents.graphrag] enabled = true`.
-See the feature catalog for the current status.
+<Aside type="tip">
+With `[documents.graphrag] enabled = true`, both GraphRAG modes are operational in this
+build: `graph entities` reads the scan-time entity graph with restricted Cypher, and
+`graph rag` expands vector seeds over co-occurrence edges and fuses the retrieved chunks.
+Neither mode is compiled into `full`.
 </Aside>
 
 ## What is in / out
@@ -102,11 +129,12 @@ See the feature catalog for the current status.
 |---|---|
 | Document ingestion: PDF, Office, HTML, email, images + OCR, prose/config/data | `comms` daemon / broker / HTTP frontend |
 | `memory` mode `documents` retrieval (exact, FTS, vector, fusion, rerank) | `shells` detached terminals |
-| `redact_text` + `vault` rehydration maps | `crawl` web ingestion |
+| `redact_text` + `vault` rehydration maps | `crawl` web ingestion / `web` tool |
 | Ingest-time NER (ONNX + Candle GLiNER2), keywords, summaries | `code-search` semantic code search |
 | Memory notes (`memory` put/get/search, governance) | `code-intel` JS/Python/Java resolution |
-| GraphRAG entity graph (`graph entities`) | |
+| GraphRAG entity graph (`graph entities` + `graph rag`) | MCP `code` tool / CLI `code` group |
 
-Code-map and git tools (`code`, `git`, `graph`, `admin`) are part of every build and
-stay available — a client folder occasionally contains scripts, and they cost nothing
-when unused.
+`git`, `graph` and `admin` remain available. The code-map tool is withheld on both MCP
+and CLI — an agent has no path to source navigation in this profile, even if the client
+folder happens to contain scripts. Document and memory processing stays local; only
+model downloads reach the network.

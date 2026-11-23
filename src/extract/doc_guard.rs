@@ -261,6 +261,8 @@ pub struct DocPhase {
 struct PhaseState {
     budget: Option<Duration>,
     started: Option<Instant>,
+    /// Set once the budget is known to be gone, so `admit` can no longer race a watchdog wake-up.
+    spent: bool,
 }
 
 /// The document-phase budget is spent.
@@ -277,6 +279,7 @@ impl DocPhase {
             state: Mutex::new(PhaseState {
                 budget: Some(budget),
                 started: None,
+                spent: false,
             }),
         }
     }
@@ -287,6 +290,7 @@ impl DocPhase {
         *self.lock() = PhaseState {
             budget: Some(budget),
             started: None,
+            spent: false,
         };
     }
 
@@ -302,10 +306,31 @@ impl DocPhase {
         };
         let started = *state.started.get_or_insert(now);
         let elapsed = now.saturating_duration_since(started);
-        if elapsed >= budget {
+        if state.spent || elapsed >= budget {
             Err(PhaseSpent { elapsed, budget })
         } else {
             Ok(())
+        }
+    }
+
+    /// Record that a per-file extraction timed out.
+    ///
+    /// The phase deadline and the per-file watchdog are two wall-clock timers started a few
+    /// microseconds apart. When they are equal (the "one file spends the whole phase" case) the
+    /// watchdog can wake just before the next `admit` observes `elapsed >= budget`, admitting one
+    /// more document and making the deferred/timeout counts depend on scheduler luck. Once the
+    /// budget has actually elapsed at timeout time, mark the phase spent so later admits are
+    /// refused deterministically. A timeout within a larger phase budget leaves the phase armed.
+    pub fn note_timeout(&self) {
+        self.note_timeout_at(Instant::now());
+    }
+
+    fn note_timeout_at(&self, now: Instant) {
+        let mut state = self.lock();
+        if let (Some(budget), Some(started)) = (state.budget, state.started)
+            && now.saturating_duration_since(started) >= budget
+        {
+            state.spent = true;
         }
     }
 
@@ -480,6 +505,29 @@ mod tests {
             phase.admit_at(t0 + Duration::from_secs(500)).is_ok(),
             "begin re-arms the phase"
         );
+    }
+
+    #[test]
+    fn a_timeout_spends_the_phase_only_when_its_budget_has_elapsed() {
+        let phase = DocPhase::with_budget(Duration::from_secs(10));
+        let t0 = Instant::now();
+        assert!(phase.admit_at(t0).is_ok(), "first document starts the clock");
+
+        phase.note_timeout_at(t0 + Duration::from_secs(9));
+        assert!(
+            phase.admit_at(t0 + Duration::from_secs(9)).is_ok(),
+            "a timeout inside a larger phase budget must not defer the remaining documents"
+        );
+
+        // Equal per-file timeout and phase budget: the watchdog may wake before `admit` next
+        // compares the clock, so the timeout itself has to settle the phase.
+        phase.note_timeout_at(t0 + Duration::from_secs(10));
+        let spent = phase.admit_at(t0 + Duration::from_secs(10)).unwrap_err();
+        assert_eq!(spent.budget, Duration::from_secs(10));
+        assert!(phase.admit_at(t0 + Duration::from_secs(11)).is_err(), "stays spent");
+
+        phase.begin(Duration::from_secs(10));
+        assert!(phase.admit_at(Instant::now()).is_ok(), "begin re-arms the phase");
     }
 
     #[test]

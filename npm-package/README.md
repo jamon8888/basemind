@@ -17,9 +17,21 @@ Full documentation: **[basemind.ai](https://basemind.ai)**
 pnpm add -g basemind
 ```
 
-The installer downloads the appropriate pre-compiled Rust binary for your platform (macOS,
-Linux, Windows; x86_64 + arm64) from
-[GitHub Releases](https://github.com/Goldziher/basemind/releases) on first install.
+This legacy name installs the **full** profile by default. To install the
+confidential `hacienda-legal` profile (documents + memory + NER + GraphRAG, no
+code/comms/crawl tools), use the explicit name or the explicit choice:
+
+```bash
+BASEMIND_PROFILE=hacienda-legal pnpm add -g basemind
+basemind-hacienda-legal --version   # explicit command name for the same profile
+```
+
+The installer selects the profile-specific asset for your OS/architecture
+(`basemind-<triple>` or `basemind-hacienda-legal-<triple>`), verifies its
+SHA-256 against the release checksums file, and fails with an explicit error if
+that asset or its checksum is missing — it never falls back silently. Archives
+(`.tar.gz` / `.zip`) and installers (`.exe` / `.dmg`) ship together at the same
+version. The Intel macOS asset requires macOS 15 or newer.
 
 ## Quickstart
 

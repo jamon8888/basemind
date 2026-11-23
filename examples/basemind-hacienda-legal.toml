@@ -133,8 +133,8 @@ max_per_chunk = 64
 
 [documents.graphrag]
 # Entity graph built from the NER sidecar at scan time (`graph entities` mode).
-# NOTE: the GraphRAG *query* surface (`graph rag`) is partially implemented —
-# see docs/agents/features.md.
+# `graph rag` queries it end to end: vector seeds → bounded entity expansion →
+# fused retrieval. Both modes are available only in the `hacienda-legal` build.
 enabled = true
 labels = ["person", "organization", "location"]
 max_rows = 200

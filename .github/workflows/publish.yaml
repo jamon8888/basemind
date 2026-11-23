@@ -288,13 +288,41 @@ jobs:
           # heal the gaps. The previous "any asset present" check skipped the builders on a
           # partial draft, so a release that lost a platform binary could never complete on
           # a rerun (the v0.10.0 / release-window failure class).
+          #
+          # Fail-closed release contract (see docs/agents/release.md "Release gates"):
+          # every archive the matrix produces, the two Windows x64 setup.exe installers,
+          # the four macOS DMG installers (arm64 + Universal, both profiles), and the
+          # checksums file that covers all of them. A missing entry means "incomplete",
+          # which re-runs every builder rather than promoting a partial release. The asset
+          # names are the stable names defined by the platform installer specs.
           required=(
+            # archives — full profile and the noavx2 baseline
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
             "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
             "basemind-aarch64-unknown-linux-gnu.tar.gz"
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"
+            # archives — hacienda-legal profile
+            "basemind-hacienda-legal-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc.zip"
+            # archives — hacienda focus profile (still a required matrix leg)
+            "basemind-hacienda-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-pc-windows-msvc.zip"
+            # Windows x64 installers (Inno Setup setup.exe)
+            "basemind-x86_64-pc-windows-msvc-setup.exe"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe"
+            # macOS installers (DMG, arm64 + Universal / Intel macOS 15+)
+            "basemind-aarch64-apple-darwin.dmg"
+            "basemind-hacienda-legal-aarch64-apple-darwin.dmg"
+            "basemind-universal-apple-darwin.dmg"
+            "basemind-hacienda-legal-universal-apple-darwin.dmg"
             "basemind_${version}_checksums.txt"
           )
 
@@ -410,8 +438,8 @@ jobs:
         include:
           - triple: aarch64-apple-darwin
             os: macos-latest
-          # Reduced focus releases ship as separate optional assets; they are not in the
-          # required full-feature asset set, so promotion never waits on them.
+          # Reduced focus archives ship as separate assets but are now REQUIRED:
+          # fail-closed promotion waits on every leg of this matrix.
           - triple: aarch64-apple-darwin
             os: macos-latest
             features: hacienda
@@ -446,10 +474,10 @@ jobs:
             features: hacienda-legal
             variant: hacienda-legal
     runs-on: ${{ matrix.os }}
-    # Focus artifacts are optional release variants. A broken optional build must
-    # not prevent required full-feature archives or checksums, but checksums still
-    # wait for every matrix leg's upload attempt.
-    continue-on-error: ${{ matrix.variant != '' }}
+    # Fail-closed: every matrix leg is a required artifact. A failed focus build
+    # (full, hacienda or hacienda-legal) fails this job, which fails finalize_release
+    # and blocks every registry publish. No `continue-on-error` here — a partial
+    # archive set must never be checksummed or promoted.
     env:
       # The ONNX Runtime artifact ort-sys ships for aarch64-apple-darwin is compiled against
       # a macOS 13.4 deployment target — every object in it is stamped 13.4 — and its CoreML
@@ -579,8 +607,8 @@ jobs:
     if: needs.meta.outputs.release_assets_exist != 'true'
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.image }}
-    # Optional focus archives are allowed to fail without blocking the required release assets.
-    continue-on-error: ${{ matrix.variant != '' }}
+    # Fail-closed: every matrix leg is a required artifact; a failed focus build
+    # blocks finalize_release and therefore the whole release.
     strategy:
       fail-fast: false
       matrix:
@@ -595,7 +623,7 @@ jobs:
             image: quay.io/pypa/manylinux_2_28_aarch64:latest
             protoc_arch: linux-aarch_64
             rustup_sha256: e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
-          # Reduced focus releases are separate optional assets (not in the required set).
+          # Reduced focus archives are separate but REQUIRED legs of the fail-closed matrix.
           - triple: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             image: quay.io/pypa/manylinux_2_28_x86_64:latest
@@ -1015,9 +1043,255 @@ jobs:
           git config --global --add safe.directory "${GITHUB_WORKSPACE:-/__w/basemind/basemind}"
           gh release upload "$tag" "$archive" --clobber --repo "$GITHUB_REPOSITORY"
 
+  build-windows-installers:
+    name: Build Windows x64 installers
+    # One tag, one release record: the installers are uploaded to the SAME draft that
+    # the archive matrix fills. They are built from the uploaded .zip assets so the
+    # installer payload is byte-for-byte the shipped archive.
+    needs: [meta, create_release, build-binaries]
+    if: needs.meta.outputs.release_assets_exist != 'true'
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+
+      - name: Verify the installer version matches the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          cargo_version="$(grep -E '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::Windows installer version $version != Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "Windows installer version verified: $version"
+
+      - name: Download the shipped Windows archives
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          id="${{ needs.create_release.outputs.release_id }}"
+          bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "$id" >/dev/null
+          for archive in basemind-x86_64-pc-windows-msvc.zip \
+                         basemind-hacienda-legal-x86_64-pc-windows-msvc.zip; do
+            bash .github/scripts/release-asset.sh download "$id" "$archive" "$archive"
+          done
+
+      - name: Build both Windows x64 setup.exe installers
+        # Platform contract (installer/windows/build-installers.sh, Inno Setup 6):
+        #   basemind-x86_64-pc-windows-msvc-setup.exe            (full)
+        #   basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe (hacienda-legal)
+        # A missing artifact makes the driver exit non-zero — no continue-on-error.
+        shell: bash
+        env:
+          BASEMIND_INSTALLER_VERSION: ${{ needs.meta.outputs.version }}
+          BASEMIND_ZIP_FULL: basemind-x86_64-pc-windows-msvc.zip
+          BASEMIND_ZIP_LEGAL: basemind-hacienda-legal-x86_64-pc-windows-msvc.zip
+        run: |
+          set -euo pipefail
+          bash installer/windows/build-installers.sh
+
+      - name: Verify install + launch of both Windows installers
+        # Real install → --version → serve --help → uninstall for each profile, before
+        # promotion. smoke-test.ps1 restores the user PATH and config on exit.
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('full', 'hacienda-legal')) {
+            $name = if ($variant -eq 'full') {
+              'basemind-x86_64-pc-windows-msvc-setup.exe'
+            } else {
+              'basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe'
+            }
+            $exe = Join-Path 'dist/installer' $name
+            if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Windows installer artifact missing before verification: $exe"
+            }
+            powershell -NoProfile -ExecutionPolicy Bypass -File installer/windows/smoke-test.ps1 -SetupExe $exe -Variant $variant -ExpectedVersion $env:VERSION
+          }
+
+      - name: Upload both Windows installers to the release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          id="${{ needs.create_release.outputs.release_id }}"
+          for artifact in basemind-x86_64-pc-windows-msvc-setup.exe \
+                          basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe; do
+            bash .github/scripts/release-asset.sh upload "$id" "dist/installer/$artifact" application/octet-stream
+          done
+
+  build-macos-installers:
+    name: Build macOS DMG installers
+    # One tag, one release record. package.sh --variant all builds the arm64 and
+    # Universal DMGs for BOTH profiles from the archives uploaded by the matrix,
+    # so the payload is byte-for-byte the shipped bits.
+    needs: [meta, create_release, build-binaries]
+    if: needs.meta.outputs.release_assets_exist != 'true'
+    # Apple Silicon runner: the arm64 DMGs can be installed and launched here.
+    # The x86_64 slice is declared minos=15.0 and is exercised on Intel macOS 15
+    # by verify-macos-installers-intel below.
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+
+      - name: Verify the installer version matches the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.meta.outputs.version }}"
+          cargo_version="$(grep -E '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "::error::macOS installer version $version != Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "macOS installer version verified: $version"
+
+      - name: Download the four macOS source archives
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          id="${{ needs.create_release.outputs.release_id }}"
+          bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "$id" >/dev/null
+          for archive in \
+            basemind-aarch64-apple-darwin.tar.gz \
+            basemind-x86_64-apple-darwin.tar.gz \
+            basemind-hacienda-legal-aarch64-apple-darwin.tar.gz \
+            basemind-hacienda-legal-x86_64-apple-darwin.tar.gz; do
+            bash .github/scripts/release-asset.sh download "$id" "$archive" "$archive"
+          done
+
+      - name: Build the pinned universal ONNX Runtime dylib
+        # Exact macOS worker interface. ort-universal.sh verifies the two pinned
+        # PyPI macOS 13 wheels (arm64 sha256 6f91d2c9b0965e86827a5ba01531d5b669770b01775b23199565d6c1f136616c,
+        # x86_64 sha256 87d8b6eaf0fbeb6835a60a4265fde7a3b60157cf1b2764773ac47237b4d48612),
+        # lipos them and validates slices + minos <= 15.0. A checksum mismatch
+        # fails closed — no unverified dylib is ever shipped.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bash scripts/macos/ort-universal.sh --out dist/libonnxruntime.universal.dylib
+          bash scripts/macos/validate.sh arch dist/libonnxruntime.universal.dylib arm64,x86_64
+          bash scripts/macos/validate.sh minos dist/libonnxruntime.universal.dylib arm64 le 15.0
+          bash scripts/macos/validate.sh minos dist/libonnxruntime.universal.dylib x86_64 le 15.0
+
+      - name: Build all four DMG installers
+        # Exact macOS worker interface. --skip-tar preserves the matrix archives;
+        # --variant all builds both profiles; --fat-ort consumes the pinned dylib
+        # above, so no thin x86_64-only runtime can slip into a Universal DMG.
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/macos/package.sh --skip-tar --variant all --out-dir dist \
+            --fat-ort dist/libonnxruntime.universal.dylib
+
+      - name: Smoke-test the arm64 DMGs (install + launch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dmg in dist/basemind-aarch64-apple-darwin.dmg \
+                     dist/basemind-hacienda-legal-aarch64-apple-darwin.dmg; do
+            [ -s "$dmg" ] || { echo "::error::DMG missing before verification: $dmg"; exit 1; }
+            bash tests/macos_dmg_smoke.sh "$dmg" arm64
+          done
+
+      - name: Upload all four DMG installers to the release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          id="${{ needs.create_release.outputs.release_id }}"
+          for dmg in basemind-aarch64-apple-darwin.dmg \
+                     basemind-hacienda-legal-aarch64-apple-darwin.dmg \
+                     basemind-universal-apple-darwin.dmg \
+                     basemind-hacienda-legal-universal-apple-darwin.dmg; do
+            bash .github/scripts/release-asset.sh upload "$id" "dist/$dmg" application/octet-stream
+          done
+
+  verify-macos-installers-intel:
+    name: Verify macOS Universal DMGs on Intel macOS 15
+    needs: [meta, create_release, build-macos-installers]
+    # The universal x86_64 slice declares minos=15.0 exactly. Only an Intel
+    # macOS 15+ runner can install and launch it, so this leg fails closed if
+    # that execution check cannot pass — blocking finalize_release and all
+    # registries just like any failed build leg.
+    if: needs.meta.outputs.release_assets_exist != 'true'
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || '' }}
+
+      - name: Download the Universal DMGs from the release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          id="${{ needs.create_release.outputs.release_id }}"
+          bash .github/scripts/release-asset.sh resolve \
+            "${{ needs.meta.outputs.tag }}" true "$id" >/dev/null
+          for dmg in basemind-universal-apple-darwin.dmg \
+                     basemind-hacienda-legal-universal-apple-darwin.dmg; do
+            bash .github/scripts/release-asset.sh download "$id" "$dmg" "$dmg"
+          done
+
+      - name: Assert the official macOS 15 Intel minimum on this host
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::expected an Intel macOS 15 runner"; exit 1; }
+          major="$(sw_vers -productVersion | cut -d. -f1)"
+          [ "$major" -ge 15 ] || {
+            echo "::error::Intel verification requires macOS 15+, got $(sw_vers -productVersion)"
+            exit 1
+          }
+          echo "Intel host $(sw_vers -productVersion): official macOS 15 minimum satisfied"
+
+      - name: Smoke-test the Universal DMGs (install + launch on Intel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dmg in basemind-universal-apple-darwin.dmg \
+                     basemind-hacienda-legal-universal-apple-darwin.dmg; do
+            [ -s "$dmg" ] || { echo "::error::DMG missing before verification: $dmg"; exit 1; }
+            bash tests/macos_dmg_smoke.sh "$dmg" universal
+          done
+
   checksums:
     name: Generate and upload checksums
-    needs: [meta, create_release, build-binaries, build-linux-binaries, build-linux-noavx2]
+    needs:
+      [
+        meta,
+        create_release,
+        build-binaries,
+        build-linux-binaries,
+        build-linux-noavx2,
+        build-windows-installers,
+        build-macos-installers,
+        verify-macos-installers-intel,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -1034,43 +1308,65 @@ jobs:
             "${{ needs.meta.outputs.tag }}" true "${{ needs.create_release.outputs.release_id }}")"
           echo "release_id=$id" >>"$GITHUB_ENV"
 
-      - name: Verify all 5 platform archives are present
+      - name: Verify every required asset is present before checksumming
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Checksums must cover every platform. Generating the file from a partial asset set is
-          # what let v0.27.0 ship archives no downloader could verify.
+          # Checksums must cover every asset the release ships: all archives, all
+          # installers and the checksums file itself is generated from that complete
+          # set. Generating it from a partial asset set is what let v0.27.0 ship
+          # archives no downloader could verify.
+          required=(
+            "basemind-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
+            "basemind-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-aarch64-apple-darwin.tar.gz"
+            "basemind-x86_64-apple-darwin.tar.gz"
+            "basemind-x86_64-pc-windows-msvc.zip"
+            "basemind-hacienda-legal-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc.zip"
+            "basemind-hacienda-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-pc-windows-msvc.zip"
+            "basemind-x86_64-pc-windows-msvc-setup.exe"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe"
+            "basemind-aarch64-apple-darwin.dmg"
+            "basemind-hacienda-legal-aarch64-apple-darwin.dmg"
+            "basemind-universal-apple-darwin.dmg"
+            "basemind-hacienda-legal-universal-apple-darwin.dmg"
+          )
           gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
             -q '.[].name' >/tmp/release_assets.txt
           missing=0
-          for asset in \
-            basemind-x86_64-unknown-linux-gnu.tar.gz \
-            basemind-aarch64-unknown-linux-gnu.tar.gz \
-            basemind-aarch64-apple-darwin.tar.gz \
-            basemind-x86_64-apple-darwin.tar.gz \
-            basemind-x86_64-pc-windows-msvc.zip; do
+          for asset in "${required[@]}"; do
             if ! grep -qx "$asset" /tmp/release_assets.txt; then
               echo "::error::release $release_id is missing $asset"
               missing=$((missing + 1))
             fi
           done
           if [ "$missing" -gt 0 ]; then
-            echo "::error::$missing of 5 platform archives missing; refusing to checksum a partial release"
+            echo "::error::$missing of ${#required[@]} required assets missing; refusing to checksum a partial release"
             exit 1
           fi
-          echo "all 5 archives present on release $release_id"
+          echo "all ${#required[@]} required assets present on release $release_id"
 
-      - name: Download archives and generate checksums
+      - name: Download every asset and generate checksums
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           while read -r name; do
             bash .github/scripts/release-asset.sh download "$release_id" "$name" "$name"
-          done < <(grep -E '^basemind-.+\.(tar\.gz|zip)$' /tmp/release_assets.txt)
+          done < <(grep -E '^basemind-.+\.(tar\.gz|zip|exe|dmg)$' /tmp/release_assets.txt)
 
-          sha256sum basemind-*.tar.gz basemind-*.zip | sort >"basemind_${{ needs.meta.outputs.version }}_checksums.txt"
+          sha256sum basemind-*.tar.gz basemind-*.zip basemind-*.exe basemind-*.dmg \
+            | sort >"basemind_${{ needs.meta.outputs.version }}_checksums.txt"
           cat "basemind_${{ needs.meta.outputs.version }}_checksums.txt"
 
       - name: Upload checksums to release
@@ -1084,8 +1380,32 @@ jobs:
 
   finalize_release:
     name: Publish GitHub release
-    needs: [meta, create_release, checksums]
-    if: always() && needs.meta.result == 'success'
+    needs:
+      [
+        meta,
+        create_release,
+        build-binaries,
+        build-linux-binaries,
+        build-linux-noavx2,
+        build-windows-installers,
+        build-macos-installers,
+        verify-macos-installers-intel,
+        checksums,
+      ]
+    # Fail-closed: promotion runs only when meta and checksums succeeded and every
+    # builder either succeeded or was skipped (skipped = the release was already
+    # complete and idempotence short-circuited it). A FAILED leg — any archive,
+    # either Windows installer, any of the four macOS DMGs — leaves this job's
+    # condition false, so nothing is promoted and no registry can publish.
+    if: >-
+      always() && needs.meta.result == 'success' && needs.checksums.result == 'success' &&
+      (needs.create_release.result == 'success' || needs.create_release.result == 'skipped') &&
+      (needs.build-binaries.result == 'success' || needs.build-binaries.result == 'skipped') &&
+      (needs.build-linux-binaries.result == 'success' || needs.build-linux-binaries.result == 'skipped') &&
+      (needs.build-linux-noavx2.result == 'success' || needs.build-linux-noavx2.result == 'skipped') &&
+      (needs.build-windows-installers.result == 'success' || needs.build-windows-installers.result == 'skipped') &&
+      (needs.build-macos-installers.result == 'success' || needs.build-macos-installers.result == 'skipped') &&
+      (needs.verify-macos-installers-intel.result == 'success' || needs.verify-macos-installers-intel.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       # The promotion step runs `.github/scripts/release-asset.sh`; without a checkout the
@@ -1110,8 +1430,10 @@ jobs:
             "$tag" false "${{ needs.create_release.outputs.release_id }}")"
 
           # The full asset set a launcher / npm install.js / pip downloader needs:
-          # every platform archive plus the checksums file they verify against. v0.27.0 was
-          # promoted with 3 of 5 archives and no checksums file, so every downloader broke.
+          # every platform archive, both Windows x64 setup.exe installers, all four
+          # macOS DMG installers, plus the checksums file that covers them. v0.27.0
+          # was promoted with 3 of 5 archives and no checksums file, so every
+          # downloader broke. Promotion stays a draft until the complete set exists.
           required=(
             "basemind-x86_64-unknown-linux-gnu.tar.gz"
             "basemind-x86_64-unknown-linux-gnu-noavx2.tar.gz"
@@ -1119,6 +1441,22 @@ jobs:
             "basemind-aarch64-apple-darwin.tar.gz"
             "basemind-x86_64-apple-darwin.tar.gz"
             "basemind-x86_64-pc-windows-msvc.zip"
+            "basemind-hacienda-legal-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-legal-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc.zip"
+            "basemind-hacienda-x86_64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-unknown-linux-gnu.tar.gz"
+            "basemind-hacienda-aarch64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-apple-darwin.tar.gz"
+            "basemind-hacienda-x86_64-pc-windows-msvc.zip"
+            "basemind-x86_64-pc-windows-msvc-setup.exe"
+            "basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe"
+            "basemind-aarch64-apple-darwin.dmg"
+            "basemind-hacienda-legal-aarch64-apple-darwin.dmg"
+            "basemind-universal-apple-darwin.dmg"
+            "basemind-hacienda-legal-universal-apple-darwin.dmg"
             "basemind_${version}_checksums.txt"
           )
 

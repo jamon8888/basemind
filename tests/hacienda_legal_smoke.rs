@@ -3,9 +3,10 @@
 //! Five properties, all but the fourth asserted against the real MCP surface (in-memory serve + rmcp
 //! client, same harness as `mcp_protected_surface.rs`):
 //!
-//! 1. **Surface gating.** The build advertises `vault`, `redact_text` and the `memory`
-//!    domain, and does NOT advertise the excluded domains (`web`, `agents`, `workspace`,
-//!    `shell`) — a client folder gets the document stack, not the broker/shell surface.
+//! 1. **Surface gating.** The build advertises `vault`, `redact_text`, `memory`, `git` and
+//!    `graph` (including its GraphRAG `entities` / `rag` modes), and does NOT advertise the
+//!    excluded domains (`code`, `web`, `agents`, `workspace`, `shell`) on either MCP or CLI —
+//!    a client folder gets the document/entity stack, not source navigation or the broker.
 //! 2. **The legal pipeline end to end.** A client memo is ingested by a scan with
 //!    ingestion-time redaction on, found by `memory mode=documents` (lexical lane —
 //!    `embed = false`, so no model is downloaded), `redact_text` returns a rehydration
@@ -124,8 +125,15 @@ async fn the_focus_surface_advertises_documents_and_rehydration_only() {
 
     let listed = service.list_all_tools().await.expect("tools/list");
     let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_ref()).collect();
-    for expected in ["memory", "vault", "redact_text", "admin", "code", "git", "graph"] {
+    for expected in ["memory", "vault", "redact_text", "admin", "git", "graph"] {
         assert!(names.contains(&expected), "{expected} must be advertised: {names:?}");
+    }
+    // The confidential profile is defined by what it does NOT expose as much as by what it does.
+    for withheld in ["code", "web", "agents", "workspace", "shell"] {
+        assert!(
+            !names.contains(&withheld),
+            "{withheld} must be withheld from the legal profile: {names:?}"
+        );
     }
     for (domain, enabled) in [
         ("web", cfg!(feature = "crawl")),
@@ -140,22 +148,55 @@ async fn the_focus_surface_advertises_documents_and_rehydration_only() {
         );
     }
 
-    let domains: Vec<&str> = basemind::mcp::mode::domain_modes()
+    let domain_modes = basemind::mcp::mode::domain_modes();
+    let domains: Vec<&str> = domain_modes.iter().map(|(domain, _)| *domain).collect();
+    for expected in ["vault", "memory", "git", "graph", "admin"] {
+        assert!(domains.contains(&expected), "{expected} domain advertised: {domains:?}");
+    }
+    for withheld in ["code", "web", "agents", "workspace", "shell"] {
+        assert!(
+            !domains.contains(&withheld),
+            "{withheld} domain must be withheld from the legal profile: {domains:?}"
+        );
+    }
+    // GraphRAG is part of the contract, not a best-effort extra: both graph modes are live.
+    let graph_modes = domain_modes
         .iter()
-        .map(|(domain, _)| *domain)
-        .collect();
-    assert!(domains.contains(&"vault"), "vault domain advertised: {domains:?}");
-    assert!(domains.contains(&"memory"), "memory domain advertised: {domains:?}");
-    for (domain, enabled) in [
-        ("web", cfg!(feature = "crawl")),
-        ("agents", cfg!(feature = "comms")),
-        ("workspace", cfg!(feature = "comms")),
-        ("shell", cfg!(feature = "shells")),
-    ] {
-        assert_eq!(
-            domains.contains(&domain),
-            enabled,
-            "feature/domain mismatch for {domain}: {domains:?}"
+        .find(|(domain, _)| *domain == "graph")
+        .map(|(_, modes)| *modes)
+        .expect("graph domain");
+    for mode in ["entities", "rag"] {
+        assert!(
+            graph_modes.contains(&mode),
+            "graph mode {mode} must be advertised in the legal profile: {graph_modes:?}"
+        );
+    }
+}
+
+/// The CLI mirrors the MCP surface: `code` and `web` are not merely feature-less, they are absent
+/// from the command tree, so an agent cannot fall back to the CLI to reach a withheld capability.
+#[test]
+fn the_focus_cli_withholds_code_and_web_commands() {
+    for command in ["code", "web"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_basemind"))
+            .args([command, "-h"])
+            .output()
+            .expect("spawn basemind help");
+        assert!(
+            !output.status.success(),
+            "`basemind {command}` must not exist in the legal profile"
+        );
+    }
+    let help = Command::new(env!("CARGO_BIN_EXE_basemind"))
+        .arg("-h")
+        .output()
+        .expect("spawn basemind -h");
+    assert!(help.status.success(), "basemind -h must work");
+    let help = String::from_utf8_lossy(&help.stdout);
+    for command in ["code", "web"] {
+        assert!(
+            !help.lines().any(|line| line.trim_start().starts_with(command)),
+            "`{command}` must not appear in the legal CLI help: {help}"
         );
     }
 }
