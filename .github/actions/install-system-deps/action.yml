@@ -91,7 +91,7 @@ runs:
         # `___isPlatformVersionAtLeast` symbols and blocks every macOS archive. Build it from
         # source below, against the deployment target we ship, exactly as the Linux branch does.
         brew install cmake tesseract tesseract-lang libmagic pkg-config protobuf \
-          libde265 x265 aom || true
+          libde265 x265 aom
 
         echo "::group::Building libheif from source (1.23.0)"
 
@@ -129,7 +129,15 @@ runs:
           echo "✓ libheif ${LIBHEIF_VERSION} installed"
         fi
 
-        echo "PKG_CONFIG_PATH=$LIBHEIF_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+        brew_prefix="$(brew --prefix)"
+        libheif_libdir="$LIBHEIF_PREFIX/lib"
+        test -f "$libheif_libdir/libheif.1.dylib"
+        {
+          echo "PKG_CONFIG_PATH=$libheif_libdir/pkgconfig:${PKG_CONFIG_PATH:-}"
+          echo "LDFLAGS=-L$libheif_libdir -L$brew_prefix/lib ${LDFLAGS:-}"
+          echo "CPPFLAGS=-I$LIBHEIF_PREFIX/include ${CPPFLAGS:-}"
+          echo "DYLD_LIBRARY_PATH=$libheif_libdir:$brew_prefix/lib:${DYLD_LIBRARY_PATH:-}"
+        } >> "$GITHUB_ENV"
 
         echo "::endgroup::"
 

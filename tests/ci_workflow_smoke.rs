@@ -16,6 +16,13 @@ fn workflow() -> String {
         .replace("\r\n", "\n")
 }
 
+fn system_dependencies_action() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/actions/install-system-deps/action.yml");
+    std::fs::read_to_string(&path)
+        .expect("read .github/actions/install-system-deps/action.yml")
+        .replace("\r\n", "\n")
+}
+
 /// The body of a top-level job: from its 2-space-indented key to the next one. Step entries live
 /// at 6 spaces under `steps:`, so only 2-space non-space lines are sibling job headers.
 fn job_block<'a>(workflow: &'a str, job: &str) -> &'a str {
@@ -131,5 +138,21 @@ fn intel_macos_uses_the_dynamic_runtime_profile() {
     assert!(
         test.contains("os: macos-15-intel") && test.contains("features: \"intel-macos\""),
         "CI must keep a native Intel macOS leg on the `intel-macos` feature profile"
+    );
+}
+
+/// Every macOS feature build links against libheif. Keep the shared action responsible for both
+/// discovery at link time and loading at test time on ARM and Intel runners.
+#[test]
+fn macos_native_library_paths_are_exported_by_the_shared_action() {
+    let action = system_dependencies_action();
+    assert!(
+        action.contains("libheif")
+            && action.contains("libheif.1.dylib")
+            && action.contains("PKG_CONFIG_PATH=")
+            && action.contains("LDFLAGS=")
+            && action.contains("CPPFLAGS=")
+            && action.contains("DYLD_LIBRARY_PATH="),
+        "the shared macOS dependency action must expose libheif to both build and runtime"
     );
 }
