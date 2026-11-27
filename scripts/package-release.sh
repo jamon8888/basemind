@@ -200,14 +200,21 @@ macos)
       echo "ONNX Runtime wheel checksum mismatch: expected $ORT_WHEEL_SHA256, got $actual_sha256" >&2
       exit 1
     fi
-    unzip -oq "$ort_tmp/$ORT_WHEEL" "$ORT_DYLIB_IN_WHEEL" -d "$ort_tmp"
+    unzip -oq "$ort_tmp/$ORT_WHEEL" "$ORT_DYLIB_IN_WHEEL" -d "$ort_tmp" || {
+      echo "Failed to extract $ORT_DYLIB_IN_WHEEL from $ORT_WHEEL" >&2
+      exit 1
+    }
     ort_lib="$ort_tmp/$ORT_DYLIB_IN_WHEEL"
     [ -f "$ort_lib" ] || {
       echo "ONNX Runtime dylib not found at $ort_lib" >&2
       exit 1
     }
-    [ "$(lipo -archs "$ort_lib")" = "x86_64" ] || {
-      echo "ONNX Runtime dylib from $ORT_WHEEL is not x86_64-only: $(lipo -archs "$ort_lib")" >&2
+    ort_archs="$(lipo -archs "$ort_lib")" || {
+      echo "Failed to inspect architectures of $ort_lib" >&2
+      exit 1
+    }
+    [ "$ort_archs" = "x86_64" ] || {
+      echo "ONNX Runtime dylib from $ORT_WHEEL is not x86_64-only: $ort_archs" >&2
       exit 1
     }
     cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
