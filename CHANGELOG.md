@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS Intel release archives build again. Microsoft removed `onnxruntime-osx-x86_64-1.23.2.tgz`
+  from its GitHub releases (404 since 2026-11-17); `scripts/package-release.sh` now vendors the same
+  1.23.2 dylib from the pinned PyPI wheel already used by CI and `scripts/macos/ort-universal.sh`.
+
 ### Changed
 
 - Profile contract: `hacienda-legal` (documents + memory + Candle NER + GraphRAG)

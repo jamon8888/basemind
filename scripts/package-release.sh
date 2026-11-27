@@ -193,7 +193,8 @@ macos)
     ORT_WHEEL_URL="https://files.pythonhosted.org/packages/9f/a8/3c23a8f75f93122d2b3410bfb74d06d0f8da4ac663185f91866b03f7da1b/${ORT_WHEEL}"
     ORT_DYLIB_IN_WHEEL="onnxruntime/capi/libonnxruntime.${ORT_VERSION}.dylib"
     ort_tmp="$(mktemp -d)"
-    curl -fsSL --retry 3 -o "$ort_tmp/$ORT_WHEEL" "$ORT_WHEEL_URL"
+    # Bounded: a stalled connection or body must fail the leg, not hold it until the job timeout.
+    curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o "$ort_tmp/$ORT_WHEEL" "$ORT_WHEEL_URL"
     actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_WHEEL" | awk '{print $1}')"
     if [ "$actual_sha256" != "$ORT_WHEEL_SHA256" ]; then
       echo "ONNX Runtime wheel checksum mismatch: expected $ORT_WHEEL_SHA256, got $actual_sha256" >&2
