@@ -10,6 +10,8 @@ use basemind::render::{self, Verbosity};
 use basemind::store::{LockHolder, Store};
 use basemind::watcher::{BatchKind, WatchBatch};
 
+#[cfg(target_os = "macos")]
+mod apple_os_version;
 mod comms_cli;
 mod doctor_cli;
 mod lang_cli;
