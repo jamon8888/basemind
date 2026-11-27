@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use basemind::config::ConfigV1;
@@ -51,8 +52,23 @@ fn offline_doc_config() -> DocConfig {
     }
 }
 
+/// A timed-out splitter thread keeps running after its caller is freed. The
+/// abandoned-extraction ledger is process-wide, so a leftover from an earlier
+/// test in this binary can starve a later scan and turn one timeout into two.
+/// `SERIAL` orders these tests; the drain waits for their leftovers.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn wait_for_abandoned_to_drain() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while basemind::extract::doc_guard::abandoned_extractions() != 0 {
+        assert!(Instant::now() < deadline, "abandoned extraction threads did not drain");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn pathological_text_file_completes_quickly_via_linear_chunking() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("syslog.txt");
     let body = pathological_log(5 * 1024 * 1024);
@@ -84,6 +100,7 @@ fn pathological_text_file_completes_quickly_via_linear_chunking() {
 
 #[test]
 fn normal_documents_chunk_exactly_as_before() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     for (name, mime, body) in [
         ("guide.md", "text/markdown", markdown_doc()),
@@ -115,6 +132,7 @@ fn normal_documents_chunk_exactly_as_before() {
 
 #[test]
 fn extraction_past_its_wall_clock_budget_is_abandoned() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("syslog.txt");
     fs::write(&path, pathological_log(2 * 1024 * 1024)).unwrap();
@@ -152,10 +170,14 @@ fn offline_scan_config() -> ConfigV1 {
 
 #[test]
 fn scan_with_a_pathological_file_completes_and_counts_it_as_degraded() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("syslog.txt"), pathological_log(5 * 1024 * 1024)).unwrap();
     fs::write(dir.path().join("guide.md"), markdown_doc()).unwrap();
 
+    // Drain a previous test's abandoned splitter while SERIAL is still held, but before the timer:
+    // otherwise its ~40 s of cleanup is charged to the scan's 30 s budget.
+    wait_for_abandoned_to_drain();
     let started = Instant::now();
     let report = scan_once(dir.path(), &offline_scan_config());
 
@@ -174,6 +196,7 @@ fn scan_with_a_pathological_file_completes_and_counts_it_as_degraded() {
 
 #[test]
 fn scan_counts_a_timed_out_document_and_still_indexes_the_rest() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("syslog.txt"), pathological_log(2 * 1024 * 1024)).unwrap();
     fs::write(dir.path().join("guide.md"), markdown_doc()).unwrap();
@@ -181,6 +204,7 @@ fn scan_counts_a_timed_out_document_and_still_indexes_the_rest() {
     cfg.documents.extraction_timeout_secs = 1;
     cfg.documents.plain_text_chunk_max_bytes = u64::MAX;
 
+    wait_for_abandoned_to_drain();
     let report = scan_once(dir.path(), &cfg);
 
     assert_eq!(report.stats.doc_timeouts, 1);
