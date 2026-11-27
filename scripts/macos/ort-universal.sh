@@ -3,13 +3,13 @@
 # assets. Both slices come from the SAME onnxruntime version (1.23.2), so no
 # "undefined ORT fat dylib input" remains in the universal DMG path.
 #
-# Why PyPI wheels and not the GitHub .tgz release: the pinned x86_64 macOS .tgz
-# (onnxruntime-osx-x86_64-1.23.2.tgz, sha256
-# d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6) is the
-# source scripts/package-release.sh uses for the thin Intel archive. The
-# matching arm64 .tgz is not published at that version; the Python wheels ARE
-# published for both macOS 13_0 architectures and carry the same native dylib.
-# Their SHA256s are pinned below and verified before extraction.
+# Why PyPI wheels and not the GitHub .tgz release: the x86_64 macOS .tgz
+# (onnxruntime-osx-x86_64-1.23.2.tgz) was removed from microsoft/onnxruntime's
+# releases (404 since 2026-11-17), and the matching arm64 .tgz was never
+# published at that version; the Python wheels ARE published for both macOS
+# 13_0 architectures and carry the same native dylib. Their SHA256s are pinned
+# below and verified before extraction. scripts/package-release.sh vendors the
+# same Intel wheel (INTEL_*) for the thin Intel archive: keep the two in step.
 #
 # Result: libonnxruntime with minos 13.4 on both slices, safely below the
 # macOS 15 minimum of the Intel basemind binary.
