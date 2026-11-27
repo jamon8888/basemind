@@ -173,7 +173,7 @@ jobs:
           wheel_url="$(python3 -c '
           import json, urllib.request, sys
           v = sys.argv[1]
-          data = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/onnxruntime/{v}/json"))
+          data = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/onnxruntime/{v}/json", timeout=30))
           urls = [u["url"] for u in data["urls"]
                   if u["filename"].endswith("macosx_13_0_x86_64.whl")]
           if not urls:
@@ -181,7 +181,9 @@ jobs:
           print(urls[0])
           ' "$version")"
           wheel="$dir/onnxruntime.whl"
-          curl -fsSL --retry 3 -o "$wheel" "$wheel_url"
+          # Bounded like package-release.sh's vendoring step: a stalled connection or body must
+          # fail this leg, not hold it until the 240-minute job timeout.
+          curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o "$wheel" "$wheel_url"
           python3 -c '
           import sys, zipfile
           wheel, out = sys.argv[1], sys.argv[2]
