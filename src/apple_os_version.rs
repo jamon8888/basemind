@@ -9,6 +9,7 @@
 //! link, which is why the `cargo test` legs stayed green.
 //!
 //! A `#[used]` static that points at each symbol is a Rust use: LTO keeps the definition. Nothing calls them.
+//! It lives in the library crate, so a downstream binary that links basemind with LTO keeps them too.
 
 unsafe extern "C" {
     fn __isPlatformVersionAtLeast(platform: u32, major: u32, minor: u32, subminor: u32) -> i32;

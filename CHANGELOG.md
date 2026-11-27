@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS ARM64 release builds link again. Since ort-sys 2.0.0-rc.15, ONNX Runtime's CoreML objects
+  call `__isPlatformVersionAtLeast`; rustc links with `-nodefaultlibs`, so the definition comes from
+  `std`, and thin LTO dropped it (`Undefined symbols for architecture arm64`). The library now keeps
+  std's Apple OS-version check symbols alive (`src/apple_os_version.rs`).
+
 ### Changed
 
 - Profile contract: `hacienda-legal` (documents + memory + Candle NER + GraphRAG)
