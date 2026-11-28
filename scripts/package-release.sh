@@ -163,7 +163,7 @@ macos)
   done
 
   if [ "$TRIPLE" = "x86_64-apple-darwin" ]; then
-    # Pinned directly from microsoft/onnxruntime's GitHub releases instead of a
+    # Pinned upstream ONNX Runtime (see below for the source) instead of a
     # Homebrew bottle: Homebrew's onnxruntime formula stopped shipping ANY
     # Intel-macOS bottle as of v1.29.1 (2026-09-10, part of Homebrew 7.0's
     # project-wide Tier-3 downgrade of Intel macOS), and the "sonoma" bottle
@@ -180,22 +180,41 @@ macos)
     # Homebrew bottle, has zero external @rpath/Homebrew dependencies (its
     # abseil/protobuf/re2 deps are statically linked in), so no dependency
     # closure to vendor alongside it.
+    #
+    # Microsoft removed the onnxruntime-osx-x86_64-1.23.2.tgz release asset
+    # (404 since 2026-11-17), which broke every x86_64-apple-darwin archive. The
+    # same 1.23.2 dylib ships in the immutable PyPI wheel, which is what
+    # ci.yaml and scripts/macos/ort-universal.sh already use: same wheel, same
+    # pinned URL and SHA256 as ort-universal.sh's INTEL_* (keep them in step).
     echo "Vendoring pinned ONNX Runtime for Intel macOS..."
     ORT_VERSION="1.23.2"
-    ORT_SHA256="d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6"
-    ORT_ASSET="onnxruntime-osx-x86_64-${ORT_VERSION}.tgz"
+    ORT_WHEEL="onnxruntime-${ORT_VERSION}-cp311-cp311-macosx_13_0_x86_64.whl"
+    ORT_WHEEL_SHA256="87d8b6eaf0fbeb6835a60a4265fde7a3b60157cf1b2764773ac47237b4d48612"
+    ORT_WHEEL_URL="https://files.pythonhosted.org/packages/9f/a8/3c23a8f75f93122d2b3410bfb74d06d0f8da4ac663185f91866b03f7da1b/${ORT_WHEEL}"
+    ORT_DYLIB_IN_WHEEL="onnxruntime/capi/libonnxruntime.${ORT_VERSION}.dylib"
     ort_tmp="$(mktemp -d)"
-    curl -fsSL -o "$ort_tmp/$ORT_ASSET" \
-      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_ASSET}"
-    actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_ASSET" | awk '{print $1}')"
-    if [ "$actual_sha256" != "$ORT_SHA256" ]; then
-      echo "ONNX Runtime checksum mismatch: expected $ORT_SHA256, got $actual_sha256" >&2
+    # Bounded: a stalled connection or body must fail the leg, not hold it until the job timeout.
+    curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o "$ort_tmp/$ORT_WHEEL" "$ORT_WHEEL_URL"
+    actual_sha256="$(shasum -a 256 "$ort_tmp/$ORT_WHEEL" | awk '{print $1}')"
+    if [ "$actual_sha256" != "$ORT_WHEEL_SHA256" ]; then
+      echo "ONNX Runtime wheel checksum mismatch: expected $ORT_WHEEL_SHA256, got $actual_sha256" >&2
       exit 1
     fi
-    tar xzf "$ort_tmp/$ORT_ASSET" -C "$ort_tmp"
-    ort_lib="$ort_tmp/onnxruntime-osx-x86_64-${ORT_VERSION}/lib/libonnxruntime.${ORT_VERSION}.dylib"
+    unzip -oq "$ort_tmp/$ORT_WHEEL" "$ORT_DYLIB_IN_WHEEL" -d "$ort_tmp" || {
+      echo "Failed to extract $ORT_DYLIB_IN_WHEEL from $ORT_WHEEL" >&2
+      exit 1
+    }
+    ort_lib="$ort_tmp/$ORT_DYLIB_IN_WHEEL"
     [ -f "$ort_lib" ] || {
       echo "ONNX Runtime dylib not found at $ort_lib" >&2
+      exit 1
+    }
+    ort_archs="$(lipo -archs "$ort_lib")" || {
+      echo "Failed to inspect architectures of $ort_lib" >&2
+      exit 1
+    }
+    [ "$ort_archs" = "x86_64" ] || {
+      echo "ONNX Runtime dylib from $ORT_WHEEL is not x86_64-only: $ort_archs" >&2
       exit 1
     }
     cp "$ort_lib" "$STAGING_DIR/libonnxruntime.dylib"
