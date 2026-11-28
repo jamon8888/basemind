@@ -1,6 +1,9 @@
 #![allow(missing_docs)]
 
 pub mod alloc_tag;
+// Keeps std's Apple OS-version check symbols through LTO, for this binary and for any downstream one.
+#[cfg(target_os = "macos")]
+mod apple_os_version;
 pub mod backpressure;
 #[cfg(feature = "code-search")]
 pub mod chunk;

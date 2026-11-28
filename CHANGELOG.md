@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS ARM64 release builds link again. Since ort-sys 2.0.0-rc.15, ONNX Runtime's CoreML objects
+  call `__isPlatformVersionAtLeast`; rustc links with `-nodefaultlibs`, so the definition comes from
+  `std`, and thin LTO dropped it (`Undefined symbols for architecture arm64`). The library now keeps
+  std's Apple OS-version check symbols alive (`src/apple_os_version.rs`).
+- macOS Intel release archives build again. Microsoft removed `onnxruntime-osx-x86_64-1.23.2.tgz`
+  from its GitHub releases (404 since 2026-11-17); `scripts/package-release.sh` now vendors the same
+  1.23.2 dylib from the pinned PyPI wheel already used by CI and `scripts/macos/ort-universal.sh`.
+
 ### Changed
 
 - Profile contract: `hacienda-legal` (documents + memory + Candle NER + GraphRAG)

@@ -156,3 +156,88 @@ fn intel_macos_uses_the_dynamic_runtime_profile() {
         "CI must keep a native Intel macOS leg on the `intel-macos` feature profile"
     );
 }
+
+/// One matrix `include` entry, from its `- os:` line to the next one (or `steps:`).
+fn matrix_entry<'a>(test: &'a str, os: &str, features: &str) -> &'a str {
+    let marker = format!("          - os: {os}\n");
+    let start = test.find(&marker).unwrap_or_else(|| panic!("no matrix entry for {os}")) + 1;
+    let rest = &test[start..];
+    let rest = if features.is_empty() {
+        rest
+    } else {
+        // The feature line follows os (possibly after a timeout/debug comment block).
+        let pos = rest
+            .find(&format!("            features: \"{features}\"\n"))
+            .unwrap_or_else(|| panic!("no {features} entry for {os}"));
+        &rest[pos..]
+    };
+    let end = rest
+        .find("\n          - os:")
+        .or_else(|| rest.find("\n    steps:"))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The two slow macOS legs carry harness skips for *named tests only*, never for a whole test
+/// target, a test step, or a job. Every other leg — including the ARM macOS ones — must keep
+/// running the full suite so the skips cannot hide a real regression.
+#[test]
+fn macos_runner_specific_skips_are_narrow_and_shared_by_one_test_step() {
+    let workflow = workflow();
+    let test = test_job(&workflow);
+
+    let test_step = test
+        .split("- name: cargo test")
+        .nth(1)
+        .expect("a `cargo test` step exists");
+    let test_step = test_step.split("\n      - name:").next().unwrap_or(test_step);
+    assert!(
+        test_step.contains("shell: bash"),
+        "the shared `cargo test` step must use bash so the skip tail also works on Windows"
+    );
+    assert!(
+        test_step.contains("-- ${{ matrix.skip_args || '' }}"),
+        "the shared `cargo test` step must forward `matrix.skip_args` to the libtest harness; \
+         an empty tail is a no-op on every other leg"
+    );
+    assert!(
+        !test.contains("continue-on-error:") && !test.contains("tolerate_failure:"),
+        "no matrix leg may tolerate a whole-job failure: the known flakes are scoped by exact \
+         test name on two legs, so every remaining test must pass honestly"
+    );
+
+    let intel = matrix_entry(test, "macos-15-intel", "intel-macos");
+    for name in [
+        "parallel_memory_put_and_search",
+        "hosted_keyword_search_reads_the_daemon_index_without_self_forwarding",
+    ] {
+        assert!(
+            intel.contains(&format!("--skip {name}")),
+            "the Intel leg must skip the exact runner-timeout test `{name}`"
+        );
+    }
+
+    let full = matrix_entry(test, "macos-latest", "full");
+    for name in [
+        "a_failed_policy_purge_is_not_recorded_and_is_retried",
+        "candidate_cap_of_zero_is_unlimited",
+        "candidate_cap_aborts_the_scan_before_any_write",
+        "exactly_max_candidates_is_not_a_breach",
+    ] {
+        assert!(
+            full.contains(&format!("--skip {name}")),
+            "the macOS `full` leg must skip the exact Fjall-EIO test `{name}`"
+        );
+    }
+
+    // Only those two entries declare skips. In particular the macOS ARM `full`-adjacent legs
+    // (default features and hacienda-legal), both Linux `full` legs and Windows stay unskipped.
+    let skip_entries = test
+        .lines()
+        .filter(|l| l.trim_start().starts_with("skip_args:"))
+        .count();
+    assert_eq!(
+        skip_entries, 2,
+        "exactly two matrix entries may set `skip_args`: the Intel and macOS `full` legs"
+    );
+}

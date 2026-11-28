@@ -94,9 +94,10 @@ declares `minos=13.4`. The merged dylib was verified as `[x86_64 arm64]` with
 `minos=13.4` on both slices and SHA256
 `b3756f40bc4bfe743ef1639844a5427c1e4075a1f948e675dd12bd2cdf427422`, which is
 below the Intel binary's 15.0 requirement. The PyPI wheels are used because
-the matching arm64 GitHub `.tgz` is not published at 1.23.2; the Intel `.tgz`
-pinned by `package-release.sh` remains
-`d10359e16347b57d9959f7e80a225a5b4a66ed7d7e007274a15cae86836485a6`.
+the matching arm64 GitHub `.tgz` is not published at 1.23.2, and the Intel
+`.tgz` was removed from microsoft/onnxruntime's releases (404 since
+2026-11-17). `package-release.sh` vendors the same pinned x86_64 wheel for the
+thin Intel archive.
 
 `package.sh` calls this script automatically for each universal DMG. Pass
 `--fat-ort FILE` to reuse a previously built dylib, or `--no-fat-ort` to keep

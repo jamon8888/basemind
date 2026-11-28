@@ -559,8 +559,8 @@ jobs:
           # Binary + its otool-discovered lib/ closure load, and the ad-hoc signature is
           # valid (a bad install_name_tool rewrite would get the process SIGKILLed).
           "$dir/basemind" --version
-          # ONNX Runtime is vendored next to the binary (pinned directly from a
-          # microsoft/onnxruntime release, see scripts/package-release.sh); ort/
+          # ONNX Runtime is vendored next to the binary (the pinned 1.23.2 PyPI
+          # wheel's dylib, see scripts/package-release.sh); ort/
           # load-dynamic resolves it relative to the executable. dlopen the
           # vendored dylib — the exact load ort performs at runtime — so a
           # broken install name or invalid signature fails here. This only
