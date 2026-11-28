@@ -1,0 +1,465 @@
+name: Release assets (non-publishing)
+
+# Build release assets from merged main into GitHub Actions artifacts only.
+# This workflow never creates, edits, uploads to, or promotes a GitHub Release;
+# it never touches the v0.39.0 tag and never publishes to crates.io, npm, PyPI,
+# Homebrew or OpenCode. The existing draft release assets are left untouched.
+#
+# Triggered by a push to this branch or manually with workflow_dispatch.
+# Artifacts are downloaded with `gh run download <run-id>`; the `release-assets`
+# artifact contains the complete asset set plus the checksum manifest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to stamp on the asset set (must match Cargo.toml)
+        required: true
+        default: "0.39.0"
+      source_ref:
+        description: Git ref to build (defaults to the merged main commit)
+        required: false
+        default: "9cba2e06d9ca3a00c288589ea85e1d8ba09a4e54"
+  push:
+    branches:
+      - release/non-publishing-assets
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-assets-non-publishing
+  cancel-in-progress: false
+
+env:
+  ASSET_VERSION: ${{ inputs.version || '0.39.0' }}
+
+jobs:
+  resolve-source:
+    name: Resolve source commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve source_ref to a single commit
+        id: resolve
+        shell: bash
+        # Pass the ref through the environment: interpolating a dispatched input
+        # into the shell script itself would allow command injection.
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || github.sha }}
+        run: |
+          set -euo pipefail
+          ref="$SOURCE_REF"
+          # Full/abbreviated SHAs and already-fetched refs resolve locally.
+          if ! sha="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+            # A branch/tag name: fetch it once here so every downstream job checks
+            # out this exact commit, not a tip that may move during the run.
+            git fetch --no-tags origin "$ref" || {
+              echo "::error::source_ref '$ref' could not be fetched" >&2
+              exit 1
+            }
+            sha="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved source_ref '$ref' to $sha"
+
+  archives:
+    name: Archive / ${{ matrix.triple }} / ${{ matrix.variant || 'full' }}
+    needs: resolve-source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full-profile legs leave `variant` empty: package-release.sh then names
+          # them basemind-<triple>, which the installers, DMG packaging and the
+          # required-asset list all expect. hacienda-legal keeps its variant.
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            features: full
+          - triple: aarch64-apple-darwin
+            os: macos-latest
+            variant: hacienda-legal
+            features: hacienda-legal
+          # Intel macOS 15 is the official floor for the hacienda-legal profile;
+          # ort-dynamic is required so the Intel slice can be lipo-merged into a
+          # universal DMG with the pinned universal ONNX Runtime dylib.
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            features: full,ort-dynamic
+          - triple: x86_64-apple-darwin
+            os: macos-15-intel
+            variant: hacienda-legal
+            features: hacienda-legal,ort-dynamic
+          # windows-2022 carries MSVC 14.4x; windows-latest's VS18 toolchain does
+          # not compile xberg-libwpd's vendored C++ (see publish.yaml).
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            features: full
+          - triple: x86_64-pc-windows-msvc
+            os: windows-2022
+            variant: hacienda-legal
+            features: hacienda-legal
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    env:
+      # Intel binaries must declare exactly 15.0 (scripts/macos/validate.sh bundle
+      # enforces it); arm64 stays at 13.4 for the pinned aarch64 ONNX Runtime dylib.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.triple == 'x86_64-apple-darwin' && '15.0' || '13.4' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install system dependencies
+        uses: ./.github/actions/install-system-deps
+
+      - name: Ensure both Windows zlib import-library names exist
+        if: matrix.triple == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $zlibFix = "C:\zlibfix"
+          $zlib = Join-Path $zlibFix "zlib.lib"
+          $zlibStatic = Join-Path $zlibFix "zlibstatic.lib"
+          if (-not (Test-Path $zlibStatic) -and (Test-Path $zlib)) {
+            Copy-Item -Path $zlib -Destination $zlibStatic -Force
+          }
+          if (-not (Test-Path $zlibStatic)) {
+            throw "zlibstatic.lib was not produced in $zlibFix"
+          }
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.triple }}-${{ matrix.variant || 'full' }}-assets
+
+      - name: Discard incomplete xberg Tesseract source cache
+        shell: bash
+        run: |
+          cache_root="target/${{ matrix.triple }}/xberg-tesseract-cache"
+          for source in leptonica tesseract; do
+            source_root="$cache_root/third_party/$source"
+            if [ -d "$source_root" ] && [ ! -f "$source_root/CMakeLists.txt" ]; then
+              echo "Removing incomplete xberg Tesseract cache: $cache_root"
+              rm -rf "$cache_root"
+              break
+            fi
+          done
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release --features "${{ matrix.features }}" --bin basemind \
+            --target "${{ matrix.triple }}"
+
+      - name: Package release archive
+        shell: bash
+        # Empty `matrix.variant` for full legs yields basemind-<triple> archives.
+        run: ./scripts/package-release.sh ${{ matrix.triple }} "${{ matrix.variant }}"
+
+      - name: Smoke-test packaged Intel binary (ONNX Runtime loads)
+        if: matrix.triple == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          variant="${{ matrix.variant }}"
+          archive="basemind-${variant:+$variant-}x86_64-apple-darwin.tar.gz"
+          tar xzf "$archive" -C "$dir"
+          "$dir/basemind" --version
+          test -f "$dir/libonnxruntime.dylib"
+          ( cd "$dir" && python3 -c "import ctypes; ctypes.CDLL('./libonnxruntime.dylib'); print('libonnxruntime.dylib load OK')" )
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.triple }}-${{ matrix.variant || 'full' }}
+          path: |
+            basemind-*.tar.gz
+            basemind-*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-installers:
+    name: Windows x64 setup.exe (full + hacienda-legal)
+    needs: [resolve-source, archives]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Download built archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: .
+
+      - name: Verify version against Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -E '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)"
+          [ "$cargo_version" = "$ASSET_VERSION" ] || {
+            echo "::error::asset version $ASSET_VERSION != Cargo.toml version $cargo_version"
+            exit 1
+          }
+          echo "Windows installer version verified: $cargo_version"
+
+      - name: Build both Windows x64 setup.exe installers
+        shell: bash
+        env:
+          BASEMIND_INSTALLER_VERSION: ${{ env.ASSET_VERSION }}
+          BASEMIND_ZIP_FULL: basemind-x86_64-pc-windows-msvc.zip
+          BASEMIND_ZIP_LEGAL: basemind-hacienda-legal-x86_64-pc-windows-msvc.zip
+        run: |
+          set -euo pipefail
+          bash installer/windows/build-installers.sh
+
+      - name: Verify install + launch + uninstall of both installers
+        shell: pwsh
+        env:
+          VERSION: ${{ env.ASSET_VERSION }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($variant in @('full', 'hacienda-legal')) {
+            $name = if ($variant -eq 'full') {
+              'basemind-x86_64-pc-windows-msvc-setup.exe'
+            } else {
+              'basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe'
+            }
+            $exe = Join-Path 'dist/installer' $name
+            if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Windows installer artifact missing before verification: $exe"
+            }
+            powershell -NoProfile -ExecutionPolicy Bypass -File installer/windows/smoke-test.ps1 -SetupExe $exe -Variant $variant -ExpectedVersion $env:VERSION
+            # A native process's nonzero exit is not covered by $ErrorActionPreference;
+            # check it before the next variant can overwrite $LASTEXITCODE with 0.
+            if ($LASTEXITCODE -ne 0) {
+              throw "smoke test failed for $variant (exit code $LASTEXITCODE)"
+            }
+          }
+
+      - name: Upload Windows installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-windows
+          path: dist/installer/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  macos-installers:
+    name: macOS DMGs (Apple Silicon + Universal, both profiles)
+    needs: [resolve-source, archives]
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      # Packaging uses --skip-tar, so nothing is recompiled here; this is only a
+      # guard for incidental toolchain use and does not change the DMG minos.
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Download built archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: .
+
+      - name: Verify version against Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -E '^version = "' Cargo.toml | head -1 | cut -d'"' -f2)"
+          [ "$cargo_version" = "$ASSET_VERSION" ] || {
+            echo "::error::asset version $ASSET_VERSION != Cargo.toml version $cargo_version"
+            exit 1
+          }
+          echo "macOS installer version verified: $cargo_version"
+
+      - name: Build and validate the pinned universal ONNX Runtime dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bash scripts/macos/ort-universal.sh --out dist/libonnxruntime.universal.dylib
+          bash scripts/macos/validate.sh arch dist/libonnxruntime.universal.dylib arm64,x86_64
+          bash scripts/macos/validate.sh minos dist/libonnxruntime.universal.dylib arm64 le 15.0
+          bash scripts/macos/validate.sh minos dist/libonnxruntime.universal.dylib x86_64 le 15.0
+
+      - name: Package four DMGs from the built archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --skip-tar keeps the freshly built archives byte-for-byte unchanged.
+          bash scripts/macos/package.sh --skip-tar --variant all --out-dir dist \
+            --fat-ort dist/libonnxruntime.universal.dylib
+
+      - name: Smoke-test both arm64 DMGs (install + launch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dmg in dist/basemind-aarch64-apple-darwin.dmg \
+                     dist/basemind-hacienda-legal-aarch64-apple-darwin.dmg; do
+            [ -s "$dmg" ] || { echo "::error::DMG missing before verification: $dmg"; exit 1; }
+            bash tests/macos_dmg_smoke.sh "$dmg" arm64
+          done
+
+      - name: Upload macOS DMG artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-macos-installers-intel:
+    name: Verify Universal DMGs on Intel macOS 15
+    needs: [resolve-source, macos-installers]
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Download Universal DMGs
+        uses: actions/download-artifact@v4
+        with:
+          name: installers-macos
+          path: .
+
+      - name: Assert the official Intel macOS 15 minimum on this host
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(uname -m)" = "x86_64" ] || { echo "::error::expected an Intel macOS 15 runner"; exit 1; }
+          major="$(sw_vers -productVersion | cut -d. -f1)"
+          [ "$major" -ge 15 ] || {
+            echo "::error::Intel verification requires macOS 15+, got $(sw_vers -productVersion)"
+            exit 1
+          }
+          echo "Intel host $(sw_vers -productVersion): official macOS 15 minimum satisfied"
+
+      - name: Smoke-test both Universal DMGs (install + launch on Intel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dmg in basemind-universal-apple-darwin.dmg \
+                     basemind-hacienda-legal-universal-apple-darwin.dmg; do
+            [ -s "$dmg" ] || { echo "::error::DMG missing before verification: $dmg"; exit 1; }
+            bash tests/macos_dmg_smoke.sh "$dmg" universal
+          done
+
+  checksums:
+    name: Verify complete asset set and generate checksums
+    needs: [resolve-source, archives, windows-installers, macos-installers, verify-macos-installers-intel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.resolve-source.outputs.sha }}
+
+      - name: Download every built asset
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: .
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: .
+
+      - name: Fail closed on a partial asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            basemind-aarch64-apple-darwin.tar.gz
+            basemind-x86_64-apple-darwin.tar.gz
+            basemind-x86_64-pc-windows-msvc.zip
+            basemind-hacienda-legal-aarch64-apple-darwin.tar.gz
+            basemind-hacienda-legal-x86_64-apple-darwin.tar.gz
+            basemind-hacienda-legal-x86_64-pc-windows-msvc.zip
+            basemind-x86_64-pc-windows-msvc-setup.exe
+            basemind-hacienda-legal-x86_64-pc-windows-msvc-setup.exe
+            basemind-aarch64-apple-darwin.dmg
+            basemind-hacienda-legal-aarch64-apple-darwin.dmg
+            basemind-universal-apple-darwin.dmg
+            basemind-hacienda-legal-universal-apple-darwin.dmg
+          )
+          missing=0
+          for asset in "${required[@]}"; do
+            if [ ! -s "$asset" ]; then
+              echo "::error::built asset set is missing $asset"
+              missing=$((missing + 1))
+            fi
+          done
+          [ "$missing" -eq 0 ] || {
+            echo "::error::$missing of ${#required[@]} required assets missing; refusing to checksum a partial set"
+            exit 1
+          }
+          echo "all ${#required[@]} required assets present"
+
+      - name: Generate checksum manifest and asset report
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum basemind-*.tar.gz basemind-*.zip basemind-*.exe basemind-*.dmg \
+            | sort >"basemind_${ASSET_VERSION}_checksums.txt"
+          {
+            echo '## Non-publishing release assets'
+            echo
+            echo 'Built from merged main; uploaded only to Actions artifacts.'
+            echo
+            echo '```text'
+            wc -c basemind-*.tar.gz basemind-*.zip basemind-*.exe basemind-*.dmg
+            echo
+            cat "basemind_${ASSET_VERSION}_checksums.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          cat "basemind_${ASSET_VERSION}_checksums.txt"
+
+      - name: Upload complete asset bundle (no release upload)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            basemind-*.tar.gz
+            basemind-*.zip
+            basemind-*.exe
+            basemind-*.dmg
+            basemind_*_checksums.txt
+          if-no-files-found: error
+          retention-days: 30
