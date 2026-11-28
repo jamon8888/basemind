@@ -170,18 +170,26 @@ jobs:
           version="1.23.2"
           dir="$RUNNER_TEMP/onnxruntime"
           mkdir -p "$dir"
+          # A socket timeout alone is not a total deadline: PyPI could trickle bytes slower than
+          # 30s apart and hold this leg until the 240-minute job timeout. Bound the whole fetch
+          # with curl, the same way the wheel download below is bounded.
+          metadata="$dir/onnxruntime-metadata.json"
+          curl -fsSL --connect-timeout 30 --max-time 60 --retry 3 \
+            -o "$metadata" "https://pypi.org/pypi/onnxruntime/${version}/json"
           wheel_url="$(python3 -c '
-          import json, urllib.request, sys
-          v = sys.argv[1]
-          data = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/onnxruntime/{v}/json"))
+          import json, sys
+          v = sys.argv[2]
+          data = json.load(open(sys.argv[1]))
           urls = [u["url"] for u in data["urls"]
                   if u["filename"].endswith("macosx_13_0_x86_64.whl")]
           if not urls:
               sys.exit(f"no x86_64 macOS wheel for onnxruntime {v}")
           print(urls[0])
-          ' "$version")"
+          ' "$metadata" "$version")"
           wheel="$dir/onnxruntime.whl"
-          curl -fsSL --retry 3 -o "$wheel" "$wheel_url"
+          # Bounded like package-release.sh's vendoring step: a stalled connection or body must
+          # fail this leg, not hold it until the 240-minute job timeout.
+          curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o "$wheel" "$wheel_url"
           python3 -c '
           import sys, zipfile
           wheel, out = sys.argv[1], sys.argv[2]
